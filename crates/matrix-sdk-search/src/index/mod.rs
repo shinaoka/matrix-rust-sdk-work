@@ -342,8 +342,11 @@ impl RoomIndex {
 
 fn register_tokenizers(index: &Index, config: &SearchIndexConfig) {
     if let Some((tokenizer_name, min_gram, max_gram)) = config.ngram_tokenizer() {
-        let tokenizer = NgramTokenizer::all_ngrams(min_gram, max_gram)
-            .expect("ngram tokenizer config should use non-zero min_gram and min_gram <= max_gram");
+        let Ok(tokenizer) = NgramTokenizer::all_ngrams(min_gram, max_gram) else {
+            unreachable!(
+                "NgramConfig only stores bounds where min_gram > 0 and min_gram <= max_gram"
+            );
+        };
 
         index.tokenizers().register(&tokenizer_name, tokenizer);
     }
@@ -364,7 +367,7 @@ mod tests {
     };
 
     use crate::{
-        config::{SearchIndexConfig, SearchTokenizer},
+        config::SearchIndexConfig,
         error::IndexError,
         index::{RoomIndex, RoomIndexOperation, builder::RoomIndexBuilder},
     };
@@ -463,9 +466,7 @@ mod tests {
     fn test_ngram_search_matches_japanese_substring() -> Result<(), Box<dyn Error>> {
         let room_id = room_id!("!room_id:localhost");
         let mut index = RoomIndexBuilder::new_in_memory(room_id)
-            .config(SearchIndexConfig {
-                tokenizer: SearchTokenizer::Ngram { min_gram: 2, max_gram: 4 },
-            })
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
             .build();
 
         let event_id = event_id!("$event_id:localhost");

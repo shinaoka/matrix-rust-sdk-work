@@ -136,9 +136,9 @@ impl MatrixSearchIndexSchema for RoomMessageSchema {
 }
 
 fn body_text_options(config: &SearchIndexConfig) -> TextOptions {
-    match config.tokenizer {
+    match &config.tokenizer {
         SearchTokenizer::Default => TEXT,
-        SearchTokenizer::Ngram { .. } => {
+        SearchTokenizer::Ngram(_) => {
             let tokenizer_name = config.body_tokenizer_name();
             let indexing_options = TEXT
                 .get_indexing_options()
@@ -180,7 +180,7 @@ mod tests {
     use tantivy::schema::FieldType;
 
     use super::{MatrixSearchIndexSchema, RoomMessageSchema};
-    use crate::config::{SearchIndexConfig, SearchTokenizer};
+    use crate::config::SearchIndexConfig;
 
     fn body_tokenizer(schema: &RoomMessageSchema) -> String {
         let tantivy_schema = schema.as_tantivy_schema();
@@ -206,8 +206,7 @@ mod tests {
 
     #[test]
     fn ngram_schema_uses_named_body_tokenizer() {
-        let config =
-            SearchIndexConfig { tokenizer: SearchTokenizer::Ngram { min_gram: 2, max_gram: 4 } };
+        let config = SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid");
         let schema = RoomMessageSchema::new_with_config(&config);
 
         assert_eq!(body_tokenizer(&schema), "matrix_ngram_2_4");

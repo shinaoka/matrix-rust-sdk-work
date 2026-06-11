@@ -38,6 +38,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 matrix-sdk-test.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]
