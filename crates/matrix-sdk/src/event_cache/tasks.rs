@@ -526,7 +526,10 @@ pub(super) async fn search_indexing_task(
                 break;
             }
             Err(RecvError::Lagged(num_skipped)) => {
-                warn!(num_skipped, "Lagged behind linked chunk updates");
+                warn!(
+                    num_skipped,
+                    "Lagged behind linked chunk updates; search index requires room reindex"
+                );
             }
         }
     }

@@ -274,8 +274,9 @@ async fn handle_room_redaction(
     cache: &RoomEventCache,
     rules: &RedactionRules,
 ) -> Option<RoomIndexOperation> {
-    if let Some(redacted_event_id) = event.redacts(rules)
-        && let Ok(Some(redacted_event)) = cache.find_event(redacted_event_id).await
+    let redacted_event_id = event.redacts(rules)?;
+
+    if let Ok(Some(redacted_event)) = cache.find_event(redacted_event_id).await
         && let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             redacted_event,
         ))) = redacted_event.raw().deserialize()
@@ -285,7 +286,8 @@ async fn handle_room_redaction(
             .await
             .or(Some(RoomIndexOperation::Remove(redacted_event.event_id.clone())));
     }
-    None
+
+    Some(RoomIndexOperation::Remove(redacted_event_id.to_owned()))
 }
 
 /// Prepare a [`TimelineEvent`] into a [`RoomIndexOperation`] for search
@@ -324,11 +326,13 @@ async fn parse_timeline_event(
 
 #[cfg(test)]
 mod tests {
+    use matrix_sdk_search::index::RoomIndexOperation;
     use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
     use ruma::{
         event_id, events::room::message::RoomMessageEventContentWithoutRelation, room_id, user_id,
     };
 
+    use super::parse_timeline_event;
     use crate::test_utils::mocks::MatrixMockServer;
 
     #[cfg(feature = "experimental-search")]
@@ -450,5 +454,75 @@ mod tests {
             "Search should return latest edit, got {:?}",
             results[0].1
         );
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_search_index_redaction_removes_redacted_event_when_cache_misses() {
+        let room_id = room_id!("!room_id:localhost");
+        let redacted_id = event_id!("$redacted");
+        let redaction_id = event_id!("$redaction");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+        let event_factory =
+            EventFactory::new().room(room_id).sender(user_id!("@user_id:localhost"));
+        let redaction = event_factory.redaction(redacted_id).event_id(redaction_id).into_event();
+        let redaction_rules = room.clone_info().room_version_rules_or_default().redaction;
+
+        let operation = parse_timeline_event(&room_cache, redaction, &redaction_rules).await;
+
+        match operation {
+            Some(RoomIndexOperation::Remove(event_id)) => assert_eq!(event_id, redacted_id),
+            other => panic!("expected remove operation for redacted event id, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_search_index_redaction_preserves_edit_aware_cache_hit() {
+        let room_id = room_id!("!room_id:localhost");
+        let original_id = event_id!("$original");
+        let edit_id = event_id!("$edit");
+        let redaction_id = event_id!("$redaction");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+        let event_factory =
+            EventFactory::new().room(room_id).sender(user_id!("@user_id:localhost"));
+        let original = event_factory.text_msg("Original message").event_id(original_id).into();
+        let edit = event_factory
+            .text_msg("* Edited message")
+            .edit(original_id, RoomMessageEventContentWithoutRelation::text_plain("Edited message"))
+            .event_id(edit_id)
+            .into();
+        room_cache.save_events([original, edit]).await;
+
+        let redaction = event_factory.redaction(edit_id).event_id(redaction_id).into_event();
+        let redaction_rules = room.clone_info().room_version_rules_or_default().redaction;
+
+        let operation = parse_timeline_event(&room_cache, redaction, &redaction_rules).await;
+
+        match operation {
+            Some(RoomIndexOperation::Edit(event_id, latest_edit)) => {
+                assert_eq!(event_id, original_id);
+                assert_eq!(latest_edit.event_id, edit_id);
+            }
+            other => panic!("expected edit operation for cached redacted edit, got {other:?}"),
+        }
     }
 }
