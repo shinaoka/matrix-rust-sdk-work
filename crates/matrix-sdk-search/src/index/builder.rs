@@ -8,6 +8,7 @@ use tantivy::{
 use zeroize::Zeroizing;
 
 use crate::{
+    config::SearchIndexConfig,
     encrypted::encrypted_dir::{EncryptedMmapDirectory, PBKDF_COUNT},
     error::IndexError,
     index::RoomIndex,
@@ -36,12 +37,19 @@ impl RoomIndexBuilder {
 pub struct PhysicalRoomIndexBuilder {
     path: PathBuf,
     room_id: OwnedRoomId,
+    config: SearchIndexConfig,
 }
 
 impl PhysicalRoomIndexBuilder {
     /// Make an new [`PhysicalRoomIndexBuilder`]
     pub(crate) fn new(path: PathBuf, room_id: OwnedRoomId) -> PhysicalRoomIndexBuilder {
-        PhysicalRoomIndexBuilder { path, room_id }
+        PhysicalRoomIndexBuilder { path, room_id, config: SearchIndexConfig::default() }
+    }
+
+    /// Configure the search index.
+    pub fn config(mut self, config: SearchIndexConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Make an unencrypted index
@@ -49,6 +57,7 @@ impl PhysicalRoomIndexBuilder {
         UnencryptedPhysicalRoomIndexBuilder {
             path: self.path.clone(),
             room_id: self.room_id.clone(),
+            config: self.config.clone(),
         }
     }
 
@@ -57,6 +66,7 @@ impl PhysicalRoomIndexBuilder {
         EncryptedPhysicalRoomIndexBuilder {
             path: self.path.clone(),
             room_id: self.room_id.clone(),
+            config: self.config.clone(),
             password: Zeroizing::new(password.into()),
         }
     }
@@ -66,6 +76,7 @@ impl PhysicalRoomIndexBuilder {
 pub struct UnencryptedPhysicalRoomIndexBuilder {
     path: PathBuf,
     room_id: OwnedRoomId,
+    config: SearchIndexConfig,
 }
 
 impl UnencryptedPhysicalRoomIndexBuilder {
@@ -87,9 +98,9 @@ impl UnencryptedPhysicalRoomIndexBuilder {
                 _ => Err(err),
             },
         }?;
-        let schema = RoomMessageSchema::new();
+        let schema = RoomMessageSchema::new_with_config(&self.config);
         let index = Index::open_or_create(mmap_dir, schema.as_tantivy_schema())?;
-        Ok(RoomIndex::new_with(index, schema, &self.room_id))
+        Ok(RoomIndex::new_with(index, schema, &self.room_id, &self.config))
     }
 }
 
@@ -97,6 +108,7 @@ impl UnencryptedPhysicalRoomIndexBuilder {
 pub struct EncryptedPhysicalRoomIndexBuilder {
     path: PathBuf,
     room_id: OwnedRoomId,
+    config: SearchIndexConfig,
     password: Zeroizing<String>,
 }
 
@@ -120,27 +132,34 @@ impl EncryptedPhysicalRoomIndexBuilder {
                     _ => Err(err),
                 },
             }?;
-        let schema = RoomMessageSchema::new();
+        let schema = RoomMessageSchema::new_with_config(&self.config);
         let index = Index::open_or_create(mmap_dir, schema.as_tantivy_schema())?;
-        Ok(RoomIndex::new_with(index, schema, &self.room_id))
+        Ok(RoomIndex::new_with(index, schema, &self.room_id, &self.config))
     }
 }
 
 /// Builder for [`RoomIndex`] in memory
 pub struct MemoryRoomIndexBuilder {
     room_id: OwnedRoomId,
+    config: SearchIndexConfig,
 }
 
 impl MemoryRoomIndexBuilder {
     /// Make an new [`MemoryIndexBuilder`]
     pub(crate) fn new(room_id: OwnedRoomId) -> MemoryRoomIndexBuilder {
-        MemoryRoomIndexBuilder { room_id }
+        MemoryRoomIndexBuilder { room_id, config: SearchIndexConfig::default() }
+    }
+
+    /// Configure the search index.
+    pub fn config(mut self, config: SearchIndexConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Build the [`RoomIndex`]
     pub fn build(&self) -> RoomIndex {
-        let schema = RoomMessageSchema::new();
+        let schema = RoomMessageSchema::new_with_config(&self.config);
         let index = Index::create_in_ram(schema.as_tantivy_schema());
-        RoomIndex::new_with(index, schema, &self.room_id)
+        RoomIndex::new_with(index, schema, &self.room_id, &self.config)
     }
 }

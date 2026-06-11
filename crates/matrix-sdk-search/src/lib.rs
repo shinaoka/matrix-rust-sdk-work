@@ -6,6 +6,8 @@ pub type OpStamp = u64;
 
 pub(crate) const TANTIVY_INDEX_MEMORY_BUDGET: usize = 50_000_000;
 
+/// A module for search index configuration.
+pub mod config;
 mod encrypted;
 mod schema;
 mod writer;

@@ -22,12 +22,13 @@ use ruma::{
 };
 use tantivy::{
     Index, IndexReader, TantivyDocument, collector::TopDocs, directory::error::OpenDirectoryError,
-    query::QueryParser, schema::Value,
+    query::QueryParser, schema::Value, tokenizer::NgramTokenizer,
 };
 use tracing::{debug, error, warn};
 
 use crate::{
     OpStamp, TANTIVY_INDEX_MEMORY_BUDGET,
+    config::SearchIndexConfig,
     error::IndexError,
     schema::{MatrixSearchIndexSchema, RoomMessageSchema},
     writer::SearchIndexWriter,
@@ -70,7 +71,13 @@ impl fmt::Debug for RoomIndex {
 }
 
 impl RoomIndex {
-    pub(crate) fn new_with(index: Index, schema: RoomMessageSchema, room_id: &RoomId) -> RoomIndex {
+    pub(crate) fn new_with(
+        index: Index,
+        schema: RoomMessageSchema,
+        room_id: &RoomId,
+        config: &SearchIndexConfig,
+    ) -> RoomIndex {
+        register_tokenizers(&index, config);
         let query_parser = QueryParser::for_index(&index, schema.default_search_fields());
         Self {
             index,
@@ -333,6 +340,15 @@ impl RoomIndex {
     }
 }
 
+fn register_tokenizers(index: &Index, config: &SearchIndexConfig) {
+    if let Some((tokenizer_name, min_gram, max_gram)) = config.ngram_tokenizer() {
+        let tokenizer = NgramTokenizer::all_ngrams(min_gram, max_gram)
+            .expect("ngram tokenizer config should use non-zero min_gram and min_gram <= max_gram");
+
+        index.tokenizers().register(&tokenizer_name, tokenizer);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, error::Error};
@@ -348,6 +364,7 @@ mod tests {
     };
 
     use crate::{
+        config::{SearchIndexConfig, SearchTokenizer},
         error::IndexError,
         index::{RoomIndex, RoomIndexOperation, builder::RoomIndexBuilder},
     };
@@ -435,6 +452,36 @@ mod tests {
         let result: HashSet<_> = result.iter().map(|(_, id)| id).collect();
 
         let true_value = [event_id_1.to_owned(), event_id_3.to_owned()];
+        let true_value: HashSet<_> = true_value.iter().collect();
+
+        assert_eq!(result, true_value, "search result not correct: {result:?}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ngram_search_matches_japanese_substring() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig {
+                tokenizer: SearchTokenizer::Ngram { min_gram: 2, max_gram: 4 },
+            })
+            .build();
+
+        let event_id = event_id!("$event_id:localhost");
+        let event = EventFactory::new()
+            .text_msg("再アンケートです。来週確認します。")
+            .event_id(event_id)
+            .room(room_id)
+            .sender(user_id!("@user_id:localhost"))
+            .into_any_sync_message_like_event();
+
+        index_message(&mut index, event)?;
+
+        let result = index.search("アンケート", 10, None).expect("search failed with: {result:?}");
+        let result: HashSet<_> = result.iter().map(|(_, id)| id).collect();
+
+        let true_value = [event_id.to_owned()];
         let true_value: HashSet<_> = true_value.iter().collect();
 
         assert_eq!(result, true_value, "search result not correct: {result:?}");

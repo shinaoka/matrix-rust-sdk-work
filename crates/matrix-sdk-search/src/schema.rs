@@ -15,13 +15,17 @@
 use ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent, Relation};
 use tantivy::{
     DateTime, TantivyDocument, doc,
-    schema::{DateOptions, DateTimePrecision, Field, INDEXED, STORED, STRING, Schema, TEXT},
+    schema::{
+        DateOptions, DateTimePrecision, Field, INDEXED, STORED, STRING, Schema, TEXT, TextOptions,
+    },
 };
 
-use crate::error::{IndexError, IndexSchemaError};
+use crate::{
+    config::{SearchIndexConfig, SearchTokenizer},
+    error::{IndexError, IndexSchemaError},
+};
 
 pub(crate) trait MatrixSearchIndexSchema {
-    fn new() -> Self;
     fn default_search_fields(&self) -> Vec<Field>;
     fn primary_key(&self) -> Field;
     fn deletion_key(&self) -> Field;
@@ -44,12 +48,12 @@ pub(crate) struct RoomMessageSchema {
     default_search_fields: Vec<Field>,
 }
 
-impl MatrixSearchIndexSchema for RoomMessageSchema {
-    fn new() -> Self {
+impl RoomMessageSchema {
+    pub(crate) fn new_with_config(config: &SearchIndexConfig) -> Self {
         let mut schema = Schema::builder();
         let event_id_field = schema.add_text_field("event_id", STORED | STRING);
         let original_event_id_field = schema.add_text_field("original_event_id", STRING);
-        let body_field = schema.add_text_field("body", TEXT);
+        let body_field = schema.add_text_field("body", body_text_options(config));
 
         let date_options =
             DateOptions::from(INDEXED).set_fast().set_precision(DateTimePrecision::Seconds);
@@ -72,6 +76,18 @@ impl MatrixSearchIndexSchema for RoomMessageSchema {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::new_with_config(&SearchIndexConfig::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn body_field(&self) -> Field {
+        self.body_field
+    }
+}
+
+impl MatrixSearchIndexSchema for RoomMessageSchema {
     fn default_search_fields(&self) -> Vec<Field> {
         self.default_search_fields.clone()
     }
@@ -119,6 +135,22 @@ impl MatrixSearchIndexSchema for RoomMessageSchema {
     }
 }
 
+fn body_text_options(config: &SearchIndexConfig) -> TextOptions {
+    match config.tokenizer {
+        SearchTokenizer::Default => TEXT,
+        SearchTokenizer::Ngram { .. } => {
+            let tokenizer_name = config.body_tokenizer_name();
+            let indexing_options = TEXT
+                .get_indexing_options()
+                .expect("TEXT should have indexing options")
+                .clone()
+                .set_tokenizer(&tokenizer_name);
+
+            TEXT.set_indexing_options(indexing_options)
+        }
+    }
+}
+
 impl TryFrom<Schema> for RoomMessageSchema {
     type Error = IndexSchemaError;
 
@@ -140,5 +172,44 @@ impl TryFrom<Schema> for RoomMessageSchema {
             sender_field,
             default_search_fields,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tantivy::schema::FieldType;
+
+    use super::{MatrixSearchIndexSchema, RoomMessageSchema};
+    use crate::config::{SearchIndexConfig, SearchTokenizer};
+
+    fn body_tokenizer(schema: &RoomMessageSchema) -> String {
+        let tantivy_schema = schema.as_tantivy_schema();
+        let field_entry = tantivy_schema.get_field_entry(schema.body_field());
+
+        let FieldType::Str(text_options) = field_entry.field_type() else {
+            panic!("body field should be a text field");
+        };
+
+        text_options
+            .get_indexing_options()
+            .expect("body field should be indexed")
+            .tokenizer()
+            .to_owned()
+    }
+
+    #[test]
+    fn default_schema_uses_default_body_tokenizer() {
+        let schema = RoomMessageSchema::new();
+
+        assert_eq!(body_tokenizer(&schema), "default");
+    }
+
+    #[test]
+    fn ngram_schema_uses_named_body_tokenizer() {
+        let config =
+            SearchIndexConfig { tokenizer: SearchTokenizer::Ngram { min_gram: 2, max_gram: 4 } };
+        let schema = RoomMessageSchema::new_with_config(&config);
+
+        assert_eq!(body_tokenizer(&schema), "matrix_ngram_2_4");
     }
 }
