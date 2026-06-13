@@ -21,6 +21,7 @@ use std::{collections::hash_map::HashMap, path::PathBuf, sync::Arc};
 use futures_util::future::join_all;
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
 use matrix_sdk_search::{
+    config::SearchIndexConfig,
     error::IndexError,
     index::{RoomIndex, RoomIndexOperation, builder::RoomIndexBuilder},
 };
@@ -47,10 +48,40 @@ type Password = String;
 pub enum SearchIndexStoreKind {
     /// Store unencrypted in file system folder
     UnencryptedDirectory(PathBuf),
+    // Matrix desktop fork patch surface: callers need to supply a custom
+    // SearchIndexConfig so desktop search can use alternate tokenizers.
+    /// Store unencrypted in a file system folder with a custom index config,
+    /// such as an ngram tokenizer for substring search.
+    UnencryptedDirectoryWithConfig(PathBuf, SearchIndexConfig),
     /// Store encrypted in file system folder
     EncryptedDirectory(PathBuf, Password),
+    /// Store encrypted in a file system folder with a custom index config,
+    /// such as an ngram tokenizer for substring search.
+    EncryptedDirectoryWithConfig(PathBuf, Password, SearchIndexConfig),
     /// Store in memory
     InMemory,
+    /// Store in memory with a custom index config for alternate tokenization
+    /// or other search settings.
+    InMemoryWithConfig(SearchIndexConfig),
+}
+
+impl SearchIndexStoreKind {
+    // Matrix desktop fork patch surface: CJK desktop search needs substring
+    // matching while preserving the SDK's encrypted on-disk search store.
+    /// Convenience constructor for encrypted on-disk indexes using an ngram
+    /// tokenizer, which improves substring matching for languages such as CJK.
+    pub fn encrypted_directory_ngram(
+        path: PathBuf,
+        password: Password,
+        min_gram: usize,
+        max_gram: usize,
+    ) -> Result<Self, matrix_sdk_search::config::NgramConfigError> {
+        Ok(Self::EncryptedDirectoryWithConfig(
+            path,
+            password,
+            SearchIndexConfig::ngram(min_gram, max_gram)?,
+        ))
+    }
 }
 
 /// Object that handles inteeraction with [`RoomIndex`]'s for search
@@ -97,12 +128,30 @@ impl SearchIndexGuard<'_> {
             SearchIndexStoreKind::UnencryptedDirectory(path) => {
                 RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id).unencrypted().build()?
             }
+            // Matrix desktop fork patch surface: config-bearing store kinds
+            // must pass the injected config into RoomIndexBuilder before
+            // selecting storage/encryption.
+            SearchIndexStoreKind::UnencryptedDirectoryWithConfig(path, config) => {
+                RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id)
+                    .config(config.clone())
+                    .unencrypted()
+                    .build()?
+            }
             SearchIndexStoreKind::EncryptedDirectory(path, password) => {
                 RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id)
                     .encrypted(password)
                     .build()?
             }
+            SearchIndexStoreKind::EncryptedDirectoryWithConfig(path, password, config) => {
+                RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id)
+                    .config(config.clone())
+                    .encrypted(password)
+                    .build()?
+            }
             SearchIndexStoreKind::InMemory => RoomIndexBuilder::new_in_memory(room_id).build(),
+            SearchIndexStoreKind::InMemoryWithConfig(config) => {
+                RoomIndexBuilder::new_in_memory(room_id).config(config.clone()).build()
+            }
         };
         Ok(index)
     }
@@ -326,13 +375,19 @@ async fn parse_timeline_event(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use matrix_sdk_search::config::SearchIndexConfig;
     use matrix_sdk_search::index::RoomIndexOperation;
     use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
     use ruma::{
-        event_id, events::room::message::RoomMessageEventContentWithoutRelation, room_id, user_id,
+        event_id,
+        events::{AnySyncMessageLikeEvent, room::message::RoomMessageEventContentWithoutRelation},
+        room_id, user_id,
     };
+    use tokio::sync::Mutex;
 
-    use super::parse_timeline_event;
+    use super::{SearchIndex, SearchIndexStoreKind, parse_timeline_event};
     use crate::test_utils::mocks::MatrixMockServer;
 
     #[cfg(feature = "experimental-search")]
@@ -365,6 +420,39 @@ mod tests {
 
         assert_eq!(response.len(), 1, "unexpected numbers of responses: {response:?}");
         assert_eq!(response[0].1, event_id, "event id doesn't match: {response:?}");
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_search_index_store_kind_can_configure_ngram_tokenizer() {
+        let room_id = room_id!("!room_id:localhost");
+        let event_id = event_id!("$event_id:localhost");
+        let user_id = user_id!("@user_id:localhost");
+        let index = SearchIndex::new(
+            Arc::new(Mutex::new(HashMap::new())),
+            SearchIndexStoreKind::InMemoryWithConfig(
+                SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"),
+            ),
+        );
+        let event = EventFactory::new()
+            .room(room_id)
+            .sender(user_id)
+            .text_msg("再アンケートです")
+            .event_id(event_id)
+            .into_any_sync_message_like_event();
+        let AnySyncMessageLikeEvent::RoomMessage(event) = event else {
+            panic!("expected room message event");
+        };
+        let event = event.as_original().expect("message should be original").clone();
+
+        let mut guard = index.lock().await;
+        guard.execute(RoomIndexOperation::Add(event), room_id).expect("event should be indexed");
+
+        let results =
+            guard.search("アンケート", 10, None, room_id).expect("ngram search should run");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, event_id);
     }
 
     #[cfg(feature = "experimental-search")]

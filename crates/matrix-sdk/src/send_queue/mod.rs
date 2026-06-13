@@ -2722,6 +2722,17 @@ impl SendHandle {
         Self { room, transaction_id, media_handles: vec![], created_at }
     }
 
+    // Matrix desktop fork patch surface: the desktop runtime must correlate the
+    // enqueue handle with the later RoomSendQueueUpdate::SentEvent without
+    // bypassing the send queue.
+    /// Returns the transaction id for this send request.
+    ///
+    /// This is the id later emitted in [`RoomSendQueueUpdate::SentEvent`] and
+    /// can be used to correlate an enqueued send with completion updates.
+    pub fn transaction_id(&self) -> &TransactionId {
+        &self.transaction_id
+    }
+
     fn nyi_for_uploads(&self) -> Result<(), RoomSendQueueStorageError> {
         if !self.media_handles.is_empty() {
             Err(RoomSendQueueStorageError::OperationNotImplementedYet)
