@@ -526,6 +526,9 @@ pub(super) async fn search_indexing_task(
                 break;
             }
             Err(RecvError::Lagged(num_skipped)) => {
+                // Matrix desktop fork patch surface: the lag warning text is
+                // adjusted to indicate that the desktop search index needs a
+                // room reindex after skipping linked-chunk updates.
                 warn!(
                     num_skipped,
                     "Lagged behind linked chunk updates; search index requires room reindex"
