@@ -27,6 +27,10 @@ use crate::timeline::{
 
 /// Outcome of a cache-only backward restore via
 /// [`Timeline::live_restore_from_cache`].
+// Matrix desktop fork patch surface: outcome type for the cache-only
+// deep-history restore path. Exposes `chunks_loaded` so the koushi-core
+// TimelineActor can compute an exact settle fence without guessing chunk
+// capacity. Not part of upstream matrix-sdk-ui.
 #[derive(Debug)]
 pub struct RestoreFromCacheOutcome {
     /// Total number of events loaded from disk and revealed in the timeline.
@@ -150,10 +154,11 @@ impl super::Timeline {
     /// touching the network, and reveal them in the live timeline stream.
     ///
     /// This is the ~O(1) alternative to calling [`paginate_backwards`] in a
-    /// loop for deep-history restore: a single call reads all available disk
-    /// chunks up to `n` events and reveals them to subscribers by decrementing
-    /// the `Skip` adaptor's count (see
-    /// [`TimelineController::reveal_lazy_items`]).
+    /// loop for deep-history restore. It mirrors [`paginate_backwards`] in live
+    /// mode: first call [`live_lazy_paginate_backwards`] to reveal any
+    /// already-in-memory hidden rows (decrementing the `Skip` adaptor count);
+    /// if that is not enough, call [`run_backwards_cache_only`] for the
+    /// remainder from disk, with no network round-trips.
     ///
     /// Only meaningful when the timeline is in live mode. If the timeline is
     /// in focused/pinned-events mode this returns an error.
@@ -164,7 +169,13 @@ impl super::Timeline {
     /// reach events that are not yet on disk.
     ///
     /// [`paginate_backwards`]: Self::paginate_backwards
-    /// [`TimelineController::reveal_lazy_items`]: crate::timeline::controller::TimelineController::reveal_lazy_items
+    /// [`live_lazy_paginate_backwards`]: crate::timeline::controller::TimelineController::live_lazy_paginate_backwards
+    /// [`run_backwards_cache_only`]: matrix_sdk::event_cache::RoomPagination::run_backwards_cache_only
+    // Matrix desktop fork patch surface: cache-only deep-history restore path
+    // used by the anchor-restore actor (koushi-core TimelineActor). Mirrors
+    // the live_lazy_paginate_backwards + run_backwards_once pattern of
+    // paginate_backwards, but substitutes run_backwards_cache_only for the
+    // disk-load step so no network round-trips occur.
     pub async fn live_restore_from_cache(
         &self,
         n: u16,
@@ -174,11 +185,24 @@ impl super::Timeline {
             _ => return Err(Error::PaginationError(NotSupported)),
         }
 
-        let CacheOnlyBackOutcome { events_loaded, chunks_loaded, reached_start, hit_gap } =
-            self.event_cache.pagination().run_backwards_cache_only(n).await?;
+        // Step 1: reveal already-in-memory hidden rows by decrementing the Skip
+        // count, exactly like live_lazy_paginate_backwards does. Returns the
+        // number of additional events that must be loaded from disk, or None
+        // when in-memory had enough.
+        let Some(needs) = self.controller.live_lazy_paginate_backwards(n).await else {
+            // All `n` events were already in memory (skip count covered them).
+            return Ok(RestoreFromCacheOutcome {
+                events_loaded: 0,
+                chunks_loaded: 0,
+                reached_start: false,
+                hit_gap: false,
+            });
+        };
 
-        // Reveal the loaded items that are currently hidden by the Skip adaptor.
-        self.controller.reveal_lazy_items(events_loaded).await;
+        // Step 2: load the remainder from disk only (no network).
+        let needs_u16 = needs.try_into().unwrap_or(u16::MAX);
+        let CacheOnlyBackOutcome { events_loaded, chunks_loaded, reached_start, hit_gap } =
+            self.event_cache.pagination().run_backwards_cache_only(needs_u16).await?;
 
         Ok(RestoreFromCacheOutcome { events_loaded, chunks_loaded, reached_start, hit_gap })
     }

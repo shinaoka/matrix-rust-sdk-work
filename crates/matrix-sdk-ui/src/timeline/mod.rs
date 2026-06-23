@@ -83,6 +83,9 @@ pub mod thread_list_service;
 mod traits;
 mod virtual_item;
 
+// Matrix desktop fork patch surface: RestoreFromCacheOutcome is a
+// koushi-specific type for the cache-only deep-history restore path.
+// Not part of upstream matrix-sdk-ui.
 pub use self::{
     builder::TimelineBuilder,
     controller::default_event_filter,

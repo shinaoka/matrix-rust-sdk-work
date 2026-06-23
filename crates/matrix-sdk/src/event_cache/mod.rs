@@ -71,7 +71,11 @@ pub use caches::{
     pagination::{BackPaginationOutcome, PaginationStatus},
     room::{
         RoomEventCache, RoomEventCacheGenericUpdate, RoomEventCacheSubscriber,
-        RoomEventCacheUpdate, pagination::{CacheOnlyBackOutcome, RoomPagination},
+        RoomEventCacheUpdate,
+        // Matrix desktop fork patch surface: CacheOnlyBackOutcome is a
+        // koushi-specific type returned by run_backwards_cache_only. Not part of
+        // upstream matrix-sdk.
+        pagination::{CacheOnlyBackOutcome, RoomPagination},
     },
     thread::pagination::ThreadPagination,
 };

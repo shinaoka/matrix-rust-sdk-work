@@ -428,6 +428,10 @@ impl<P: RoomDataProvider> TimelineController<P> {
     ///
     /// [`live_lazy_paginate_backwards`]: Self::live_lazy_paginate_backwards
     /// [`RoomPagination::run_backwards_cache_only`]: matrix_sdk::event_cache::RoomPagination::run_backwards_cache_only
+    // Matrix desktop fork patch surface: helper for the cache-only deep-history
+    // restore path; used by live_restore_from_cache to reveal already-loaded
+    // items without an additional disk load. Not part of upstream matrix-sdk-ui.
+    #[allow(dead_code)]
     pub(super) async fn reveal_lazy_items(&self, num: usize) {
         if num == 0 {
             return;

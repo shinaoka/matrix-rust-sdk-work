@@ -166,6 +166,10 @@ impl RoomPagination {
     /// a subscribed live [`Timeline`] ingests the events exactly as if
     /// [`paginate_backwards`] had been called — but without the pagination-
     /// status changes or network round-trips.
+    // Matrix desktop fork patch surface: cache-only backward load used by
+    // live_restore_from_cache (matrix-sdk-ui) for deep-history anchor restore
+    // in koushi-core. Returns CacheOnlyBackOutcome.chunks_loaded so the caller
+    // can compute an exact DiffBatch settle fence. Not part of upstream matrix-sdk.
     ///
     /// Stops when any of the following is true:
     /// - The cumulative loaded-event count reaches `n`.
@@ -243,6 +247,9 @@ impl RoomPagination {
 }
 
 /// Outcome of a cache-only backward load via [`RoomPagination::run_backwards_cache_only`].
+// Matrix desktop fork patch surface: returned by run_backwards_cache_only to
+// expose chunks_loaded for exact DiffBatch settle accounting. Not part of
+// upstream matrix-sdk.
 #[derive(Debug)]
 pub struct CacheOnlyBackOutcome {
     /// Total number of events loaded from disk in this call.
