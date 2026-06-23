@@ -16,7 +16,7 @@ use async_rx::StreamExt as _;
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt as _, pin_mut};
-use matrix_sdk::event_cache::PaginationStatus;
+use matrix_sdk::event_cache::{CacheOnlyBackOutcome, PaginationStatus};
 use tracing::instrument;
 
 use super::Error;
@@ -24,6 +24,25 @@ use crate::timeline::{
     PaginationError::{self, NotSupported},
     controller::TimelineFocusKind,
 };
+
+/// Outcome of a cache-only backward restore via
+/// [`Timeline::live_restore_from_cache`].
+#[derive(Debug)]
+pub struct RestoreFromCacheOutcome {
+    /// Total number of events loaded from disk and revealed in the timeline.
+    pub events_loaded: usize,
+    /// Number of disk chunks read. Each chunk produces exactly one
+    /// [`RoomEventCacheUpdate::UpdateTimelineEvents`] broadcast that flows
+    /// through the 3-hop async pipeline to the Timeline subscriber as one
+    /// `DiffBatch` actor message. Callers can use this as the exact expected
+    /// count of DiffBatch messages to settle against.
+    pub chunks_loaded: usize,
+    /// `true` if the start of the stored timeline was reached.
+    pub reached_start: bool,
+    /// `true` if a gap was encountered before `n` events were loaded. The
+    /// caller should fall back to network-backed pagination.
+    pub hit_gap: bool,
+}
 
 impl super::Timeline {
     /// Add more events to the start of the timeline.
@@ -125,6 +144,43 @@ impl super::Timeline {
                 Err(err) => return Err(err.into()),
             }
         }
+    }
+
+    /// Load up to `n` events backward from the on-disk cache only, without
+    /// touching the network, and reveal them in the live timeline stream.
+    ///
+    /// This is the ~O(1) alternative to calling [`paginate_backwards`] in a
+    /// loop for deep-history restore: a single call reads all available disk
+    /// chunks up to `n` events and reveals them to subscribers by decrementing
+    /// the `Skip` adaptor's count (see
+    /// [`TimelineController::reveal_lazy_items`]).
+    ///
+    /// Only meaningful when the timeline is in live mode. If the timeline is
+    /// in focused/pinned-events mode this returns an error.
+    ///
+    /// Returns [`RestoreFromCacheOutcome`] which carries the number of events
+    /// loaded plus flags for `reached_start` and `hit_gap`. When `hit_gap` is
+    /// `true`, the caller should fall back to network-backed pagination to
+    /// reach events that are not yet on disk.
+    ///
+    /// [`paginate_backwards`]: Self::paginate_backwards
+    /// [`TimelineController::reveal_lazy_items`]: crate::timeline::controller::TimelineController::reveal_lazy_items
+    pub async fn live_restore_from_cache(
+        &self,
+        n: u16,
+    ) -> Result<RestoreFromCacheOutcome, Error> {
+        match self.controller.focus() {
+            TimelineFocusKind::Live { .. } => {}
+            _ => return Err(Error::PaginationError(NotSupported)),
+        }
+
+        let CacheOnlyBackOutcome { events_loaded, chunks_loaded, reached_start, hit_gap } =
+            self.event_cache.pagination().run_backwards_cache_only(n).await?;
+
+        // Reveal the loaded items that are currently hidden by the Skip adaptor.
+        self.controller.reveal_lazy_items(events_loaded).await;
+
+        Ok(RestoreFromCacheOutcome { events_loaded, chunks_loaded, reached_start, hit_gap })
     }
 
     /// Subscribe to the back-pagination status of a live timeline.

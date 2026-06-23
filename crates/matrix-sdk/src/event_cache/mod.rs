@@ -71,7 +71,7 @@ pub use caches::{
     pagination::{BackPaginationOutcome, PaginationStatus},
     room::{
         RoomEventCache, RoomEventCacheGenericUpdate, RoomEventCacheSubscriber,
-        RoomEventCacheUpdate, pagination::RoomPagination,
+        RoomEventCacheUpdate, pagination::{CacheOnlyBackOutcome, RoomPagination},
     },
     thread::pagination::ThreadPagination,
 };

@@ -145,12 +145,120 @@ impl RoomPagination {
         PaginationStatusSubscriber { subscriber: self.0.cache.status().subscribe() }
     }
 
+    /// Load the next disk chunk backward from the cache, without going to the
+    /// network.
+    ///
+    /// Returns [`LoadMoreEventsBackwardsOutcome`] which is either a gap, the
+    /// start of the timeline, or a set of events loaded from disk.
     #[cfg(test)]
     pub(super) async fn load_more_events_backwards(
         &self,
     ) -> Result<LoadMoreEventsBackwardsOutcome> {
         self.0.cache.load_more_events_backwards().await
     }
+
+    /// Load up to `n` events backward from the on-disk cache only, without
+    /// touching the network.
+    ///
+    /// Loops over [`load_more_events_backwards`] (one SQLite chunk per call)
+    /// and fires the same [`RoomEventCacheUpdate::UpdateTimelineEvents`]
+    /// broadcast that [`conclude_backwards_pagination_from_disk`] produces, so
+    /// a subscribed live [`Timeline`] ingests the events exactly as if
+    /// [`paginate_backwards`] had been called — but without the pagination-
+    /// status changes or network round-trips.
+    ///
+    /// Stops when any of the following is true:
+    /// - The cumulative loaded-event count reaches `n`.
+    /// - A [`LoadMoreEventsBackwardsOutcome::Gap`] is encountered (`hit_gap`).
+    /// - A [`LoadMoreEventsBackwardsOutcome::StartOfTimeline`] is encountered
+    ///   (`reached_start`).
+    ///
+    /// [`load_more_events_backwards`]: PaginatedCache::load_more_events_backwards
+    /// [`conclude_backwards_pagination_from_disk`]: PaginatedCache::conclude_backwards_pagination_from_disk
+    /// [`Timeline`]: matrix_sdk_ui::timeline::Timeline
+    /// [`paginate_backwards`]: Self::run_backwards_once
+    pub async fn run_backwards_cache_only(
+        &self,
+        n: u16,
+    ) -> Result<CacheOnlyBackOutcome> {
+        let mut events_loaded: usize = 0;
+        let mut chunks_loaded: usize = 0;
+        let target = n as usize;
+
+        loop {
+            if events_loaded >= target {
+                break;
+            }
+
+            match self.0.cache.load_more_events_backwards().await? {
+                LoadMoreEventsBackwardsOutcome::Gap { .. } => {
+                    return Ok(CacheOnlyBackOutcome {
+                        events_loaded,
+                        chunks_loaded,
+                        reached_start: false,
+                        hit_gap: true,
+                    });
+                }
+
+                LoadMoreEventsBackwardsOutcome::StartOfTimeline => {
+                    return Ok(CacheOnlyBackOutcome {
+                        events_loaded,
+                        chunks_loaded,
+                        reached_start: true,
+                        hit_gap: false,
+                    });
+                }
+
+                LoadMoreEventsBackwardsOutcome::Events {
+                    events,
+                    timeline_event_diffs,
+                    reached_start,
+                } => {
+                    let count = events.len();
+                    self.0
+                        .cache
+                        .conclude_backwards_pagination_from_disk(
+                            events,
+                            timeline_event_diffs,
+                            reached_start,
+                        )
+                        .await;
+                    events_loaded += count;
+                    chunks_loaded += 1;
+
+                    if reached_start {
+                        return Ok(CacheOnlyBackOutcome {
+                            events_loaded,
+                            chunks_loaded,
+                            reached_start: true,
+                            hit_gap: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(CacheOnlyBackOutcome { events_loaded, chunks_loaded, reached_start: false, hit_gap: false })
+    }
+}
+
+/// Outcome of a cache-only backward load via [`RoomPagination::run_backwards_cache_only`].
+#[derive(Debug)]
+pub struct CacheOnlyBackOutcome {
+    /// Total number of events loaded from disk in this call.
+    pub events_loaded: usize,
+    /// Number of disk chunks read (one `conclude_backwards_pagination_from_disk`
+    /// broadcast per chunk). Callers can use this as the exact expected number
+    /// of [`RoomEventCacheUpdate::UpdateTimelineEvents`] broadcasts that will
+    /// flow through the 3-hop async pipeline to the Timeline subscriber.
+    pub chunks_loaded: usize,
+    /// `true` if the start of the stored timeline was reached (no more disk
+    /// chunks behind the current oldest).
+    pub reached_start: bool,
+    /// `true` if a gap chunk was encountered before `n` events were loaded.
+    /// The caller must decide whether to resolve the gap via the network or
+    /// to treat the cache as non-contiguous.
+    pub hit_gap: bool,
 }
 
 impl PaginatedCache for Arc<RoomEventCacheInner> {

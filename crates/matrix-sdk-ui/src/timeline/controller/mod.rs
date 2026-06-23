@@ -414,6 +414,33 @@ impl<P: RoomDataProvider> TimelineController<P> {
         }
     }
 
+    /// Reveal `num` events that were loaded into the cache but are currently
+    /// hidden by the `Skip` adaptor.
+    ///
+    /// This is the skip-count counterpart of [`live_lazy_paginate_backwards`]
+    /// for use after [`RoomPagination::run_backwards_cache_only`]: the events
+    /// are already in the observable (the broadcast fired by
+    /// `conclude_backwards_pagination_from_disk` has been delivered), so we
+    /// only need to decrement `skip_count` by the loaded count to make them
+    /// visible in the timeline stream.
+    ///
+    /// It is a no-op when `skip_count` is already zero (all items are visible).
+    ///
+    /// [`live_lazy_paginate_backwards`]: Self::live_lazy_paginate_backwards
+    /// [`RoomPagination::run_backwards_cache_only`]: matrix_sdk::event_cache::RoomPagination::run_backwards_cache_only
+    pub(super) async fn reveal_lazy_items(&self, num: usize) {
+        if num == 0 {
+            return;
+        }
+        let state = self.state.read().await;
+        let (count, _needs) = state
+            .meta
+            .subscriber_skip_count
+            .compute_next_when_paginating_backwards(num);
+        let is_live_timeline = true;
+        state.meta.subscriber_skip_count.update(count, is_live_timeline);
+    }
+
     /// Run a lazy backwards pagination (in live mode).
     ///
     /// It adjusts the `count` value of the `Skip` higher-order stream so that

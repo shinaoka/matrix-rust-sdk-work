@@ -87,6 +87,7 @@ pub use self::{
     builder::TimelineBuilder,
     controller::default_event_filter,
     error::*,
+    pagination::RestoreFromCacheOutcome,
     event_filter::{TimelineEventCondition, TimelineEventFilter},
     event_item::{
         AnyOtherStateEventContentChange, BeaconInfo, EmbeddedEvent, EncryptedMessage,
