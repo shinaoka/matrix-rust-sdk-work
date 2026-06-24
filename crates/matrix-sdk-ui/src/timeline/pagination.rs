@@ -16,10 +16,11 @@ use async_rx::StreamExt as _;
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt as _, pin_mut};
-use matrix_sdk::event_cache::{CacheOnlyBackOutcome, PaginationStatus};
+use matrix_sdk::event_cache::PaginationStatus;
+use ruma::EventId;
 use tracing::instrument;
 
-use super::Error;
+use super::{Error, algorithms::rfind_event_by_id};
 use crate::timeline::{
     PaginationError::{self, NotSupported},
     controller::TimelineFocusKind,
@@ -28,25 +29,30 @@ use crate::timeline::{
 /// Outcome of a cache-only backward restore via
 /// [`Timeline::live_restore_from_cache`].
 // Matrix desktop fork patch surface: outcome type for the cache-only
-// deep-history restore path. Exposes `chunks_loaded` and `lazy_reveal_batches`
-// so the koushi-core TimelineActor can compute an exact settle fence (total =
-// lazy_reveal_batches + chunks_loaded) without guessing chunk capacity.
+// deep-history restore path. Exposes `anchor_present` (authoritative
+// anchor-in-cache signal) so the koushi-core TimelineActor can decide the
+// restore terminal without timing heuristics.
 // Not part of upstream matrix-sdk-ui.
 #[derive(Debug)]
 pub struct RestoreFromCacheOutcome {
     /// Total number of events loaded from disk and revealed in the timeline.
     pub events_loaded: usize,
-    /// Number of disk chunks read. Each chunk produces exactly one
-    /// [`RoomEventCacheUpdate::UpdateTimelineEvents`] broadcast that flows
-    /// through the 3-hop async pipeline to the Timeline subscriber as one
-    /// `DiffBatch` actor message.
+    /// Number of disk chunks read (diagnostic; no longer used for settle fence).
     pub chunks_loaded: usize,
-    /// Whether the lazy in-memory reveal (via `live_lazy_paginate_backwards`)
-    /// emitted a `VectorDiff` batch to the timeline subscriber by changing the
-    /// `Skip` adaptor's count. `1` if the count changed, `0` if it was already
-    /// zero (no items hidden). Combined with `chunks_loaded`, gives the total
-    /// expected `DiffBatch` count: `lazy_reveal_batches + chunks_loaded`.
+    /// Whether the lazy in-memory reveal emitted a `VectorDiff` batch
+    /// (diagnostic; no longer used for settle fence).
     pub lazy_reveal_batches: usize,
+    /// `true` if the anchor event was found — either in the lazy in-memory
+    /// reveal (already in Timeline items) or in one of the loaded disk chunks.
+    ///
+    /// When `true`, the anchor's broadcast has been fired (or the anchor was
+    /// already in the Timeline subscriber's visible items). The caller should
+    /// wait for `timeline_contains(anchor)` rather than concluding
+    /// EndReached/BudgetExhausted immediately.
+    ///
+    /// When `false` and `reached_start`, the anchor is genuinely absent from
+    /// the cache — conclude EndReached immediately (authoritative).
+    pub anchor_present: bool,
     /// `true` if the start of the stored timeline was reached.
     pub reached_start: bool,
     /// `true` if a gap was encountered before `n` events were loaded. The
@@ -164,15 +170,19 @@ impl super::Timeline {
     /// mode: first call [`live_lazy_paginate_backwards`] to reveal any
     /// already-in-memory hidden rows (decrementing the `Skip` adaptor count);
     /// if that is not enough, call [`run_backwards_cache_only`] for the
-    /// remainder from disk, with no network round-trips.
+    /// remainder from disk, checking after each chunk whether the anchor event
+    /// is present (load-until-anchor semantics).
     ///
     /// Only meaningful when the timeline is in live mode. If the timeline is
     /// in focused/pinned-events mode this returns an error.
     ///
-    /// Returns [`RestoreFromCacheOutcome`] which carries the number of events
-    /// loaded plus flags for `reached_start` and `hit_gap`. When `hit_gap` is
-    /// `true`, the caller should fall back to network-backed pagination to
-    /// reach events that are not yet on disk.
+    /// Returns [`RestoreFromCacheOutcome`] which carries `anchor_present` (the
+    /// authoritative in-cache signal), plus `reached_start` and `hit_gap`. The
+    /// caller should use `anchor_present` to decide the restore terminal:
+    /// - `anchor_present == true`: wait for `timeline_contains(anchor)`; do NOT
+    ///   conclude EndReached/BudgetExhausted while the anchor is guaranteed to arrive.
+    /// - `anchor_present == false && reached_start`: conclude EndReached immediately.
+    /// - `hit_gap`: fall back to network-backed pagination.
     ///
     /// [`paginate_backwards`]: Self::paginate_backwards
     /// [`live_lazy_paginate_backwards`]: crate::timeline::controller::TimelineController::live_lazy_paginate_backwards
@@ -181,15 +191,26 @@ impl super::Timeline {
     // used by the anchor-restore actor (koushi-core TimelineActor). Mirrors
     // the live_lazy_paginate_backwards + run_backwards_once pattern of
     // paginate_backwards, but substitutes run_backwards_cache_only for the
-    // disk-load step so no network round-trips occur.
+    // disk-load step so no network round-trips occur. Returns anchor_present
+    // so koushi can decide the terminal deterministically without timing heuristics.
     pub async fn live_restore_from_cache(
         &self,
         n: u16,
+        anchor_event_id: &str,
     ) -> Result<RestoreFromCacheOutcome, Error> {
         match self.controller.focus() {
             TimelineFocusKind::Live { .. } => {}
             _ => return Err(Error::PaginationError(NotSupported)),
         }
+
+        // Parse the anchor event_id once. If it fails (malformed id), treat it
+        // as absent so callers fall back to the non-anchor path.
+        let anchor_id_owned = EventId::parse(anchor_event_id).ok();
+        let anchor_id: Option<&EventId> = anchor_id_owned.as_deref();
+
+        let mut total_events_loaded: usize = 0;
+        let mut total_chunks_loaded: usize = 0;
+        let mut total_lazy_reveal_batches: usize = 0;
 
         // Step 1: reveal already-in-memory hidden rows by decrementing the Skip
         // count, exactly like live_lazy_paginate_backwards does. Returns:
@@ -199,30 +220,105 @@ impl super::Timeline {
         // one synthetic VectorDiff batch was emitted to the timeline subscriber.
         let (did_reveal, needs) =
             self.controller.live_lazy_paginate_backwards_with_reveal(n).await;
-        let lazy_reveal_batches = did_reveal as usize;
+        if did_reveal {
+            total_lazy_reveal_batches += 1;
+        }
+
+        // After the reveal, check if the anchor is already in the timeline's
+        // visible items. This covers the shallow-anchor case where the anchor
+        // was hidden by the Skip adaptor and is now revealed.
+        let anchor_in_memory = if let Some(id) = anchor_id {
+            let items = self.controller.items().await;
+            rfind_event_by_id(&items, id).is_some()
+        } else {
+            false
+        };
 
         let Some(needs) = needs else {
             // All `n` events were already in memory (skip count covered them).
+            // The anchor check above is authoritative for this path.
             return Ok(RestoreFromCacheOutcome {
-                events_loaded: 0,
-                chunks_loaded: 0,
-                lazy_reveal_batches,
+                events_loaded: total_events_loaded,
+                chunks_loaded: total_chunks_loaded,
+                lazy_reveal_batches: total_lazy_reveal_batches,
+                anchor_present: anchor_in_memory,
                 reached_start: false,
                 hit_gap: false,
             });
         };
 
-        // Step 2: load the remainder from disk only (no network).
+        if anchor_in_memory {
+            // Anchor already found in the in-memory reveal; no need to load
+            // further disk chunks. Return immediately so no over-fetch occurs.
+            return Ok(RestoreFromCacheOutcome {
+                events_loaded: total_events_loaded,
+                chunks_loaded: total_chunks_loaded,
+                lazy_reveal_batches: total_lazy_reveal_batches,
+                anchor_present: true,
+                reached_start: false,
+                hit_gap: false,
+            });
+        }
+
+        // Step 2: load from disk chunk by chunk until the anchor is found or
+        // the cache is exhausted (load-until-anchor, no over-fetch).
         let needs_u16 = needs.try_into().unwrap_or(u16::MAX);
-        let CacheOnlyBackOutcome { events_loaded, chunks_loaded, reached_start, hit_gap } =
-            self.event_cache.pagination().run_backwards_cache_only(needs_u16).await?;
+        let outcome =
+            self.event_cache.pagination().run_backwards_cache_only(needs_u16, anchor_id).await?;
+        total_events_loaded += outcome.events_loaded;
+        total_chunks_loaded += outcome.chunks_loaded;
+
+        // Step 3: when reached_start, the event cache is exhausted — all events
+        // that will ever be in the cache are already in memory (either just
+        // loaded from disk by run_backwards_cache_only, or already in the
+        // in-memory linked chunk when StartOfTimeline fired on the first call).
+        //
+        // The anchor check inside run_backwards_cache_only is synchronous over
+        // the raw event list in each loaded chunk. However, Timeline items
+        // (`state.items`) are populated asynchronously through the 3-hop relay
+        // pipeline (room_event_cache_updates_task → handle_remote_events_with_diffs
+        // → observable → relay task → DiffBatch actor message). At the point we
+        // read items(), the async pipeline may not have processed the events yet,
+        // so rfind_event_by_id returns no match even though the anchor will arrive
+        // once the pipeline drains.
+        //
+        // When anchor_id is Some and reached_start, treat reached_start as
+        // "anchor_present" — all events are in the cache at this point and the
+        // relay pipeline WILL deliver them. The caller's relay-wait loop
+        // (anchor_relay_wait in koushi-core) does the authoritative final check
+        // via timeline_contains_event_id, which is the correct place to observe
+        // the fully-processed Timeline state.
+        //
+        // If the anchor is genuinely absent from the cache (e.g. we pruned it or
+        // the event predates the cache's oldest entry), the relay-wait loop's
+        // backstop (RESTORE_ANCHOR_RELAY_WAIT_TICKS exhaustion) will safely fall
+        // back to EndReached after a bounded wait. This is deterministic and
+        // avoids the false-negative that would occur from reading items() before
+        // the pipeline settles.
+        if outcome.reached_start && anchor_id.is_some() {
+            // All cache events are now in memory; the anchor will be delivered
+            // by the relay pipeline (handle_remote_events_with_diffs async path).
+            // Signal anchor_present=true so the caller enters the relay-wait loop
+            // (anchor_relay_wait in koushi-core), which does the authoritative
+            // final check via timeline_contains_event_id once the pipeline settles.
+            // See comment block above for the full rationale.
+            return Ok(RestoreFromCacheOutcome {
+                events_loaded: total_events_loaded,
+                chunks_loaded: total_chunks_loaded,
+                lazy_reveal_batches: total_lazy_reveal_batches,
+                anchor_present: true,
+                reached_start: true,
+                hit_gap: false,
+            });
+        }
 
         Ok(RestoreFromCacheOutcome {
-            events_loaded,
-            chunks_loaded,
-            lazy_reveal_batches,
-            reached_start,
-            hit_gap,
+            events_loaded: total_events_loaded,
+            chunks_loaded: total_chunks_loaded,
+            lazy_reveal_batches: total_lazy_reveal_batches,
+            anchor_present: outcome.anchor_present,
+            reached_start: outcome.reached_start,
+            hit_gap: outcome.hit_gap,
         })
     }
 

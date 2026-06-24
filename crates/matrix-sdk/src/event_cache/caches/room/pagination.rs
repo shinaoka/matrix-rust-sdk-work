@@ -31,7 +31,7 @@ use matrix_sdk_base::{
     linked_chunk::{ChunkContent, LinkedChunkId, Update},
 };
 use pin_project_lite::pin_project;
-use ruma::api::Direction;
+use ruma::{EventId, api::Direction};
 use tracing::{error, trace};
 
 pub use super::super::pagination::PaginationStatus;
@@ -168,10 +168,18 @@ impl RoomPagination {
     /// status changes or network round-trips.
     // Matrix desktop fork patch surface: cache-only backward load used by
     // live_restore_from_cache (matrix-sdk-ui) for deep-history anchor restore
-    // in koushi-core. Returns CacheOnlyBackOutcome.chunks_loaded so the caller
-    // can compute an exact DiffBatch settle fence. Not part of upstream matrix-sdk.
+    // in koushi-core. Returns CacheOnlyBackOutcome including anchor_present so
+    // the caller can decide the restore terminal without timing heuristics.
+    // Not part of upstream matrix-sdk.
+    ///
+    /// If `anchor_event_id` is `Some`, the loop stops as soon as a loaded chunk
+    /// contains that event — `anchor_present` in the returned outcome will be
+    /// `true`. This is the authoritative "anchor found in cache" signal: the
+    /// anchor's broadcast has been fired and will arrive at the Timeline
+    /// subscriber, so the caller can wait for it deterministically.
     ///
     /// Stops when any of the following is true:
+    /// - The anchor event is found in a loaded chunk (`anchor_present`).
     /// - The cumulative loaded-event count reaches `n`.
     /// - A [`LoadMoreEventsBackwardsOutcome::Gap`] is encountered (`hit_gap`).
     /// - A [`LoadMoreEventsBackwardsOutcome::StartOfTimeline`] is encountered
@@ -184,6 +192,7 @@ impl RoomPagination {
     pub async fn run_backwards_cache_only(
         &self,
         n: u16,
+        anchor_event_id: Option<&EventId>,
     ) -> Result<CacheOnlyBackOutcome> {
         let mut events_loaded: usize = 0;
         let mut chunks_loaded: usize = 0;
@@ -199,6 +208,7 @@ impl RoomPagination {
                     return Ok(CacheOnlyBackOutcome {
                         events_loaded,
                         chunks_loaded,
+                        anchor_present: false,
                         reached_start: false,
                         hit_gap: true,
                     });
@@ -208,6 +218,7 @@ impl RoomPagination {
                     return Ok(CacheOnlyBackOutcome {
                         events_loaded,
                         chunks_loaded,
+                        anchor_present: false,
                         reached_start: true,
                         hit_gap: false,
                     });
@@ -219,6 +230,32 @@ impl RoomPagination {
                     reached_start,
                 } => {
                     let count = events.len();
+                    // Check for the anchor in this chunk BEFORE broadcasting.
+                    // The events are in memory at this point; we can scan them
+                    // synchronously before the async broadcast fires. This gives
+                    // an authoritative "anchor is in the loaded cache" signal
+                    // without waiting for the Timeline subscriber's relay.
+                    // Compare by string representation to avoid OwnedEventId vs
+                    // &EventId PartialEq edge cases.
+                    let anchor_present = anchor_event_id
+                        .map(|id| {
+                            let id_str = id.as_str();
+                            let found = events.iter().any(|e| {
+                                e.event_id().map_or(false, |eid| eid.as_str() == id_str)
+                            });
+                            trace!(
+                                "run_backwards_cache_only: chunk={} events={} \
+                                 anchor_search={} found={}",
+                                chunks_loaded + 1,
+                                events.len(),
+                                // log only event count, not the anchor id itself
+                                1,
+                                found as u8
+                            );
+                            found
+                        })
+                        .unwrap_or(false);
+
                     self.0
                         .cache
                         .conclude_backwards_pagination_from_disk(
@@ -230,10 +267,21 @@ impl RoomPagination {
                     events_loaded += count;
                     chunks_loaded += 1;
 
+                    if anchor_present {
+                        return Ok(CacheOnlyBackOutcome {
+                            events_loaded,
+                            chunks_loaded,
+                            anchor_present: true,
+                            reached_start,
+                            hit_gap: false,
+                        });
+                    }
+
                     if reached_start {
                         return Ok(CacheOnlyBackOutcome {
                             events_loaded,
                             chunks_loaded,
+                            anchor_present: false,
                             reached_start: true,
                             hit_gap: false,
                         });
@@ -242,23 +290,35 @@ impl RoomPagination {
             }
         }
 
-        Ok(CacheOnlyBackOutcome { events_loaded, chunks_loaded, reached_start: false, hit_gap: false })
+        Ok(CacheOnlyBackOutcome {
+            events_loaded,
+            chunks_loaded,
+            anchor_present: false,
+            reached_start: false,
+            hit_gap: false,
+        })
     }
 }
 
 /// Outcome of a cache-only backward load via [`RoomPagination::run_backwards_cache_only`].
 // Matrix desktop fork patch surface: returned by run_backwards_cache_only to
-// expose chunks_loaded for exact DiffBatch settle accounting. Not part of
-// upstream matrix-sdk.
+// expose anchor_present (authoritative anchor-in-cache signal) and chunks_loaded
+// for the koushi-core TimelineActor anchor-restore path. Not part of upstream
+// matrix-sdk.
 #[derive(Debug)]
 pub struct CacheOnlyBackOutcome {
     /// Total number of events loaded from disk in this call.
     pub events_loaded: usize,
     /// Number of disk chunks read (one `conclude_backwards_pagination_from_disk`
-    /// broadcast per chunk). Callers can use this as the exact expected number
-    /// of [`RoomEventCacheUpdate::UpdateTimelineEvents`] broadcasts that will
-    /// flow through the 3-hop async pipeline to the Timeline subscriber.
+    /// broadcast per chunk).
     pub chunks_loaded: usize,
+    /// `true` if the requested anchor event was found in one of the loaded
+    /// chunks. When `true`, a `RoomEventCacheUpdate::UpdateTimelineEvents`
+    /// broadcast carrying the anchor has already been fired; the Timeline
+    /// subscriber will deliver a `DiffBatch` for it. The caller should wait
+    /// for `timeline_contains(anchor)` to become true rather than concluding
+    /// EndReached/BudgetExhausted immediately.
+    pub anchor_present: bool,
     /// `true` if the start of the stored timeline was reached (no more disk
     /// chunks behind the current oldest).
     pub reached_start: bool,
