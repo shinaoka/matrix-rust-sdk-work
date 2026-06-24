@@ -193,13 +193,18 @@ impl RoomPagination {
         &self,
         n: u16,
         anchor_event_id: Option<&EventId>,
+        max_chunks: u16,
     ) -> Result<CacheOnlyBackOutcome> {
         let mut events_loaded: usize = 0;
         let mut chunks_loaded: usize = 0;
         let target = n as usize;
+        let chunk_cap = max_chunks as usize;
 
         loop {
-            if events_loaded >= target {
+            // Stop when either the event count or the chunk cap is reached.
+            // The chunk cap enforces RESTORE_ANCHOR_MAX_CHUNKS so a fragmented
+            // cache (many small chunks) cannot walk beyond the safety bound.
+            if events_loaded >= target || chunks_loaded >= chunk_cap {
                 break;
             }
 

@@ -197,6 +197,7 @@ impl super::Timeline {
         &self,
         n: u16,
         anchor_event_id: &str,
+        max_chunks: u16,
     ) -> Result<RestoreFromCacheOutcome, Error> {
         match self.controller.focus() {
             TimelineFocusKind::Live { .. } => {}
@@ -262,51 +263,51 @@ impl super::Timeline {
 
         // Step 2: load from disk chunk by chunk until the anchor is found or
         // the cache is exhausted (load-until-anchor, no over-fetch).
+        // Pass max_chunks so run_backwards_cache_only enforces the chunk budget
+        // regardless of how many events each chunk contains (P2b fix).
         let needs_u16 = needs.try_into().unwrap_or(u16::MAX);
-        let outcome =
-            self.event_cache.pagination().run_backwards_cache_only(needs_u16, anchor_id).await?;
+        let outcome = self
+            .event_cache
+            .pagination()
+            .run_backwards_cache_only(needs_u16, anchor_id, max_chunks)
+            .await?;
         total_events_loaded += outcome.events_loaded;
         total_chunks_loaded += outcome.chunks_loaded;
 
-        // Step 3: when reached_start, the event cache is exhausted — all events
-        // that will ever be in the cache are already in memory (either just
-        // loaded from disk by run_backwards_cache_only, or already in the
-        // in-memory linked chunk when StartOfTimeline fired on the first call).
+        // Step 3: reached_start — the event cache is exhausted. All events that
+        // will ever be in the cache are now in memory.
         //
-        // The anchor check inside run_backwards_cache_only is synchronous over
-        // the raw event list in each loaded chunk. However, Timeline items
-        // (`state.items`) are populated asynchronously through the 3-hop relay
-        // pipeline (room_event_cache_updates_task → handle_remote_events_with_diffs
-        // → observable → relay task → DiffBatch actor message). At the point we
-        // read items(), the async pipeline may not have processed the events yet,
-        // so rfind_event_by_id returns no match even though the anchor will arrive
-        // once the pipeline drains.
+        // anchor_present is true only when the anchor was actually found:
+        //   a) run_backwards_cache_only found it synchronously in a loaded chunk
+        //      (outcome.anchor_present); OR
+        //   b) the relay pipeline already settled and it is visible in the
+        //      Timeline's item list (fast-path check via rfind_event_by_id).
         //
-        // When anchor_id is Some and reached_start, treat reached_start as
-        // "anchor_present" — all events are in the cache at this point and the
-        // relay pipeline WILL deliver them. The caller's relay-wait loop
-        // (anchor_relay_wait in koushi-core) does the authoritative final check
-        // via timeline_contains_event_id, which is the correct place to observe
-        // the fully-processed Timeline state.
+        // When neither (a) nor (b) is true the anchor is genuinely absent from
+        // the cache (stale or pruned scroll anchor). Return anchor_present=false
+        // so the caller takes the authoritative EndReached path immediately,
+        // rather than spending 40 × 50 ms on the backstop (P2a fix).
         //
-        // If the anchor is genuinely absent from the cache (e.g. we pruned it or
-        // the event predates the cache's oldest entry), the relay-wait loop's
-        // backstop (RESTORE_ANCHOR_RELAY_WAIT_TICKS exhaustion) will safely fall
-        // back to EndReached after a bounded wait. This is deterministic and
-        // avoids the false-negative that would occur from reading items() before
-        // the pipeline settles.
-        if outcome.reached_start && anchor_id.is_some() {
-            // All cache events are now in memory; the anchor will be delivered
-            // by the relay pipeline (handle_remote_events_with_diffs async path).
-            // Signal anchor_present=true so the caller enters the relay-wait loop
-            // (anchor_relay_wait in koushi-core), which does the authoritative
-            // final check via timeline_contains_event_id once the pipeline settles.
-            // See comment block above for the full rationale.
+        // When (a) is true the diff is already in flight through the 3-hop relay
+        // (conclude_backwards_pagination_from_disk → event-cache task →
+        // observable → relay task → DiffBatch actor msg). The caller's
+        // anchor_relay_wait loop (40 × 50 ms) gives the pipeline time to settle.
+        if outcome.reached_start {
+            let anchor_found = if outcome.anchor_present {
+                // Case (a): found synchronously in a disk chunk.
+                true
+            } else if let Some(id) = anchor_id {
+                // Case (b): check whether the relay pipeline already settled.
+                let items = self.controller.items().await;
+                rfind_event_by_id(&items, id).is_some()
+            } else {
+                false
+            };
             return Ok(RestoreFromCacheOutcome {
                 events_loaded: total_events_loaded,
                 chunks_loaded: total_chunks_loaded,
                 lazy_reveal_batches: total_lazy_reveal_batches,
-                anchor_present: true,
+                anchor_present: anchor_found,
                 reached_start: true,
                 hit_gap: false,
             });
