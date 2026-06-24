@@ -454,7 +454,29 @@ impl<P: RoomDataProvider> TimelineController<P> {
     /// method returns `Some(needs)` where `needs` is the number of events that
     /// must be unlazily backwards paginated.
     pub(super) async fn live_lazy_paginate_backwards(&self, num_events: u16) -> Option<usize> {
+        let (_, needs) = self.live_lazy_paginate_backwards_with_reveal(num_events).await;
+        needs
+    }
+
+    /// Run a lazy backwards pagination (in live mode) and also report whether
+    /// the `Skip` adaptor's count actually changed.
+    ///
+    /// When the skip count changes, the `Skip` higher-order stream emits one
+    /// synthetic batch of `VectorDiff`s to the timeline subscriber. The caller
+    /// can use `did_reveal` as a DiffBatch count contribution for settle-fence
+    /// accounting.
+    ///
+    /// Returns `(did_reveal, Option<needs>)`.
+    // Matrix desktop fork patch surface: reveal-batch accounting for the
+    // cache-only deep-history restore path. Callers need to know whether the
+    // lazy reveal produced a DiffBatch so the settle fence waits for it.
+    // Not part of upstream matrix-sdk-ui.
+    pub(super) async fn live_lazy_paginate_backwards_with_reveal(
+        &self,
+        num_events: u16,
+    ) -> (bool, Option<usize>) {
         let state = self.state.read().await;
+        let prev_count = state.meta.subscriber_skip_count.get();
 
         let (count, needs) = state
             .meta
@@ -465,7 +487,11 @@ impl<P: RoomDataProvider> TimelineController<P> {
         let is_live_timeline = true;
         state.meta.subscriber_skip_count.update(count, is_live_timeline);
 
-        needs
+        // The Skip adaptor emits one synthetic VectorDiff batch whenever the
+        // count changes. It only changes when prev_count > 0 (decrement from
+        // count down toward 0; when already 0 set_if_not_eq is a no-op).
+        let did_reveal = prev_count != count;
+        (did_reveal, needs)
     }
 
     /// Is this timeline receiving events from sync (aka has a live focus)?

@@ -28,9 +28,10 @@ use crate::timeline::{
 /// Outcome of a cache-only backward restore via
 /// [`Timeline::live_restore_from_cache`].
 // Matrix desktop fork patch surface: outcome type for the cache-only
-// deep-history restore path. Exposes `chunks_loaded` so the koushi-core
-// TimelineActor can compute an exact settle fence without guessing chunk
-// capacity. Not part of upstream matrix-sdk-ui.
+// deep-history restore path. Exposes `chunks_loaded` and `lazy_reveal_batches`
+// so the koushi-core TimelineActor can compute an exact settle fence (total =
+// lazy_reveal_batches + chunks_loaded) without guessing chunk capacity.
+// Not part of upstream matrix-sdk-ui.
 #[derive(Debug)]
 pub struct RestoreFromCacheOutcome {
     /// Total number of events loaded from disk and revealed in the timeline.
@@ -38,9 +39,14 @@ pub struct RestoreFromCacheOutcome {
     /// Number of disk chunks read. Each chunk produces exactly one
     /// [`RoomEventCacheUpdate::UpdateTimelineEvents`] broadcast that flows
     /// through the 3-hop async pipeline to the Timeline subscriber as one
-    /// `DiffBatch` actor message. Callers can use this as the exact expected
-    /// count of DiffBatch messages to settle against.
+    /// `DiffBatch` actor message.
     pub chunks_loaded: usize,
+    /// Whether the lazy in-memory reveal (via `live_lazy_paginate_backwards`)
+    /// emitted a `VectorDiff` batch to the timeline subscriber by changing the
+    /// `Skip` adaptor's count. `1` if the count changed, `0` if it was already
+    /// zero (no items hidden). Combined with `chunks_loaded`, gives the total
+    /// expected `DiffBatch` count: `lazy_reveal_batches + chunks_loaded`.
+    pub lazy_reveal_batches: usize,
     /// `true` if the start of the stored timeline was reached.
     pub reached_start: bool,
     /// `true` if a gap was encountered before `n` events were loaded. The
@@ -186,14 +192,21 @@ impl super::Timeline {
         }
 
         // Step 1: reveal already-in-memory hidden rows by decrementing the Skip
-        // count, exactly like live_lazy_paginate_backwards does. Returns the
-        // number of additional events that must be loaded from disk, or None
-        // when in-memory had enough.
-        let Some(needs) = self.controller.live_lazy_paginate_backwards(n).await else {
+        // count, exactly like live_lazy_paginate_backwards does. Returns:
+        //   (did_reveal, Some(needs)) — in-memory partial, disk needed for rest
+        //   (did_reveal, None) — in-memory fully satisfied the request
+        // `did_reveal` is true when the Skip adaptor's count changed and thus
+        // one synthetic VectorDiff batch was emitted to the timeline subscriber.
+        let (did_reveal, needs) =
+            self.controller.live_lazy_paginate_backwards_with_reveal(n).await;
+        let lazy_reveal_batches = did_reveal as usize;
+
+        let Some(needs) = needs else {
             // All `n` events were already in memory (skip count covered them).
             return Ok(RestoreFromCacheOutcome {
                 events_loaded: 0,
                 chunks_loaded: 0,
+                lazy_reveal_batches,
                 reached_start: false,
                 hit_gap: false,
             });
@@ -204,7 +217,13 @@ impl super::Timeline {
         let CacheOnlyBackOutcome { events_loaded, chunks_loaded, reached_start, hit_gap } =
             self.event_cache.pagination().run_backwards_cache_only(needs_u16).await?;
 
-        Ok(RestoreFromCacheOutcome { events_loaded, chunks_loaded, reached_start, hit_gap })
+        Ok(RestoreFromCacheOutcome {
+            events_loaded,
+            chunks_loaded,
+            lazy_reveal_batches,
+            reached_start,
+            hit_gap,
+        })
     }
 
     /// Subscribe to the back-pagination status of a live timeline.
