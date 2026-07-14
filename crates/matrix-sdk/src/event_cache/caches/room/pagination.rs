@@ -33,7 +33,7 @@ use matrix_sdk_base::{
     linked_chunk::{ChunkContent, ChunkIdentifier, LinkedChunkId, RawChunk, Update},
 };
 use pin_project_lite::pin_project;
-use ruma::{EventId, OwnedEventId, api::Direction};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, api::Direction};
 use tracing::{error, trace};
 
 pub use super::super::pagination::PaginationStatus;
@@ -68,6 +68,7 @@ pub enum RoomTimelineContinuity {
 /// An opaque handle for one persisted room timeline gap.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RoomTimelineGapHandle {
+    room_id: OwnedRoomId,
     chunk_identifier: ChunkIdentifier,
 }
 
@@ -206,7 +207,11 @@ fn mix_revision(revision: &mut u64, bytes: &[u8]) {
     }
 }
 
-fn inspect_ordered_chunks(chunks: &[RawChunk<Event, Gap>]) -> RoomTimelineGapInspection {
+fn inspect_ordered_chunks(
+    room_id: &OwnedRoomId,
+    topology_generation: u64,
+    chunks: &[RawChunk<Event, Gap>],
+) -> RoomTimelineGapInspection {
     if chunks.is_empty() {
         return RoomTimelineGapInspection {
             continuity: RoomTimelineContinuity::Unknown,
@@ -214,29 +219,12 @@ fn inspect_ordered_chunks(chunks: &[RawChunk<Event, Gap>]) -> RoomTimelineGapIns
         };
     }
 
-    let mut revision = 0xcbf29ce484222325;
-    for chunk in chunks {
-        mix_revision(&mut revision, &chunk.identifier.index().to_le_bytes());
-        match &chunk.content {
-            ChunkContent::Gap(gap) => {
-                mix_revision(&mut revision, b"gap");
-                mix_revision(&mut revision, gap.token.as_bytes());
-            }
-            ChunkContent::Items(events) => {
-                mix_revision(&mut revision, b"items");
-                for event_id in events.iter().filter_map(Event::event_id) {
-                    mix_revision(&mut revision, event_id.as_bytes());
-                }
-            }
-        }
-    }
-
-    let gaps = chunks
+    let gap_data = chunks
         .iter()
         .enumerate()
         .filter_map(|(index, chunk)| match &chunk.content {
             ChunkContent::Items(_) => None,
-            ChunkContent::Gap(_) => {
+            ChunkContent::Gap(gap) => {
                 let older_event_id =
                     chunks[..index].iter().rev().find_map(|chunk| match &chunk.content {
                         ChunkContent::Gap(_) => None,
@@ -249,12 +237,33 @@ fn inspect_ordered_chunks(chunks: &[RawChunk<Event, Gap>]) -> RoomTimelineGapIns
                         ChunkContent::Gap(_) => None,
                         ChunkContent::Items(events) => events.iter().find_map(Event::event_id),
                     });
-                Some(RoomTimelineGapDescriptor {
-                    handle: RoomTimelineGapHandle { chunk_identifier: chunk.identifier },
-                    revision,
-                    older_event_id,
-                    newer_event_id,
-                })
+                Some((chunk.identifier, gap.token.as_str(), older_event_id, newer_event_id))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut revision = 0xcbf29ce484222325;
+    mix_revision(&mut revision, &topology_generation.to_le_bytes());
+    for (identifier, token, older_event_id, newer_event_id) in &gap_data {
+        mix_revision(&mut revision, &identifier.index().to_le_bytes());
+        mix_revision(&mut revision, token.as_bytes());
+        if let Some(event_id) = older_event_id {
+            mix_revision(&mut revision, event_id.as_bytes());
+        }
+        mix_revision(&mut revision, b"boundary");
+        if let Some(event_id) = newer_event_id {
+            mix_revision(&mut revision, event_id.as_bytes());
+        }
+    }
+
+    let gaps = gap_data
+        .into_iter()
+        .map(|(chunk_identifier, _token, older_event_id, newer_event_id)| {
+            RoomTimelineGapDescriptor {
+                handle: RoomTimelineGapHandle { room_id: room_id.clone(), chunk_identifier },
+                revision,
+                older_event_id,
+                newer_event_id,
             }
         })
         .collect::<Vec<_>>();
@@ -366,7 +375,11 @@ impl RoomPagination {
     pub async fn inspect_timeline_gaps(&self) -> Result<RoomTimelineGapInspection> {
         let state = self.0.cache.state.read().await?;
         let chunks = state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
-        Ok(inspect_ordered_chunks(&order_persisted_chunks(chunks)?))
+        Ok(inspect_ordered_chunks(
+            &state.state.room_id,
+            state.gap_topology_generation(),
+            &order_persisted_chunks(chunks)?,
+        ))
     }
 
     /// Repair one persisted room-timeline gap with a single bounded network
@@ -387,7 +400,11 @@ impl RoomPagination {
             let mut state = self.0.cache.state.write().await?;
             let persisted =
                 state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
-            let current = inspect_ordered_chunks(&order_persisted_chunks(persisted)?);
+            let current = inspect_ordered_chunks(
+                &state.state.room_id,
+                state.gap_topology_generation(),
+                &order_persisted_chunks(persisted)?,
+            );
             if !current.gaps.iter().any(|gap| gap == descriptor) {
                 return Ok(RoomTimelineGapRepairOutcome::Stale);
             }
@@ -455,7 +472,11 @@ impl RoomPagination {
         let mut state = self.0.cache.state.write().await?;
         let persisted =
             state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
-        let current = inspect_ordered_chunks(&order_persisted_chunks(persisted)?);
+        let current = inspect_ordered_chunks(
+            &state.state.room_id,
+            state.gap_topology_generation(),
+            &order_persisted_chunks(persisted)?,
+        );
         if !current.gaps.iter().any(|gap| gap == descriptor) {
             return Ok(RoomTimelineGapRepairOutcome::Stale);
         }
@@ -517,7 +538,11 @@ impl RoomPagination {
         let timeline_event_diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
         let persisted_after =
             state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
-        let after = inspect_ordered_chunks(&order_persisted_chunks(persisted_after)?);
+        let after = inspect_ordered_chunks(
+            &state.state.room_id,
+            state.gap_topology_generation(),
+            &order_persisted_chunks(persisted_after)?,
+        );
         drop(state);
 
         if !timeline_event_diffs.is_empty() {
@@ -647,7 +672,7 @@ impl RoomPagination {
                             let id_str = id.as_str();
                             let found = events
                                 .iter()
-                                .any(|e| e.event_id().map_or(false, |eid| eid.as_str() == id_str));
+                                .any(|e| e.event_id().is_some_and(|eid| eid.as_str() == id_str));
                             trace!(
                                 "run_backwards_cache_only: chunk={} events={} \
                                  anchor_search={} found={}",

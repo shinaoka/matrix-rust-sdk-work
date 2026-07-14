@@ -131,6 +131,9 @@ pub struct RoomEventCacheState {
     /// [`RoomEventCacheStateLock::write`] when the state must be reset.
     update_sender: RoomEventCacheUpdateSender,
 
+    /// Monotonic generation for persisted gap-topology mutations.
+    gap_topology_generation: u64,
+
     /// A clone of
     /// [`super::super::EventCacheInner::linked_chunk_update_sender`].
     pub(super) linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
@@ -388,6 +391,7 @@ impl LockedRoomEventCacheState {
             event_focused_caches: HashMap::new(),
             pagination_status,
             update_sender,
+            gap_topology_generation: 0,
             linked_chunk_update_sender,
             room_version_rules,
             waited_for_initial_prev_token: false,
@@ -429,6 +433,11 @@ impl<'a> lock::Reload for RoomEventCacheStateLockWriteGuard<'a> {
 }
 
 impl<'a> RoomEventCacheStateLockReadGuard<'a> {
+    /// Return the monotonic persisted gap-topology generation.
+    pub fn gap_topology_generation(&self) -> u64 {
+        self.state.gap_topology_generation
+    }
+
     /// Return the subscriber count.
     pub fn subscriber_count(&self) -> &Arc<AtomicUsize> {
         &self.state.subscriber_count
@@ -544,6 +553,11 @@ impl<'a> RoomEventCacheStateLockReadGuard<'a> {
 }
 
 impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
+    /// Return the monotonic persisted gap-topology generation.
+    pub fn gap_topology_generation(&self) -> u64 {
+        self.state.gap_topology_generation
+    }
+
     /// Return a mutable reference to the underlying room linked chunk.
     pub fn room_linked_chunk_mut(&mut self) -> &mut EventLinkedChunk {
         &mut self.state.room_linked_chunk
@@ -745,6 +759,9 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
         updates: Vec<Update<Event, Gap>>,
     ) -> Result<(), EventCacheError> {
         let linked_chunk_id = OwnedLinkedChunkId::Room(self.state.room_id.clone());
+        let changes_gap_topology = updates.iter().any(|update| {
+            matches!(update, Update::NewGapChunk { .. } | Update::RemoveChunk(_) | Update::Clear)
+        });
 
         send_updates_to_store(
             &self.store,
@@ -752,7 +769,13 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
             &self.state.linked_chunk_update_sender,
             updates,
         )
-        .await
+        .await?;
+
+        if changes_gap_topology {
+            self.state.gap_topology_generation = self.state.gap_topology_generation.wrapping_add(1);
+        }
+
+        Ok(())
     }
 
     /// Reset this data structure as if it were brand new.
