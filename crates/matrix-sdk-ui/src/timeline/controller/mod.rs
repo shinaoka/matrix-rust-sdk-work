@@ -437,10 +437,8 @@ impl<P: RoomDataProvider> TimelineController<P> {
             return;
         }
         let state = self.state.read().await;
-        let (count, _needs) = state
-            .meta
-            .subscriber_skip_count
-            .compute_next_when_paginating_backwards(num);
+        let (count, _needs) =
+            state.meta.subscriber_skip_count.compute_next_when_paginating_backwards(num);
         let is_live_timeline = true;
         state.meta.subscriber_skip_count.update(count, is_live_timeline);
     }

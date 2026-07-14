@@ -24,7 +24,8 @@ pub struct SearchIndexConfig {
 }
 
 impl SearchIndexConfig {
-    /// Create a search index configuration with Tantivy's default text tokenizer.
+    /// Create a search index configuration with Tantivy's default text
+    /// tokenizer.
     pub fn new() -> Self {
         Self::default()
     }
