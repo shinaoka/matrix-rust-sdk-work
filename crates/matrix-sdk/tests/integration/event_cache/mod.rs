@@ -2528,6 +2528,75 @@ async fn test_repair_timeline_gap_rejects_a_handle_from_another_room() {
 }
 
 #[async_test]
+async fn test_late_ordinary_pagination_coalesces_ahead_of_queued_gap_repair() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-coalesce:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("coalesced-gap-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("coalesced-gap-token")
+        .match_limit(8)
+        .ok(RoomMessagesResponseTemplate::default()
+            .with_delay(Duration::from_secs(1))
+            .events(vec![event_factory.text_msg("coalesced").event_id(event_id!("$coalesced"))]))
+        .expect(1)
+        .named("one-shared-ordinary-pagination")
+        .mount()
+        .await;
+
+    let first_pagination = room_event_cache.pagination();
+    let first = spawn(async move { first_pagination.run_backwards_once(8).await });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| request.url.path().ends_with("/messages")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let targeted_pagination = room_event_cache.pagination();
+    let targeted = spawn(async move {
+        targeted_pagination
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let late_pagination = room_event_cache.pagination();
+    let late = spawn(async move { late_pagination.run_backwards_once(8).await });
+
+    let first_outcome = first.await.unwrap().unwrap();
+    let late_outcome = late.await.unwrap().unwrap();
+    assert_eq!(first_outcome.events.len(), 1);
+    assert_eq!(late_outcome.events.len(), 1);
+    assert_eq!(targeted.await.unwrap().unwrap(), RoomTimelineGapRepairOutcome::Stale);
+}
+
+#[async_test]
 async fn test_deduplication() {
     let room_id = room_id!("!foo:bar.baz");
     let event_factory = EventFactory::new().room(room_id).sender(&ALICE);

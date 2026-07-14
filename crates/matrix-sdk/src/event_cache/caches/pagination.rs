@@ -326,6 +326,13 @@ pub(in super::super) struct SharedPaginationTask {
     _join_handle: Arc<AbortOnDrop<()>>,
 }
 
+impl SharedPaginationTask {
+    /// Await this already-running pagination without starting another one.
+    pub(in super::super) async fn outcome(&self) -> Result<Option<BackPaginationOutcome>> {
+        self.fut.clone().await
+    }
+}
+
 #[derive(Clone)]
 pub(in super::super) enum SharedPaginationStatus {
     /// No pagination is happening right now.

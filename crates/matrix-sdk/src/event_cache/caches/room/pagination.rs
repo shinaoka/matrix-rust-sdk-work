@@ -415,8 +415,16 @@ impl RoomPagination {
         &self,
         num_requested_events: u16,
     ) -> Result<BackPaginationOutcome> {
-        let _operation_guard = self.0.cache.pagination_operation_lock.read().await;
-        self.0.run_backwards_until(num_requested_events).await
+        let mut events = Vec::new();
+
+        loop {
+            let outcome = self.run_backwards_once_serialized(num_requested_events).await?;
+            let reached_start = outcome.reached_start;
+            events.extend(outcome.events);
+            if reached_start || events.len() >= usize::from(num_requested_events) {
+                return Ok(BackPaginationOutcome { reached_start, events });
+            }
+        }
     }
 
     /// Run a single back-pagination for the requested number of events.
@@ -424,8 +432,35 @@ impl RoomPagination {
     /// This automatically takes care of waiting for a pagination token from
     /// sync, if we haven't done that before.
     pub async fn run_backwards_once(&self, batch_size: u16) -> Result<BackPaginationOutcome> {
-        let _operation_guard = self.0.cache.pagination_operation_lock.read().await;
-        self.0.run_backwards_once(batch_size).await
+        self.run_backwards_once_serialized(batch_size).await
+    }
+
+    async fn run_backwards_once_serialized(
+        &self,
+        batch_size: u16,
+    ) -> Result<BackPaginationOutcome> {
+        let mut status = self.0.cache.shared_pagination_status.subscribe();
+
+        loop {
+            if let SharedPaginationStatus::Paginating { shared_task } = status.get() {
+                if let Some(outcome) = shared_task.outcome().await? {
+                    return Ok(outcome);
+                }
+                continue;
+            }
+
+            tokio::select! {
+                operation_guard = self.0.cache.pagination_operation_lock.read() => {
+                    let _operation_guard = operation_guard;
+                    return self.0.run_backwards_once(batch_size).await;
+                }
+                _ = status.next() => {
+                    // A normal pagination may have started while a targeted repair
+                    // was queued for the write lock. Loop so this caller can join
+                    // that shared task instead of waiting behind the writer.
+                }
+            }
+        }
     }
 
     /// Inspect all persisted room-timeline gaps without exposing SDK
