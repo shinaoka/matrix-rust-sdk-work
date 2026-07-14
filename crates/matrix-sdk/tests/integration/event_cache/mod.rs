@@ -717,7 +717,6 @@ async fn test_backpaginating_without_token() {
     let f = EventFactory::new().room(room_id).sender(user_id!("@a:b.c"));
     let room = server.sync_joined_room(&client, room_id).await;
     let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
-
     let (events, mut room_stream) = room_event_cache.subscribe().await.unwrap();
 
     assert!(events.is_empty());
@@ -2132,6 +2131,7 @@ async fn test_inspect_and_repair_specific_persisted_timeline_gap() {
     client.event_cache().subscribe().unwrap();
     let room = server.sync_joined_room(&client, room_id).await;
     let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
 
     let inspection = room_event_cache.inspect_timeline_gaps().await.unwrap();
     assert_eq!(inspection.continuity, RoomTimelineContinuity::Gapped);
@@ -2163,11 +2163,16 @@ async fn test_inspect_and_repair_specific_persisted_timeline_gap() {
         .pagination()
         .repair_timeline_gap(
             &older_gap,
-            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 1 },
+            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 2 },
         )
         .await
         .unwrap();
-    assert_eq!(deferred, RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded: 1 });
+    assert_eq!(deferred, RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded: 2 });
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+            room_updates.recv()
+    );
+    assert!(!diffs.is_empty());
 
     let outcome = room_event_cache
         .pagination()
