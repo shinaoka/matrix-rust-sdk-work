@@ -80,7 +80,7 @@ pub use caches::{
         pagination::{
             CacheOnlyBackOutcome, RoomPagination, RoomTimelineContinuity,
             RoomTimelineGapDescriptor, RoomTimelineGapHandle, RoomTimelineGapInspection,
-            RoomTimelineGapRepairOutcome,
+            RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome,
         },
     },
     thread::pagination::ThreadPagination,

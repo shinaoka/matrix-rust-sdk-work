@@ -10,7 +10,8 @@ use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     event_cache::{
         BackPaginationOutcome, EventCacheError, PaginationStatus, RoomEventCacheUpdate,
-        RoomTimelineContinuity, RoomTimelineGapRepairOutcome, TimelineVectorDiffs,
+        RoomTimelineContinuity, RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome,
+        TimelineVectorDiffs,
     },
     linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     store::StoreConfig,
@@ -35,7 +36,12 @@ use ruma::{
     room_version_rules::RedactionRules,
     user_id,
 };
-use tokio::{spawn, sync::broadcast, time::sleep};
+use tokio::{
+    spawn,
+    sync::broadcast,
+    time::{sleep, timeout},
+};
+use wiremock::ResponseTemplate;
 
 mod read_receipts;
 mod threads;
@@ -2153,13 +2159,37 @@ async fn test_inspect_and_repair_specific_persisted_timeline_gap() {
         .mount()
         .await;
 
-    let outcome = room_event_cache.pagination().repair_timeline_gap(&older_gap, 16).await.unwrap();
+    let deferred = room_event_cache
+        .pagination()
+        .repair_timeline_gap(
+            &older_gap,
+            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 1 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(deferred, RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded: 1 });
+
+    let outcome = room_event_cache
+        .pagination()
+        .repair_timeline_gap(
+            &older_gap,
+            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 4 },
+        )
+        .await
+        .unwrap();
     assert_eq!(outcome, RoomTimelineGapRepairOutcome::BoundariesJoined { events: 1 });
 
     let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
     assert_eq!(after.gaps.len(), 1);
     assert_eq!(
-        room_event_cache.pagination().repair_timeline_gap(&older_gap, 16).await.unwrap(),
+        room_event_cache
+            .pagination()
+            .repair_timeline_gap(
+                &older_gap,
+                RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 4 },
+            )
+            .await
+            .unwrap(),
         RoomTimelineGapRepairOutcome::Stale
     );
 }
@@ -2235,7 +2265,14 @@ async fn test_repair_timeline_gap_reports_progress_with_a_new_sdk_token() {
         .await;
 
     assert_eq!(
-        room_event_cache.pagination().repair_timeline_gap(&gap, 16).await.unwrap(),
+        room_event_cache
+            .pagination()
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 4 },
+            )
+            .await
+            .unwrap(),
         RoomTimelineGapRepairOutcome::Progress { events: 1 }
     );
     let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
@@ -2282,12 +2319,84 @@ async fn test_repair_timeline_gap_reports_start_reached_when_continuity_is_prove
         .await;
 
     assert_eq!(
-        room_event_cache.pagination().repair_timeline_gap(&gap, 8).await.unwrap(),
+        room_event_cache
+            .pagination()
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 4 },
+            )
+            .await
+            .unwrap(),
         RoomTimelineGapRepairOutcome::StartReached { events: 1 }
     );
     let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
     assert_eq!(after.continuity, RoomTimelineContinuity::Complete);
     assert!(after.gaps.is_empty());
+}
+
+#[async_test]
+async fn test_repair_timeline_gap_returns_stale_before_a_concurrent_request_error() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-stale-error:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("stale-error-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("stale-error-token")
+        .match_limit(8)
+        .respond_with(ResponseTemplate::new(400).set_delay(Duration::from_secs(1)))
+        .named("repair-gap-fails-after-topology-change")
+        .mount()
+        .await;
+
+    let pagination = room_event_cache.pagination();
+    let repair = spawn(async move {
+        pagination
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| request.url.path().ends_with("/messages")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("replacement-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+
+    assert_eq!(repair.await.unwrap().unwrap(), RoomTimelineGapRepairOutcome::Stale);
 }
 
 #[async_test]

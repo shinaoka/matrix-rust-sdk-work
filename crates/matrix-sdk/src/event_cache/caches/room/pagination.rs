@@ -111,11 +111,29 @@ pub struct RoomTimelineGapInspection {
     pub gaps: Vec<RoomTimelineGapDescriptor>,
 }
 
+/// Limits one targeted gap-repair operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomTimelineGapRepairBudget {
+    /// Maximum number of events requested from the homeserver.
+    pub event_limit: u16,
+    /// Maximum number of persisted chunks revealed into the live cache before
+    /// the selected gap is reached.
+    pub cached_chunk_limit: u16,
+}
+
 /// Result of one bounded targeted gap-repair request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoomTimelineGapRepairOutcome {
     /// The descriptor no longer matches the persisted gap topology.
     Stale,
+    /// The selected gap was not reached within the cache-reveal budget. The
+    /// caller may re-inspect and continue with another bounded operation.
+    Deferred {
+        /// Number of persisted chunks revealed by this operation.
+        cached_chunks_loaded: usize,
+    },
+    /// The owning client shut down before the request could be sent.
+    Failed,
     /// Events were added, but the server returned another pagination token.
     Progress {
         /// Number of events returned by this request after deduplication.
@@ -361,18 +379,21 @@ impl RoomPagination {
     pub async fn repair_timeline_gap(
         &self,
         descriptor: &RoomTimelineGapDescriptor,
-        batch_size: u16,
+        budget: RoomTimelineGapRepairBudget,
     ) -> Result<RoomTimelineGapRepairOutcome> {
         let _operation_guard = self.0.cache.pagination_operation_lock.write().await;
 
-        let current = self.inspect_timeline_gaps().await?;
-        if !current.gaps.iter().any(|gap| gap == descriptor) {
-            return Ok(RoomTimelineGapRepairOutcome::Stale);
-        }
-
-        let (prev_token, cache_diffs) = {
+        let (prev_token, cache_diffs, cached_chunks_loaded) = {
             let mut state = self.0.cache.state.write().await?;
+            let persisted =
+                state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
+            let current = inspect_ordered_chunks(&order_persisted_chunks(persisted)?);
+            if !current.gaps.iter().any(|gap| gap == descriptor) {
+                return Ok(RoomTimelineGapRepairOutcome::Stale);
+            }
+
             let mut cache_diffs = Vec::new();
+            let mut cached_chunks_loaded = 0usize;
 
             loop {
                 if let Some(chunk) = state
@@ -383,7 +404,11 @@ impl RoomPagination {
                     let ChunkContent::Gap(gap) = chunk.content() else {
                         return Ok(RoomTimelineGapRepairOutcome::Stale);
                     };
-                    break (gap.token.clone(), cache_diffs);
+                    break (Some(gap.token.clone()), cache_diffs, cached_chunks_loaded);
+                }
+
+                if cached_chunks_loaded >= usize::from(budget.cached_chunk_limit) {
+                    break (None, cache_diffs, cached_chunks_loaded);
                 }
 
                 let first = state
@@ -403,6 +428,7 @@ impl RoomPagination {
                 state.room_linked_chunk_mut().insert_new_chunk_as_first(previous)?;
                 let _ = state.room_linked_chunk_mut().store_updates().take();
                 cache_diffs.extend(state.room_linked_chunk_mut().updates_as_vector_diffs());
+                cached_chunks_loaded += 1;
             }
         };
 
@@ -416,14 +442,15 @@ impl RoomPagination {
             );
         }
 
-        let Some((events, new_token)) = self
+        let Some(prev_token) = prev_token else {
+            return Ok(RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded });
+        };
+
+        let request_result = self
             .0
             .cache
-            .paginate_backwards_with_network(batch_size, &Some(prev_token.clone()))
-            .await?
-        else {
-            return Ok(RoomTimelineGapRepairOutcome::Stale);
-        };
+            .paginate_backwards_with_network(budget.event_limit, &Some(prev_token.clone()))
+            .await;
 
         let mut state = self.0.cache.state.write().await?;
         let persisted =
@@ -439,6 +466,10 @@ impl RoomPagination {
         if !target_still_matches {
             return Ok(RoomTimelineGapRepairOutcome::Stale);
         }
+
+        let Some((events, new_token)) = request_result? else {
+            return Ok(RoomTimelineGapRepairOutcome::Failed);
+        };
 
         let gap_count_before = current.gaps.len();
         let DeduplicationOutcome {
