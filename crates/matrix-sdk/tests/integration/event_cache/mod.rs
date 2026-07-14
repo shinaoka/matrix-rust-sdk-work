@@ -10,7 +10,7 @@ use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     event_cache::{
         BackPaginationOutcome, EventCacheError, PaginationStatus, RoomEventCacheUpdate,
-        TimelineVectorDiffs,
+        RoomTimelineContinuity, RoomTimelineGapRepairOutcome, TimelineVectorDiffs,
     },
     linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     store::StoreConfig,
@@ -2058,6 +2058,236 @@ async fn test_lazy_loading() {
     }
 
     assert!(updates_stream.is_empty());
+}
+
+#[async_test]
+async fn test_inspect_and_repair_specific_persisted_timeline_gap() {
+    let room_id = room_id!("!gap-repair:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let old = event_factory.text_msg("old").event_id(event_id!("$old")).into_event();
+    let middle = event_factory.text_msg("middle").event_id(event_id!("$middle")).into_event();
+    let newest = event_factory.text_msg("newest").event_id(event_id!("$newest")).into_event();
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    {
+        let store = client.event_cache_store().lock().await.unwrap();
+        store
+            .as_clean()
+            .unwrap()
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(room_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![old],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(ChunkIdentifier::new(0)),
+                        new: ChunkIdentifier::new(1),
+                        next: None,
+                        gap: Gap { token: "older-secret-token".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(1)),
+                        new: ChunkIdentifier::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(2), 0),
+                        items: vec![middle],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(ChunkIdentifier::new(2)),
+                        new: ChunkIdentifier::new(3),
+                        next: None,
+                        gap: Gap { token: "newer-secret-token".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(3)),
+                        new: ChunkIdentifier::new(4),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(4), 0),
+                        items: vec![newest],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    client.event_cache().subscribe().unwrap();
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+    let inspection = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(inspection.continuity, RoomTimelineContinuity::Gapped);
+    assert_eq!(inspection.gaps.len(), 2);
+    let older_gap = inspection
+        .gaps
+        .iter()
+        .find(|gap| gap.older_event_id.as_deref() == Some(event_id!("$old")))
+        .unwrap()
+        .clone();
+    assert_eq!(older_gap.newer_event_id.as_deref(), Some(event_id!("$middle")));
+    let debug = format!("{inspection:?}");
+    assert!(!debug.contains("older-secret-token"));
+    assert!(!debug.contains("newer-secret-token"));
+    assert!(!debug.contains("$old"));
+    assert!(!debug.contains("$middle"));
+
+    server
+        .mock_room_messages()
+        .match_from("older-secret-token")
+        .match_limit(16)
+        .ok(RoomMessagesResponseTemplate::default()
+            .events(vec![event_factory.text_msg("bridge").event_id(event_id!("$bridge"))]))
+        .named("repair-specific-persisted-gap")
+        .mount()
+        .await;
+
+    let outcome = room_event_cache.pagination().repair_timeline_gap(&older_gap, 16).await.unwrap();
+    assert_eq!(outcome, RoomTimelineGapRepairOutcome::BoundariesJoined { events: 1 });
+
+    let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(after.gaps.len(), 1);
+    assert_eq!(
+        room_event_cache.pagination().repair_timeline_gap(&older_gap, 16).await.unwrap(),
+        RoomTimelineGapRepairOutcome::Stale
+    );
+}
+
+#[async_test]
+async fn test_repair_timeline_gap_reports_progress_with_a_new_sdk_token() {
+    let room_id = room_id!("!gap-progress:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    {
+        let store = client.event_cache_store().lock().await.unwrap();
+        store
+            .as_clean()
+            .unwrap()
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(room_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![
+                            event_factory
+                                .text_msg("old")
+                                .event_id(event_id!("$p-old"))
+                                .into_event(),
+                        ],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(ChunkIdentifier::new(0)),
+                        new: ChunkIdentifier::new(1),
+                        next: None,
+                        gap: Gap { token: "progress-secret-token".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(1)),
+                        new: ChunkIdentifier::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(2), 0),
+                        items: vec![
+                            event_factory
+                                .text_msg("new")
+                                .event_id(event_id!("$p-new"))
+                                .into_event(),
+                        ],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    client.event_cache().subscribe().unwrap();
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("progress-secret-token")
+        .match_limit(16)
+        .ok(RoomMessagesResponseTemplate::default()
+            .end_token("next-secret-token")
+            .events(vec![event_factory.text_msg("bridge").event_id(event_id!("$p-bridge"))]))
+        .named("repair-gap-progress")
+        .mount()
+        .await;
+
+    assert_eq!(
+        room_event_cache.pagination().repair_timeline_gap(&gap, 16).await.unwrap(),
+        RoomTimelineGapRepairOutcome::Progress { events: 1 }
+    );
+    let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(after.continuity, RoomTimelineContinuity::Gapped);
+    assert_eq!(after.gaps.len(), 1);
+    assert_eq!(after.gaps[0].newer_event_id.as_deref(), Some(event_id!("$p-bridge")));
+}
+
+#[async_test]
+async fn test_repair_timeline_gap_reports_start_reached_when_continuity_is_proven() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-start:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("start-secret-token")
+                .add_timeline_event(
+                    event_factory.text_msg("new").event_id(event_id!("$start-new")),
+                ),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let inspection = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(inspection.continuity, RoomTimelineContinuity::Gapped);
+    let gap = inspection.gaps.into_iter().next().unwrap();
+
+    server
+        .mock_room_messages()
+        .match_from("start-secret-token")
+        .match_limit(8)
+        .ok(RoomMessagesResponseTemplate::default()
+            .events(vec![event_factory.text_msg("old").event_id(event_id!("$start-old"))]))
+        .named("repair-gap-to-start")
+        .mount()
+        .await;
+
+    assert_eq!(
+        room_event_cache.pagination().repair_timeline_gap(&gap, 8).await.unwrap(),
+        RoomTimelineGapRepairOutcome::StartReached { events: 1 }
+    );
+    let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(after.continuity, RoomTimelineContinuity::Complete);
+    assert!(after.gaps.is_empty());
 }
 
 #[async_test]

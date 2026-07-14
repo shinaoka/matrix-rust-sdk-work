@@ -36,7 +36,7 @@ use ruma::{
 };
 pub(super) use state::{LockedRoomEventCacheState, RoomEventCacheStateLockWriteGuard};
 pub use subscriber::RoomEventCacheSubscriber;
-use tokio::sync::{Notify, broadcast::Receiver, mpsc};
+use tokio::sync::{Notify, RwLock, broadcast::Receiver, mpsc};
 use tracing::{instrument, trace, warn};
 pub use updates::{
     RoomEventCacheGenericUpdate, RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdate,
@@ -245,6 +245,12 @@ impl RoomEventCache {
         RoomPagination::new(self.inner.clone())
     }
 
+    /// Inspect all persisted timeline gaps without exposing pagination tokens
+    /// or linked-chunk identifiers.
+    pub async fn inspect_timeline_gaps(&self) -> Result<pagination::RoomTimelineGapInspection> {
+        self.pagination().inspect_timeline_gaps().await
+    }
+
     /// Return a [`ThreadPagination`] type useful for running back-pagination
     /// queries in the `thread_id` thread.
     pub async fn thread_pagination(&self, thread_id: OwnedEventId) -> Result<ThreadPagination> {
@@ -436,6 +442,10 @@ pub(super) struct RoomEventCacheInner {
 
     pub shared_pagination_status: SharedObservable<SharedPaginationStatus>,
 
+    /// Serializes ordinary, automatic, cache-only, and targeted room
+    /// pagination operations.
+    pub pagination_operation_lock: RwLock<()>,
+
     /// Sender to the auto-shrink channel.
     ///
     /// See doc comment around [`EventCache::auto_shrink_linked_chunk_task`] for
@@ -463,6 +473,7 @@ impl RoomEventCacheInner {
             state,
             update_sender,
             pagination_batch_token_notifier: Default::default(),
+            pagination_operation_lock: Default::default(),
             auto_shrink_sender,
             shared_pagination_status,
         }
