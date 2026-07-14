@@ -32,6 +32,7 @@ use matrix_sdk_base::{
     event_cache::{Event, Gap},
     linked_chunk::{ChunkContent, ChunkIdentifier, LinkedChunkId, RawChunk, Update},
 };
+use matrix_sdk_common::executor::spawn;
 use pin_project_lite::pin_project;
 use ruma::{EventId, OwnedEventId, OwnedRoomId, api::Direction};
 use tracing::{error, trace};
@@ -439,7 +440,7 @@ impl RoomPagination {
         &self,
         batch_size: u16,
     ) -> Result<BackPaginationOutcome> {
-        let mut status = self.0.cache.shared_pagination_status.subscribe();
+        let status = self.0.cache.shared_pagination_status.subscribe();
 
         loop {
             if let SharedPaginationStatus::Paginating { shared_task } = status.get() {
@@ -449,17 +450,7 @@ impl RoomPagination {
                 continue;
             }
 
-            tokio::select! {
-                operation_guard = self.0.cache.pagination_operation_lock.read() => {
-                    let _operation_guard = operation_guard;
-                    return self.0.run_backwards_once(batch_size).await;
-                }
-                _ = status.next() => {
-                    // A normal pagination may have started while a targeted repair
-                    // was queued for the write lock. Loop so this caller can join
-                    // that shared task instead of waiting behind the writer.
-                }
-            }
+            return self.0.run_backwards_once(batch_size).await;
         }
     }
 
@@ -484,6 +475,19 @@ impl RoomPagination {
     /// [`RoomTimelineGapRepairOutcome::Stale`] is returned without applying
     /// the response.
     pub async fn repair_timeline_gap(
+        &self,
+        descriptor: &RoomTimelineGapDescriptor,
+        budget: RoomTimelineGapRepairBudget,
+    ) -> Result<RoomTimelineGapRepairOutcome> {
+        let pagination = self.clone();
+        let descriptor = descriptor.clone();
+        let task =
+            spawn(async move { pagination.repair_timeline_gap_inner(&descriptor, budget).await });
+
+        task.await.expect("targeted room-timeline gap repair task panicked")
+    }
+
+    async fn repair_timeline_gap_inner(
         &self,
         descriptor: &RoomTimelineGapDescriptor,
         budget: RoomTimelineGapRepairBudget,
@@ -863,6 +867,10 @@ pub struct CacheOnlyBackOutcome {
 impl PaginatedCache for Arc<RoomEventCacheInner> {
     fn status(&self) -> &SharedObservable<SharedPaginationStatus> {
         &self.shared_pagination_status
+    }
+
+    fn pagination_operation_lock(&self) -> Option<Arc<tokio::sync::RwLock<()>>> {
+        Some(self.pagination_operation_lock.clone())
     }
 
     async fn load_more_events_backwards(&self) -> Result<LoadMoreEventsBackwardsOutcome> {

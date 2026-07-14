@@ -444,7 +444,7 @@ pub(super) struct RoomEventCacheInner {
 
     /// Serializes ordinary, automatic, cache-only, and targeted room
     /// pagination operations.
-    pub pagination_operation_lock: RwLock<()>,
+    pub pagination_operation_lock: Arc<RwLock<()>>,
 
     /// Sender to the auto-shrink channel.
     ///

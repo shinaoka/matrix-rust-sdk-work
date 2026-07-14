@@ -2597,6 +2597,141 @@ async fn test_late_ordinary_pagination_coalesces_ahead_of_queued_gap_repair() {
 }
 
 #[async_test]
+async fn test_cancelled_ordinary_caller_keeps_targeted_repair_serialized() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-cancelled-ordinary:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("cancelled-ordinary-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("cancelled-ordinary-token")
+        .match_limit(8)
+        .ok(RoomMessagesResponseTemplate::default()
+            .with_delay(Duration::from_secs(1))
+            .events(vec![event_factory.text_msg("ordinary").event_id(event_id!("$ordinary"))]))
+        .expect(1)
+        .named("cancelled-caller-shared-pagination")
+        .mount()
+        .await;
+    server
+        .mock_room_messages()
+        .match_from("cancelled-ordinary-token")
+        .match_limit(7)
+        .ok(RoomMessagesResponseTemplate::default()
+            .events(vec![event_factory.text_msg("targeted").event_id(event_id!("$targeted"))]))
+        .expect(0)
+        .named("targeted-pagination-must-remain-queued")
+        .mount()
+        .await;
+
+    let ordinary_pagination = room_event_cache.pagination();
+    let ordinary = spawn(async move { ordinary_pagination.run_backwards_once(8).await });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| request.url.path().ends_with("/messages")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    ordinary.abort();
+
+    let targeted_pagination = room_event_cache.pagination();
+    let targeted = targeted_pagination
+        .repair_timeline_gap(
+            &gap,
+            RoomTimelineGapRepairBudget { event_limit: 7, cached_chunk_limit: 2 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(targeted, RoomTimelineGapRepairOutcome::Stale);
+}
+
+#[async_test]
+async fn test_cancelled_targeted_repair_finishes_persistence_and_broadcast() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-cancelled-repair:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("cancelled-repair-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("cancelled-repair-token")
+        .match_limit(8)
+        .ok(RoomMessagesResponseTemplate::default()
+            .with_delay(Duration::from_secs(1))
+            .events(vec![event_factory.text_msg("repaired").event_id(event_id!("$repaired"))]))
+        .expect(1)
+        .named("cancelled-targeted-repair")
+        .mount()
+        .await;
+
+    let pagination = room_event_cache.pagination();
+    let repair = spawn(async move {
+        pagination
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            )
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| request.url.path().ends_with("/messages")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    repair.abort();
+
+    assert!(matches!(
+        timeout(Duration::from_secs(2), room_updates.recv()).await,
+        Ok(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)))
+    ));
+    let inspection = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(inspection.continuity, RoomTimelineContinuity::Complete);
+    assert!(inspection.gaps.is_empty());
+}
+
+#[async_test]
 async fn test_deduplication() {
     let room_id = room_id!("!foo:bar.baz");
     let event_factory = EventFactory::new().room(room_id).sender(&ALICE);

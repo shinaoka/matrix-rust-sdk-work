@@ -152,6 +152,12 @@ where
         let this = self.clone();
 
         let fut: Pin<Box<dyn SharedPaginationFuture>> = Box::pin(async move {
+            let _operation_guard = if let Some(lock) = this.cache.pagination_operation_lock() {
+                Some(lock.read_owned().await)
+            } else {
+                None
+            };
+
             match this.paginate_backwards_impl(batch_size).await? {
                 Some(outcome) => {
                     // Back-pagination's over and successful, don't reset the status to the previous
@@ -348,6 +354,13 @@ pub(in super::super) enum SharedPaginationStatus {
 
 pub(in super::super) trait PaginatedCache {
     fn status(&self) -> &SharedObservable<SharedPaginationStatus>;
+
+    /// Optional room-wide operation lock. The shared pagination task acquires
+    /// and owns this guard so cancelling an initiating caller cannot release
+    /// serialization while the detached request is still running.
+    fn pagination_operation_lock(&self) -> Option<Arc<tokio::sync::RwLock<()>>> {
+        None
+    }
 
     fn load_more_events_backwards(
         &self,
