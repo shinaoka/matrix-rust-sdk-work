@@ -37,7 +37,8 @@ use crate::timeline::{
 pub struct RestoreFromCacheOutcome {
     /// Total number of events loaded from disk and revealed in the timeline.
     pub events_loaded: usize,
-    /// Number of disk chunks read (diagnostic; no longer used for settle fence).
+    /// Number of disk chunks read (diagnostic; no longer used for settle
+    /// fence).
     pub chunks_loaded: usize,
     /// Whether the lazy in-memory reveal emitted a `VectorDiff` batch
     /// (diagnostic; no longer used for settle fence).
@@ -180,8 +181,10 @@ impl super::Timeline {
     /// authoritative in-cache signal), plus `reached_start` and `hit_gap`. The
     /// caller should use `anchor_present` to decide the restore terminal:
     /// - `anchor_present == true`: wait for `timeline_contains(anchor)`; do NOT
-    ///   conclude EndReached/BudgetExhausted while the anchor is guaranteed to arrive.
-    /// - `anchor_present == false && reached_start`: conclude EndReached immediately.
+    ///   conclude EndReached/BudgetExhausted while the anchor is guaranteed to
+    ///   arrive.
+    /// - `anchor_present == false && reached_start`: conclude EndReached
+    ///   immediately.
     /// - `hit_gap`: fall back to network-backed pagination.
     ///
     /// [`paginate_backwards`]: Self::paginate_backwards
@@ -192,7 +195,8 @@ impl super::Timeline {
     // the live_lazy_paginate_backwards + run_backwards_once pattern of
     // paginate_backwards, but substitutes run_backwards_cache_only for the
     // disk-load step so no network round-trips occur. Returns anchor_present
-    // so koushi can decide the terminal deterministically without timing heuristics.
+    // so koushi can decide the terminal deterministically without timing
+    // heuristics.
     pub async fn live_restore_from_cache(
         &self,
         n: u16,
@@ -219,8 +223,7 @@ impl super::Timeline {
         //   (did_reveal, None) — in-memory fully satisfied the request
         // `did_reveal` is true when the Skip adaptor's count changed and thus
         // one synthetic VectorDiff batch was emitted to the timeline subscriber.
-        let (did_reveal, needs) =
-            self.controller.live_lazy_paginate_backwards_with_reveal(n).await;
+        let (did_reveal, needs) = self.controller.live_lazy_paginate_backwards_with_reveal(n).await;
         if did_reveal {
             total_lazy_reveal_batches += 1;
         }

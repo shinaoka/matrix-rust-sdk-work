@@ -90,7 +90,6 @@ pub use self::{
     builder::TimelineBuilder,
     controller::default_event_filter,
     error::*,
-    pagination::RestoreFromCacheOutcome,
     event_filter::{TimelineEventCondition, TimelineEventFilter},
     event_item::{
         AnyOtherStateEventContentChange, BeaconInfo, EmbeddedEvent, EncryptedMessage,
@@ -103,6 +102,7 @@ pub use self::{
     },
     item::{TimelineItem, TimelineItemKind, TimelineUniqueId},
     latest_event::{LatestEventValue, LatestEventValueLocalState},
+    pagination::RestoreFromCacheOutcome,
     thread_list_service::{ThreadListPaginationState, ThreadListService},
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
