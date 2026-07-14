@@ -16,7 +16,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -88,6 +88,8 @@ struct EventFocusedCacheKey {
     thread_mode: EventFocusThreadMode,
 }
 
+static NEXT_GAP_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct RoomEventCacheState {
     /// Whether thread support has been enabled for the event cache.
     enabled_thread_support: bool,
@@ -133,6 +135,9 @@ pub struct RoomEventCacheState {
 
     /// Monotonic generation for persisted gap-topology mutations.
     gap_topology_generation: u64,
+
+    /// Process-local identity for this room-cache state instance.
+    gap_snapshot_id: u64,
 
     /// A clone of
     /// [`super::super::EventCacheInner::linked_chunk_update_sender`].
@@ -392,6 +397,7 @@ impl LockedRoomEventCacheState {
             pagination_status,
             update_sender,
             gap_topology_generation: 0,
+            gap_snapshot_id: NEXT_GAP_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed),
             linked_chunk_update_sender,
             room_version_rules,
             waited_for_initial_prev_token: false,
@@ -433,6 +439,11 @@ impl<'a> lock::Reload for RoomEventCacheStateLockWriteGuard<'a> {
 }
 
 impl<'a> RoomEventCacheStateLockReadGuard<'a> {
+    /// Return the process-local room-cache snapshot identity.
+    pub fn gap_snapshot_id(&self) -> u64 {
+        self.state.gap_snapshot_id
+    }
+
     /// Return the monotonic persisted gap-topology generation.
     pub fn gap_topology_generation(&self) -> u64 {
         self.state.gap_topology_generation
@@ -553,6 +564,11 @@ impl<'a> RoomEventCacheStateLockReadGuard<'a> {
 }
 
 impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
+    /// Return the process-local room-cache snapshot identity.
+    pub fn gap_snapshot_id(&self) -> u64 {
+        self.state.gap_snapshot_id
+    }
+
     /// Return the monotonic persisted gap-topology generation.
     pub fn gap_topology_generation(&self) -> u64 {
         self.state.gap_topology_generation

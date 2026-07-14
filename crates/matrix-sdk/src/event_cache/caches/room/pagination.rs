@@ -69,6 +69,7 @@ pub enum RoomTimelineContinuity {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RoomTimelineGapHandle {
     room_id: OwnedRoomId,
+    snapshot_id: u64,
     chunk_identifier: ChunkIdentifier,
 }
 
@@ -209,6 +210,7 @@ fn mix_revision(revision: &mut u64, bytes: &[u8]) {
 
 fn inspect_ordered_chunks(
     room_id: &OwnedRoomId,
+    snapshot_id: u64,
     topology_generation: u64,
     chunks: &[RawChunk<Event, Gap>],
 ) -> RoomTimelineGapInspection {
@@ -243,6 +245,7 @@ fn inspect_ordered_chunks(
         .collect::<Vec<_>>();
 
     let mut revision = 0xcbf29ce484222325;
+    mix_revision(&mut revision, &snapshot_id.to_le_bytes());
     mix_revision(&mut revision, &topology_generation.to_le_bytes());
     for (identifier, token, older_event_id, newer_event_id) in &gap_data {
         mix_revision(&mut revision, &identifier.index().to_le_bytes());
@@ -260,7 +263,11 @@ fn inspect_ordered_chunks(
         .into_iter()
         .map(|(chunk_identifier, _token, older_event_id, newer_event_id)| {
             RoomTimelineGapDescriptor {
-                handle: RoomTimelineGapHandle { room_id: room_id.clone(), chunk_identifier },
+                handle: RoomTimelineGapHandle {
+                    room_id: room_id.clone(),
+                    snapshot_id,
+                    chunk_identifier,
+                },
                 revision,
                 older_event_id,
                 newer_event_id,
@@ -275,6 +282,47 @@ fn inspect_ordered_chunks(
             RoomTimelineContinuity::Gapped
         },
         gaps,
+    }
+}
+
+#[cfg(test)]
+mod gap_snapshot_tests {
+    use matrix_sdk_base::{
+        event_cache::{Event, Gap},
+        linked_chunk::{ChunkContent, ChunkIdentifier, RawChunk},
+    };
+    use ruma::OwnedRoomId;
+
+    use super::inspect_ordered_chunks;
+
+    #[test]
+    fn reconstructed_room_state_invalidates_old_gap_descriptors() {
+        let chunks: Vec<RawChunk<Event, Gap>> = vec![
+            RawChunk {
+                content: ChunkContent::Items(Vec::new()),
+                previous: None,
+                identifier: ChunkIdentifier::new(0),
+                next: Some(ChunkIdentifier::new(1)),
+            },
+            RawChunk {
+                content: ChunkContent::Gap(Gap { token: "private".to_owned() }),
+                previous: Some(ChunkIdentifier::new(0)),
+                identifier: ChunkIdentifier::new(1),
+                next: Some(ChunkIdentifier::new(2)),
+            },
+            RawChunk {
+                content: ChunkContent::Items(Vec::new()),
+                previous: Some(ChunkIdentifier::new(1)),
+                identifier: ChunkIdentifier::new(2),
+                next: None,
+            },
+        ];
+        let room_id = OwnedRoomId::try_from("!snapshot:example.org").unwrap();
+
+        let first = inspect_ordered_chunks(&room_id, 1, 0, &chunks);
+        let reconstructed = inspect_ordered_chunks(&room_id, 2, 0, &chunks);
+
+        assert_ne!(first.gaps, reconstructed.gaps);
     }
 }
 
@@ -377,6 +425,7 @@ impl RoomPagination {
         let chunks = state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
         Ok(inspect_ordered_chunks(
             &state.state.room_id,
+            state.gap_snapshot_id(),
             state.gap_topology_generation(),
             &order_persisted_chunks(chunks)?,
         ))
@@ -402,6 +451,7 @@ impl RoomPagination {
                 state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
             let current = inspect_ordered_chunks(
                 &state.state.room_id,
+                state.gap_snapshot_id(),
                 state.gap_topology_generation(),
                 &order_persisted_chunks(persisted)?,
             );
@@ -474,6 +524,7 @@ impl RoomPagination {
             state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
         let current = inspect_ordered_chunks(
             &state.state.room_id,
+            state.gap_snapshot_id(),
             state.gap_topology_generation(),
             &order_persisted_chunks(persisted)?,
         );
@@ -528,6 +579,9 @@ impl RoomPagination {
             new_gap,
             &topo_ordered_events,
         );
+        // `post_process_new_events` begins by flushing the linked-chunk updates
+        // to the EventCacheStore. The persisted inspection below therefore
+        // proves the repair survives cache reconstruction.
         state
             .post_process_new_events(
                 topo_ordered_events,
@@ -540,6 +594,7 @@ impl RoomPagination {
             state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
         let after = inspect_ordered_chunks(
             &state.state.room_id,
+            state.gap_snapshot_id(),
             state.gap_topology_generation(),
             &order_persisted_chunks(persisted_after)?,
         );
