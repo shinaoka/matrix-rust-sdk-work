@@ -51,7 +51,7 @@ use ruma::{
     room_version_rules::RoomVersionRules,
     serde::Raw,
 };
-use tokio::sync::{RwLock, RwLockWriteGuard, broadcast};
+use tokio::sync::{RwLock, RwLockWriteGuard, broadcast, watch};
 use tracing::{
     Instrument as _, Span, debug, error, field::debug, info, info_span, instrument, trace, warn,
 };
@@ -66,10 +66,10 @@ pub(super) use self::{
     state_transaction::TimelineStateTransaction,
 };
 use super::{
-    DateDividerMode, EmbeddedEvent, Error, EventSendState, EventTimelineItem, InReplyToDetails,
-    MediaUploadProgress, PaginationError, Profile, TimelineDetails, TimelineEventItemId,
-    TimelineFocus, TimelineItem, TimelineItemContent, TimelineItemKind,
-    TimelineReadReceiptTracking, VirtualTimelineItem,
+    DateDividerMode, EmbeddedEvent, Error, EventSendState, EventTimelineItem,
+    GapRepairProjectionId, InReplyToDetails, MediaUploadProgress, PaginationError, Profile,
+    TimelineDetails, TimelineEventItemId, TimelineFocus, TimelineItem, TimelineItemContent,
+    TimelineItemKind, TimelineReadReceiptTracking, VirtualTimelineItem,
     algorithms::{rfind_event_by_id, rfind_event_item},
     event_item::{ReactionStatus, RemoteEventOrigin},
     item::TimelineUniqueId,
@@ -202,6 +202,17 @@ pub(super) struct TimelineController<P: RoomDataProvider = Room> {
 
     /// Settings applied to this timeline.
     pub(super) settings: TimelineSettings,
+
+    /// Latest gap-repair publication settled at the observable timeline
+    /// boundary. The watch value makes completion race-safe when the event
+    /// cache task wins the race with the repair caller.
+    gap_repair_projection_tx: watch::Sender<Option<GapRepairProjectionSettlement>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GapRepairProjectionSettlement {
+    projection: GapRepairProjectionId,
+    observable: bool,
 }
 
 #[derive(Clone)]
@@ -380,7 +391,70 @@ impl<P: RoomDataProvider> TimelineController<P> {
             is_room_encrypted,
         )));
 
-        Self { state, focus, room_data_provider, settings }
+        let (gap_repair_projection_tx, _) = watch::channel(None);
+
+        Self { state, focus, room_data_provider, settings, gap_repair_projection_tx }
+    }
+
+    /// Finish one raw gap-repair publication at the observable UI boundary.
+    ///
+    /// New visible events already carry the exact projection tag. Filtered or
+    /// aggregation-only publications do not, so an existing remote item is
+    /// re-emitted with the tag as a causal barrier. If no remote item exists,
+    /// there is no UI projection to render and the waiter settles `false`.
+    pub(super) async fn complete_gap_repair_projection(&self, projection: GapRepairProjectionId) {
+        let observable = {
+            let mut state = self.state.write().await;
+            let items = state.items.clone_items();
+            if items.iter().any(|item| {
+                item.as_event().and_then(EventTimelineItem::gap_repair_projection)
+                    == Some(projection)
+            }) {
+                true
+            } else if let Some((index, item, event)) =
+                items.iter().enumerate().find_map(|(index, item)| {
+                    let event = item.as_event()?.clone();
+                    event.as_remote()?;
+                    Some((index, item.clone(), event))
+                })
+            {
+                let mut tagged_event = event;
+                tagged_event.as_remote_mut().expect("remote event checked above").origin =
+                    RemoteEventOrigin::GapRepair {
+                        actor_generation: projection.actor_generation,
+                        repair_generation: projection.repair_generation,
+                        projection_batch: projection.projection_batch,
+                    };
+                let tagged_item = item.with_kind(tagged_event);
+                let mut transaction = state.items.transaction();
+                transaction.replace(index, tagged_item);
+                transaction.commit();
+                true
+            } else {
+                false
+            }
+        };
+
+        self.gap_repair_projection_tx
+            .send_replace(Some(GapRepairProjectionSettlement { projection, observable }));
+    }
+
+    pub(super) async fn wait_for_gap_repair_projection(
+        &self,
+        projection: GapRepairProjectionId,
+    ) -> bool {
+        let mut receiver = self.gap_repair_projection_tx.subscribe();
+        loop {
+            let settlement = *receiver.borrow_and_update();
+            if let Some(settlement) = settlement
+                && settlement.projection == projection
+            {
+                return settlement.observable;
+            }
+            if receiver.changed().await.is_err() {
+                return false;
+            }
+        }
     }
 
     /// Listens to encryption state changes for the room in

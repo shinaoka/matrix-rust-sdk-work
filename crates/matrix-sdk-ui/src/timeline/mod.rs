@@ -311,6 +311,15 @@ impl Timeline {
         (items, stream)
     }
 
+    /// Wait until a targeted gap-repair publication has crossed the
+    /// observable timeline boundary.
+    ///
+    /// Returns `false` when the publication produced no renderable timeline
+    /// item, so callers must not wait for a UI diff that cannot exist.
+    pub async fn wait_for_gap_repair_projection(&self, projection: GapRepairProjectionId) -> bool {
+        self.controller.wait_for_gap_repair_projection(projection).await
+    }
+
     /// Send a message to the room, and add it to the timeline as a local echo.
     ///
     /// For simplicity, this method doesn't currently allow custom message

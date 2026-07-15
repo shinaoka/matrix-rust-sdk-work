@@ -27,7 +27,9 @@ use ruma::OwnedEventId;
 use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing::{error, instrument, trace, warn};
 
-use crate::timeline::{TimelineController, TimelineFocus, event_item::RemoteEventOrigin};
+use crate::timeline::{
+    GapRepairProjectionId, TimelineController, TimelineFocus, event_item::RemoteEventOrigin,
+};
 
 /// Long-lived task, in the pinned events focus mode, that updates the timeline
 /// after any changes in the pinned events.
@@ -280,6 +282,21 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
                         projection_batch,
                     },
                 };
+                let gap_repair_projection = match origin {
+                    RemoteEventOrigin::GapRepair {
+                        actor_generation,
+                        repair_generation,
+                        projection_batch,
+                    } => Some(GapRepairProjectionId {
+                        actor_generation,
+                        repair_generation,
+                        projection_batch,
+                    }),
+                    RemoteEventOrigin::Cache
+                    | RemoteEventOrigin::Sync
+                    | RemoteEventOrigin::Pagination
+                    | RemoteEventOrigin::Unknown => None,
+                };
 
                 let has_diffs = !diffs.is_empty();
 
@@ -289,6 +306,12 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
                     // Only handle the remote aggregation for a non-live timeline, that's not the
                     // pinned events one (since the latter handles remote aggregations on its own).
                     timeline_controller.handle_remote_aggregations(diffs, origin).await;
+                }
+
+                if let Some(projection) = gap_repair_projection
+                    && !matches!(timeline_focus, TimelineFocus::PinnedEvents)
+                {
+                    timeline_controller.complete_gap_repair_projection(projection).await;
                 }
 
                 if has_diffs && matches!(origin, RemoteEventOrigin::Cache) {
