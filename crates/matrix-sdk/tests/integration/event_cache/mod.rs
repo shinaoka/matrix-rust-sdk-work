@@ -10,7 +10,8 @@ use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     event_cache::{
         BackPaginationOutcome, EventCacheError, PaginationStatus, RoomEventCacheUpdate,
-        TimelineVectorDiffs,
+        RoomTimelineContinuity, RoomTimelineGapProjectionId, RoomTimelineGapRepairBudget,
+        RoomTimelineGapRepairOutcome, TimelineVectorDiffs,
     },
     linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     store::StoreConfig,
@@ -35,7 +36,12 @@ use ruma::{
     room_version_rules::RedactionRules,
     user_id,
 };
-use tokio::{spawn, sync::broadcast, time::sleep};
+use tokio::{
+    spawn,
+    sync::broadcast,
+    time::{sleep, timeout},
+};
+use wiremock::ResponseTemplate;
 
 mod read_receipts;
 mod threads;
@@ -711,7 +717,6 @@ async fn test_backpaginating_without_token() {
     let f = EventFactory::new().room(room_id).sender(user_id!("@a:b.c"));
     let room = server.sync_joined_room(&client, room_id).await;
     let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
-
     let (events, mut room_stream) = room_event_cache.subscribe().await.unwrap();
 
     assert!(events.is_empty());
@@ -2058,6 +2063,699 @@ async fn test_lazy_loading() {
     }
 
     assert!(updates_stream.is_empty());
+}
+
+#[async_test]
+async fn test_inspect_and_repair_specific_persisted_timeline_gap() {
+    let room_id = room_id!("!gap-repair:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let old = event_factory.text_msg("old").event_id(event_id!("$old")).into_event();
+    let middle = event_factory.text_msg("middle").event_id(event_id!("$middle")).into_event();
+    let newest = event_factory.text_msg("newest").event_id(event_id!("$newest")).into_event();
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    {
+        let store = client.event_cache_store().lock().await.unwrap();
+        store
+            .as_clean()
+            .unwrap()
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(room_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![old],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(ChunkIdentifier::new(0)),
+                        new: ChunkIdentifier::new(1),
+                        next: None,
+                        gap: Gap { token: "older-secret-token".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(1)),
+                        new: ChunkIdentifier::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(2), 0),
+                        items: vec![middle],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(ChunkIdentifier::new(2)),
+                        new: ChunkIdentifier::new(3),
+                        next: None,
+                        gap: Gap { token: "newer-secret-token".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(3)),
+                        new: ChunkIdentifier::new(4),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(4), 0),
+                        items: vec![newest],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    client.event_cache().subscribe().unwrap();
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+
+    let inspection = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(inspection.continuity, RoomTimelineContinuity::Gapped);
+    assert_eq!(inspection.gaps.len(), 2);
+    let older_gap = inspection
+        .gaps
+        .iter()
+        .find(|gap| gap.older_event_id.as_deref() == Some(event_id!("$old")))
+        .unwrap()
+        .clone();
+    assert_eq!(older_gap.newer_event_id.as_deref(), Some(event_id!("$middle")));
+    let debug = format!("{inspection:?}");
+    assert!(!debug.contains("older-secret-token"));
+    assert!(!debug.contains("newer-secret-token"));
+    assert!(!debug.contains("$old"));
+    assert!(!debug.contains("$middle"));
+
+    server
+        .mock_room_messages()
+        .match_from("older-secret-token")
+        .match_limit(16)
+        .ok(RoomMessagesResponseTemplate::default()
+            .events(vec![event_factory.text_msg("bridge").event_id(event_id!("$bridge"))]))
+        .named("repair-specific-persisted-gap")
+        .mount()
+        .await;
+
+    let gap_only = room_event_cache
+        .pagination()
+        .repair_timeline_gap_with_projection(
+            &older_gap,
+            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 1 },
+            RoomTimelineGapProjectionId { actor_generation: 9, repair_generation: 1 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gap_only.outcome,
+        RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded: 1 }
+    );
+    assert_eq!(gap_only.last_projection_batch, None);
+    assert!(timeout(Duration::from_millis(50), room_updates.recv()).await.is_err());
+
+    let deferred = room_event_cache
+        .pagination()
+        .repair_timeline_gap_with_projection(
+            &older_gap,
+            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 1 },
+            RoomTimelineGapProjectionId { actor_generation: 9, repair_generation: 2 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deferred.outcome,
+        RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded: 1 }
+    );
+    assert_eq!(deferred.last_projection_batch, Some(1));
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+            diffs,
+            origin: matrix_sdk::event_cache::EventsOrigin::GapRepair {
+                actor_generation: 9,
+                repair_generation: 2,
+                projection_batch: 1,
+            },
+        })) = room_updates.recv()
+    );
+    assert!(!diffs.is_empty());
+
+    let outcome = room_event_cache
+        .pagination()
+        .repair_timeline_gap(
+            &older_gap,
+            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 4 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RoomTimelineGapRepairOutcome::BoundariesJoined { events: 1 });
+
+    let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(after.gaps.len(), 1);
+    assert_eq!(
+        room_event_cache
+            .pagination()
+            .repair_timeline_gap(
+                &older_gap,
+                RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 4 },
+            )
+            .await
+            .unwrap(),
+        RoomTimelineGapRepairOutcome::Stale
+    );
+}
+
+#[async_test]
+async fn test_repair_timeline_gap_reports_progress_with_a_new_sdk_token() {
+    let room_id = room_id!("!gap-progress:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    {
+        let store = client.event_cache_store().lock().await.unwrap();
+        store
+            .as_clean()
+            .unwrap()
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(room_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![
+                            event_factory
+                                .text_msg("old")
+                                .event_id(event_id!("$p-old"))
+                                .into_event(),
+                        ],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(ChunkIdentifier::new(0)),
+                        new: ChunkIdentifier::new(1),
+                        next: None,
+                        gap: Gap { token: "progress-secret-token".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(1)),
+                        new: ChunkIdentifier::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(2), 0),
+                        items: vec![
+                            event_factory
+                                .text_msg("new")
+                                .event_id(event_id!("$p-new"))
+                                .into_event(),
+                        ],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    client.event_cache().subscribe().unwrap();
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("progress-secret-token")
+        .match_limit(16)
+        .ok(RoomMessagesResponseTemplate::default()
+            .end_token("next-secret-token")
+            .events(vec![event_factory.text_msg("bridge").event_id(event_id!("$p-bridge"))]))
+        .named("repair-gap-progress")
+        .mount()
+        .await;
+
+    assert_eq!(
+        room_event_cache
+            .pagination()
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 4 },
+            )
+            .await
+            .unwrap(),
+        RoomTimelineGapRepairOutcome::Progress { events: 1 }
+    );
+    let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(after.continuity, RoomTimelineContinuity::Gapped);
+    assert_eq!(after.gaps.len(), 1);
+    assert_eq!(after.gaps[0].newer_event_id.as_deref(), Some(event_id!("$p-bridge")));
+}
+
+#[async_test]
+async fn test_repair_timeline_gap_reports_start_reached_when_continuity_is_proven() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-start:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("start-secret-token")
+                .add_timeline_event(
+                    event_factory.text_msg("new").event_id(event_id!("$start-new")),
+                ),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let inspection = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(inspection.continuity, RoomTimelineContinuity::Gapped);
+    let gap = inspection.gaps.into_iter().next().unwrap();
+
+    server
+        .mock_room_messages()
+        .match_from("start-secret-token")
+        .match_limit(8)
+        .ok(RoomMessagesResponseTemplate::default()
+            .events(vec![event_factory.text_msg("old").event_id(event_id!("$start-old"))]))
+        .named("repair-gap-to-start")
+        .mount()
+        .await;
+
+    assert_eq!(
+        room_event_cache
+            .pagination()
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 4 },
+            )
+            .await
+            .unwrap(),
+        RoomTimelineGapRepairOutcome::StartReached { events: 1 }
+    );
+    let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(after.continuity, RoomTimelineContinuity::Complete);
+    assert!(after.gaps.is_empty());
+}
+
+#[async_test]
+async fn test_repair_timeline_gap_returns_stale_before_a_concurrent_request_error() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-stale-error:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("stale-error-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("stale-error-token")
+        .match_limit(8)
+        .respond_with(ResponseTemplate::new(400).set_delay(Duration::from_secs(1)))
+        .named("repair-gap-fails-after-topology-change")
+        .mount()
+        .await;
+
+    let pagination = room_event_cache.pagination();
+    let repair = spawn(async move {
+        pagination
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| request.url.path().ends_with("/messages")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    room_event_cache.clear().await.unwrap();
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("stale-error-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+
+    assert_eq!(repair.await.unwrap().unwrap(), RoomTimelineGapRepairOutcome::Stale);
+}
+
+#[async_test]
+async fn test_repair_timeline_gap_accepts_unrelated_live_events_during_request() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-live:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("live-gap-token")
+                .add_timeline_event(
+                    event_factory.text_msg("known").event_id(event_id!("$live-known")),
+                ),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("live-gap-token")
+        .match_limit(8)
+        .ok(RoomMessagesResponseTemplate::default()
+            .with_delay(Duration::from_secs(1))
+            .events(vec![event_factory.text_msg("old").event_id(event_id!("$live-old"))]))
+        .named("repair-gap-with-concurrent-live-event")
+        .mount()
+        .await;
+
+    let pagination = room_event_cache.pagination();
+    let repair = spawn(async move {
+        pagination
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| request.url.path().ends_with("/messages")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                event_factory.text_msg("live").event_id(event_id!("$live-appended")),
+            ),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+
+    assert_eq!(
+        repair.await.unwrap().unwrap(),
+        RoomTimelineGapRepairOutcome::StartReached { events: 1 }
+    );
+}
+
+#[async_test]
+async fn test_repair_timeline_gap_rejects_a_handle_from_another_room() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let first_room_id = room_id!("!gap-owner-one:example.org");
+    let second_room_id = room_id!("!gap-owner-two:example.org");
+    let first_room = server.sync_joined_room(&client, first_room_id).await;
+    let second_room = server.sync_joined_room(&client, second_room_id).await;
+    let (first_cache, _first_handles) = first_room.event_cache().await.unwrap();
+    let (second_cache, _second_handles) = second_room.event_cache().await.unwrap();
+    let (_, mut first_updates) = first_cache.subscribe().await.unwrap();
+    let (_, mut second_updates) = second_cache.subscribe().await.unwrap();
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |sync| {
+            sync.add_joined_room(
+                JoinedRoomBuilder::new(first_room_id)
+                    .set_timeline_limited()
+                    .set_timeline_prev_batch("shared-token"),
+            );
+            sync.add_joined_room(
+                JoinedRoomBuilder::new(second_room_id)
+                    .set_timeline_limited()
+                    .set_timeline_prev_batch("shared-token"),
+            );
+        })
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = first_updates.recv());
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = second_updates.recv());
+
+    let foreign_gap = first_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+    assert_eq!(
+        second_cache
+            .pagination()
+            .repair_timeline_gap(
+                &foreign_gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            )
+            .await
+            .unwrap(),
+        RoomTimelineGapRepairOutcome::Stale
+    );
+}
+
+#[async_test]
+async fn test_late_ordinary_pagination_coalesces_ahead_of_queued_gap_repair() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-coalesce:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("coalesced-gap-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("coalesced-gap-token")
+        .match_limit(8)
+        .ok(RoomMessagesResponseTemplate::default()
+            .with_delay(Duration::from_secs(1))
+            .events(vec![event_factory.text_msg("coalesced").event_id(event_id!("$coalesced"))]))
+        .expect(1)
+        .named("one-shared-ordinary-pagination")
+        .mount()
+        .await;
+
+    let first_pagination = room_event_cache.pagination();
+    let first = spawn(async move { first_pagination.run_backwards_once(8).await });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| request.url.path().ends_with("/messages")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let targeted_pagination = room_event_cache.pagination();
+    let targeted = spawn(async move {
+        targeted_pagination
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let late_pagination = room_event_cache.pagination();
+    let late = spawn(async move { late_pagination.run_backwards_once(8).await });
+
+    let first_outcome = first.await.unwrap().unwrap();
+    let late_outcome = late.await.unwrap().unwrap();
+    assert_eq!(first_outcome.events.len(), 1);
+    assert_eq!(late_outcome.events.len(), 1);
+    assert_eq!(targeted.await.unwrap().unwrap(), RoomTimelineGapRepairOutcome::Stale);
+}
+
+#[async_test]
+async fn test_cancelled_ordinary_caller_keeps_targeted_repair_serialized() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-cancelled-ordinary:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("cancelled-ordinary-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("cancelled-ordinary-token")
+        .match_limit(8)
+        .ok(RoomMessagesResponseTemplate::default()
+            .with_delay(Duration::from_secs(1))
+            .events(vec![event_factory.text_msg("ordinary").event_id(event_id!("$ordinary"))]))
+        .expect(1)
+        .named("cancelled-caller-shared-pagination")
+        .mount()
+        .await;
+    server
+        .mock_room_messages()
+        .match_from("cancelled-ordinary-token")
+        .match_limit(7)
+        .ok(RoomMessagesResponseTemplate::default()
+            .events(vec![event_factory.text_msg("targeted").event_id(event_id!("$targeted"))]))
+        .expect(0)
+        .named("targeted-pagination-must-remain-queued")
+        .mount()
+        .await;
+
+    let ordinary_pagination = room_event_cache.pagination();
+    let ordinary = spawn(async move { ordinary_pagination.run_backwards_once(8).await });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| request.url.path().ends_with("/messages")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    ordinary.abort();
+
+    let targeted_pagination = room_event_cache.pagination();
+    let targeted = targeted_pagination
+        .repair_timeline_gap(
+            &gap,
+            RoomTimelineGapRepairBudget { event_limit: 7, cached_chunk_limit: 2 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(targeted, RoomTimelineGapRepairOutcome::Stale);
+}
+
+#[async_test]
+async fn test_cancelled_targeted_repair_finishes_persistence_and_broadcast() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!gap-cancelled-repair:example.org");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (_, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("cancelled-repair-token"),
+        )
+        .await;
+    assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
+    let gap = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.remove(0);
+
+    server
+        .mock_room_messages()
+        .match_from("cancelled-repair-token")
+        .match_limit(8)
+        .ok(RoomMessagesResponseTemplate::default()
+            .with_delay(Duration::from_secs(1))
+            .events(vec![event_factory.text_msg("repaired").event_id(event_id!("$repaired"))]))
+        .expect(1)
+        .named("cancelled-targeted-repair")
+        .mount()
+        .await;
+
+    let pagination = room_event_cache.pagination();
+    let repair = spawn(async move {
+        pagination
+            .repair_timeline_gap(
+                &gap,
+                RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            )
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = server.received_requests().await.unwrap();
+            if requests.iter().any(|request| request.url.path().ends_with("/messages")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    repair.abort();
+
+    assert!(matches!(
+        timeout(Duration::from_secs(2), room_updates.recv()).await,
+        Ok(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)))
+    ));
+    let inspection = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert_eq!(inspection.continuity, RoomTimelineContinuity::Complete);
+    assert!(inspection.gaps.is_empty());
 }
 
 #[async_test]

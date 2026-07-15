@@ -70,8 +70,19 @@ pub use caches::{
     event_focused::EventFocusThreadMode,
     pagination::{BackPaginationOutcome, PaginationStatus},
     room::{
-        RoomEventCache, RoomEventCacheGenericUpdate, RoomEventCacheSubscriber,
-        RoomEventCacheUpdate, pagination::RoomPagination,
+        RoomEventCache,
+        RoomEventCacheGenericUpdate,
+        RoomEventCacheSubscriber,
+        RoomEventCacheUpdate,
+        // Matrix desktop fork patch surface: CacheOnlyBackOutcome is a
+        // koushi-specific type returned by run_backwards_cache_only. Not part of
+        // upstream matrix-sdk.
+        pagination::{
+            CacheOnlyBackOutcome, RoomPagination, RoomTimelineContinuity,
+            RoomTimelineGapDescriptor, RoomTimelineGapHandle, RoomTimelineGapInspection,
+            RoomTimelineGapProjectionId, RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome,
+            RoomTimelineGapRepairResult,
+        },
     },
     thread::pagination::ThreadPagination,
 };
@@ -715,6 +726,16 @@ pub enum EventsOrigin {
 
     /// The cause of the change is purely internal to the cache.
     Cache,
+
+    /// Events were published by one actor-owned targeted gap repair.
+    GapRepair {
+        /// Generation of the application timeline actor that owns the repair.
+        actor_generation: u64,
+        /// Actor-local generation of the targeted repair operation.
+        repair_generation: u64,
+        /// One-based publication index within the repair operation.
+        projection_batch: u32,
+    },
 }
 
 #[cfg(test)]

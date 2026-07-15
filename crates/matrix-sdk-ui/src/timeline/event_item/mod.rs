@@ -475,9 +475,32 @@ impl EventTimelineItem {
             EventTimelineItemKind::Remote(remote_event) => match remote_event.origin {
                 RemoteEventOrigin::Sync => Some(EventItemOrigin::Sync),
                 RemoteEventOrigin::Pagination => Some(EventItemOrigin::Pagination),
+                RemoteEventOrigin::GapRepair { .. } => Some(EventItemOrigin::Pagination),
                 RemoteEventOrigin::Cache => Some(EventItemOrigin::Cache),
                 RemoteEventOrigin::Unknown => None,
             },
+        }
+    }
+
+    /// Return the actor/repair generations that causally produced this item.
+    pub fn gap_repair_projection(&self) -> Option<GapRepairProjectionId> {
+        match &self.kind {
+            EventTimelineItemKind::Remote(remote_event) => match remote_event.origin {
+                RemoteEventOrigin::GapRepair {
+                    actor_generation,
+                    repair_generation,
+                    projection_batch,
+                } => Some(GapRepairProjectionId {
+                    actor_generation,
+                    repair_generation,
+                    projection_batch,
+                }),
+                RemoteEventOrigin::Cache
+                | RemoteEventOrigin::Sync
+                | RemoteEventOrigin::Pagination
+                | RemoteEventOrigin::Unknown => None,
+            },
+            EventTimelineItemKind::Local(_) => None,
         }
     }
 
@@ -776,6 +799,17 @@ pub enum EventItemOrigin {
     Cache,
 }
 
+/// Stable causal identity attached to items emitted by targeted gap repair.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct GapRepairProjectionId {
+    /// Generation of the application timeline actor that owns the repair.
+    pub actor_generation: u64,
+    /// Actor-local generation of the targeted repair operation.
+    pub repair_generation: u64,
+    /// One-based publication index within the repair operation.
+    pub projection_batch: u32,
+}
+
 /// What's the status of a reaction?
 #[derive(Clone, Debug)]
 pub enum ReactionStatus {
@@ -932,9 +966,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EventSendState, EventTimelineItem, EventTimelineItemKind, LiveLocationState,
-        LocalEventTimelineItem, Message, MsgLikeContent, MsgLikeKind, RemoteEventOrigin,
-        RemoteEventTimelineItem, TimelineDetails, TimelineItemContent,
+        EventSendState, EventTimelineItem, EventTimelineItemKind, GapRepairProjectionId,
+        LiveLocationState, LocalEventTimelineItem, Message, MsgLikeContent, MsgLikeKind,
+        RemoteEventOrigin, RemoteEventTimelineItem, TimelineDetails, TimelineItemContent,
     };
 
     fn message_content() -> TimelineItemContent {
@@ -1007,6 +1041,26 @@ mod tests {
             }),
             false,
         )
+    }
+
+    #[test]
+    fn targeted_gap_repair_projection_survives_the_ui_timeline_item() {
+        let mut item = remote_item(message_content(), None);
+        item.as_remote_mut().unwrap().origin = RemoteEventOrigin::GapRepair {
+            actor_generation: 9,
+            repair_generation: 11,
+            projection_batch: 2,
+        };
+
+        assert!(matches!(item.origin(), Some(super::EventItemOrigin::Pagination)));
+        assert_eq!(
+            item.gap_repair_projection(),
+            Some(GapRepairProjectionId {
+                actor_generation: 9,
+                repair_generation: 11,
+                projection_batch: 2,
+            })
+        );
     }
 
     fn sample_raw_event() -> Raw<AnySyncTimelineEvent> {

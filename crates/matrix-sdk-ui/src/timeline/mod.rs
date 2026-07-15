@@ -83,6 +83,9 @@ pub mod thread_list_service;
 mod traits;
 mod virtual_item;
 
+// Matrix desktop fork patch surface: RestoreFromCacheOutcome is a
+// koushi-specific type for the cache-only deep-history restore path.
+// Not part of upstream matrix-sdk-ui.
 pub use self::{
     builder::TimelineBuilder,
     controller::default_event_filter,
@@ -90,15 +93,17 @@ pub use self::{
     event_filter::{TimelineEventCondition, TimelineEventFilter},
     event_item::{
         AnyOtherStateEventContentChange, BeaconInfo, EmbeddedEvent, EncryptedMessage,
-        EventItemOrigin, EventSendState, EventTimelineItem, InReplyToDetails, LiveLocationState,
-        MediaUploadProgress, MemberProfileChange, MembershipChange, Message, MsgLikeContent,
-        MsgLikeKind, OtherMessageLike, OtherState, PollResult, PollState, Profile, ReactionInfo,
-        ReactionStatus, ReactionsByKeyBySender, RoomMembershipChange, RoomPinnedEventsChange,
-        Sticker, ThreadSummary, TimelineDetails, TimelineEventItemId, TimelineEventShieldState,
-        TimelineEventShieldStateCode, TimelineItemContent,
+        EventItemOrigin, EventSendState, EventTimelineItem, GapRepairProjectionId,
+        InReplyToDetails, LiveLocationState, MediaUploadProgress, MemberProfileChange,
+        MembershipChange, Message, MsgLikeContent, MsgLikeKind, OtherMessageLike, OtherState,
+        PollResult, PollState, Profile, ReactionInfo, ReactionStatus, ReactionsByKeyBySender,
+        RoomMembershipChange, RoomPinnedEventsChange, Sticker, ThreadSummary, TimelineDetails,
+        TimelineEventItemId, TimelineEventShieldState, TimelineEventShieldStateCode,
+        TimelineItemContent,
     },
     item::{TimelineItem, TimelineItemKind, TimelineUniqueId},
     latest_event::{LatestEventValue, LatestEventValueLocalState},
+    pagination::RestoreFromCacheOutcome,
     thread_list_service::{ThreadListPaginationState, ThreadListService},
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,

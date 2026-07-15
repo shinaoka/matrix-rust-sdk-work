@@ -83,6 +83,8 @@ pub(in crate::timeline) enum RemoteEventOrigin {
     Sync,
     /// The event came from pagination.
     Pagination,
+    /// The event came from one actor-owned targeted gap repair.
+    GapRepair { actor_generation: u64, repair_generation: u64, projection_batch: u32 },
     /// We don't know.
     Unknown,
 }

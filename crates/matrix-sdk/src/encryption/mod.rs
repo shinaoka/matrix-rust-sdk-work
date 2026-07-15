@@ -47,6 +47,7 @@ use matrix_sdk_base::{
         },
         types::{
             SecretsBundle, SignedKey,
+            events::room::encrypted::EncryptedEvent,
             requests::{
                 OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
             },
@@ -56,7 +57,8 @@ use matrix_sdk_base::{
 };
 use matrix_sdk_common::{executor::spawn, locks::Mutex as StdMutex};
 use ruma::{
-    DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
+    DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, RoomId, TransactionId,
+    UserId,
     api::{
         client::{
             keys::{
@@ -76,9 +78,10 @@ use ruma::{
         MediaSource, ThumbnailInfo,
         member::{MembershipChange, OriginalSyncRoomMemberEvent},
     },
+    serde::Raw,
 };
 #[cfg(feature = "experimental-send-custom-to-device")]
-use ruma::{events::AnyToDeviceEventContent, serde::Raw, to_device::DeviceIdOrAllDevices};
+use ruma::{events::AnyToDeviceEventContent, to_device::DeviceIdOrAllDevices};
 use serde::{Deserialize, de::Error as _};
 use tasks::BundleReceiverTask;
 use tokio::sync::{Mutex, RwLockReadGuard};
@@ -832,6 +835,26 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Request the Megolm room key needed for an undecryptable encrypted event.
+    ///
+    /// If a cancellation for a previous request is generated, it is sent before
+    /// the new request as required by the Matrix room-key-request protocol.
+    #[instrument(skip_all)]
+    pub async fn request_room_key_for_event(
+        &self,
+        event: &Raw<impl Sized>,
+        room_id: &RoomId,
+    ) -> Result<()> {
+        let olm_machine = self.olm_machine().await.as_ref().ok_or(Error::NoOlmMachine)?.clone();
+        let event = Raw::<EncryptedEvent>::from_json_string(event.json().get().to_owned())?;
+        let (cancellation, request) = olm_machine.request_room_key(&event, room_id).await?;
+
+        if let Some(cancellation) = cancellation {
+            self.send_outgoing_request(cancellation).await?;
+        }
+        self.send_outgoing_request(request).await
     }
 
     #[instrument(skip_all)]

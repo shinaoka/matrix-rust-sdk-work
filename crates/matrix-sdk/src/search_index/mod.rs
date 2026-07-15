@@ -377,8 +377,7 @@ async fn parse_timeline_event(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use matrix_sdk_search::config::SearchIndexConfig;
-    use matrix_sdk_search::index::RoomIndexOperation;
+    use matrix_sdk_search::{config::SearchIndexConfig, index::RoomIndexOperation};
     use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
     use ruma::{
         event_id,

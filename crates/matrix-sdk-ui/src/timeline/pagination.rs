@@ -17,13 +17,49 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt as _, pin_mut};
 use matrix_sdk::event_cache::PaginationStatus;
+use ruma::EventId;
 use tracing::instrument;
 
-use super::Error;
+use super::{Error, algorithms::rfind_event_by_id};
 use crate::timeline::{
     PaginationError::{self, NotSupported},
     controller::TimelineFocusKind,
 };
+
+/// Outcome of a cache-only backward restore via
+/// [`Timeline::live_restore_from_cache`].
+// Matrix desktop fork patch surface: outcome type for the cache-only
+// deep-history restore path. Exposes `anchor_present` (authoritative
+// anchor-in-cache signal) so the koushi-core TimelineActor can decide the
+// restore terminal without timing heuristics.
+// Not part of upstream matrix-sdk-ui.
+#[derive(Debug)]
+pub struct RestoreFromCacheOutcome {
+    /// Total number of events loaded from disk and revealed in the timeline.
+    pub events_loaded: usize,
+    /// Number of disk chunks read (diagnostic; no longer used for settle
+    /// fence).
+    pub chunks_loaded: usize,
+    /// Whether the lazy in-memory reveal emitted a `VectorDiff` batch
+    /// (diagnostic; no longer used for settle fence).
+    pub lazy_reveal_batches: usize,
+    /// `true` if the anchor event was found — either in the lazy in-memory
+    /// reveal (already in Timeline items) or in one of the loaded disk chunks.
+    ///
+    /// When `true`, the anchor's broadcast has been fired (or the anchor was
+    /// already in the Timeline subscriber's visible items). The caller should
+    /// wait for `timeline_contains(anchor)` rather than concluding
+    /// EndReached/BudgetExhausted immediately.
+    ///
+    /// When `false` and `reached_start`, the anchor is genuinely absent from
+    /// the cache — conclude EndReached immediately (authoritative).
+    pub anchor_present: bool,
+    /// `true` if the start of the stored timeline was reached.
+    pub reached_start: bool,
+    /// `true` if a gap was encountered before `n` events were loaded. The
+    /// caller should fall back to network-backed pagination.
+    pub hit_gap: bool,
+}
 
 impl super::Timeline {
     /// Add more events to the start of the timeline.
@@ -125,6 +161,169 @@ impl super::Timeline {
                 Err(err) => return Err(err.into()),
             }
         }
+    }
+
+    /// Load up to `n` events backward from the on-disk cache only, without
+    /// touching the network, and reveal them in the live timeline stream.
+    ///
+    /// This is the ~O(1) alternative to calling [`paginate_backwards`] in a
+    /// loop for deep-history restore. It mirrors [`paginate_backwards`] in live
+    /// mode: first call [`live_lazy_paginate_backwards`] to reveal any
+    /// already-in-memory hidden rows (decrementing the `Skip` adaptor count);
+    /// if that is not enough, call [`run_backwards_cache_only`] for the
+    /// remainder from disk, checking after each chunk whether the anchor event
+    /// is present (load-until-anchor semantics).
+    ///
+    /// Only meaningful when the timeline is in live mode. If the timeline is
+    /// in focused/pinned-events mode this returns an error.
+    ///
+    /// Returns [`RestoreFromCacheOutcome`] which carries `anchor_present` (the
+    /// authoritative in-cache signal), plus `reached_start` and `hit_gap`. The
+    /// caller should use `anchor_present` to decide the restore terminal:
+    /// - `anchor_present == true`: wait for `timeline_contains(anchor)`; do NOT
+    ///   conclude EndReached/BudgetExhausted while the anchor is guaranteed to
+    ///   arrive.
+    /// - `anchor_present == false && reached_start`: conclude EndReached
+    ///   immediately.
+    /// - `hit_gap`: fall back to network-backed pagination.
+    ///
+    /// [`paginate_backwards`]: Self::paginate_backwards
+    /// [`live_lazy_paginate_backwards`]: crate::timeline::controller::TimelineController::live_lazy_paginate_backwards
+    /// [`run_backwards_cache_only`]: matrix_sdk::event_cache::RoomPagination::run_backwards_cache_only
+    // Matrix desktop fork patch surface: cache-only deep-history restore path
+    // used by the anchor-restore actor (koushi-core TimelineActor). Mirrors
+    // the live_lazy_paginate_backwards + run_backwards_once pattern of
+    // paginate_backwards, but substitutes run_backwards_cache_only for the
+    // disk-load step so no network round-trips occur. Returns anchor_present
+    // so koushi can decide the terminal deterministically without timing
+    // heuristics.
+    pub async fn live_restore_from_cache(
+        &self,
+        n: u16,
+        anchor_event_id: &str,
+        max_chunks: u16,
+    ) -> Result<RestoreFromCacheOutcome, Error> {
+        match self.controller.focus() {
+            TimelineFocusKind::Live { .. } => {}
+            _ => return Err(Error::PaginationError(NotSupported)),
+        }
+
+        // Parse the anchor event_id once. If it fails (malformed id), treat it
+        // as absent so callers fall back to the non-anchor path.
+        let anchor_id_owned = EventId::parse(anchor_event_id).ok();
+        let anchor_id: Option<&EventId> = anchor_id_owned.as_deref();
+
+        let mut total_events_loaded: usize = 0;
+        let mut total_chunks_loaded: usize = 0;
+        let mut total_lazy_reveal_batches: usize = 0;
+
+        // Step 1: reveal already-in-memory hidden rows by decrementing the Skip
+        // count, exactly like live_lazy_paginate_backwards does. Returns:
+        //   (did_reveal, Some(needs)) — in-memory partial, disk needed for rest
+        //   (did_reveal, None) — in-memory fully satisfied the request
+        // `did_reveal` is true when the Skip adaptor's count changed and thus
+        // one synthetic VectorDiff batch was emitted to the timeline subscriber.
+        let (did_reveal, needs) = self.controller.live_lazy_paginate_backwards_with_reveal(n).await;
+        if did_reveal {
+            total_lazy_reveal_batches += 1;
+        }
+
+        // After the reveal, check if the anchor is already in the timeline's
+        // visible items. This covers the shallow-anchor case where the anchor
+        // was hidden by the Skip adaptor and is now revealed.
+        let anchor_in_memory = if let Some(id) = anchor_id {
+            let items = self.controller.items().await;
+            rfind_event_by_id(&items, id).is_some()
+        } else {
+            false
+        };
+
+        let Some(needs) = needs else {
+            // All `n` events were already in memory (skip count covered them).
+            // The anchor check above is authoritative for this path.
+            return Ok(RestoreFromCacheOutcome {
+                events_loaded: total_events_loaded,
+                chunks_loaded: total_chunks_loaded,
+                lazy_reveal_batches: total_lazy_reveal_batches,
+                anchor_present: anchor_in_memory,
+                reached_start: false,
+                hit_gap: false,
+            });
+        };
+
+        if anchor_in_memory {
+            // Anchor already found in the in-memory reveal; no need to load
+            // further disk chunks. Return immediately so no over-fetch occurs.
+            return Ok(RestoreFromCacheOutcome {
+                events_loaded: total_events_loaded,
+                chunks_loaded: total_chunks_loaded,
+                lazy_reveal_batches: total_lazy_reveal_batches,
+                anchor_present: true,
+                reached_start: false,
+                hit_gap: false,
+            });
+        }
+
+        // Step 2: load from disk chunk by chunk until the anchor is found or
+        // the cache is exhausted (load-until-anchor, no over-fetch).
+        // Pass max_chunks so run_backwards_cache_only enforces the chunk budget
+        // regardless of how many events each chunk contains (P2b fix).
+        let needs_u16 = needs.try_into().unwrap_or(u16::MAX);
+        let outcome = self
+            .event_cache
+            .pagination()
+            .run_backwards_cache_only(needs_u16, anchor_id, max_chunks)
+            .await?;
+        total_events_loaded += outcome.events_loaded;
+        total_chunks_loaded += outcome.chunks_loaded;
+
+        // Step 3: reached_start — the event cache is exhausted. All events that
+        // will ever be in the cache are now in memory.
+        //
+        // anchor_present is true only when the anchor was actually found:
+        //   a) run_backwards_cache_only found it synchronously in a loaded chunk
+        //      (outcome.anchor_present); OR
+        //   b) the relay pipeline already settled and it is visible in the
+        //      Timeline's item list (fast-path check via rfind_event_by_id).
+        //
+        // When neither (a) nor (b) is true the anchor is genuinely absent from
+        // the cache (stale or pruned scroll anchor). Return anchor_present=false
+        // so the caller takes the authoritative EndReached path immediately,
+        // rather than spending 40 × 50 ms on the backstop (P2a fix).
+        //
+        // When (a) is true the diff is already in flight through the 3-hop relay
+        // (conclude_backwards_pagination_from_disk → event-cache task →
+        // observable → relay task → DiffBatch actor msg). The caller's
+        // anchor_relay_wait loop (40 × 50 ms) gives the pipeline time to settle.
+        if outcome.reached_start {
+            let anchor_found = if outcome.anchor_present {
+                // Case (a): found synchronously in a disk chunk.
+                true
+            } else if let Some(id) = anchor_id {
+                // Case (b): check whether the relay pipeline already settled.
+                let items = self.controller.items().await;
+                rfind_event_by_id(&items, id).is_some()
+            } else {
+                false
+            };
+            return Ok(RestoreFromCacheOutcome {
+                events_loaded: total_events_loaded,
+                chunks_loaded: total_chunks_loaded,
+                lazy_reveal_batches: total_lazy_reveal_batches,
+                anchor_present: anchor_found,
+                reached_start: true,
+                hit_gap: false,
+            });
+        }
+
+        Ok(RestoreFromCacheOutcome {
+            events_loaded: total_events_loaded,
+            chunks_loaded: total_chunks_loaded,
+            lazy_reveal_batches: total_lazy_reveal_batches,
+            anchor_present: outcome.anchor_present,
+            reached_start: outcome.reached_start,
+            hit_gap: outcome.hit_gap,
+        })
     }
 
     /// Subscribe to the back-pagination status of a live timeline.

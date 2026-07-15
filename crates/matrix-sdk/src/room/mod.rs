@@ -2450,6 +2450,16 @@ impl Room {
         Ok(())
     }
 
+    /// Share this room's current Megolm key with eligible devices.
+    ///
+    /// This is intended for UI recovery actions after another device reports
+    /// that it cannot decrypt recent messages. The recipient filtering is the
+    /// same as the normal send preshare path.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn reshare_room_key(&self) -> Result<()> {
+        self.share_room_key().await
+    }
+
     /// Wait for the room to be fully synced.
     ///
     /// This method makes sure the room that was returned when joining a room
