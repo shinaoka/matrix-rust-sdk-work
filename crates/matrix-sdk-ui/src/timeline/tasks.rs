@@ -79,6 +79,13 @@ pub(in crate::timeline) async fn pinned_events_task(
             EventsOrigin::Sync => RemoteEventOrigin::Sync,
             EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
             EventsOrigin::Cache => RemoteEventOrigin::Cache,
+            EventsOrigin::GapRepair { actor_generation, repair_generation, projection_batch } => {
+                RemoteEventOrigin::GapRepair {
+                    actor_generation,
+                    repair_generation,
+                    projection_batch,
+                }
+            }
         };
         timeline_controller.handle_remote_events_with_diffs(update.diffs, origin).await;
     }
@@ -143,6 +150,13 @@ pub(in crate::timeline) async fn event_focused_task(
             EventsOrigin::Sync => RemoteEventOrigin::Sync,
             EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
             EventsOrigin::Cache => RemoteEventOrigin::Cache,
+            EventsOrigin::GapRepair { actor_generation, repair_generation, projection_batch } => {
+                RemoteEventOrigin::GapRepair {
+                    actor_generation,
+                    repair_generation,
+                    projection_batch,
+                }
+            }
         };
         timeline_controller.handle_remote_events_with_diffs(update.diffs, origin).await;
     }
@@ -182,6 +196,13 @@ pub(in crate::timeline) async fn thread_updates_task(
             EventsOrigin::Sync => RemoteEventOrigin::Sync,
             EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
             EventsOrigin::Cache => RemoteEventOrigin::Cache,
+            EventsOrigin::GapRepair { actor_generation, repair_generation, projection_batch } => {
+                RemoteEventOrigin::GapRepair {
+                    actor_generation,
+                    repair_generation,
+                    projection_batch,
+                }
+            }
         };
 
         let has_diffs = !update.diffs.is_empty();
@@ -249,6 +270,15 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
                     EventsOrigin::Sync => RemoteEventOrigin::Sync,
                     EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
                     EventsOrigin::Cache => RemoteEventOrigin::Cache,
+                    EventsOrigin::GapRepair {
+                        actor_generation,
+                        repair_generation,
+                        projection_batch,
+                    } => RemoteEventOrigin::GapRepair {
+                        actor_generation,
+                        repair_generation,
+                        projection_batch,
+                    },
                 };
 
                 let has_diffs = !diffs.is_empty();

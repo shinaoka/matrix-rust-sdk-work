@@ -540,7 +540,9 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 match origin {
                     // Never add any item to a focused timeline when the item comes from sync.
                     RemoteEventOrigin::Sync | RemoteEventOrigin::Unknown => false,
-                    RemoteEventOrigin::Cache | RemoteEventOrigin::Pagination => true,
+                    RemoteEventOrigin::Cache
+                    | RemoteEventOrigin::Pagination
+                    | RemoteEventOrigin::GapRepair { .. } => true,
                 }
             }
 

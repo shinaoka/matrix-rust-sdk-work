@@ -10,8 +10,8 @@ use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     event_cache::{
         BackPaginationOutcome, EventCacheError, PaginationStatus, RoomEventCacheUpdate,
-        RoomTimelineContinuity, RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome,
-        TimelineVectorDiffs,
+        RoomTimelineContinuity, RoomTimelineGapProjectionId, RoomTimelineGapRepairBudget,
+        RoomTimelineGapRepairOutcome, TimelineVectorDiffs,
     },
     linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     store::StoreConfig,
@@ -2159,18 +2159,45 @@ async fn test_inspect_and_repair_specific_persisted_timeline_gap() {
         .mount()
         .await;
 
-    let deferred = room_event_cache
+    let gap_only = room_event_cache
         .pagination()
-        .repair_timeline_gap(
+        .repair_timeline_gap_with_projection(
             &older_gap,
-            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 2 },
+            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 1 },
+            RoomTimelineGapProjectionId { actor_generation: 9, repair_generation: 1 },
         )
         .await
         .unwrap();
-    assert_eq!(deferred, RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded: 2 });
+    assert_eq!(
+        gap_only.outcome,
+        RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded: 1 }
+    );
+    assert_eq!(gap_only.last_projection_batch, None);
+    assert!(timeout(Duration::from_millis(50), room_updates.recv()).await.is_err());
+
+    let deferred = room_event_cache
+        .pagination()
+        .repair_timeline_gap_with_projection(
+            &older_gap,
+            RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 1 },
+            RoomTimelineGapProjectionId { actor_generation: 9, repair_generation: 2 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deferred.outcome,
+        RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded: 1 }
+    );
+    assert_eq!(deferred.last_projection_batch, Some(1));
     assert_let_timeout!(
-        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
-            room_updates.recv()
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+            diffs,
+            origin: matrix_sdk::event_cache::EventsOrigin::GapRepair {
+                actor_generation: 9,
+                repair_generation: 2,
+                projection_batch: 1,
+            },
+        })) = room_updates.recv()
     );
     assert!(!diffs.is_empty());
 

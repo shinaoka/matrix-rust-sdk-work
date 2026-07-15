@@ -125,6 +125,19 @@ pub struct RoomTimelineGapRepairBudget {
     pub cached_chunk_limit: u16,
 }
 
+/// Identifies the actor-owned projection produced by one targeted gap repair.
+///
+/// The identifier is carried through the event cache and UI timeline so the
+/// application can fence rendering on the exact repair-produced diff rather
+/// than on an unrelated pagination or sync batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RoomTimelineGapProjectionId {
+    /// Generation of the application timeline actor that owns the repair.
+    pub actor_generation: u64,
+    /// Actor-local generation of the targeted repair operation.
+    pub repair_generation: u64,
+}
+
 /// Result of one bounded targeted gap-repair request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoomTimelineGapRepairOutcome {
@@ -153,6 +166,21 @@ pub enum RoomTimelineGapRepairOutcome {
         /// Number of events returned by this request after deduplication.
         events: usize,
     },
+}
+
+/// Outcome plus the final causally tagged timeline projection batch, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomTimelineGapRepairResult {
+    /// Coarse topology outcome of the bounded repair.
+    pub outcome: RoomTimelineGapRepairOutcome,
+    /// Final tagged projection batch published by this operation, if any.
+    pub last_projection_batch: Option<u32>,
+}
+
+impl RoomTimelineGapRepairResult {
+    fn new(outcome: RoomTimelineGapRepairOutcome, last_projection_batch: Option<u32>) -> Self {
+        Self { outcome, last_projection_batch }
+    }
 }
 
 fn invalid_gap_topology(details: impl Into<String>) -> EventCacheError {
@@ -479,10 +507,30 @@ impl RoomPagination {
         descriptor: &RoomTimelineGapDescriptor,
         budget: RoomTimelineGapRepairBudget,
     ) -> Result<RoomTimelineGapRepairOutcome> {
+        Ok(self.repair_timeline_gap_task(descriptor, budget, None).await?.outcome)
+    }
+
+    /// Repair one gap while causally tagging any published timeline update.
+    pub async fn repair_timeline_gap_with_projection(
+        &self,
+        descriptor: &RoomTimelineGapDescriptor,
+        budget: RoomTimelineGapRepairBudget,
+        projection: RoomTimelineGapProjectionId,
+    ) -> Result<RoomTimelineGapRepairResult> {
+        self.repair_timeline_gap_task(descriptor, budget, Some(projection)).await
+    }
+
+    async fn repair_timeline_gap_task(
+        &self,
+        descriptor: &RoomTimelineGapDescriptor,
+        budget: RoomTimelineGapRepairBudget,
+        projection: Option<RoomTimelineGapProjectionId>,
+    ) -> Result<RoomTimelineGapRepairResult> {
         let pagination = self.clone();
         let descriptor = descriptor.clone();
-        let task =
-            spawn(async move { pagination.repair_timeline_gap_inner(&descriptor, budget).await });
+        let task = spawn(async move {
+            pagination.repair_timeline_gap_inner(&descriptor, budget, projection).await
+        });
 
         task.await.expect("targeted room-timeline gap repair task panicked")
     }
@@ -491,8 +539,10 @@ impl RoomPagination {
         &self,
         descriptor: &RoomTimelineGapDescriptor,
         budget: RoomTimelineGapRepairBudget,
-    ) -> Result<RoomTimelineGapRepairOutcome> {
+        projection: Option<RoomTimelineGapProjectionId>,
+    ) -> Result<RoomTimelineGapRepairResult> {
         let _operation_guard = self.0.cache.pagination_operation_lock.write().await;
+        let mut last_projection_batch = None;
 
         let (prev_token, cached_chunks_loaded) = {
             let mut state = self.0.cache.state.write().await?;
@@ -505,7 +555,10 @@ impl RoomPagination {
                 &order_persisted_chunks(persisted)?,
             );
             if !current.gaps.iter().any(|gap| gap == descriptor) {
-                return Ok(RoomTimelineGapRepairOutcome::Stale);
+                return Ok(RoomTimelineGapRepairResult::new(
+                    RoomTimelineGapRepairOutcome::Stale,
+                    last_projection_batch,
+                ));
             }
 
             let mut cached_chunks_loaded = 0usize;
@@ -517,7 +570,10 @@ impl RoomPagination {
                     .find(|chunk| chunk.identifier() == descriptor.handle.chunk_identifier)
                 {
                     let ChunkContent::Gap(gap) = chunk.content() else {
-                        return Ok(RoomTimelineGapRepairOutcome::Stale);
+                        return Ok(RoomTimelineGapRepairResult::new(
+                            RoomTimelineGapRepairOutcome::Stale,
+                            last_projection_batch,
+                        ));
                     };
                     break (Some(gap.token.clone()), cached_chunks_loaded);
                 }
@@ -537,30 +593,44 @@ impl RoomPagination {
                     .load_previous_chunk(LinkedChunkId::Room(&state.state.room_id), first)
                     .await?
                 else {
-                    return Ok(RoomTimelineGapRepairOutcome::Stale);
+                    return Ok(RoomTimelineGapRepairResult::new(
+                        RoomTimelineGapRepairOutcome::Stale,
+                        last_projection_batch,
+                    ));
                 };
 
                 state.room_linked_chunk_mut().insert_new_chunk_as_first(previous)?;
                 let _ = state.room_linked_chunk_mut().store_updates().take();
                 let cache_diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
                 if !cache_diffs.is_empty() {
+                    let projection_batch = last_projection_batch.unwrap_or(0) + 1;
                     // There is no cancellation point between mutating the in-memory
                     // linked chunk and publishing its diffs. A cancelled repair can
                     // therefore never leave subscribers behind the cache state.
                     self.0.cache.update_sender.send(
                         RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
                             diffs: cache_diffs,
-                            origin: EventsOrigin::Cache,
+                            origin: projection.map_or(EventsOrigin::Cache, |projection| {
+                                EventsOrigin::GapRepair {
+                                    actor_generation: projection.actor_generation,
+                                    repair_generation: projection.repair_generation,
+                                    projection_batch,
+                                }
+                            }),
                         }),
                         Some(RoomEventCacheGenericUpdate { room_id: self.0.cache.room_id.clone() }),
                     );
+                    last_projection_batch = Some(projection_batch);
                 }
                 cached_chunks_loaded += 1;
             }
         };
 
         let Some(prev_token) = prev_token else {
-            return Ok(RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded });
+            return Ok(RoomTimelineGapRepairResult::new(
+                RoomTimelineGapRepairOutcome::Deferred { cached_chunks_loaded },
+                last_projection_batch,
+            ));
         };
 
         let request_result = self
@@ -579,18 +649,27 @@ impl RoomPagination {
             &order_persisted_chunks(persisted)?,
         );
         if !current.gaps.iter().any(|gap| gap == descriptor) {
-            return Ok(RoomTimelineGapRepairOutcome::Stale);
+            return Ok(RoomTimelineGapRepairResult::new(
+                RoomTimelineGapRepairOutcome::Stale,
+                last_projection_batch,
+            ));
         }
         let target_still_matches = state.room_linked_chunk().chunks().any(|chunk| {
             chunk.identifier() == descriptor.handle.chunk_identifier
                 && matches!(chunk.content(), ChunkContent::Gap(gap) if gap.token == prev_token)
         });
         if !target_still_matches {
-            return Ok(RoomTimelineGapRepairOutcome::Stale);
+            return Ok(RoomTimelineGapRepairResult::new(
+                RoomTimelineGapRepairOutcome::Stale,
+                last_projection_batch,
+            ));
         }
 
         let Some((events, new_token)) = request_result? else {
-            return Ok(RoomTimelineGapRepairOutcome::Failed);
+            return Ok(RoomTimelineGapRepairResult::new(
+                RoomTimelineGapRepairOutcome::Failed,
+                last_projection_batch,
+            ));
         };
 
         let gap_count_before = current.gaps.len();
@@ -651,22 +730,31 @@ impl RoomPagination {
         drop(state);
 
         if !timeline_event_diffs.is_empty() {
+            let projection_batch = last_projection_batch.unwrap_or(0) + 1;
             self.0.cache.update_sender.send(
                 RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
                     diffs: timeline_event_diffs,
-                    origin: EventsOrigin::Pagination,
+                    origin: projection.map_or(EventsOrigin::Pagination, |projection| {
+                        EventsOrigin::GapRepair {
+                            actor_generation: projection.actor_generation,
+                            repair_generation: projection.repair_generation,
+                            projection_batch,
+                        }
+                    }),
                 }),
                 Some(RoomEventCacheGenericUpdate { room_id: self.0.cache.room_id.clone() }),
             );
+            last_projection_batch = Some(projection_batch);
         }
 
-        Ok(if after.continuity == RoomTimelineContinuity::Complete {
+        let outcome = if after.continuity == RoomTimelineContinuity::Complete {
             RoomTimelineGapRepairOutcome::StartReached { events: events_count }
         } else if after.gaps.len() >= gap_count_before {
             RoomTimelineGapRepairOutcome::Progress { events: events_count }
         } else {
             RoomTimelineGapRepairOutcome::BoundariesJoined { events: events_count }
-        })
+        };
+        Ok(RoomTimelineGapRepairResult::new(outcome, last_projection_batch))
     }
 
     /// Returns a subscriber to the pagination status.
