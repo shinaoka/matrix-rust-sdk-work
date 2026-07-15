@@ -33,9 +33,10 @@ use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
 use crate::timeline::{
-    AnyOtherStateEventContentChange, MsgLikeContent, MsgLikeKind, TimelineEventCondition,
-    TimelineEventFilter, TimelineItem, TimelineItemContent, TimelineItemKind,
-    controller::TimelineSettings, event_filter::MembershipChangeFilter, tests::TestTimelineBuilder,
+    AnyOtherStateEventContentChange, GapRepairProjectionId, MsgLikeContent, MsgLikeKind,
+    TimelineEventCondition, TimelineEventFilter, TimelineItem, TimelineItemContent,
+    TimelineItemKind, controller::TimelineSettings, event_filter::MembershipChangeFilter,
+    event_item::RemoteEventOrigin, tests::TestTimelineBuilder,
 };
 
 #[async_test]
@@ -113,6 +114,66 @@ async fn test_filter_always_false() {
     timeline.handle_live_event(f.room_name("Alice's room").sender(&ALICE)).await;
 
     assert_eq!(timeline.controller.items().await.len(), 0);
+}
+
+#[async_test]
+async fn test_filtered_gap_repair_settles_without_an_observable_projection() {
+    let timeline = TestTimelineBuilder::new()
+        .settings(TimelineSettings { event_filter: Arc::new(|_, _| false), ..Default::default() })
+        .build();
+    let projection =
+        GapRepairProjectionId { actor_generation: 9, repair_generation: 11, projection_batch: 1 };
+
+    timeline
+        .controller
+        .handle_remote_events_with_diffs(
+            vec![VectorDiff::PushFront {
+                value: timeline.factory.text_msg("filtered repair").sender(&ALICE).into_event(),
+            }],
+            RemoteEventOrigin::GapRepair {
+                actor_generation: projection.actor_generation,
+                repair_generation: projection.repair_generation,
+                projection_batch: projection.projection_batch,
+            },
+        )
+        .await;
+    timeline.controller.complete_gap_repair_projection(projection).await;
+
+    assert!(!timeline.controller.wait_for_gap_repair_projection(projection).await);
+    assert!(timeline.controller.items().await.is_empty());
+}
+
+#[async_test]
+async fn test_aggregation_only_gap_repair_emits_a_tagged_observable_barrier() {
+    let timeline = TestTimeline::new();
+    let mut stream = timeline.subscribe().await;
+    let message_event_id = timeline.factory.text_msg("message").sender(&ALICE).into_event();
+    let event_id = message_event_id.event_id().unwrap().to_owned();
+    timeline.handle_live_event(message_event_id).await;
+    let _message = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let _date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    let projection =
+        GapRepairProjectionId { actor_generation: 9, repair_generation: 11, projection_batch: 2 };
+
+    timeline
+        .controller
+        .handle_remote_events_with_diffs(
+            vec![VectorDiff::PushFront {
+                value: timeline.factory.reaction(&event_id, "+1").sender(&BOB).into_event(),
+            }],
+            RemoteEventOrigin::GapRepair {
+                actor_generation: projection.actor_generation,
+                repair_generation: projection.repair_generation,
+                projection_batch: projection.projection_batch,
+            },
+        )
+        .await;
+    timeline.controller.complete_gap_repair_projection(projection).await;
+
+    assert!(timeline.controller.wait_for_gap_repair_projection(projection).await);
+    let _aggregation = assert_next_matches!(stream, VectorDiff::Set { value, .. } => value);
+    let barrier = assert_next_matches!(stream, VectorDiff::Set { value, .. } => value);
+    assert_eq!(barrier.as_event().unwrap().gap_repair_projection(), Some(projection));
 }
 
 #[async_test]
