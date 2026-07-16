@@ -74,6 +74,7 @@ pub use caches::{
         RoomEventCacheGenericUpdate,
         RoomEventCacheSubscriber,
         RoomEventCacheUpdate,
+        RoomTimelineSyncObservation,
         // Matrix desktop fork patch surface: CacheOnlyBackOutcome is a
         // koushi-specific type returned by run_backwards_cache_only. Not part of
         // upstream matrix-sdk.

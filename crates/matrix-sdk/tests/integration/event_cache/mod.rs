@@ -46,6 +46,87 @@ use wiremock::ResponseTemplate;
 mod read_receipts;
 mod threads;
 
+#[async_test]
+async fn test_room_timeline_sync_observation_tracks_the_committed_limited_gap() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!sync-observation:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let factory = EventFactory::new().room(room_id).sender(*ALICE);
+    let message_id = event_id!("$sync-observation-message");
+    let relation_id = event_id!("$sync-observation-relation");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("secret-prev-batch")
+                .add_timeline_event(factory.text_msg("message").event_id(message_id))
+                .add_timeline_event(factory.reaction(message_id, "ack").event_id(relation_id)),
+        )
+        .await;
+
+    let observation = room_event_cache
+        .latest_sync_observation()
+        .await
+        .expect("non-empty limited sync must be observed");
+    assert_eq!(observation.sequence(), 1);
+    assert!(observation.limited());
+    assert_eq!(observation.event_count(), 2);
+    assert!(observation.prev_batch_present());
+    assert_eq!(observation.newest_event_id(), Some(relation_id));
+
+    let inserted_gap = observation.inserted_gap().expect("limited sync gap");
+    let inspection = room_event_cache.inspect_timeline_gaps().await.unwrap();
+    assert!(inspection.gaps.contains(inserted_gap));
+
+    let debug = format!("{observation:?}");
+    assert!(!debug.contains(relation_id.as_str()));
+    assert!(!debug.contains("secret-prev-batch"));
+}
+
+#[async_test]
+async fn test_empty_room_update_does_not_reuse_or_advance_a_sync_observation() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!sync-observation-empty:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let factory = EventFactory::new().room(room_id).sender(*ALICE);
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                factory.text_msg("first").event_id(event_id!("$sync-observation-first")),
+            ),
+        )
+        .await;
+    let baseline = room_event_cache
+        .latest_sync_observation()
+        .await
+        .expect("first timeline observation")
+        .sequence();
+
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id)).await;
+
+    assert_eq!(
+        room_event_cache
+            .latest_sync_observation()
+            .await
+            .expect("baseline observation remains readable")
+            .sequence(),
+        baseline,
+        "an empty room update must not advance or manufacture an observation",
+    );
+}
+
 macro_rules! assert_event_id {
     ($timeline_event:expr, $event_id:literal) => {
         assert_eq!($timeline_event.event_id().unwrap().as_str(), $event_id);

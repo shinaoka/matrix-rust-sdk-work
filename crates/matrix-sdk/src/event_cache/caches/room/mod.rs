@@ -20,7 +20,10 @@ mod updates;
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use eyeball::SharedObservable;
@@ -43,6 +46,8 @@ pub use updates::{
     RoomEventCacheUpdateSender,
 };
 
+use self::pagination::RoomTimelineGapDescriptor;
+
 use super::{
     super::{AutoShrinkChannelPayload, EventCacheError, EventsOrigin, Result, RoomPagination},
     TimelineVectorDiffs,
@@ -64,6 +69,58 @@ use crate::{
 #[derive(Clone)]
 pub struct RoomEventCache {
     inner: Arc<RoomEventCacheInner>,
+}
+
+/// Token-free provenance for the latest room timeline committed from sync.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RoomTimelineSyncObservation {
+    pub(super) sequence: u64,
+    pub(super) limited: bool,
+    pub(super) event_count: usize,
+    pub(super) prev_batch_present: bool,
+    pub(super) newest_event_id: Option<OwnedEventId>,
+    pub(super) inserted_gap: Option<RoomTimelineGapDescriptor>,
+}
+
+impl RoomTimelineSyncObservation {
+    /// Monotonic process-local observation sequence for this room cache.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    /// Whether the sync timeline was limited.
+    pub fn limited(&self) -> bool {
+        self.limited
+    }
+    /// Number of raw events in the sync timeline before projection.
+    pub fn event_count(&self) -> usize {
+        self.event_count
+    }
+    /// Whether the sync timeline carried a previous-batch token.
+    pub fn prev_batch_present(&self) -> bool {
+        self.prev_batch_present
+    }
+    /// Newest raw event identity in the sync timeline, including relations.
+    pub fn newest_event_id(&self) -> Option<&EventId> {
+        self.newest_event_id.as_deref()
+    }
+    /// Exact persisted gap introduced by this sync timeline, if any.
+    pub fn inserted_gap(&self) -> Option<&RoomTimelineGapDescriptor> {
+        self.inserted_gap.as_ref()
+    }
+}
+
+impl fmt::Debug for RoomTimelineSyncObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RoomTimelineSyncObservation")
+            .field("sequence", &self.sequence)
+            .field("limited", &self.limited)
+            .field("event_count", &self.event_count)
+            .field("prev_batch_present", &self.prev_batch_present)
+            .field("has_newest_event", &self.newest_event_id.is_some())
+            .field("has_inserted_gap", &self.inserted_gap.is_some())
+            .finish()
+    }
 }
 
 impl fmt::Debug for RoomEventCache {
@@ -107,6 +164,11 @@ impl RoomEventCache {
         let state = self.inner.state.read().await?;
 
         Ok(state.room_linked_chunk().events().map(|(_position, item)| item.clone()).collect())
+    }
+
+    /// Return the latest committed sync-timeline observation, if any.
+    pub async fn latest_sync_observation(&self) -> Option<RoomTimelineSyncObservation> {
+        self.inner.latest_sync_observation.read().await.clone()
     }
 
     /// Subscribe to this room updates, after getting the initial list of
@@ -454,6 +516,9 @@ pub(super) struct RoomEventCacheInner {
 
     /// Update sender for this room.
     update_sender: RoomEventCacheUpdateSender,
+
+    latest_sync_observation: RwLock<Option<RoomTimelineSyncObservation>>,
+    next_sync_observation_sequence: AtomicU64,
 }
 
 impl RoomEventCacheInner {
@@ -476,6 +541,8 @@ impl RoomEventCacheInner {
             pagination_operation_lock: Default::default(),
             auto_shrink_sender,
             shared_pagination_status,
+            latest_sync_observation: Default::default(),
+            next_sync_observation_sequence: AtomicU64::new(1),
         }
     }
 
@@ -582,10 +649,16 @@ impl RoomEventCacheInner {
         // Add all the events to the backend.
         trace!("adding new events");
 
-        let (stored_prev_batch_token, timeline_event_diffs) =
+        let (stored_prev_batch_token, timeline_event_diffs, mut sync_observation) =
             state.handle_sync(timeline, &ephemeral_events).await?;
 
         drop(state);
+
+        if let Some(observation) = sync_observation.as_mut() {
+            observation.sequence =
+                self.next_sync_observation_sequence.fetch_add(1, Ordering::Relaxed);
+            *self.latest_sync_observation.write().await = Some(observation.clone());
+        }
 
         // Now that all events have been added, we can trigger the
         // `pagination_token_notifier`.

@@ -849,7 +849,14 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
         &mut self,
         mut timeline: Timeline,
         ephemeral_events: &[Raw<AnySyncEphemeralRoomEvent>],
-    ) -> Result<(bool, Vec<VectorDiff<Event>>), EventCacheError> {
+    ) -> Result<
+        (bool, Vec<VectorDiff<Event>>, Option<super::RoomTimelineSyncObservation>),
+        EventCacheError,
+    > {
+        let limited = timeline.limited;
+        let event_count = timeline.events.len();
+        let prev_batch_present = timeline.prev_batch.is_some();
+        let newest_event_id = timeline.events.iter().rev().find_map(Event::event_id);
         let mut prev_batch = timeline.prev_batch.take();
 
         let DeduplicationOutcome {
@@ -930,7 +937,7 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
                 self.update_read_receipts(Some(&new_receipt)).await?;
             }
 
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), None));
         }
 
         // If we've never waited for an initial previous-batch token, and we've now
@@ -965,7 +972,34 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
 
         let timeline_event_diffs = self.state.room_linked_chunk.updates_as_vector_diffs();
 
-        Ok((has_new_gap, timeline_event_diffs))
+        let inserted_gap = if has_new_gap {
+            let chunks =
+                self.store.load_all_chunks(LinkedChunkId::Room(&self.state.room_id)).await?;
+            super::pagination::inspect_ordered_chunks(
+                &self.state.room_id,
+                self.state.gap_snapshot_id,
+                self.state.gap_topology_generation,
+                &super::pagination::order_persisted_chunks(chunks)?,
+            )
+            .gaps
+            .last()
+            .cloned()
+        } else {
+            None
+        };
+
+        Ok((
+            has_new_gap,
+            timeline_event_diffs,
+            Some(super::RoomTimelineSyncObservation {
+                sequence: 0,
+                limited,
+                event_count,
+                prev_batch_present,
+                newest_event_id,
+                inserted_gap,
+            }),
+        ))
     }
 
     /// Subscribe to thread for a given root event, and get a (maybe empty)

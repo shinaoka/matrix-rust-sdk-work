@@ -327,6 +327,171 @@ macro_rules! assert_entries_batch {
 }
 
 #[async_test]
+async fn test_room_subscription_checkpoint_tracks_the_response_generation_and_gap()
+-> Result<(), Error> {
+    let (_, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_id = room_id!("!checkpoint:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 1 } },
+            "rooms": { room_id: { "initial": true } },
+        },
+    };
+
+    let generation = room_list.subscribe_to_rooms_with_generation(&[room_id]).await;
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= { "room_subscriptions": { room_id: { "timeline_limit": 20 } } },
+        respond with = {
+            "pos": "1",
+            "rooms": {
+                room_id: {
+                    "timeline": [timeline_event!("$checkpoint-event:bar.org" at 1 sec)],
+                    "prev_batch": "secret-checkpoint-token"
+                }
+            },
+        },
+    };
+
+    // Subscribe after publication to prove the latest room checkpoint is retained.
+    let checkpoints = room_list.room_subscription_checkpoints();
+    let retained = checkpoints.get();
+    let checkpoint = retained.get(room_id).expect("retained room checkpoint");
+    assert_eq!(checkpoint.subscription_generation(), generation);
+    let timeline = checkpoint.timeline().expect("new sync observation");
+    assert!(timeline.inserted_gap().is_some());
+    let debug = format!("{checkpoint:?}");
+    assert!(!debug.contains(room_id.as_str()));
+    assert!(!debug.contains("$checkpoint-event"));
+    assert!(!debug.contains("secret-checkpoint-token"));
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_room_subscription_checkpoint_does_not_reuse_the_baseline_observation()
+-> Result<(), Error> {
+    let (_, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_id = room_id!("!checkpoint-empty:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 1 } },
+            "rooms": {
+                room_id: {
+                    "initial": true,
+                    "timeline": [timeline_event!("$baseline-event:bar.org" at 1 sec)]
+                }
+            },
+        },
+    };
+
+    let generation = room_list.subscribe_to_rooms_with_generation(&[room_id]).await;
+    let checkpoints = room_list.room_subscription_checkpoints();
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= { "room_subscriptions": { room_id: { "timeline_limit": 20 } } },
+        respond with = { "pos": "1", "rooms": { room_id: {} } },
+    };
+
+    let retained = checkpoints.get();
+    let checkpoint = retained.get(room_id).expect("retained empty checkpoint");
+    assert_eq!(checkpoint.subscription_generation(), generation);
+    assert!(checkpoint.timeline().is_none());
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_delayed_subscription_response_cannot_repopulate_a_replaced_generation()
+-> Result<(), Error> {
+    let (_, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let old_room_id = room_id!("!checkpoint-old:bar.org");
+    let new_room_id = room_id!("!checkpoint-new:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 2 } },
+            "rooms": {
+                old_room_id: { "initial": true },
+                new_room_id: { "initial": true }
+            },
+        },
+    };
+
+    let old_generation = room_list.subscribe_to_rooms_with_generation(&[old_room_id]).await;
+
+    let delayed_old_response = async {
+        sync_then_assert_request_and_fake_response! {
+            [server, room_list, sync]
+            sync matches Some(Ok(_)),
+            // Reconfiguration may cancel and regenerate the HTTP request
+            // before the delayed response settles. The response body still
+            // belongs to the old room and must not be attributed to the new
+            // subscription generation in either case.
+            assert request >= {},
+            respond with = {
+                "pos": "1",
+                "rooms": {
+                    old_room_id: {
+                        "timeline": [timeline_event!("$stale-generation-event:bar.org" at 1 sec)],
+                        "prev_batch": "stale-generation-token"
+                    }
+                },
+            },
+            after delay = Duration::from_millis(1_000),
+        }
+    };
+    let replace_subscription = async {
+        sleep(Duration::from_millis(500)).await;
+        room_list.subscribe_to_rooms_with_generation(&[new_room_id]).await
+    };
+
+    let (_, new_generation) = tokio::join!(delayed_old_response, replace_subscription);
+    assert_ne!(new_generation, old_generation);
+    assert!(
+        room_list.room_subscription_checkpoints().get().is_empty(),
+        "the delayed old response must not restore checkpoints after the generation clear",
+    );
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {
+            "room_subscriptions": { new_room_id: { "timeline_limit": 20 } }
+        },
+        respond with = {
+            "pos": "2",
+            "rooms": { new_room_id: {} },
+        },
+    };
+
+    let retained = room_list.room_subscription_checkpoints().get();
+    let checkpoint = retained.get(new_room_id).expect("new generation checkpoint");
+    assert_eq!(checkpoint.subscription_generation(), new_generation);
+    assert!(checkpoint.timeline().is_none());
+
+    Ok(())
+}
+
+#[async_test]
 async fn test_sync_all_states() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
