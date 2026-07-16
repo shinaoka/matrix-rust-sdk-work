@@ -56,10 +56,15 @@ mod room_list;
 pub mod sorters;
 mod state;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_stream::stream;
-use eyeball::Subscriber;
+use eyeball::{SharedObservable, Subscriber};
 use futures_util::{Stream, StreamExt, pin_mut};
 use matrix_sdk::{
     Client, Error as SlidingSyncError, Room, SlidingSync, SlidingSyncList, SlidingSyncMode,
@@ -116,6 +121,59 @@ pub(crate) const DEFAULT_LIST_TIMELINE_LIMIT: u32 = 1;
 /// The default `timeline_limit` value when used with room subscriptions.
 const DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT: u32 = 20;
 
+/// Process-local generation of one complete room-subscription set.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RoomSubscriptionGeneration(u64);
+
+impl RoomSubscriptionGeneration {
+    /// Return the coarse generation number.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Provenance checkpoint for a room present in a subscription response.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RoomSubscriptionCheckpoint {
+    subscription_generation: RoomSubscriptionGeneration,
+    room_id: OwnedRoomId,
+    timeline: Option<matrix_sdk::event_cache::RoomTimelineSyncObservation>,
+}
+
+impl RoomSubscriptionCheckpoint {
+    /// Generation of the subscription request that produced this response.
+    pub fn subscription_generation(&self) -> RoomSubscriptionGeneration {
+        self.subscription_generation
+    }
+
+    /// Room associated with this checkpoint.
+    pub fn room_id(&self) -> &RoomId {
+        &self.room_id
+    }
+
+    /// New timeline observation committed after the subscription baseline.
+    pub fn timeline(&self) -> Option<&matrix_sdk::event_cache::RoomTimelineSyncObservation> {
+        self.timeline.as_ref()
+    }
+}
+
+impl fmt::Debug for RoomSubscriptionCheckpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RoomSubscriptionCheckpoint")
+            .field("subscription_generation", &self.subscription_generation)
+            .field("has_timeline", &self.timeline.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RoomSubscriptionState {
+    generation: u64,
+    active_rooms: BTreeSet<OwnedRoomId>,
+    observation_baselines: BTreeMap<OwnedRoomId, u64>,
+}
+
 /// The [`RoomListService`] type. See the module's documentation to learn more.
 #[derive(Debug)]
 pub struct RoomListService {
@@ -129,6 +187,10 @@ pub struct RoomListService {
     ///
     /// `RoomListService` is a simple state-machine.
     state_machine: StateMachine,
+
+    room_subscription_state: Arc<Mutex<RoomSubscriptionState>>,
+    room_subscription_checkpoints:
+        SharedObservable<Arc<BTreeMap<OwnedRoomId, RoomSubscriptionCheckpoint>>>,
 }
 
 impl RoomListService {
@@ -265,7 +327,13 @@ impl RoomListService {
         // Eagerly subscribe the event cache to sync responses.
         client.event_cache().subscribe()?;
 
-        Ok(Self { client, sliding_sync, state_machine })
+        Ok(Self {
+            client,
+            sliding_sync,
+            state_machine,
+            room_subscription_state: Default::default(),
+            room_subscription_checkpoints: SharedObservable::new(Arc::new(BTreeMap::new())),
+        })
     }
 
     /// Start to sync the room list.
@@ -303,10 +371,19 @@ impl RoomListService {
                 // Calculate the next state, and run the associated actions.
                 let next_state = self.state_machine.next(&self.sliding_sync).await?;
 
+                let subscription_generation = RoomSubscriptionGeneration(
+                    self.room_subscription_state.lock().unwrap().generation,
+                );
+
                 // Do the sync.
                 match sync.next().await {
                     // Got a successful result while syncing.
-                    Some(Ok(_update_summary)) => {
+                    Some(Ok(update_summary)) => {
+                        self.publish_room_subscription_checkpoints(
+                            subscription_generation,
+                            &update_summary.rooms,
+                        )
+                        .await;
                         debug!(state = ?next_state, "New state");
 
                         // Update the state.
@@ -479,6 +556,30 @@ impl RoomListService {
     /// [listen_to_room]: matrix_sdk::latest_events::LatestEvents::listen_to_room
     /// [`LatestEventValue`]: matrix_sdk::latest_events::LatestEventValue
     pub async fn subscribe_to_rooms(&self, room_ids: &[&RoomId]) {
+        self.subscribe_to_rooms_with_generation(room_ids).await;
+    }
+
+    /// Replace room subscriptions and return their process-local generation.
+    pub async fn subscribe_to_rooms_with_generation(
+        &self,
+        room_ids: &[&RoomId],
+    ) -> RoomSubscriptionGeneration {
+        let mut observation_baselines = BTreeMap::new();
+        for room_id in room_ids {
+            let sequence = if let Some(room) = self.client.get_room(room_id) {
+                match room.event_cache().await {
+                    Ok((cache, _drop_handles)) => cache
+                        .latest_sync_observation()
+                        .await
+                        .map_or(0, |observation| observation.sequence()),
+                    Err(_) => 0,
+                }
+            } else {
+                0
+            };
+            observation_baselines.insert((*room_id).to_owned(), sequence);
+        }
+
         // Calculate the settings for the room subscriptions.
         let settings = assign!(http::request::RoomSubscription::default(), {
             required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
@@ -516,11 +617,75 @@ impl RoomListService {
         }
 
         // Subscribe to the rooms.
+        let generation = {
+            let mut state = self.room_subscription_state.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1).max(1);
+            state.active_rooms = room_ids.iter().map(|room_id| (*room_id).to_owned()).collect();
+            state.observation_baselines = observation_baselines;
+            RoomSubscriptionGeneration(state.generation)
+        };
+        self.room_subscription_checkpoints.set(Arc::new(BTreeMap::new()));
+
         self.sliding_sync.clear_and_subscribe_to_rooms(
             room_ids,
             Some(settings),
             cancel_in_flight_request,
-        )
+        );
+
+        generation
+    }
+
+    /// Subscribe to the retained latest checkpoint per room.
+    pub fn room_subscription_checkpoints(
+        &self,
+    ) -> Subscriber<Arc<BTreeMap<OwnedRoomId, RoomSubscriptionCheckpoint>>> {
+        self.room_subscription_checkpoints.subscribe()
+    }
+
+    async fn publish_room_subscription_checkpoints(
+        &self,
+        generation: RoomSubscriptionGeneration,
+        updated_rooms: &[OwnedRoomId],
+    ) {
+        let state = self.room_subscription_state.lock().unwrap().clone();
+        if state.generation != generation.0 {
+            return;
+        }
+
+        let mut additions = Vec::new();
+        for room_id in updated_rooms {
+            if !state.active_rooms.contains(room_id) {
+                continue;
+            }
+            let baseline = state.observation_baselines.get(room_id).copied().unwrap_or(0);
+            let timeline = if let Some(room) = self.client.get_room(room_id) {
+                match room.event_cache().await {
+                    Ok((cache, _drop_handles)) => cache
+                        .latest_sync_observation()
+                        .await
+                        .filter(|observation| observation.sequence() > baseline),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            additions.push((
+                room_id.clone(),
+                RoomSubscriptionCheckpoint {
+                    subscription_generation: generation,
+                    room_id: room_id.clone(),
+                    timeline,
+                },
+            ));
+        }
+
+        let current_generation = self.room_subscription_state.lock().unwrap().generation;
+        if current_generation != generation.0 || additions.is_empty() {
+            return;
+        }
+        let mut retained = (*self.room_subscription_checkpoints.get()).clone();
+        retained.extend(additions);
+        self.room_subscription_checkpoints.set(Arc::new(retained));
     }
 
     #[cfg(test)]
