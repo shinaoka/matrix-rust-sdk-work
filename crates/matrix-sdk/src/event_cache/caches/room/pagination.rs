@@ -187,7 +187,9 @@ fn invalid_gap_topology(details: impl Into<String>) -> EventCacheError {
     EventCacheError::InvalidLinkedChunkMetadata { details: details.into() }
 }
 
-fn order_persisted_chunks(chunks: Vec<RawChunk<Event, Gap>>) -> Result<Vec<RawChunk<Event, Gap>>> {
+pub(super) fn order_persisted_chunks(
+    chunks: Vec<RawChunk<Event, Gap>>,
+) -> Result<Vec<RawChunk<Event, Gap>>> {
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
@@ -238,7 +240,7 @@ fn mix_revision(revision: &mut u64, bytes: &[u8]) {
     }
 }
 
-fn inspect_ordered_chunks(
+pub(super) fn inspect_ordered_chunks(
     room_id: &OwnedRoomId,
     snapshot_id: u64,
     topology_generation: u64,
