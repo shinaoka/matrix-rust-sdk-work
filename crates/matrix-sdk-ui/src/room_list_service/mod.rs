@@ -167,10 +167,20 @@ impl fmt::Debug for RoomSubscriptionCheckpoint {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct RoomSubscriptionState {
     generation: u64,
     active_rooms: BTreeSet<OwnedRoomId>,
+}
+
+impl fmt::Debug for RoomSubscriptionState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RoomSubscriptionState")
+            .field("generation", &self.generation)
+            .field("active_room_count", &self.active_rooms.len())
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -609,21 +619,17 @@ impl RoomListService {
             }
         }
 
-        // Reconfigure first. A sync iteration that already captured the old
-        // generation will discard the resulting response if it races with this
-        // change; the next iteration will capture the new generation and its
-        // own event-cache baseline.
-        self.sliding_sync.clear_and_subscribe_to_rooms(
-            room_ids,
-            Some(settings),
-            cancel_in_flight_request,
-        );
-
-        // Publish the generation and clear retained checkpoints under the
-        // same lock used by the publication commit below. This prevents a late
-        // publisher from restoring an inactive generation after the clear.
+        // Reconfigure, publish the generation, and clear retained checkpoints
+        // under the same lock used by iteration capture and publication
+        // commit. No observer can pair the new request configuration with the
+        // old generation or restore an inactive generation after the clear.
         let generation = {
             let mut state = self.room_subscription_state.lock().unwrap();
+            self.sliding_sync.clear_and_subscribe_to_rooms(
+                room_ids,
+                Some(settings),
+                cancel_in_flight_request,
+            );
             state.generation = state.generation.wrapping_add(1).max(1);
             state.active_rooms = room_ids.iter().map(|room_id| (*room_id).to_owned()).collect();
             self.room_subscription_checkpoints.set(Arc::new(BTreeMap::new()));
@@ -775,9 +781,22 @@ mod tests {
     use futures_util::{StreamExt, pin_mut};
     use matrix_sdk::{SlidingSyncMode, test_utils::mocks::MatrixMockServer};
     use matrix_sdk_test::{TestError, async_test};
-    use ruma::{api::client::sync::sync_events::v5, assign, uint};
+    use ruma::{api::client::sync::sync_events::v5, assign, room_id, uint};
 
-    use super::{ALL_ROOMS_LIST_NAME, Error, RoomListService, State};
+    use super::{ALL_ROOMS_LIST_NAME, Error, RoomListService, RoomSubscriptionState, State};
+
+    #[test]
+    fn room_subscription_state_debug_redacts_active_room_ids() {
+        let room_id = room_id!("!private-subscription:example.org");
+        let state = RoomSubscriptionState {
+            generation: 7,
+            active_rooms: [room_id.to_owned()].into_iter().collect(),
+        };
+
+        let debug = format!("{state:?}");
+        assert!(!debug.contains(room_id.as_str()));
+        assert!(debug.contains("active_room_count: 1"));
+    }
 
     #[async_test]
     async fn test_all_rooms_are_declared() -> Result<(), TestError> {
