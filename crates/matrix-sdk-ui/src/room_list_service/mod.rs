@@ -171,6 +171,12 @@ impl fmt::Debug for RoomSubscriptionCheckpoint {
 struct RoomSubscriptionState {
     generation: u64,
     active_rooms: BTreeSet<OwnedRoomId>,
+}
+
+#[derive(Clone)]
+struct RoomSubscriptionIteration {
+    generation: RoomSubscriptionGeneration,
+    active_rooms: BTreeSet<OwnedRoomId>,
     observation_baselines: BTreeMap<OwnedRoomId, u64>,
 }
 
@@ -371,16 +377,19 @@ impl RoomListService {
                 // Calculate the next state, and run the associated actions.
                 let next_state = self.state_machine.next(&self.sliding_sync).await?;
 
-                let subscription_generation = RoomSubscriptionGeneration(
-                    self.room_subscription_state.lock().unwrap().generation,
-                );
+                // Bind the event-cache baseline to this exact sync iteration,
+                // rather than to the earlier subscription API call. An older
+                // in-flight response therefore keeps its older generation,
+                // while a response polled after reconfiguration gets a fresh
+                // baseline that cannot reuse a pre-iteration observation.
+                let subscription_iteration = self.capture_room_subscription_iteration().await;
 
                 // Do the sync.
                 match sync.next().await {
                     // Got a successful result while syncing.
                     Some(Ok(update_summary)) => {
                         self.publish_room_subscription_checkpoints(
-                            subscription_generation,
+                            subscription_iteration,
                             &update_summary.rooms,
                         )
                         .await;
@@ -564,22 +573,6 @@ impl RoomListService {
         &self,
         room_ids: &[&RoomId],
     ) -> RoomSubscriptionGeneration {
-        let mut observation_baselines = BTreeMap::new();
-        for room_id in room_ids {
-            let sequence = if let Some(room) = self.client.get_room(room_id) {
-                match room.event_cache().await {
-                    Ok((cache, _drop_handles)) => cache
-                        .latest_sync_observation()
-                        .await
-                        .map_or(0, |observation| observation.sequence()),
-                    Err(_) => 0,
-                }
-            } else {
-                0
-            };
-            observation_baselines.insert((*room_id).to_owned(), sequence);
-        }
-
         // Calculate the settings for the room subscriptions.
         let settings = assign!(http::request::RoomSubscription::default(), {
             required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
@@ -616,21 +609,26 @@ impl RoomListService {
             }
         }
 
-        // Subscribe to the rooms.
-        let generation = {
-            let mut state = self.room_subscription_state.lock().unwrap();
-            state.generation = state.generation.wrapping_add(1).max(1);
-            state.active_rooms = room_ids.iter().map(|room_id| (*room_id).to_owned()).collect();
-            state.observation_baselines = observation_baselines;
-            RoomSubscriptionGeneration(state.generation)
-        };
-        self.room_subscription_checkpoints.set(Arc::new(BTreeMap::new()));
-
+        // Reconfigure first. A sync iteration that already captured the old
+        // generation will discard the resulting response if it races with this
+        // change; the next iteration will capture the new generation and its
+        // own event-cache baseline.
         self.sliding_sync.clear_and_subscribe_to_rooms(
             room_ids,
             Some(settings),
             cancel_in_flight_request,
         );
+
+        // Publish the generation and clear retained checkpoints under the
+        // same lock used by the publication commit below. This prevents a late
+        // publisher from restoring an inactive generation after the clear.
+        let generation = {
+            let mut state = self.room_subscription_state.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1).max(1);
+            state.active_rooms = room_ids.iter().map(|room_id| (*room_id).to_owned()).collect();
+            self.room_subscription_checkpoints.set(Arc::new(BTreeMap::new()));
+            RoomSubscriptionGeneration(state.generation)
+        };
 
         generation
     }
@@ -642,22 +640,49 @@ impl RoomListService {
         self.room_subscription_checkpoints.subscribe()
     }
 
+    async fn capture_room_subscription_iteration(&self) -> RoomSubscriptionIteration {
+        loop {
+            let state = self.room_subscription_state.lock().unwrap().clone();
+            let mut observation_baselines = BTreeMap::new();
+
+            for room_id in &state.active_rooms {
+                let sequence = if let Some(room) = self.client.get_room(room_id) {
+                    match room.event_cache().await {
+                        Ok((cache, _drop_handles)) => cache
+                            .latest_sync_observation()
+                            .await
+                            .map_or(0, |observation| observation.sequence()),
+                        Err(_) => 0,
+                    }
+                } else {
+                    0
+                };
+                observation_baselines.insert(room_id.clone(), sequence);
+            }
+
+            let current = self.room_subscription_state.lock().unwrap();
+            if current.generation == state.generation && current.active_rooms == state.active_rooms
+            {
+                return RoomSubscriptionIteration {
+                    generation: RoomSubscriptionGeneration(state.generation),
+                    active_rooms: state.active_rooms,
+                    observation_baselines,
+                };
+            }
+        }
+    }
+
     async fn publish_room_subscription_checkpoints(
         &self,
-        generation: RoomSubscriptionGeneration,
+        iteration: RoomSubscriptionIteration,
         updated_rooms: &[OwnedRoomId],
     ) {
-        let state = self.room_subscription_state.lock().unwrap().clone();
-        if state.generation != generation.0 {
-            return;
-        }
-
         let mut additions = Vec::new();
         for room_id in updated_rooms {
-            if !state.active_rooms.contains(room_id) {
+            if !iteration.active_rooms.contains(room_id) {
                 continue;
             }
-            let baseline = state.observation_baselines.get(room_id).copied().unwrap_or(0);
+            let baseline = iteration.observation_baselines.get(room_id).copied().unwrap_or(0);
             let timeline = if let Some(room) = self.client.get_room(room_id) {
                 match room.event_cache().await {
                     Ok((cache, _drop_handles)) => cache
@@ -672,15 +697,23 @@ impl RoomListService {
             additions.push((
                 room_id.clone(),
                 RoomSubscriptionCheckpoint {
-                    subscription_generation: generation,
+                    subscription_generation: iteration.generation,
                     room_id: room_id.clone(),
                     timeline,
                 },
             ));
         }
 
-        let current_generation = self.room_subscription_state.lock().unwrap().generation;
-        if current_generation != generation.0 || additions.is_empty() {
+        if additions.is_empty() {
+            return;
+        }
+
+        // Validate and commit while holding the same lock used to replace the
+        // subscription generation and clear retained checkpoints.
+        let state = self.room_subscription_state.lock().unwrap();
+        if state.generation != iteration.generation.0
+            || state.active_rooms != iteration.active_rooms
+        {
             return;
         }
         let mut retained = (*self.room_subscription_checkpoints.get()).clone();

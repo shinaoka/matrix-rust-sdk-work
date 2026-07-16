@@ -416,6 +416,82 @@ async fn test_room_subscription_checkpoint_does_not_reuse_the_baseline_observati
 }
 
 #[async_test]
+async fn test_delayed_subscription_response_cannot_repopulate_a_replaced_generation()
+-> Result<(), Error> {
+    let (_, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let old_room_id = room_id!("!checkpoint-old:bar.org");
+    let new_room_id = room_id!("!checkpoint-new:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 2 } },
+            "rooms": {
+                old_room_id: { "initial": true },
+                new_room_id: { "initial": true }
+            },
+        },
+    };
+
+    let old_generation = room_list.subscribe_to_rooms_with_generation(&[old_room_id]).await;
+
+    let delayed_old_response = async {
+        sync_then_assert_request_and_fake_response! {
+            [server, room_list, sync]
+            sync matches Some(Ok(_)),
+            // Reconfiguration may cancel and regenerate the HTTP request
+            // before the delayed response settles. The response body still
+            // belongs to the old room and must not be attributed to the new
+            // subscription generation in either case.
+            assert request >= {},
+            respond with = {
+                "pos": "1",
+                "rooms": {
+                    old_room_id: {
+                        "timeline": [timeline_event!("$stale-generation-event:bar.org" at 1 sec)],
+                        "prev_batch": "stale-generation-token"
+                    }
+                },
+            },
+            after delay = Duration::from_millis(1_000),
+        }
+    };
+    let replace_subscription = async {
+        sleep(Duration::from_millis(500)).await;
+        room_list.subscribe_to_rooms_with_generation(&[new_room_id]).await
+    };
+
+    let (_, new_generation) = tokio::join!(delayed_old_response, replace_subscription);
+    assert_ne!(new_generation, old_generation);
+    assert!(
+        room_list.room_subscription_checkpoints().get().is_empty(),
+        "the delayed old response must not restore checkpoints after the generation clear",
+    );
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {
+            "room_subscriptions": { new_room_id: { "timeline_limit": 20 } }
+        },
+        respond with = {
+            "pos": "2",
+            "rooms": { new_room_id: {} },
+        },
+    };
+
+    let retained = room_list.room_subscription_checkpoints().get();
+    let checkpoint = retained.get(new_room_id).expect("new generation checkpoint");
+    assert_eq!(checkpoint.subscription_generation(), new_generation);
+    assert!(checkpoint.timeline().is_none());
+
+    Ok(())
+}
+
+#[async_test]
 async fn test_sync_all_states() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
