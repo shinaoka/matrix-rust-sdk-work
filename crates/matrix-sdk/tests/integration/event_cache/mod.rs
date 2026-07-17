@@ -197,6 +197,52 @@ async fn test_committed_room_observation_is_retained_and_advances_for_empty_resp
     assert!(!debug.contains("private-committed-token"));
 }
 
+#[async_test]
+async fn test_committed_response_fence_advances_when_a_known_room_is_omitted() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let omitted_room_id = room_id!("!committed-response-omitted:example.org");
+    let present_room_id = room_id!("!committed-response-present:example.org");
+    server.sync_joined_room(&client, omitted_room_id).await;
+    server.sync_joined_room(&client, present_room_id).await;
+
+    let observations = client.event_cache().subscribe_to_committed_room_timeline_observations();
+    let omitted_before = observations
+        .borrow()
+        .get(omitted_room_id)
+        .cloned()
+        .expect("the known room has an initial committed observation");
+    let mut responses = client.event_cache().subscribe_to_committed_room_updates_responses();
+
+    server.sync_room(&client, JoinedRoomBuilder::new(present_room_id)).await;
+    responses.changed().await.unwrap();
+
+    let response = responses.borrow().expect("the committed response fence advances");
+    assert!(response.response_sequence() > omitted_before.response_sequence());
+    assert_eq!(response.joined_room_count(), 1);
+    assert_eq!(response.left_room_count(), 0);
+    assert_eq!(response.invited_room_count(), 0);
+
+    let observations = observations.borrow();
+    assert_eq!(
+        observations
+            .get(omitted_room_id)
+            .expect("the omitted room remains retained")
+            .response_sequence(),
+        omitted_before.response_sequence(),
+        "an omitted room must not receive a manufactured per-room observation",
+    );
+    assert_eq!(
+        observations
+            .get(present_room_id)
+            .expect("the present room receives a committed observation")
+            .response_sequence(),
+        response.response_sequence(),
+    );
+}
+
 macro_rules! assert_event_id {
     ($timeline_event:expr, $event_id:literal) => {
         assert_eq!($timeline_event.event_id().unwrap().as_str(), $event_id);
