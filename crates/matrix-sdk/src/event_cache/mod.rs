@@ -150,6 +150,38 @@ impl fmt::Debug for CommittedRoomTimelineObservation {
     }
 }
 
+/// Token-free fence published after all event-cache topology mutations for one
+/// room-updates response have committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedRoomUpdatesResponse {
+    response_sequence: u64,
+    joined_room_count: usize,
+    left_room_count: usize,
+    invited_room_count: usize,
+}
+
+impl CommittedRoomUpdatesResponse {
+    /// Monotonic process-local sequence of the committed room-updates response.
+    pub fn response_sequence(&self) -> u64 {
+        self.response_sequence
+    }
+
+    /// Number of joined rooms present in this response.
+    pub fn joined_room_count(&self) -> usize {
+        self.joined_room_count
+    }
+
+    /// Number of left rooms present in this response.
+    pub fn left_room_count(&self) -> usize {
+        self.left_room_count
+    }
+
+    /// Number of invited rooms present in this response.
+    pub fn invited_room_count(&self) -> usize {
+        self.invited_room_count
+    }
+}
+
 /// An error observed in the [`EventCache`].
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum EventCacheError {
@@ -276,6 +308,7 @@ impl EventCache {
         let (generic_update_sender, _) = channel(128);
         let (linked_chunk_update_sender, _) = channel(128);
         let (committed_room_timeline_sender, _) = watch::channel(Arc::new(HashMap::new()));
+        let (committed_room_updates_response_sender, _) = watch::channel(None);
 
         let weak_client = WeakClient::from_inner(client);
 
@@ -297,6 +330,7 @@ impl EventCache {
                 linked_chunk_update_sender,
                 committed_room_timeline_sequence: AtomicU64::new(0),
                 committed_room_timeline_sender,
+                committed_room_updates_response_sender,
                 #[cfg(feature = "e2e-encryption")]
                 redecryption_channels,
                 automatic_pagination: OnceLock::new(),
@@ -471,6 +505,13 @@ impl EventCache {
         self.inner.committed_room_timeline_sender.subscribe()
     }
 
+    /// Subscribe to the retained latest room-updates response commit fence.
+    pub fn subscribe_to_committed_room_updates_responses(
+        &self,
+    ) -> watch::Receiver<Option<CommittedRoomUpdatesResponse>> {
+        self.inner.committed_room_updates_response_sender.subscribe()
+    }
+
     /// Returns a reference to the [`AutomaticPagination`] API, if enabled at
     /// construction with the
     /// [`EventCacheConfig::experimental_auto_backpagination`] flag.
@@ -599,6 +640,7 @@ struct EventCacheInner {
     committed_room_timeline_sequence: AtomicU64,
     committed_room_timeline_sender:
         watch::Sender<Arc<HashMap<OwnedRoomId, CommittedRoomTimelineObservation>>>,
+    committed_room_updates_response_sender: watch::Sender<Option<CommittedRoomUpdatesResponse>>,
 
     /// A test helper receiver that will be emitted every time the thread
     /// subscriber task subscribed to a new thread.
@@ -706,6 +748,10 @@ impl EventCacheInner {
         // to investigate, this code remains sequential for now. See also
         // https://github.com/matrix-org/matrix-rust-sdk/pull/5426.
 
+        let joined_room_count = updates.joined.len();
+        let left_room_count = updates.left.len();
+        let invited_room_count = updates.invited.len();
+
         // Left rooms.
         for (room_id, left_room_update) in updates.left {
             let Ok(caches) = self.all_caches_for_room(&room_id).await else {
@@ -761,6 +807,15 @@ impl EventCacheInner {
 
         // Invited rooms.
         // TODO: we don't anything with `updates.invite` at this point.
+
+        self.committed_room_updates_response_sender.send_replace(Some(
+            CommittedRoomUpdatesResponse {
+                response_sequence,
+                joined_room_count,
+                left_room_count,
+                invited_room_count,
+            },
+        ));
 
         Ok(())
     }
