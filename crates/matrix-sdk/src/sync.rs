@@ -17,7 +17,6 @@
 use std::{
     collections::{BTreeMap, btree_map},
     fmt,
-    sync::atomic::Ordering,
     time::Duration,
 };
 
@@ -189,17 +188,17 @@ impl Client {
         self.handle_sync_events(HandlerKind::Presence, None, presence).await?;
         self.handle_sync_to_device_events(to_device).await?;
 
-        let response_sequence = self
-            .inner
-            .room_updates_response_sequence
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        // Ignore errors when there are no receivers.
-        let _ = self.inner.room_updates_sender.send(rooms.clone());
-        let _ = self
-            .inner
-            .event_cache_room_updates_sender
-            .send(SequencedRoomUpdates { response_sequence, updates: rooms.clone() });
+        // Keep sequence assignment and both observer publications in one
+        // synchronous critical section. Concurrent sync requests must not
+        // publish N+1 before N to the event-cache consumer.
+        self.inner.room_updates_publication_sequence.publish(|response_sequence| {
+            // Ignore errors when there are no receivers.
+            let _ = self.inner.room_updates_sender.send(rooms.clone());
+            let _ = self
+                .inner
+                .event_cache_room_updates_sender
+                .send(SequencedRoomUpdates { response_sequence, updates: rooms.clone() });
+        });
 
         for (room_id, room_info) in &rooms.joined {
             let Some(room) = self.get_room(room_id) else {

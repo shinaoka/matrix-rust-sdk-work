@@ -124,6 +124,27 @@ pub(crate) struct SequencedRoomUpdates {
     pub(crate) response_sequence: u64,
     pub(crate) updates: RoomUpdates,
 }
+
+#[derive(Default)]
+pub(crate) struct RoomUpdatesPublicationSequence {
+    next: StdMutex<u64>,
+    latest: AtomicU64,
+}
+
+impl RoomUpdatesPublicationSequence {
+    pub(crate) fn publish<T>(&self, publish: impl FnOnce(u64) -> T) -> T {
+        let mut next = self.next.lock().unwrap();
+        let response_sequence = next.wrapping_add(1);
+        *next = response_sequence;
+        let result = publish(response_sequence);
+        self.latest.store(response_sequence, Ordering::Release);
+        result
+    }
+
+    pub(crate) fn latest(&self) -> u64 {
+        self.latest.load(Ordering::Acquire)
+    }
+}
 #[cfg(feature = "e2e-encryption")]
 use crate::{
     cross_process_lock::CrossProcessLock,
@@ -357,7 +378,7 @@ pub(crate) struct ClientInner {
     /// sync response.
     pub(crate) room_updates_sender: broadcast::Sender<RoomUpdates>,
     pub(crate) event_cache_room_updates_sender: broadcast::Sender<SequencedRoomUpdates>,
-    pub(crate) room_updates_response_sequence: AtomicU64,
+    pub(crate) room_updates_publication_sequence: RoomUpdatesPublicationSequence,
 
     /// Whether the client should update its homeserver URL with the discovery
     /// information present in the login response.
@@ -473,7 +494,7 @@ impl ClientInner {
             // ballast for all observers to catch up.
             room_updates_sender: broadcast::Sender::new(32),
             event_cache_room_updates_sender: broadcast::Sender::new(32),
-            room_updates_response_sequence: AtomicU64::new(0),
+            room_updates_publication_sequence: RoomUpdatesPublicationSequence::default(),
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
             event_cache,
@@ -1303,7 +1324,7 @@ impl Client {
     /// Sequence assigned to the latest sync response whose room updates were
     /// published to observers.
     pub fn latest_room_updates_response_sequence(&self) -> u64 {
-        self.inner.room_updates_response_sequence.load(Ordering::Acquire)
+        self.inner.room_updates_publication_sequence.latest()
     }
 
     pub(crate) async fn notification_handlers(
@@ -3653,7 +3674,11 @@ struct PreJoinRoomInfo {
 // The http mocking library is not supported for wasm32
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{Arc, mpsc},
+        thread,
+        time::Duration,
+    };
 
     use assert_matches::assert_matches;
     use assert_matches2::assert_let;
@@ -3694,7 +3719,7 @@ pub(crate) mod tests {
     };
     use url::Url;
 
-    use super::Client;
+    use super::{Client, RoomUpdatesPublicationSequence};
     use crate::{
         Error, TransmissionProgress,
         client::{WeakClient, caches::CachedValue, futures::SendMediaUploadRequest},
@@ -3703,6 +3728,38 @@ pub(crate) mod tests {
         media::MediaError,
         test_utils::{client::MockClientBuilder, mocks::MatrixMockServer},
     };
+
+    #[test]
+    fn room_update_publications_are_sequence_ordered_across_threads() {
+        let sequence = Arc::new(RoomUpdatesPublicationSequence::default());
+        let (published_tx, published_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let first_sequence = sequence.clone();
+        let first_published = published_tx.clone();
+        let first = thread::spawn(move || {
+            first_sequence.publish(|value| {
+                first_published.send(value).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        assert_eq!(published_rx.recv().unwrap(), 1);
+
+        let second_sequence = sequence.clone();
+        let second = thread::spawn(move || {
+            second_sequence.publish(|value| published_tx.send(value).unwrap());
+        });
+        assert!(matches!(
+            published_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        assert_eq!(published_rx.recv().unwrap(), 2);
+        second.join().unwrap();
+        assert_eq!(sequence.latest(), 2);
+    }
 
     #[async_test]
     async fn test_account_data() {
