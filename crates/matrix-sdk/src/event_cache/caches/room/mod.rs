@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod live_tail;
 pub mod pagination;
 mod state;
 mod subscriber;
@@ -37,7 +38,9 @@ use ruma::{
     events::{AnyRoomAccountDataEvent, AnySyncEphemeralRoomEvent, relation::RelationType},
     serde::Raw,
 };
-pub(super) use state::{LockedRoomEventCacheState, RoomEventCacheStateLockWriteGuard};
+pub(super) use state::{
+    LockedRoomEventCacheState, RoomEventCacheStateLockReadGuard, RoomEventCacheStateLockWriteGuard,
+};
 pub use subscriber::RoomEventCacheSubscriber;
 use tokio::sync::{Notify, RwLock, broadcast::Receiver, mpsc};
 use tracing::{instrument, trace, warn};
@@ -519,6 +522,9 @@ pub(super) struct RoomEventCacheInner {
 
     latest_sync_observation: RwLock<Option<RoomTimelineSyncObservation>>,
     next_sync_observation_sequence: AtomicU64,
+
+    #[cfg(feature = "testing")]
+    live_tail_commit_test_hook: std::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl RoomEventCacheInner {
@@ -543,6 +549,8 @@ impl RoomEventCacheInner {
             shared_pagination_status,
             latest_sync_observation: Default::default(),
             next_sync_observation_sequence: AtomicU64::new(1),
+            #[cfg(feature = "testing")]
+            live_tail_commit_test_hook: Default::default(),
         }
     }
 

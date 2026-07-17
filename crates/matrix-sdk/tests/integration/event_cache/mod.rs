@@ -9,9 +9,11 @@ use matrix_sdk::{
     assert_let_timeout, assert_next_matches_with_timeout,
     deserialized_responses::TimelineEvent,
     event_cache::{
-        BackPaginationOutcome, CommittedRoomUpdateMembership, EventCacheError, PaginationStatus,
-        RoomEventCacheUpdate, RoomTimelineContinuity, RoomTimelineGapProjectionId,
-        RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome, TimelineVectorDiffs,
+        BackPaginationOutcome, CommittedRoomUpdateMembership, EventCacheError, EventsOrigin,
+        PaginationStatus, RoomEventCacheUpdate, RoomLiveTailRefreshCancellation,
+        RoomLiveTailRefreshOutcome, RoomLiveTailRefreshResult, RoomTimelineContinuity,
+        RoomTimelineGapProjectionId, RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome,
+        TimelineVectorDiffs,
     },
     linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     store::StoreConfig,
@@ -29,7 +31,7 @@ use matrix_sdk_test::{
     ALICE, BOB, JoinedRoomBuilder, LeftRoomBuilder, async_test, event_factory::EventFactory,
 };
 use ruma::{
-    EventId, event_id,
+    EventId, OwnedEventId, event_id,
     events::{
         AnySyncMessageLikeEvent, AnySyncTimelineEvent, TimelineEventType,
         room::message::{RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
@@ -40,7 +42,7 @@ use ruma::{
 };
 use tokio::{
     spawn,
-    sync::broadcast,
+    sync::{Notify, broadcast},
     time::{sleep, timeout},
 };
 use wiremock::ResponseTemplate;
@@ -289,6 +291,566 @@ macro_rules! assert_event_id {
     ($timeline_event:expr, $event_id:literal) => {
         assert_eq!($timeline_event.event_id().unwrap().as_str(), $event_id);
     };
+}
+
+mod live_tail_refresh {
+    use super::*;
+
+    fn projection(repair_generation: u64) -> RoomTimelineGapProjectionId {
+        RoomTimelineGapProjectionId { actor_generation: 41, repair_generation }
+    }
+
+    fn event_ids<I, E>(events: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = E>,
+        E: std::borrow::Borrow<TimelineEvent>,
+    {
+        events.into_iter().map(|event| event.borrow().event_id().unwrap().to_string()).collect()
+    }
+
+    async fn wait_for_messages_requests(server: &MatrixMockServer, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let requests = server.received_requests().await.unwrap();
+                let count = requests
+                    .iter()
+                    .filter(|request| request.url.path().ends_with("/messages"))
+                    .count();
+                if count >= expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("live-tail /messages request was not observed");
+    }
+
+    #[async_test]
+    async fn test_zero_event_limit_is_rejected_before_refreshing_the_live_tail() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!live-tail-zero-limit:example.org");
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        let cancellation = RoomLiveTailRefreshCancellation::new();
+
+        let result = room_event_cache
+            .pagination()
+            .refresh_live_tail_with_projection(
+                0,
+                RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
+                cancellation,
+            )
+            .await;
+
+        assert_matches!(result, Err(EventCacheError::InvalidLinkedChunkMetadata { .. }));
+        let _: Option<RoomLiveTailRefreshResult> = None;
+        let _ = RoomLiveTailRefreshOutcome::Cancelled;
+    }
+
+    #[async_test]
+    async fn test_live_tail_refresh_uses_tokenless_messages_and_appends_newest_events() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!live-tail-overlap:example.org");
+        let factory = EventFactory::new().room(room_id).sender(*ALICE);
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .set_timeline_limited()
+                    .set_timeline_prev_batch("unrelated-historical-gap-one")
+                    .add_timeline_event(
+                        factory.text_msg("old-1").event_id(event_id!("$live-tail-old-1")),
+                    ),
+            )
+            .await;
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .set_timeline_limited()
+                    .set_timeline_prev_batch("unrelated-historical-gap-two")
+                    .add_timeline_event(
+                        factory.text_msg("edge").event_id(event_id!("$live-tail-edge")),
+                    ),
+            )
+            .await;
+
+        assert_eq!(room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.len(), 2);
+        let (initial, mut subscriber) = room_event_cache.subscribe().await.unwrap();
+        assert_eq!(event_ids(&initial), ["$live-tail-edge"]);
+
+        server
+            .mock_room_messages()
+            .match_limit(128)
+            .ok(RoomMessagesResponseTemplate::default().events(vec![
+                factory.text_msg("new-2").event_id(event_id!("$live-tail-new-2")),
+                factory.text_msg("new-1").event_id(event_id!("$live-tail-new-1")),
+                factory.text_msg("edge").event_id(event_id!("$live-tail-edge")),
+            ]))
+            .expect(1)
+            .named("tokenless-live-tail-overlap")
+            .mount()
+            .await;
+
+        let result = room_event_cache
+            .pagination()
+            .refresh_live_tail_with_projection(
+                128,
+                projection(1),
+                RoomLiveTailRefreshCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, RoomLiveTailRefreshOutcome::Advanced { events: 2 });
+        assert_eq!(result.returned_events, 3);
+        assert_eq!(result.last_projection_batch, Some(1));
+
+        let update = timeout(Duration::from_secs(1), subscriber.recv()).await.unwrap().unwrap();
+        let RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, origin }) =
+            update
+        else {
+            panic!("expected a live-tail timeline publication");
+        };
+        assert_matches!(
+            origin,
+            EventsOrigin::GapRepair {
+                actor_generation: 41,
+                repair_generation: 1,
+                projection_batch: 1,
+            }
+        );
+        let mut projected = Vector::from(initial);
+        for diff in diffs {
+            diff.apply(&mut projected);
+        }
+        assert_eq!(
+            event_ids(&projected),
+            ["$live-tail-edge", "$live-tail-new-1", "$live-tail-new-2"]
+        );
+        assert_eq!(
+            event_ids(room_event_cache.events().await.unwrap())
+                .iter()
+                .filter(|event_id| event_id.as_str() == "$live-tail-edge")
+                .count(),
+            1,
+        );
+        assert_eq!(room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.len(), 2);
+
+        let requests = server.received_requests().await.unwrap();
+        let message_requests = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/messages"))
+            .collect::<Vec<_>>();
+        assert_eq!(message_requests.len(), 1);
+        let query = message_requests[0].url.query_pairs().collect::<Vec<_>>();
+        assert!(query.iter().all(|(key, _)| key != "from"), "query={query:?}");
+        assert!(query.iter().any(|(key, value)| key == "dir" && value == "b"));
+        assert!(query.iter().any(|(key, value)| key == "limit" && value == "128"));
+    }
+
+    #[async_test]
+    async fn test_unchanged_live_tail_is_a_successful_proof_without_projection() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!live-tail-unchanged:example.org");
+        let factory = EventFactory::new().room(room_id).sender(*ALICE);
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    factory.text_msg("edge").event_id(event_id!("$unchanged-edge")),
+                ),
+            )
+            .await;
+        let (initial, mut subscriber) = room_event_cache.subscribe().await.unwrap();
+
+        server
+            .mock_room_messages()
+            .match_limit(128)
+            .ok(RoomMessagesResponseTemplate::default()
+                .events(vec![factory.text_msg("edge").event_id(event_id!("$unchanged-edge"))]))
+            .expect(1)
+            .named("tokenless-live-tail-unchanged")
+            .mount()
+            .await;
+
+        let result = room_event_cache
+            .pagination()
+            .refresh_live_tail_with_projection(
+                128,
+                projection(2),
+                RoomLiveTailRefreshCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, RoomLiveTailRefreshOutcome::Unchanged);
+        assert!(result.returned_events > 0);
+        assert_eq!(result.last_projection_batch, None);
+        assert_eq!(event_ids(room_event_cache.events().await.unwrap()), event_ids(initial));
+        assert!(timeout(Duration::from_millis(50), subscriber.recv()).await.is_err());
+    }
+
+    #[async_test]
+    async fn test_detached_live_tail_publishes_latest_page_and_one_navigable_gap() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!live-tail-detached:example.org");
+        let factory = EventFactory::new().room(room_id).sender(*ALICE);
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .set_timeline_limited()
+                    .set_timeline_prev_batch("existing-historical-gap")
+                    .add_timeline_event(
+                        factory.text_msg("stale-edge").event_id(event_id!("$stale-edge")),
+                    ),
+            )
+            .await;
+        let baseline_gaps = room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.len();
+        let (initial, mut subscriber) = room_event_cache.subscribe().await.unwrap();
+
+        let tail_ids = (0..128)
+            .map(|index| OwnedEventId::try_from(format!("$detached-{index:03}")).unwrap())
+            .collect::<Vec<_>>();
+        let backwards_tail = tail_ids
+            .iter()
+            .rev()
+            .map(|event_id| {
+                factory
+                    .text_msg(format!("detached {event_id}"))
+                    .event_id(event_id)
+                    .into_raw_timeline()
+            })
+            .collect::<Vec<_>>();
+        server
+            .mock_room_messages()
+            .match_limit(128)
+            .ok(RoomMessagesResponseTemplate::default()
+                .end_token("detached-historical-page")
+                .events(backwards_tail))
+            .expect(1)
+            .named("tokenless-live-tail-detached")
+            .mount()
+            .await;
+
+        let result = room_event_cache
+            .pagination()
+            .refresh_live_tail_with_projection(
+                128,
+                projection(3),
+                RoomLiveTailRefreshCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            RoomLiveTailRefreshOutcome::Detached { events: 128, historical_gap_remaining: true }
+        );
+        assert_eq!(result.returned_events, 128);
+        assert_eq!(result.last_projection_batch, Some(1));
+
+        let update = timeout(Duration::from_secs(1), subscriber.recv()).await.unwrap().unwrap();
+        let RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, origin }) =
+            update
+        else {
+            panic!("expected a detached live-tail publication");
+        };
+        assert_matches!(
+            origin,
+            EventsOrigin::GapRepair {
+                actor_generation: 41,
+                repair_generation: 3,
+                projection_batch: 1,
+            }
+        );
+        let mut projected = Vector::from(initial);
+        for diff in diffs {
+            diff.apply(&mut projected);
+        }
+        let projected_ids = event_ids(&projected);
+        assert_eq!(projected_ids.first().map(String::as_str), Some("$stale-edge"));
+        assert_eq!(
+            &projected_ids[1..],
+            tail_ids.iter().map(ToString::to_string).collect::<Vec<_>>().as_slice()
+        );
+
+        let inspection = room_event_cache.inspect_timeline_gaps().await.unwrap();
+        assert_eq!(inspection.gaps.len(), baseline_gaps + 1);
+        let tail_gap = inspection
+            .gaps
+            .iter()
+            .filter(|gap| gap.newer_event_id.as_deref() == Some(tail_ids[0].as_ref()))
+            .collect::<Vec<_>>();
+        assert_eq!(tail_gap.len(), 1);
+        assert_eq!(tail_gap[0].older_event_id.as_deref(), Some(event_id!("$stale-edge")));
+    }
+
+    #[async_test]
+    async fn test_live_tail_refresh_discards_response_when_sync_moves_cache_fence() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!live-tail-stale:example.org");
+        let factory = EventFactory::new().room(room_id).sender(*ALICE);
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    factory.text_msg("edge").event_id(event_id!("$stale-fence-edge")),
+                ),
+            )
+            .await;
+        let (_, mut subscriber) = room_event_cache.subscribe().await.unwrap();
+
+        server
+            .mock_room_messages()
+            .match_limit(128)
+            .ok(RoomMessagesResponseTemplate::default().with_delay(Duration::from_secs(1)).events(
+                vec![
+                    factory.text_msg("refresh").event_id(event_id!("$stale-refresh-event")),
+                    factory.text_msg("edge").event_id(event_id!("$stale-fence-edge")),
+                ],
+            ))
+            .expect(1)
+            .named("live-tail-response-after-sync-fence")
+            .mount()
+            .await;
+
+        let pagination = room_event_cache.pagination();
+        let refresh = spawn(async move {
+            pagination
+                .refresh_live_tail_with_projection(
+                    128,
+                    projection(4),
+                    RoomLiveTailRefreshCancellation::new(),
+                )
+                .await
+        });
+        wait_for_messages_requests(&server, 1).await;
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    factory.text_msg("sync").event_id(event_id!("$stale-sync-event")),
+                ),
+            )
+            .await;
+        assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = subscriber.recv());
+
+        let result = refresh.await.unwrap().unwrap();
+        assert_eq!(result.outcome, RoomLiveTailRefreshOutcome::Stale);
+        assert_eq!(result.returned_events, 2);
+        assert_eq!(result.last_projection_batch, None);
+        assert_eq!(
+            event_ids(room_event_cache.events().await.unwrap()),
+            ["$stale-fence-edge", "$stale-sync-event"]
+        );
+        assert!(timeout(Duration::from_millis(50), subscriber.recv()).await.is_err());
+    }
+
+    #[async_test]
+    async fn test_live_tail_refresh_cancels_network_but_finishes_started_commit() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!live-tail-cancellation:example.org");
+        let factory = EventFactory::new().room(room_id).sender(*ALICE);
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    factory.text_msg("edge").event_id(event_id!("$cancel-edge")),
+                ),
+            )
+            .await;
+        let (initial, mut subscriber) = room_event_cache.subscribe().await.unwrap();
+
+        server
+            .mock_room_messages()
+            .match_limit(127)
+            .ok(RoomMessagesResponseTemplate::default().with_delay(Duration::from_secs(1)).events(
+                vec![
+                    factory.text_msg("cancelled").event_id(event_id!("$cancelled-network-event")),
+                    factory.text_msg("edge").event_id(event_id!("$cancel-edge")),
+                ],
+            ))
+            .expect(1)
+            .named("cancel-live-tail-network-phase")
+            .mount()
+            .await;
+
+        let cancellation = RoomLiveTailRefreshCancellation::new();
+        assert_eq!(format!("{cancellation:?}"), "RoomLiveTailRefreshCancellation(..)");
+        let pagination = room_event_cache.pagination();
+        let network_cancellation = cancellation.clone();
+        let cancelled = spawn(async move {
+            pagination
+                .refresh_live_tail_with_projection(127, projection(5), network_cancellation)
+                .await
+        });
+        wait_for_messages_requests(&server, 1).await;
+        cancellation.cancel();
+        let cancelled_result =
+            timeout(Duration::from_secs(1), cancelled).await.unwrap().unwrap().unwrap();
+        assert_eq!(cancelled_result.outcome, RoomLiveTailRefreshOutcome::Cancelled);
+        assert_eq!(cancelled_result.returned_events, 0);
+        assert_eq!(event_ids(room_event_cache.events().await.unwrap()), ["$cancel-edge"]);
+        assert!(timeout(Duration::from_millis(50), subscriber.recv()).await.is_err());
+
+        server
+            .mock_room_messages()
+            .match_limit(128)
+            .ok(RoomMessagesResponseTemplate::default().events(vec![
+                factory.text_msg("committed").event_id(event_id!("$commit-after-cancel")),
+                factory.text_msg("edge").event_id(event_id!("$cancel-edge")),
+            ]))
+            .expect(1)
+            .named("finish-live-tail-commit-after-cancellation")
+            .mount()
+            .await;
+
+        let commit_entered = Arc::new(Notify::new());
+        let release_commit = Arc::new(Notify::new());
+        let pagination = room_event_cache.pagination();
+        pagination.set_live_tail_commit_test_hook(commit_entered.clone(), release_commit.clone());
+        let commit_cancellation = RoomLiveTailRefreshCancellation::new();
+        let cancellation_after_commit = commit_cancellation.clone();
+        let committed = spawn(async move {
+            pagination
+                .refresh_live_tail_with_projection(128, projection(6), commit_cancellation)
+                .await
+        });
+        timeout(Duration::from_secs(2), commit_entered.notified()).await.unwrap();
+        cancellation_after_commit.cancel();
+        release_commit.notify_one();
+
+        let committed_result = committed.await.unwrap().unwrap();
+        assert_eq!(committed_result.outcome, RoomLiveTailRefreshOutcome::Advanced { events: 1 });
+        assert_eq!(committed_result.last_projection_batch, Some(1));
+        let update = timeout(Duration::from_secs(1), subscriber.recv()).await.unwrap().unwrap();
+        let RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) = update
+        else {
+            panic!("expected the committed live-tail publication");
+        };
+        let mut projected = Vector::from(initial);
+        for diff in diffs {
+            diff.apply(&mut projected);
+        }
+        assert_eq!(event_ids(&projected), ["$cancel-edge", "$commit-after-cancel"]);
+        assert!(timeout(Duration::from_millis(50), subscriber.recv()).await.is_err());
+
+        let store = client.event_cache_store().lock().await.unwrap();
+        let stored = store
+            .as_clean()
+            .unwrap()
+            .find_event(room_id, event_id!("$commit-after-cancel"))
+            .await
+            .unwrap();
+        assert!(stored.is_some(), "the completed commit must be persisted");
+    }
+
+    #[async_test]
+    async fn test_detached_live_tail_gap_continues_with_standard_back_pagination() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!live-tail-standard-pagination:example.org");
+        let factory = EventFactory::new().room(room_id).sender(*ALICE);
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    factory.text_msg("stale").event_id(event_id!("$pagination-stale")),
+                ),
+            )
+            .await;
+        let (_, mut subscriber) = room_event_cache.subscribe().await.unwrap();
+
+        server
+            .mock_room_messages()
+            .match_limit(128)
+            .ok(RoomMessagesResponseTemplate::default()
+                .end_token("detached-pagination-token")
+                .events(vec![
+                    factory.text_msg("tail-new").event_id(event_id!("$pagination-tail-new")),
+                    factory.text_msg("tail-old").event_id(event_id!("$pagination-tail-old")),
+                ]))
+            .expect(1)
+            .named("create-detached-live-tail-gap")
+            .mount()
+            .await;
+        let detached = room_event_cache
+            .pagination()
+            .refresh_live_tail_with_projection(
+                128,
+                projection(7),
+                RoomLiveTailRefreshCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            detached.outcome,
+            RoomLiveTailRefreshOutcome::Detached { events: 2, historical_gap_remaining: true }
+        );
+        assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = subscriber.recv());
+
+        server
+            .mock_room_messages()
+            .match_from("detached-pagination-token")
+            .match_limit(50)
+            .ok(RoomMessagesResponseTemplate::default().events(vec![
+                factory.text_msg("older-2").event_id(event_id!("$pagination-older-2")),
+                factory.text_msg("older-1").event_id(event_id!("$pagination-older-1")),
+            ]))
+            .expect(1)
+            .named("continue-detached-gap-with-standard-pagination")
+            .mount()
+            .await;
+
+        let back_paginated = room_event_cache.pagination().run_backwards_once(50).await.unwrap();
+        assert_eq!(back_paginated.events.len(), 2);
+        assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = subscriber.recv());
+        assert_eq!(
+            event_ids(room_event_cache.events().await.unwrap()),
+            [
+                "$pagination-stale",
+                "$pagination-older-1",
+                "$pagination-older-2",
+                "$pagination-tail-old",
+                "$pagination-tail-new",
+            ]
+        );
+        assert!(room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.is_empty());
+    }
 }
 
 #[async_test]
@@ -2431,7 +2993,7 @@ async fn test_inspect_and_repair_specific_persisted_timeline_gap() {
     assert_let_timeout!(
         Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
             diffs,
-            origin: matrix_sdk::event_cache::EventsOrigin::GapRepair {
+            origin: EventsOrigin::GapRepair {
                 actor_generation: 9,
                 repair_generation: 2,
                 projection_batch: 1,

@@ -35,6 +35,7 @@ use matrix_sdk_base::{
 use matrix_sdk_common::executor::spawn;
 use pin_project_lite::pin_project;
 use ruma::{EventId, OwnedEventId, OwnedRoomId, api::Direction};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, trace};
 
 pub use super::super::pagination::PaginationStatus;
@@ -136,6 +137,70 @@ pub struct RoomTimelineGapProjectionId {
     pub actor_generation: u64,
     /// Actor-local generation of the targeted repair operation.
     pub repair_generation: u64,
+}
+
+/// Outcome of one authoritative room live-tail refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomLiveTailRefreshOutcome {
+    /// The network phase was cancelled before a response was received.
+    Cancelled,
+    /// The response proved that the cached live edge was already current.
+    Unchanged,
+    /// The response overlapped the cached live edge and appended newer events.
+    Advanced {
+        /// Number of newly appended events.
+        events: usize,
+    },
+    /// The response did not overlap the cached live edge and installed a new tail.
+    Detached {
+        /// Number of events installed in the refreshed live tail.
+        events: usize,
+        /// Whether the response retained a token for older history.
+        historical_gap_remaining: bool,
+    },
+    /// The cache changed while the request was in flight.
+    Stale,
+    /// The room was no longer available to issue the request.
+    Failed,
+}
+
+/// Result of one authoritative room live-tail refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomLiveTailRefreshResult {
+    /// Classification of the refresh.
+    pub outcome: RoomLiveTailRefreshOutcome,
+    /// Number of events returned by the homeserver before cache deduplication.
+    pub returned_events: usize,
+    /// Final causally tagged publication batch, if any.
+    pub last_projection_batch: Option<u32>,
+}
+
+/// Cancellation handle for the network phase of a room live-tail refresh.
+#[derive(Clone, Default)]
+pub struct RoomLiveTailRefreshCancellation {
+    cancellation: CancellationToken,
+}
+
+impl RoomLiveTailRefreshCancellation {
+    /// Create a cancellation handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancel the network phase of the associated live-tail refresh.
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub(super) async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+}
+
+impl fmt::Debug for RoomLiveTailRefreshCancellation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RoomLiveTailRefreshCancellation(..)")
+    }
 }
 
 /// Result of one bounded targeted gap-repair request.
@@ -430,6 +495,10 @@ impl RoomPagination {
     /// Construct a new [`RoomPagination`].
     pub(super) fn new(cache: Arc<RoomEventCacheInner>) -> Self {
         Self(Pagination::new(cache))
+    }
+
+    pub(super) fn cache(&self) -> &Arc<RoomEventCacheInner> {
+        &self.0.cache
     }
 
     /// Starts a back-pagination for the requested number of events.
