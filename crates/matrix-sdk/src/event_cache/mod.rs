@@ -36,6 +36,9 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
 use futures_util::future::try_join_all;
 use matrix_sdk_base::{
     cross_process_lock::CrossProcessLockError,
@@ -385,6 +388,8 @@ impl EventCache {
                 committed_room_timeline_sequence: AtomicU64::new(0),
                 committed_room_timeline_sender,
                 committed_room_updates_response_sender,
+                #[cfg(test)]
+                fail_next_joined_room_update: AtomicBool::new(false),
                 #[cfg(feature = "e2e-encryption")]
                 redecryption_channels,
                 automatic_pagination: OnceLock::new(),
@@ -696,6 +701,9 @@ struct EventCacheInner {
         watch::Sender<Arc<HashMap<OwnedRoomId, CommittedRoomTimelineObservation>>>,
     committed_room_updates_response_sender: watch::Sender<Option<CommittedRoomUpdatesResponse>>,
 
+    #[cfg(test)]
+    fail_next_joined_room_update: AtomicBool,
+
     /// A test helper receiver that will be emitted every time the thread
     /// subscriber task subscribed to a new thread.
     ///
@@ -716,6 +724,11 @@ struct EventCacheInner {
 type AutoShrinkChannelPayload = OwnedRoomId;
 
 impl EventCacheInner {
+    #[cfg(test)]
+    fn fail_next_joined_room_update_for_testing(&self) {
+        self.fail_next_joined_room_update.store(true, Ordering::Release);
+    }
+
     fn client(&self) -> Result<Client> {
         self.client.get().ok_or(EventCacheError::ClientDropped)
     }
@@ -835,7 +848,19 @@ impl EventCacheInner {
                 .await
                 .map(|observation| observation.sequence());
 
-            if let Err(err) = caches.handle_joined_room_update(joined_room_update).await {
+            let result = {
+                #[cfg(test)]
+                {
+                    if self.fail_next_joined_room_update.swap(false, Ordering::AcqRel) {
+                        Err(EventCacheError::ClientDropped)
+                    } else {
+                        caches.handle_joined_room_update(joined_room_update).await
+                    }
+                }
+                #[cfg(not(test))]
+                caches.handle_joined_room_update(joined_room_update).await
+            };
+            if let Err(err) = result {
                 // Non-fatal error, try to continue to the next room.
                 error!(%room_id, "handling joined room update: {err}");
                 continue;
@@ -970,24 +995,29 @@ mod tests {
     use ruma::{event_id, room_id, user_id};
     use tokio::time::sleep;
 
-    use super::{
-        CommittedRoomUpdateMembership, CommittedRoomUpdatesResponse, EventCacheError,
-        RoomEventCacheGenericUpdate,
-    };
+    use super::{CommittedRoomUpdateMembership, EventCacheError, RoomEventCacheGenericUpdate};
     use crate::test_utils::{
         assert_event_matches_msg, client::MockClientBuilder, logged_in_client,
     };
 
-    #[test]
-    fn committed_response_does_not_classify_failed_joined_processing_as_absent() {
+    #[async_test]
+    async fn test_committed_response_does_not_classify_failed_joined_processing_as_absent() {
         let room_id = room_id!("!joined-processing-failed:example.org");
-        let response = CommittedRoomUpdatesResponse {
-            response_sequence: 7,
-            joined_room_ids: Arc::new([room_id.to_owned()].into_iter().collect()),
-            left_room_ids: Arc::default(),
-            invited_room_ids: Arc::default(),
-            joined_timeline_observations: Arc::default(),
-        };
+        let client = logged_in_client(None).await;
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+        let mut responses = event_cache.subscribe_to_committed_room_updates_responses();
+        event_cache.inner.fail_next_joined_room_update_for_testing();
+
+        let mut updates = RoomUpdates::default();
+        updates.joined.insert(room_id.to_owned(), JoinedRoomUpdate::default());
+        event_cache.inner.handle_room_updates(updates, 7).await.unwrap();
+
+        let response = responses
+            .borrow_and_update()
+            .clone()
+            .expect("the committed response must still be published after a joined-room failure");
 
         assert_eq!(response.room_membership(room_id), CommittedRoomUpdateMembership::Joined);
         assert!(response.room_timeline_observation(room_id).is_none());
