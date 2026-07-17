@@ -463,6 +463,14 @@ impl EventCache {
         self.inner.committed_room_timeline_sender.subscribe()
     }
 
+    /// Current process-local committed-room observation sequence.
+    ///
+    /// Consumers may capture this before starting a new sync backend and
+    /// ignore retained observations at or below the returned baseline.
+    pub fn committed_room_timeline_observation_sequence(&self) -> u64 {
+        self.inner.committed_room_timeline_sequence.load(Ordering::Acquire)
+    }
+
     /// Returns a reference to the [`AutomaticPagination`] API, if enabled at
     /// construction with the
     /// [`EventCacheConfig::experimental_auto_backpagination`] flag.
@@ -734,7 +742,7 @@ impl EventCacheInner {
                 });
             let sequence = self
                 .committed_room_timeline_sequence
-                .fetch_add(1, Ordering::Relaxed)
+                .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1);
             let observation =
                 CommittedRoomTimelineObservation { room_id: room_id.clone(), sequence, timeline };
