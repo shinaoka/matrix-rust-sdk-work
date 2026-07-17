@@ -137,7 +137,7 @@ async fn test_committed_room_observation_is_retained_and_advances_for_empty_resp
     server.sync_joined_room(&client, room_id).await;
     let factory = EventFactory::new().room(room_id).sender(*ALICE);
     let mut observations = client.event_cache().subscribe_to_committed_room_timeline_observations();
-    let baseline = client.event_cache().committed_room_timeline_observation_sequence();
+    let response_baseline = client.latest_room_updates_response_sequence();
 
     server
         .sync_room(
@@ -156,12 +156,8 @@ async fn test_committed_room_observation_is_retained_and_advances_for_empty_resp
     let first = observations.borrow().get(room_id).cloned().expect("committed room observation");
     assert!(first.has_timeline_update());
     assert!(first.has_inserted_gap());
-    assert!(first.sequence() > baseline);
-    assert_eq!(
-        client.event_cache().committed_room_timeline_observation_sequence(),
-        first.sequence()
-    );
-
+    assert!(first.response_sequence() > response_baseline);
+    assert_eq!(client.latest_room_updates_response_sequence(), first.response_sequence());
     let late = client.event_cache().subscribe_to_committed_room_timeline_observations();
     assert_eq!(
         late.borrow().get(room_id).map(|value| value.sequence()),
@@ -174,6 +170,7 @@ async fn test_committed_room_observation_is_retained_and_advances_for_empty_resp
     let empty =
         observations.borrow().get(room_id).cloned().expect("explicit empty committed response");
     assert!(empty.sequence() > first.sequence());
+    assert!(empty.response_sequence() > first.response_sequence());
     assert!(!empty.has_timeline_update());
     assert!(!empty.has_inserted_gap());
 
@@ -190,6 +187,7 @@ async fn test_committed_room_observation_is_retained_and_advances_for_empty_resp
         .cloned()
         .expect("ephemeral-only response is committed explicitly");
     assert!(ephemeral.sequence() > empty.sequence());
+    assert!(ephemeral.response_sequence() > empty.response_sequence());
     assert!(!ephemeral.has_timeline_update());
     assert!(!ephemeral.has_inserted_gap());
 

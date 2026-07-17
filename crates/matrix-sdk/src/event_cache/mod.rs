@@ -101,6 +101,7 @@ pub use crate::event_cache::automatic_pagination::AutomaticPagination;
 pub struct CommittedRoomTimelineObservation {
     room_id: OwnedRoomId,
     sequence: u64,
+    response_sequence: u64,
     timeline: Option<RoomTimelineSyncObservation>,
 }
 
@@ -113,6 +114,12 @@ impl CommittedRoomTimelineObservation {
     /// Monotonic process-local committed-response sequence.
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Monotonic process-local sync-response sequence that produced this room
+    /// update.
+    pub fn response_sequence(&self) -> u64 {
+        self.response_sequence
     }
 
     /// Whether this response contained a timeline update.
@@ -136,6 +143,7 @@ impl fmt::Debug for CommittedRoomTimelineObservation {
         formatter
             .debug_struct("CommittedRoomTimelineObservation")
             .field("sequence", &self.sequence)
+            .field("response_sequence", &self.response_sequence)
             .field("has_timeline_update", &self.has_timeline_update())
             .field("has_inserted_gap", &self.has_inserted_gap())
             .finish()
@@ -331,7 +339,7 @@ impl EventCache {
             // Spawn the task that will listen to all the room updates at once.
             let listen_updates_task = task_monitor.spawn_infinite_task("event_cache::room_updates_task", tasks::room_updates_task(
                 self.inner.clone(),
-                client.subscribe_to_all_room_updates(),
+                client.subscribe_to_sequenced_room_updates(),
             )).abort_on_drop();
 
             let ignore_user_list_update_task = task_monitor.spawn_infinite_task("event_cache::ignore_user_list_update_task", tasks::ignore_user_list_update_task(
@@ -413,7 +421,7 @@ impl EventCache {
     /// For benchmarking purposes only.
     #[doc(hidden)]
     pub async fn handle_room_updates(&self, updates: RoomUpdates) -> Result<()> {
-        self.inner.handle_room_updates(updates).await
+        self.inner.handle_room_updates(updates, 0).await
     }
 
     /// Check whether [`EventCache::subscribe`] has been called.
@@ -461,14 +469,6 @@ impl EventCache {
         &self,
     ) -> watch::Receiver<Arc<HashMap<OwnedRoomId, CommittedRoomTimelineObservation>>> {
         self.inner.committed_room_timeline_sender.subscribe()
-    }
-
-    /// Current process-local committed-room observation sequence.
-    ///
-    /// Consumers may capture this before starting a new sync backend and
-    /// ignore retained observations at or below the returned baseline.
-    pub fn committed_room_timeline_observation_sequence(&self) -> u64 {
-        self.inner.committed_room_timeline_sequence.load(Ordering::Acquire)
     }
 
     /// Returns a reference to the [`AutomaticPagination`] API, if enabled at
@@ -689,7 +689,11 @@ impl EventCacheInner {
 
     /// Handles a single set of room updates at once.
     #[instrument(skip(self, updates))]
-    async fn handle_room_updates(&self, updates: RoomUpdates) -> Result<()> {
+    async fn handle_room_updates(
+        &self,
+        updates: RoomUpdates,
+        response_sequence: u64,
+    ) -> Result<()> {
         // First, take the lock that indicates we're processing updates, to avoid
         // handling multiple updates concurrently.
         let _lock = {
@@ -744,8 +748,12 @@ impl EventCacheInner {
                 .committed_room_timeline_sequence
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1);
-            let observation =
-                CommittedRoomTimelineObservation { room_id: room_id.clone(), sequence, timeline };
+            let observation = CommittedRoomTimelineObservation {
+                room_id: room_id.clone(),
+                sequence,
+                response_sequence,
+                timeline,
+            };
             let mut retained = self.committed_room_timeline_sender.borrow().as_ref().clone();
             retained.insert(room_id, observation);
             self.committed_room_timeline_sender.send_replace(Arc::new(retained));
@@ -914,7 +922,7 @@ mod tests {
         updates.joined.insert(room_id2.to_owned(), joined_room_update2);
 
         // Have the event cache handle them.
-        event_cache.inner.handle_room_updates(updates).await.unwrap();
+        event_cache.inner.handle_room_updates(updates, 0).await.unwrap();
 
         // We can find the events in a single room.
         let room1 = client.get_room(room_id1).unwrap();

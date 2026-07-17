@@ -19,7 +19,10 @@ use std::{
     fmt::{self, Debug},
     future::{Future, ready},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak},
+    sync::{
+        Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -115,6 +118,12 @@ use crate::{
     sliding_sync::Version as SlidingSyncVersion,
     sync::{RoomUpdate, SyncResponse},
 };
+
+#[derive(Clone)]
+pub(crate) struct SequencedRoomUpdates {
+    pub(crate) response_sequence: u64,
+    pub(crate) updates: RoomUpdates,
+}
 #[cfg(feature = "e2e-encryption")]
 use crate::{
     cross_process_lock::CrossProcessLock,
@@ -347,6 +356,8 @@ pub(crate) struct ClientInner {
     /// The sender-side of a channel used to observe all the room updates of a
     /// sync response.
     pub(crate) room_updates_sender: broadcast::Sender<RoomUpdates>,
+    pub(crate) event_cache_room_updates_sender: broadcast::Sender<SequencedRoomUpdates>,
+    pub(crate) room_updates_response_sequence: AtomicU64,
 
     /// Whether the client should update its homeserver URL with the discovery
     /// information present in the login response.
@@ -461,6 +472,8 @@ impl ClientInner {
             // A single `RoomUpdates` is sent once per sync, so we assume that 32 is sufficient
             // ballast for all observers to catch up.
             room_updates_sender: broadcast::Sender::new(32),
+            event_cache_room_updates_sender: broadcast::Sender::new(32),
+            room_updates_response_sequence: AtomicU64::new(0),
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
             event_cache,
@@ -1279,6 +1292,18 @@ impl Client {
     /// a sync response.
     pub fn subscribe_to_all_room_updates(&self) -> broadcast::Receiver<RoomUpdates> {
         self.inner.room_updates_sender.subscribe()
+    }
+
+    pub(crate) fn subscribe_to_sequenced_room_updates(
+        &self,
+    ) -> broadcast::Receiver<SequencedRoomUpdates> {
+        self.inner.event_cache_room_updates_sender.subscribe()
+    }
+
+    /// Sequence assigned to the latest sync response whose room updates were
+    /// published to observers.
+    pub fn latest_room_updates_response_sequence(&self) -> u64 {
+        self.inner.room_updates_response_sequence.load(Ordering::Acquire)
     }
 
     pub(crate) async fn notification_handlers(
