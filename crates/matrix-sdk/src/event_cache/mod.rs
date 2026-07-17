@@ -28,7 +28,7 @@
 #![forbid(missing_docs)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{
         Arc, OnceLock, RwLock as StdRwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -150,14 +150,28 @@ impl fmt::Debug for CommittedRoomTimelineObservation {
     }
 }
 
+/// Membership of a room in one committed room-updates response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommittedRoomUpdateMembership {
+    /// The response contained a joined-room update.
+    Joined,
+    /// The response contained a left-room update.
+    Left,
+    /// The response contained an invited-room update.
+    Invited,
+    /// The response did not contain the room in any membership section.
+    Absent,
+}
+
 /// Token-free fence published after all event-cache topology mutations for one
 /// room-updates response have committed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CommittedRoomUpdatesResponse {
     response_sequence: u64,
-    joined_room_count: usize,
-    left_room_count: usize,
-    invited_room_count: usize,
+    joined_room_ids: Arc<HashSet<OwnedRoomId>>,
+    left_room_ids: Arc<HashSet<OwnedRoomId>>,
+    invited_room_ids: Arc<HashSet<OwnedRoomId>>,
+    joined_timeline_observations: Arc<HashMap<OwnedRoomId, CommittedRoomTimelineObservation>>,
 }
 
 impl CommittedRoomUpdatesResponse {
@@ -168,17 +182,57 @@ impl CommittedRoomUpdatesResponse {
 
     /// Number of joined rooms present in this response.
     pub fn joined_room_count(&self) -> usize {
-        self.joined_room_count
+        self.joined_room_ids.len()
     }
 
     /// Number of left rooms present in this response.
     pub fn left_room_count(&self) -> usize {
-        self.left_room_count
+        self.left_room_ids.len()
     }
 
     /// Number of invited rooms present in this response.
     pub fn invited_room_count(&self) -> usize {
-        self.invited_room_count
+        self.invited_room_ids.len()
+    }
+
+    /// Return the membership section containing `room_id`, or
+    /// [`CommittedRoomUpdateMembership::Absent`] if the room was omitted.
+    pub fn room_membership(&self, room_id: &RoomId) -> CommittedRoomUpdateMembership {
+        if self.joined_room_ids.contains(room_id) {
+            CommittedRoomUpdateMembership::Joined
+        } else if self.left_room_ids.contains(room_id) {
+            CommittedRoomUpdateMembership::Left
+        } else if self.invited_room_ids.contains(room_id) {
+            CommittedRoomUpdateMembership::Invited
+        } else {
+            CommittedRoomUpdateMembership::Absent
+        }
+    }
+
+    /// Return the committed timeline observation when this response contained
+    /// a joined-room update and its event-cache processing succeeded.
+    ///
+    /// A joined room without an observation was present in the response but
+    /// failed before its topology mutation committed. Callers must not infer
+    /// absence from that case.
+    pub fn room_timeline_observation(
+        &self,
+        room_id: &RoomId,
+    ) -> Option<&CommittedRoomTimelineObservation> {
+        self.joined_timeline_observations.get(room_id)
+    }
+}
+
+impl fmt::Debug for CommittedRoomUpdatesResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommittedRoomUpdatesResponse")
+            .field("response_sequence", &self.response_sequence)
+            .field("joined_room_count", &self.joined_room_count())
+            .field("left_room_count", &self.left_room_count())
+            .field("invited_room_count", &self.invited_room_count())
+            .field("joined_timeline_observation_count", &self.joined_timeline_observations.len())
+            .finish()
     }
 }
 
@@ -748,9 +802,10 @@ impl EventCacheInner {
         // to investigate, this code remains sequential for now. See also
         // https://github.com/matrix-org/matrix-rust-sdk/pull/5426.
 
-        let joined_room_count = updates.joined.len();
-        let left_room_count = updates.left.len();
-        let invited_room_count = updates.invited.len();
+        let joined_room_ids = Arc::new(updates.joined.keys().cloned().collect());
+        let left_room_ids = Arc::new(updates.left.keys().cloned().collect());
+        let invited_room_ids = Arc::new(updates.invited.keys().cloned().collect());
+        let mut joined_timeline_observations = HashMap::new();
 
         // Left rooms.
         for (room_id, left_room_update) in updates.left {
@@ -801,7 +856,8 @@ impl EventCacheInner {
                 timeline,
             };
             let mut retained = self.committed_room_timeline_sender.borrow().as_ref().clone();
-            retained.insert(room_id, observation);
+            retained.insert(room_id.clone(), observation.clone());
+            joined_timeline_observations.insert(room_id, observation);
             self.committed_room_timeline_sender.send_replace(Arc::new(retained));
         }
 
@@ -811,9 +867,10 @@ impl EventCacheInner {
         self.committed_room_updates_response_sender.send_replace(Some(
             CommittedRoomUpdatesResponse {
                 response_sequence,
-                joined_room_count,
-                left_room_count,
-                invited_room_count,
+                joined_room_ids,
+                left_room_ids,
+                invited_room_ids,
+                joined_timeline_observations: Arc::new(joined_timeline_observations),
             },
         ));
 
@@ -913,10 +970,28 @@ mod tests {
     use ruma::{event_id, room_id, user_id};
     use tokio::time::sleep;
 
-    use super::{EventCacheError, RoomEventCacheGenericUpdate};
+    use super::{
+        CommittedRoomUpdateMembership, CommittedRoomUpdatesResponse, EventCacheError,
+        RoomEventCacheGenericUpdate,
+    };
     use crate::test_utils::{
         assert_event_matches_msg, client::MockClientBuilder, logged_in_client,
     };
+
+    #[test]
+    fn committed_response_does_not_classify_failed_joined_processing_as_absent() {
+        let room_id = room_id!("!joined-processing-failed:example.org");
+        let response = CommittedRoomUpdatesResponse {
+            response_sequence: 7,
+            joined_room_ids: Arc::new([room_id.to_owned()].into_iter().collect()),
+            left_room_ids: Arc::default(),
+            invited_room_ids: Arc::default(),
+            joined_timeline_observations: Arc::default(),
+        };
+
+        assert_eq!(response.room_membership(room_id), CommittedRoomUpdateMembership::Joined);
+        assert!(response.room_timeline_observation(room_id).is_none());
+    }
 
     #[async_test]
     async fn test_must_explicitly_subscribe() {
