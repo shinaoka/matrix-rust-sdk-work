@@ -30,7 +30,10 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, OnceLock, RwLock as StdRwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{
+        Arc, OnceLock, RwLock as StdRwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use futures_util::future::try_join_all;
@@ -46,7 +49,7 @@ use ruma::{OwnedRoomId, RoomId};
 use tokio::sync::{
     Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
     broadcast::{Receiver, Sender, channel},
-    mpsc,
+    mpsc, watch,
 };
 use tracing::{error, instrument, trace};
 
@@ -91,6 +94,53 @@ pub use caches::{
 pub use redecryptor::{DecryptionRetryRequest, RedecryptorReport};
 
 pub use crate::event_cache::automatic_pagination::AutomaticPagination;
+
+/// Retained, token-free provenance for one room update after its event-cache
+/// topology mutation has committed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CommittedRoomTimelineObservation {
+    room_id: OwnedRoomId,
+    sequence: u64,
+    timeline: Option<RoomTimelineSyncObservation>,
+}
+
+impl CommittedRoomTimelineObservation {
+    /// Room routed by this observation.
+    pub fn room_id(&self) -> &RoomId {
+        &self.room_id
+    }
+
+    /// Monotonic process-local committed-response sequence.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Whether this response contained a timeline update.
+    pub fn has_timeline_update(&self) -> bool {
+        self.timeline.is_some()
+    }
+
+    /// Whether this response inserted an opaque timeline gap.
+    pub fn has_inserted_gap(&self) -> bool {
+        self.timeline.as_ref().and_then(RoomTimelineSyncObservation::inserted_gap).is_some()
+    }
+
+    /// Exact opaque gap descriptor inserted by this committed response.
+    pub fn inserted_gap(&self) -> Option<&RoomTimelineGapDescriptor> {
+        self.timeline.as_ref().and_then(RoomTimelineSyncObservation::inserted_gap)
+    }
+}
+
+impl fmt::Debug for CommittedRoomTimelineObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommittedRoomTimelineObservation")
+            .field("sequence", &self.sequence)
+            .field("has_timeline_update", &self.has_timeline_update())
+            .field("has_inserted_gap", &self.has_inserted_gap())
+            .finish()
+    }
+}
 
 /// An error observed in the [`EventCache`].
 #[derive(thiserror::Error, Clone, Debug)]
@@ -217,6 +267,7 @@ impl EventCache {
     pub(crate) fn new(client: &Arc<ClientInner>, event_cache_store: EventCacheStoreLock) -> Self {
         let (generic_update_sender, _) = channel(128);
         let (linked_chunk_update_sender, _) = channel(128);
+        let (committed_room_timeline_sender, _) = watch::channel(Arc::new(HashMap::new()));
 
         let weak_client = WeakClient::from_inner(client);
 
@@ -236,6 +287,8 @@ impl EventCache {
                 auto_shrink_sender: Default::default(),
                 generic_update_sender,
                 linked_chunk_update_sender,
+                committed_room_timeline_sequence: AtomicU64::new(0),
+                committed_room_timeline_sender,
                 #[cfg(feature = "e2e-encryption")]
                 redecryption_channels,
                 automatic_pagination: OnceLock::new(),
@@ -402,6 +455,14 @@ impl EventCache {
         self.inner.generic_update_sender.subscribe()
     }
 
+    /// Subscribe to the retained latest committed timeline observation for
+    /// every joined room.
+    pub fn subscribe_to_committed_room_timeline_observations(
+        &self,
+    ) -> watch::Receiver<Arc<HashMap<OwnedRoomId, CommittedRoomTimelineObservation>>> {
+        self.inner.committed_room_timeline_sender.subscribe()
+    }
+
     /// Returns a reference to the [`AutomaticPagination`] API, if enabled at
     /// construction with the
     /// [`EventCacheConfig::experimental_auto_backpagination`] flag.
@@ -527,6 +588,10 @@ struct EventCacheInner {
     /// See doc comment of [`RoomEventCacheLinkedChunkUpdate`].
     linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
 
+    committed_room_timeline_sequence: AtomicU64,
+    committed_room_timeline_sender:
+        watch::Sender<Arc<HashMap<OwnedRoomId, CommittedRoomTimelineObservation>>>,
+
     /// A test helper receiver that will be emitted every time the thread
     /// subscriber task subscribed to a new thread.
     ///
@@ -651,10 +716,31 @@ impl EventCacheInner {
                 continue;
             };
 
+            let previous_timeline_sequence = caches
+                .room
+                .latest_sync_observation()
+                .await
+                .map(|observation| observation.sequence());
+
             if let Err(err) = caches.handle_joined_room_update(joined_room_update).await {
                 // Non-fatal error, try to continue to the next room.
                 error!(%room_id, "handling joined room update: {err}");
+                continue;
             }
+
+            let timeline =
+                caches.room.latest_sync_observation().await.filter(|observation| {
+                    Some(observation.sequence()) != previous_timeline_sequence
+                });
+            let sequence = self
+                .committed_room_timeline_sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            let observation =
+                CommittedRoomTimelineObservation { room_id: room_id.clone(), sequence, timeline };
+            let mut retained = self.committed_room_timeline_sender.borrow().as_ref().clone();
+            retained.insert(room_id, observation);
+            self.committed_room_timeline_sender.send_replace(Arc::new(retained));
         }
 
         // Invited rooms.
