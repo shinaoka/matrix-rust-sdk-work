@@ -859,6 +859,13 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
         let newest_event_id = timeline.events.iter().rev().find_map(Event::event_id);
         let mut prev_batch = timeline.prev_batch.take();
 
+        if event_count == 0 && !prev_batch_present {
+            if let Some(new_receipt) = extract_read_receipt(ephemeral_events) {
+                self.update_read_receipts(Some(&new_receipt)).await?;
+            }
+            return Ok((false, Vec::new(), None));
+        }
+
         let DeduplicationOutcome {
             all_events: events,
             in_memory_duplicated_event_ids,
@@ -958,7 +965,13 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
 
         // Extract a new read receipt, if available.
         let new_receipt = extract_read_receipt(ephemeral_events);
-        self.post_process_new_events(events, PostProcessingOrigin::Sync, new_receipt).await?;
+        self.propagate_changes().await?;
+        if let Err(error) = self
+            .post_process_persisted_events(events, PostProcessingOrigin::Sync, new_receipt)
+            .await
+        {
+            error!(?error, "post-processing a committed sync timeline failed");
+        }
 
         if timeline.limited && has_new_gap {
             // If there was a previous batch token for a limited timeline, unload the chunks
@@ -1028,6 +1041,15 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
         // Update the store before doing the post-processing.
         self.propagate_changes().await?;
 
+        self.post_process_persisted_events(events, post_processing_origin, receipt_event).await
+    }
+
+    async fn post_process_persisted_events(
+        &mut self,
+        events: Vec<Event>,
+        post_processing_origin: PostProcessingOrigin,
+        receipt_event: Option<ReceiptEventContent>,
+    ) -> Result<(), EventCacheError> {
         // Need an explicit re-borrow to avoid a deref vs deref-mut borrowck conflict
         // below.
         let state = &mut *self.state;

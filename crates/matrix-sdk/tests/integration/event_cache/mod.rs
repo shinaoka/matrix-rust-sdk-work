@@ -171,7 +171,23 @@ async fn test_committed_room_observation_is_retained_and_advances_for_empty_resp
     assert!(!empty.has_timeline_update());
     assert!(!empty.has_inserted_gap());
 
-    let debug = format!("{first:?} {empty:?}");
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_typing(factory.typing(vec![*ALICE])),
+        )
+        .await;
+    observations.changed().await.unwrap();
+    let ephemeral = observations
+        .borrow()
+        .get(room_id)
+        .cloned()
+        .expect("ephemeral-only response is committed explicitly");
+    assert!(ephemeral.sequence() > empty.sequence());
+    assert!(!ephemeral.has_timeline_update());
+    assert!(!ephemeral.has_inserted_gap());
+
+    let debug = format!("{first:?} {empty:?} {ephemeral:?}");
     assert!(!debug.contains(room_id.as_str()));
     assert!(!debug.contains("$committed-observation-event"));
     assert!(!debug.contains("private-committed-token"));
