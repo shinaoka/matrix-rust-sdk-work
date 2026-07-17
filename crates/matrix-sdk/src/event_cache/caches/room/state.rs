@@ -449,6 +449,11 @@ impl<'a> RoomEventCacheStateLockReadGuard<'a> {
         self.state.gap_topology_generation
     }
 
+    /// Return the newest event identity in the loaded room timeline.
+    pub(super) fn newest_event_id(&self) -> Option<OwnedEventId> {
+        self.state.room_linked_chunk.revents().find_map(|(_, event)| event.event_id())
+    }
+
     /// Return the subscriber count.
     pub fn subscriber_count(&self) -> &Arc<AtomicUsize> {
         &self.state.subscriber_count
@@ -572,6 +577,11 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
     /// Return the monotonic persisted gap-topology generation.
     pub fn gap_topology_generation(&self) -> u64 {
         self.state.gap_topology_generation
+    }
+
+    /// Return the newest event identity in the loaded room timeline.
+    pub(super) fn newest_event_id(&self) -> Option<OwnedEventId> {
+        self.state.room_linked_chunk.revents().find_map(|(_, event)| event.event_id())
     }
 
     /// Return a mutable reference to the underlying room linked chunk.
@@ -1042,6 +1052,24 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
         self.propagate_changes().await?;
 
         self.post_process_persisted_events(events, post_processing_origin, receipt_event).await
+    }
+
+    /// Persist a committed live-tail update and run the same secondary processing as a sync.
+    ///
+    /// Once persistence succeeds, secondary processing failures must not hide the committed
+    /// timeline update from subscribers.
+    pub(super) async fn post_process_live_tail_events(
+        &mut self,
+        events: Vec<Event>,
+    ) -> Result<(), EventCacheError> {
+        self.propagate_changes().await?;
+        if let Err(error) =
+            self.post_process_persisted_events(events, PostProcessingOrigin::Sync, None).await
+        {
+            error!(?error, "post-processing a committed live-tail refresh failed");
+        }
+
+        Ok(())
     }
 
     async fn post_process_persisted_events(
