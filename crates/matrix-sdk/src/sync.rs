@@ -43,7 +43,7 @@ use ruma::{
 };
 use tracing::{debug, error, instrument, warn};
 
-use crate::{Client, Result, Room, event_handler::HandlerKind};
+use crate::{Client, Result, Room, client::SequencedRoomUpdates, event_handler::HandlerKind};
 
 /// The processed response of a `/sync` request.
 #[derive(Clone, Default)]
@@ -188,8 +188,17 @@ impl Client {
         self.handle_sync_events(HandlerKind::Presence, None, presence).await?;
         self.handle_sync_to_device_events(to_device).await?;
 
-        // Ignore errors when there are no receivers.
-        let _ = self.inner.room_updates_sender.send(rooms.clone());
+        // Keep sequence assignment and both observer publications in one
+        // synchronous critical section. Concurrent sync requests must not
+        // publish N+1 before N to the event-cache consumer.
+        self.inner.room_updates_publication_sequence.publish(|response_sequence| {
+            // Ignore errors when there are no receivers.
+            let _ = self.inner.room_updates_sender.send(rooms.clone());
+            let _ = self
+                .inner
+                .event_cache_room_updates_sender
+                .send(SequencedRoomUpdates { response_sequence, updates: rooms.clone() });
+        });
 
         for (room_id, room_info) in &rooms.joined {
             let Some(room) = self.get_room(room_id) else {

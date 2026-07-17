@@ -127,6 +127,76 @@ async fn test_empty_room_update_does_not_reuse_or_advance_a_sync_observation() {
     );
 }
 
+#[async_test]
+async fn test_committed_room_observation_is_retained_and_advances_for_empty_responses() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!committed-observation:example.org");
+    server.sync_joined_room(&client, room_id).await;
+    let factory = EventFactory::new().room(room_id).sender(*ALICE);
+    let mut observations = client.event_cache().subscribe_to_committed_room_timeline_observations();
+    let response_baseline = client.latest_room_updates_response_sequence();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("private-committed-token")
+                .add_timeline_event(
+                    factory
+                        .text_msg("committed")
+                        .event_id(event_id!("$committed-observation-event")),
+                ),
+        )
+        .await;
+    observations.changed().await.unwrap();
+    let first = observations.borrow().get(room_id).cloned().expect("committed room observation");
+    assert!(first.has_timeline_update());
+    assert!(first.has_inserted_gap());
+    assert!(first.response_sequence() > response_baseline);
+    assert_eq!(client.latest_room_updates_response_sequence(), first.response_sequence());
+    let late = client.event_cache().subscribe_to_committed_room_timeline_observations();
+    assert_eq!(
+        late.borrow().get(room_id).map(|value| value.sequence()),
+        Some(first.sequence()),
+        "a late subscriber must replay the retained per-room observation",
+    );
+
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id)).await;
+    observations.changed().await.unwrap();
+    let empty =
+        observations.borrow().get(room_id).cloned().expect("explicit empty committed response");
+    assert!(empty.sequence() > first.sequence());
+    assert!(empty.response_sequence() > first.response_sequence());
+    assert!(!empty.has_timeline_update());
+    assert!(!empty.has_inserted_gap());
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_typing(factory.typing(vec![*ALICE])),
+        )
+        .await;
+    observations.changed().await.unwrap();
+    let ephemeral = observations
+        .borrow()
+        .get(room_id)
+        .cloned()
+        .expect("ephemeral-only response is committed explicitly");
+    assert!(ephemeral.sequence() > empty.sequence());
+    assert!(ephemeral.response_sequence() > empty.response_sequence());
+    assert!(!ephemeral.has_timeline_update());
+    assert!(!ephemeral.has_inserted_gap());
+
+    let debug = format!("{first:?} {empty:?} {ephemeral:?}");
+    assert!(!debug.contains(room_id.as_str()));
+    assert!(!debug.contains("$committed-observation-event"));
+    assert!(!debug.contains("private-committed-token"));
+}
+
 macro_rules! assert_event_id {
     ($timeline_event:expr, $event_id:literal) => {
         assert_eq!($timeline_event.event_id().unwrap().as_str(), $event_id);
