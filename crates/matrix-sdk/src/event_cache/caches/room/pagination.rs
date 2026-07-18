@@ -298,6 +298,16 @@ pub(super) fn order_persisted_chunks(
     Ok(ordered)
 }
 
+fn cached_chunks_required_for_gap(
+    persisted: &[RawChunk<Event, Gap>],
+    current_first: ChunkIdentifier,
+    target: ChunkIdentifier,
+) -> Option<usize> {
+    let first = persisted.iter().position(|chunk| chunk.identifier == current_first)?;
+    let target = persisted.iter().position(|chunk| chunk.identifier == target)?;
+    (target <= first).then(|| first - target)
+}
+
 fn mix_revision(revision: &mut u64, bytes: &[u8]) {
     for byte in bytes {
         *revision ^= u64::from(*byte);
@@ -380,7 +390,32 @@ mod gap_snapshot_tests {
     };
     use ruma::OwnedRoomId;
 
-    use super::inspect_ordered_chunks;
+    use super::{cached_chunks_required_for_gap, inspect_ordered_chunks};
+
+    #[test]
+    fn cached_chunks_required_for_gap_tracks_persisted_reveal_distance() {
+        let chunks = (0..5)
+            .map(|identifier| RawChunk {
+                content: ChunkContent::Items(Vec::new()),
+                previous: (identifier > 0).then(|| ChunkIdentifier::new(identifier - 1)),
+                identifier: ChunkIdentifier::new(identifier),
+                next: (identifier < 4).then(|| ChunkIdentifier::new(identifier + 1)),
+            })
+            .collect::<Vec<RawChunk<Event, Gap>>>();
+
+        let cases = [(3, 3, Some(0)), (3, 2, Some(1)), (4, 1, Some(3)), (2, 3, None), (3, 9, None)];
+
+        for (current_first, target, expected) in cases {
+            assert_eq!(
+                cached_chunks_required_for_gap(
+                    &chunks,
+                    ChunkIdentifier::new(current_first),
+                    ChunkIdentifier::new(target),
+                ),
+                expected,
+            );
+        }
+    }
 
     #[test]
     fn reconstructed_room_state_invalidates_old_gap_descriptors() {
@@ -619,11 +654,12 @@ impl RoomPagination {
             let mut state = self.0.cache.state.write().await?;
             let persisted =
                 state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
+            let persisted = order_persisted_chunks(persisted)?;
             let current = inspect_ordered_chunks(
                 &state.state.room_id,
                 state.gap_snapshot_id(),
                 state.gap_topology_generation(),
-                &order_persisted_chunks(persisted)?,
+                &persisted,
             );
             if !current.gaps.iter().any(|gap| gap == descriptor) {
                 return Ok(RoomTimelineGapRepairResult::new(
@@ -632,6 +668,31 @@ impl RoomPagination {
                 ));
             }
 
+            let target_is_resident = state
+                .room_linked_chunk()
+                .chunks()
+                .any(|chunk| chunk.identifier() == descriptor.handle.chunk_identifier);
+            let cached_chunks_required = if target_is_resident {
+                0
+            } else {
+                let current_first = state
+                    .room_linked_chunk()
+                    .chunks()
+                    .next()
+                    .expect("a linked chunk is never empty")
+                    .identifier();
+                let Some(required) = cached_chunks_required_for_gap(
+                    &persisted,
+                    current_first,
+                    descriptor.handle.chunk_identifier,
+                ) else {
+                    return Ok(RoomTimelineGapRepairResult::new(
+                        RoomTimelineGapRepairOutcome::Stale,
+                        last_projection_batch,
+                    ));
+                };
+                required
+            };
             let mut cached_chunks_loaded = 0usize;
 
             loop {
@@ -649,7 +710,9 @@ impl RoomPagination {
                     break (Some(gap.token.clone()), cached_chunks_loaded);
                 }
 
-                if cached_chunks_loaded >= usize::from(budget.cached_chunk_limit) {
+                if cached_chunks_loaded >= cached_chunks_required
+                    || cached_chunks_loaded >= usize::from(budget.cached_chunk_limit)
+                {
                     break (None, cached_chunks_loaded);
                 }
 
