@@ -352,7 +352,7 @@ mod live_tail_refresh {
     }
 
     #[async_test]
-    async fn test_live_tail_refresh_uses_tokenless_messages_and_appends_newest_events() {
+    async fn test_live_tail_refresh_uses_tokenless_messages_after_stable_anchor() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
         client.event_cache().subscribe().unwrap();
@@ -380,6 +380,11 @@ mod live_tail_refresh {
                     .set_timeline_limited()
                     .set_timeline_prev_batch("unrelated-historical-gap-two")
                     .add_timeline_event(
+                        factory
+                            .text_msg("older anchor")
+                            .event_id(event_id!("$live-tail-older-anchor")),
+                    )
+                    .add_timeline_event(
                         factory.text_msg("edge").event_id(event_id!("$live-tail-edge")),
                     ),
             )
@@ -387,7 +392,7 @@ mod live_tail_refresh {
 
         assert_eq!(room_event_cache.inspect_timeline_gaps().await.unwrap().gaps.len(), 2);
         let (initial, mut subscriber) = room_event_cache.subscribe().await.unwrap();
-        assert_eq!(event_ids(&initial), ["$live-tail-edge"]);
+        assert_eq!(event_ids(&initial), ["$live-tail-older-anchor", "$live-tail-edge"]);
 
         server
             .mock_room_messages()
@@ -396,6 +401,9 @@ mod live_tail_refresh {
                 factory.text_msg("new-2").event_id(event_id!("$live-tail-new-2")),
                 factory.text_msg("new-1").event_id(event_id!("$live-tail-new-1")),
                 factory.text_msg("edge").event_id(event_id!("$live-tail-edge")),
+                factory
+                    .text_msg("older anchor")
+                    .event_id(event_id!("$live-tail-older-anchor")),
             ]))
             .expect(1)
             .named("tokenless-live-tail-overlap")
@@ -412,7 +420,7 @@ mod live_tail_refresh {
             .await
             .unwrap();
         assert_eq!(result.outcome, RoomLiveTailRefreshOutcome::Advanced { events: 2 });
-        assert_eq!(result.returned_events, 3);
+        assert_eq!(result.returned_events, 4);
         assert_eq!(result.last_projection_batch, Some(1));
 
         let update = timeout(Duration::from_secs(1), subscriber.recv()).await.unwrap().unwrap();
@@ -435,7 +443,12 @@ mod live_tail_refresh {
         }
         assert_eq!(
             event_ids(&projected),
-            ["$live-tail-edge", "$live-tail-new-1", "$live-tail-new-2"]
+            [
+                "$live-tail-older-anchor",
+                "$live-tail-edge",
+                "$live-tail-new-1",
+                "$live-tail-new-2"
+            ]
         );
         assert_eq!(
             event_ids(room_event_cache.events().await.unwrap())
@@ -459,7 +472,7 @@ mod live_tail_refresh {
     }
 
     #[async_test]
-    async fn test_unchanged_live_tail_is_a_successful_proof_without_projection() {
+    async fn test_unchanged_live_tail_is_proven_by_stable_anchor_without_projection() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
         client.event_cache().subscribe().unwrap();
@@ -471,9 +484,15 @@ mod live_tail_refresh {
         server
             .sync_room(
                 &client,
-                JoinedRoomBuilder::new(room_id).add_timeline_event(
-                    factory.text_msg("edge").event_id(event_id!("$unchanged-edge")),
-                ),
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_event(
+                        factory
+                            .text_msg("older anchor")
+                            .event_id(event_id!("$unchanged-older-anchor")),
+                    )
+                    .add_timeline_event(
+                        factory.text_msg("edge").event_id(event_id!("$unchanged-edge")),
+                    ),
             )
             .await;
         let (initial, mut subscriber) = room_event_cache.subscribe().await.unwrap();
@@ -481,8 +500,12 @@ mod live_tail_refresh {
         server
             .mock_room_messages()
             .match_limit(128)
-            .ok(RoomMessagesResponseTemplate::default()
-                .events(vec![factory.text_msg("edge").event_id(event_id!("$unchanged-edge"))]))
+            .ok(RoomMessagesResponseTemplate::default().events(vec![
+                factory.text_msg("edge").event_id(event_id!("$unchanged-edge")),
+                factory
+                    .text_msg("older anchor")
+                    .event_id(event_id!("$unchanged-older-anchor")),
+            ]))
             .expect(1)
             .named("tokenless-live-tail-unchanged")
             .mount()
@@ -684,9 +707,15 @@ mod live_tail_refresh {
         server
             .sync_room(
                 &client,
-                JoinedRoomBuilder::new(room_id).add_timeline_event(
-                    factory.text_msg("edge").event_id(event_id!("$cancel-edge")),
-                ),
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_event(
+                        factory
+                            .text_msg("older anchor")
+                            .event_id(event_id!("$cancel-older-anchor")),
+                    )
+                    .add_timeline_event(
+                        factory.text_msg("edge").event_id(event_id!("$cancel-edge")),
+                    ),
             )
             .await;
         let (initial, mut subscriber) = room_event_cache.subscribe().await.unwrap();
@@ -698,6 +727,9 @@ mod live_tail_refresh {
                 vec![
                     factory.text_msg("cancelled").event_id(event_id!("$cancelled-network-event")),
                     factory.text_msg("edge").event_id(event_id!("$cancel-edge")),
+                    factory
+                        .text_msg("older anchor")
+                        .event_id(event_id!("$cancel-older-anchor")),
                 ],
             ))
             .expect(1)
@@ -720,7 +752,10 @@ mod live_tail_refresh {
             timeout(Duration::from_secs(1), cancelled).await.unwrap().unwrap().unwrap();
         assert_eq!(cancelled_result.outcome, RoomLiveTailRefreshOutcome::Cancelled);
         assert_eq!(cancelled_result.returned_events, 0);
-        assert_eq!(event_ids(room_event_cache.events().await.unwrap()), ["$cancel-edge"]);
+        assert_eq!(
+            event_ids(room_event_cache.events().await.unwrap()),
+            ["$cancel-older-anchor", "$cancel-edge"]
+        );
         assert!(timeout(Duration::from_millis(50), subscriber.recv()).await.is_err());
 
         server
@@ -729,6 +764,9 @@ mod live_tail_refresh {
             .ok(RoomMessagesResponseTemplate::default().events(vec![
                 factory.text_msg("committed").event_id(event_id!("$commit-after-cancel")),
                 factory.text_msg("edge").event_id(event_id!("$cancel-edge")),
+                factory
+                    .text_msg("older anchor")
+                    .event_id(event_id!("$cancel-older-anchor")),
             ]))
             .expect(1)
             .named("finish-live-tail-commit-after-cancellation")
@@ -762,7 +800,10 @@ mod live_tail_refresh {
         for diff in diffs {
             diff.apply(&mut projected);
         }
-        assert_eq!(event_ids(&projected), ["$cancel-edge", "$commit-after-cancel"]);
+        assert_eq!(
+            event_ids(&projected),
+            ["$cancel-older-anchor", "$cancel-edge", "$commit-after-cancel"]
+        );
         assert!(timeout(Duration::from_millis(50), subscriber.recv()).await.is_err());
 
         let store = client.event_cache_store().lock().await.unwrap();
