@@ -14,15 +14,19 @@
 
 use std::sync::Arc;
 
-use matrix_sdk_base::{event_cache::Gap, linked_chunk::LinkedChunkId};
+use matrix_sdk_base::{
+    event_cache::Gap,
+    linked_chunk::{ChunkContent, LinkedChunkId},
+};
 use ruma::OwnedEventId;
 
 use super::{
     RoomEventCacheGenericUpdate, RoomEventCacheStateLockReadGuard,
     RoomEventCacheStateLockWriteGuard, RoomEventCacheUpdate,
     pagination::{
-        RoomLiveTailRefreshCancellation, RoomLiveTailRefreshOutcome, RoomLiveTailRefreshResult,
-        RoomPagination, RoomTimelineGapProjectionId,
+        RoomLiveTailRefreshCancellation, RoomLiveTailRefreshDiagnostics,
+        RoomLiveTailRefreshOutcome, RoomLiveTailRefreshResult, RoomPagination,
+        RoomTimelineGapProjectionId,
     },
 };
 use crate::{
@@ -38,14 +42,24 @@ struct LiveTailSnapshotFence {
     gap_snapshot_id: u64,
     gap_topology_generation: u64,
     newest_event_id: Option<OwnedEventId>,
+    contiguous_suffix_event_ids: Vec<OwnedEventId>,
 }
 
 impl LiveTailSnapshotFence {
     fn capture(state: &RoomEventCacheStateLockReadGuard<'_>) -> Self {
+        let mut contiguous_suffix_event_ids = Vec::new();
+        for chunk in state.room_linked_chunk().rchunks() {
+            match chunk.content() {
+                ChunkContent::Items(events) => contiguous_suffix_event_ids
+                    .extend(events.iter().rev().filter_map(|event| event.event_id())),
+                ChunkContent::Gap(_) => break,
+            }
+        }
         Self {
             gap_snapshot_id: state.gap_snapshot_id(),
             gap_topology_generation: state.gap_topology_generation(),
             newest_event_id: state.newest_event_id(),
+            contiguous_suffix_event_ids,
         }
     }
 
@@ -54,6 +68,66 @@ impl LiveTailSnapshotFence {
             && self.gap_topology_generation == state.gap_topology_generation()
             && self.newest_event_id == state.newest_event_id()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveTailReconciliation {
+    /// Replace the cached suffix newer than this proven older anchor. The
+    /// response is ordered newest-to-oldest, and the anchor itself stays in
+    /// place, so only the preceding prefix is committed.
+    Anchored { response_prefix_len: usize },
+    /// One page did not reach an older event in the contiguous cached suffix.
+    /// Install the authoritative page as a detached tail and retain its token
+    /// as an explicit historical gap.
+    Detached,
+}
+
+fn plan_live_tail_reconciliation(
+    cached_suffix_event_ids: &[OwnedEventId],
+    response_event_ids: &[OwnedEventId],
+) -> LiveTailReconciliation {
+    let (newest_cached_response_index, older_anchor) =
+        live_tail_anchor_indices(cached_suffix_event_ids, response_event_ids);
+    let Some(_) = newest_cached_response_index else {
+        return LiveTailReconciliation::Detached;
+    };
+    older_anchor.map_or(LiveTailReconciliation::Detached, |response_prefix_len| {
+        LiveTailReconciliation::Anchored { response_prefix_len }
+    })
+}
+
+fn live_tail_anchor_indices(
+    cached_suffix_event_ids: &[OwnedEventId],
+    response_event_ids: &[OwnedEventId],
+) -> (Option<usize>, Option<usize>) {
+    let newest_cached_response_index = cached_suffix_event_ids
+        .first()
+        .and_then(|newest| response_event_ids.iter().position(|response| response == newest));
+    let older_anchor = newest_cached_response_index.and_then(|newest_index| {
+        response_event_ids
+            .iter()
+            .enumerate()
+            .skip(newest_index + 1)
+            .filter(|(_, response_event_id)| {
+                cached_suffix_event_ids
+                    .iter()
+                    .skip(1)
+                    .any(|cached_event_id| cached_event_id == *response_event_id)
+            })
+            .map(|(index, _)| index)
+            .last()
+    });
+    (newest_cached_response_index, older_anchor)
+}
+
+fn anchored_materialized_event_count(
+    response_event_count: usize,
+    in_memory_duplicate_count: usize,
+) -> usize {
+    // Store-only duplicates are absent from the loaded linked chunk. They are
+    // not globally new, but the reconciliation must remove their old stored
+    // positions and materialize them into the authoritative live suffix.
+    response_event_count.saturating_sub(in_memory_duplicate_count)
 }
 
 impl RoomPagination {
@@ -93,6 +167,7 @@ impl RoomPagination {
             return Ok(RoomLiveTailRefreshResult {
                 outcome: RoomLiveTailRefreshOutcome::Failed,
                 returned_events: 0,
+                diagnostics: RoomLiveTailRefreshDiagnostics::default(),
                 last_projection_batch: None,
             });
         };
@@ -103,6 +178,7 @@ impl RoomPagination {
                 return Ok(RoomLiveTailRefreshResult {
                     outcome: RoomLiveTailRefreshOutcome::Cancelled,
                     returned_events: 0,
+                    diagnostics: RoomLiveTailRefreshDiagnostics::default(),
                     last_projection_batch: None,
                 });
             }
@@ -123,25 +199,26 @@ impl RoomPagination {
         projection: RoomTimelineGapProjectionId,
     ) -> Result<RoomLiveTailRefreshResult> {
         let returned_events = response.chunk.len();
-        let previous_edge = fence.newest_event_id.clone();
-        let response_contains_previous_edge = previous_edge.as_ref().is_some_and(|previous_edge| {
-            response
-                .chunk
-                .iter()
-                .any(|event| event.event_id().as_deref() == Some(previous_edge.as_ref()))
-        });
         let historical_gap_remaining = response.end.is_some();
         let mut response_events = response.chunk;
-
-        // When the page overlaps the cached edge, only the edge and events newer
-        // than it belong to the live-tail commit. Older page members already have
-        // their place in the retained history.
-        if let Some(previous_edge) = previous_edge.as_ref()
-            && let Some(edge_index) = response_events
-                .iter()
-                .position(|event| event.event_id().as_deref() == Some(previous_edge.as_ref()))
-        {
-            response_events.truncate(edge_index + 1);
+        let response_event_ids =
+            response_events.iter().filter_map(|event| event.event_id()).collect::<Vec<_>>();
+        let (newest_cached_response_index, older_anchor_response_index) =
+            live_tail_anchor_indices(&fence.contiguous_suffix_event_ids, &response_event_ids);
+        let mut diagnostics = RoomLiveTailRefreshDiagnostics {
+            cached_suffix_events: fence.contiguous_suffix_event_ids.len(),
+            response_events_with_ids: response_event_ids.len(),
+            newest_cached_response_index,
+            older_anchor_response_index,
+            ..Default::default()
+        };
+        let reconciliation =
+            plan_live_tail_reconciliation(&fence.contiguous_suffix_event_ids, &response_event_ids);
+        if let LiveTailReconciliation::Anchored { response_prefix_len } = reconciliation {
+            // Keep the proven older anchor in place. Rebuild everything newer
+            // than it, including the formerly cached newest event, so events
+            // hidden immediately before that newest event are not discarded.
+            response_events.truncate(response_prefix_len);
         }
 
         let mut state = self.cache().state.write().await?;
@@ -161,6 +238,7 @@ impl RoomPagination {
             return Ok(RoomLiveTailRefreshResult {
                 outcome: RoomLiveTailRefreshOutcome::Stale,
                 returned_events,
+                diagnostics,
                 last_projection_batch: None,
             });
         }
@@ -181,32 +259,41 @@ impl RoomPagination {
             )
             .await?
         };
-        let duplicate_count =
-            in_memory_duplicated_event_ids.len() + in_store_duplicated_event_ids.len();
+        let in_memory_duplicate_count = in_memory_duplicated_event_ids.len();
+        diagnostics.in_memory_duplicates = in_memory_duplicate_count;
+        diagnostics.in_store_duplicates = in_store_duplicated_event_ids.len();
+        let duplicate_count = in_memory_duplicate_count + in_store_duplicated_event_ids.len();
         let new_event_count = events.len().saturating_sub(duplicate_count);
-        let outcome =
-            match (previous_edge.as_ref(), response_contains_previous_edge, new_event_count) {
-                (_, _, 0) => RoomLiveTailRefreshOutcome::Unchanged,
-                (Some(_), true, count) => RoomLiveTailRefreshOutcome::Advanced { events: count },
-                (Some(_), false, count) => {
-                    RoomLiveTailRefreshOutcome::Detached { events: count, historical_gap_remaining }
-                }
-                (None, _, count) => RoomLiveTailRefreshOutcome::Advanced { events: count },
-            };
+        diagnostics.new_events = new_event_count;
+        let materialized_event_count =
+            anchored_materialized_event_count(events.len(), in_memory_duplicate_count);
+        let outcome = match reconciliation {
+            LiveTailReconciliation::Anchored { .. } if materialized_event_count == 0 => {
+                RoomLiveTailRefreshOutcome::Unchanged
+            }
+            LiveTailReconciliation::Anchored { .. } => {
+                RoomLiveTailRefreshOutcome::Advanced { events: materialized_event_count }
+            }
+            LiveTailReconciliation::Detached => RoomLiveTailRefreshOutcome::Detached {
+                events: new_event_count,
+                historical_gap_remaining,
+            },
+        };
         if matches!(outcome, RoomLiveTailRefreshOutcome::Unchanged) {
             return Ok(RoomLiveTailRefreshResult {
                 outcome,
                 returned_events,
+                diagnostics,
                 last_projection_batch: None,
             });
         }
 
         state.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids).await?;
         let chronological_events = events.into_iter().rev().collect::<Vec<_>>();
-        let insert_historical_gap = matches!(outcome, RoomLiveTailRefreshOutcome::Detached { .. })
-            || previous_edge.is_none();
-        let new_gap =
-            insert_historical_gap.then_some(response.end).flatten().map(|token| Gap { token });
+        let new_gap = matches!(reconciliation, LiveTailReconciliation::Detached)
+            .then_some(response.end)
+            .flatten()
+            .map(|token| Gap { token });
         state.room_linked_chunk_mut().push_live_events(new_gap, &chronological_events);
         state.post_process_live_tail_events(chronological_events).await?;
         let timeline_event_diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
@@ -229,6 +316,62 @@ impl RoomPagination {
         };
         drop(state);
 
-        Ok(RoomLiveTailRefreshResult { outcome, returned_events, last_projection_batch })
+        Ok(RoomLiveTailRefreshResult {
+            outcome,
+            returned_events,
+            diagnostics,
+            last_projection_batch,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruma::owned_event_id;
+
+    use super::{
+        LiveTailReconciliation, anchored_materialized_event_count, plan_live_tail_reconciliation,
+    };
+
+    #[test]
+    fn cached_newest_event_does_not_hide_a_gap_immediately_before_it() {
+        let cached = [owned_event_id!("$latest"), owned_event_id!("$older")];
+        let response =
+            [owned_event_id!("$latest"), owned_event_id!("$missing"), owned_event_id!("$older")];
+
+        assert_eq!(
+            plan_live_tail_reconciliation(&cached, &response),
+            LiveTailReconciliation::Anchored { response_prefix_len: 2 }
+        );
+    }
+
+    #[test]
+    fn matching_contiguous_suffix_has_no_events_to_insert() {
+        let cached = [owned_event_id!("$latest"), owned_event_id!("$older")];
+        let response = [owned_event_id!("$latest"), owned_event_id!("$older")];
+
+        assert_eq!(
+            plan_live_tail_reconciliation(&cached, &response),
+            LiveTailReconciliation::Anchored { response_prefix_len: 1 }
+        );
+    }
+
+    #[test]
+    fn page_without_an_older_cached_anchor_becomes_a_detached_tail() {
+        let cached = [owned_event_id!("$latest"), owned_event_id!("$far-older")];
+        let response = [owned_event_id!("$latest"), owned_event_id!("$missing")];
+
+        assert_eq!(
+            plan_live_tail_reconciliation(&cached, &response),
+            LiveTailReconciliation::Detached
+        );
+    }
+
+    #[test]
+    fn store_only_duplicates_are_materialized_into_the_live_timeline() {
+        // A store-only duplicate is not present in the in-memory linked chunk.
+        // It must therefore count as materialized work even though it is not a
+        // globally new event.
+        assert_eq!(anchored_materialized_event_count(3, 2), 1);
     }
 }

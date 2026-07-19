@@ -85,11 +85,11 @@ pub use caches::{
         // koushi-specific type returned by run_backwards_cache_only. Not part of
         // upstream matrix-sdk.
         pagination::{
-            CacheOnlyBackOutcome, RoomLiveTailRefreshCancellation, RoomLiveTailRefreshOutcome,
-            RoomLiveTailRefreshResult, RoomPagination, RoomTimelineContinuity,
-            RoomTimelineGapDescriptor, RoomTimelineGapHandle, RoomTimelineGapInspection,
-            RoomTimelineGapProjectionId, RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome,
-            RoomTimelineGapRepairResult,
+            CacheOnlyBackOutcome, RoomLiveTailRefreshCancellation, RoomLiveTailRefreshDiagnostics,
+            RoomLiveTailRefreshOutcome, RoomLiveTailRefreshResult, RoomPagination,
+            RoomTimelineContinuity, RoomTimelineGapDescriptor, RoomTimelineGapHandle,
+            RoomTimelineGapInspection, RoomTimelineGapProjectionId, RoomTimelineGapRepairBudget,
+            RoomTimelineGapRepairOutcome, RoomTimelineGapRepairResult,
         },
     },
     thread::pagination::ThreadPagination,
