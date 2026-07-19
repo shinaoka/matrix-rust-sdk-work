@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
+use futures_util::StreamExt;
+use imbl::Vector;
 use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk_test::{ALICE, BOB, async_test, sync_timeline_event};
 use ruma::{
@@ -174,6 +176,40 @@ async fn test_aggregation_only_gap_repair_emits_a_tagged_observable_barrier() {
     let _aggregation = assert_next_matches!(stream, VectorDiff::Set { value, .. } => value);
     let barrier = assert_next_matches!(stream, VectorDiff::Set { value, .. } => value);
     assert_eq!(barrier.as_event().unwrap().gap_repair_projection(), Some(projection));
+}
+
+#[async_test]
+async fn test_gap_repair_barrier_is_visible_through_the_skipping_subscriber() {
+    let timeline = TestTimeline::new();
+    let values = (0..25)
+        .map(|index| {
+            timeline.factory.text_msg(format!("message {index}")).sender(&ALICE).into_event()
+        })
+        .collect::<Vector<_>>();
+    timeline
+        .controller
+        .handle_remote_events_with_diffs(
+            vec![VectorDiff::Append { values }],
+            RemoteEventOrigin::Sync,
+        )
+        .await;
+
+    let (initial, mut stream) = timeline.controller.subscribe().await;
+    assert_eq!(initial.len(), 20, "the public subscriber must skip the old prefix");
+
+    let projection =
+        GapRepairProjectionId { actor_generation: 9, repair_generation: 11, projection_batch: 3 };
+    timeline.controller.complete_gap_repair_projection(projection).await;
+
+    assert!(timeline.controller.wait_for_gap_repair_projection(projection).await);
+    let diffs = tokio::time::timeout(Duration::from_millis(100), stream.next())
+        .await
+        .expect("an observable barrier must reach the public subscriber")
+        .expect("timeline subscriber must remain open");
+    assert!(diffs.iter().any(|diff| {
+        matches!(diff, VectorDiff::Set { value, .. }
+            if value.as_event().and_then(|event| event.gap_repair_projection()) == Some(projection))
+    }));
 }
 
 #[async_test]

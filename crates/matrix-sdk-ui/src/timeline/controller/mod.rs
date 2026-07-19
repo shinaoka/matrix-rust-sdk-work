@@ -399,25 +399,26 @@ impl<P: RoomDataProvider> TimelineController<P> {
     /// Finish one raw gap-repair publication at the observable UI boundary.
     ///
     /// New visible events already carry the exact projection tag. Filtered or
-    /// aggregation-only publications do not, so an existing remote item is
-    /// re-emitted with the tag as a causal barrier. If no remote item exists,
-    /// there is no UI projection to render and the waiter settles `false`.
+    /// aggregation-only publications do not, so an existing remote item in the
+    /// public subscriber's visible suffix is re-emitted with the tag as a
+    /// causal barrier. If that suffix has no remote item, there is no UI
+    /// projection to render and the waiter settles `false`.
     pub(super) async fn complete_gap_repair_projection(&self, projection: GapRepairProjectionId) {
         let observable = {
             let mut state = self.state.write().await;
             let items = state.items.clone_items();
-            if items.iter().any(|item| {
+            let visible_start = state.meta.subscriber_skip_count.get();
+            let mut visible_items = items.iter().enumerate().skip(visible_start);
+            if visible_items.clone().any(|(_, item)| {
                 item.as_event().and_then(EventTimelineItem::gap_repair_projection)
                     == Some(projection)
             }) {
                 true
-            } else if let Some((index, item, event)) =
-                items.iter().enumerate().find_map(|(index, item)| {
-                    let event = item.as_event()?.clone();
-                    event.as_remote()?;
-                    Some((index, item.clone(), event))
-                })
-            {
+            } else if let Some((index, item, event)) = visible_items.find_map(|(index, item)| {
+                let event = item.as_event()?.clone();
+                event.as_remote()?;
+                Some((index, item.clone(), event))
+            }) {
                 let mut tagged_event = event;
                 tagged_event.as_remote_mut().expect("remote event checked above").origin =
                     RemoteEventOrigin::GapRepair {
