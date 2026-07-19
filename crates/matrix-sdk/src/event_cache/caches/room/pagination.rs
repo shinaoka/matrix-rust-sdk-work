@@ -164,6 +164,25 @@ pub enum RoomLiveTailRefreshOutcome {
     Failed,
 }
 
+/// Privacy-safe reconciliation counters for one live-tail refresh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoomLiveTailRefreshDiagnostics {
+    /// Events in the loaded contiguous suffix captured before the request.
+    pub cached_suffix_events: usize,
+    /// Response events that carried an event ID.
+    pub response_events_with_ids: usize,
+    /// Response index of the cached newest event, if reached.
+    pub newest_cached_response_index: Option<usize>,
+    /// Response index of the selected older cached anchor, if reached.
+    pub older_anchor_response_index: Option<usize>,
+    /// Response events already present in the loaded linked chunk.
+    pub in_memory_duplicates: usize,
+    /// Response events present only in the persistent store.
+    pub in_store_duplicates: usize,
+    /// Response events not previously present in either location.
+    pub new_events: usize,
+}
+
 /// Result of one authoritative room live-tail refresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoomLiveTailRefreshResult {
@@ -171,6 +190,8 @@ pub struct RoomLiveTailRefreshResult {
     pub outcome: RoomLiveTailRefreshOutcome,
     /// Number of events returned by the homeserver before cache deduplication.
     pub returned_events: usize,
+    /// Reconciliation counters without event IDs or message content.
+    pub diagnostics: RoomLiveTailRefreshDiagnostics,
     /// Final causally tagged publication batch, if any.
     pub last_projection_batch: Option<u32>,
 }
