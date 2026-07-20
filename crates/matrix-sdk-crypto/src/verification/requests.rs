@@ -1204,6 +1204,7 @@ async fn scan_qr_code<T: Clone>(
             ready: state.to_owned(),
             verification: verification.to_owned().into(),
             other_device_data: state.other_device_data.to_owned(),
+            sas_start_origin: None,
         },
     };
 
@@ -1332,6 +1333,7 @@ async fn generate_qr_code<T: Clone>(
                 ready: state.to_owned(),
                 verification: verification.to_owned().into(),
                 other_device_data: state.other_device_data.to_owned(),
+                sas_start_origin: None,
             },
         };
 
@@ -1494,6 +1496,7 @@ async fn start_sas<T: Clone>(
                 ready: state.to_owned(),
                 verification: sas.to_owned().into(),
                 other_device_data: state.other_device_data.to_owned(),
+                sas_start_origin: Some(SasStartOrigin::Local),
             };
 
             (state, sas, content)
@@ -1510,6 +1513,7 @@ async fn start_sas<T: Clone>(
                 ready: state.to_owned(),
                 verification: sas.to_owned().into(),
                 other_device_data: state.other_device_data.to_owned(),
+                sas_start_origin: Some(SasStartOrigin::Local),
             };
             (state, sas, content)
         }
@@ -1570,9 +1574,16 @@ impl Ready {
                 ready: self.clone(),
                 verification,
                 other_device_data: self.other_device_data.clone(),
+                sas_start_origin: Some(SasStartOrigin::Remote),
             },
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SasStartOrigin {
+    Local,
+    Remote,
 }
 
 #[derive(Clone, Debug)]
@@ -1580,6 +1591,7 @@ struct Transitioned {
     ready: Ready,
     verification: Verification,
     other_device_data: DeviceData,
+    sas_start_origin: Option<SasStartOrigin>,
 }
 
 impl RequestState<Transitioned> {
@@ -1599,6 +1611,19 @@ impl RequestState<Transitioned> {
         we_started: bool,
         request_handle: RequestHandle,
     ) -> Result<Option<RequestState<Transitioned>>, CryptoStoreError> {
+        // A ready request adopts at most one remote SAS. Later SAS starts from the same
+        // peer, device, and flow are replays; locally started SAS and QR transitions must
+        // keep using their existing negotiation paths.
+        if self.state.sas_start_origin == Some(SasStartOrigin::Remote)
+            && matches!(&self.state.verification, Verification::SasV1(_))
+            && matches!(content.method(), StartMethod::SasV1(_))
+            && sender.as_str() == self.other_user_id.as_str()
+            && content.from_device() == self.state.other_device_data.device_id()
+            && content.flow_id() == self.flow_id.as_str()
+        {
+            return Ok(None);
+        }
+
         receive_start(sender, content, we_started, request_handle, self, &self.state.ready).await
     }
 
@@ -1628,6 +1653,7 @@ mod tests {
 
     use assert_matches::assert_matches;
     use assert_matches2::assert_let;
+    use futures_util::{FutureExt, StreamExt};
     #[cfg(feature = "qrcode")]
     use matrix_sdk_qrcode::QrVerificationData;
     use matrix_sdk_test::async_test;
@@ -1638,13 +1664,14 @@ mod tests {
 
     use super::VerificationRequest;
     use crate::{
-        DeviceData, VerificationRequestState,
+        DeviceData, SasState, VerificationRequestState,
         types::requests::OutgoingVerificationRequest,
         verification::{
             FlowId, Verification, VerificationStore,
             cache::VerificationCache,
             event_enums::{
-                CancelContent, OutgoingContent, ReadyContent, RequestContent, StartContent,
+                AcceptContent, CancelContent, KeyContent, OutgoingContent, ReadyContent,
+                RequestContent, StartContent,
             },
             tests::{alice_id, bob_id, setup_stores},
         },
@@ -1856,6 +1883,105 @@ mod tests {
         assert!(!alice_sas.is_cancelled());
         assert!(alice_sas.started_from_request());
         assert!(bob_sas.started_from_request());
+    }
+
+    #[async_test]
+    async fn test_replayed_sas_start_keeps_adopted_responder_sas() {
+        let (_alice, alice_store, bob, bob_store) = setup_stores().await;
+        let bob_device_data = DeviceData::from_account(&bob);
+
+        let alice_request = build_test_request(&alice_store, bob_id(), None);
+        let bob_request = build_incoming_verification_request(&bob_store, &alice_request).await;
+        do_accept_request(&bob_request, bob_device_data, &alice_request, None);
+
+        let (alice_sas, start_request) = alice_request.start_sas().await.unwrap().unwrap();
+        let start_content: OutgoingContent = start_request.try_into().unwrap();
+        let start_content = StartContent::try_from(&start_content).unwrap();
+
+        bob_request.receive_start(alice_id(), &start_content).await.unwrap();
+        assert_let!(
+            VerificationRequestState::Transitioned { verification: Verification::SasV1(sas), .. } =
+                bob_request.state()
+        );
+        let bob_sas = sas;
+        let accept_request = bob_sas.accept().unwrap();
+        assert_matches!(bob_sas.state(), SasState::Accepted { .. });
+
+        let mut request_changes = Box::pin(bob_request.changes());
+        bob_request.receive_start(alice_id(), &start_content).await.unwrap();
+
+        assert!(request_changes.next().now_or_never().is_none());
+        assert_let!(
+            VerificationRequestState::Transitioned { verification: Verification::SasV1(sas), .. } =
+                bob_request.state()
+        );
+        let adopted_bob_sas = sas;
+        assert_matches!(adopted_bob_sas.state(), SasState::Accepted { .. });
+        assert!(adopted_bob_sas.accept().is_none());
+
+        let accept_content: OutgoingContent = accept_request.try_into().unwrap();
+        let accept_content = AcceptContent::try_from(&accept_content).unwrap();
+        let (alice_key, alice_key_request) =
+            alice_sas.receive_any_event(bob_id(), &accept_content.into()).unwrap();
+        alice_sas.mark_request_as_sent(&alice_key_request.unwrap().request_id);
+
+        let alice_key = KeyContent::try_from(&alice_key).unwrap();
+        let (bob_key, bob_key_request) =
+            adopted_bob_sas.receive_any_event(alice_id(), &alice_key.into()).unwrap();
+        adopted_bob_sas.mark_request_as_sent(&bob_key_request.unwrap().request_id);
+
+        let bob_key = KeyContent::try_from(&bob_key).unwrap();
+        alice_sas.receive_any_event(bob_id(), &bob_key.into());
+
+        assert_matches!(alice_sas.state(), SasState::KeysExchanged { .. });
+        assert_matches!(adopted_bob_sas.state(), SasState::KeysExchanged { .. });
+        assert_eq!(
+            alice_sas.emoji().expect("initiator should derive emoji"),
+            adopted_bob_sas.emoji().expect("responder should derive emoji")
+        );
+        assert!(!alice_sas.is_cancelled());
+        assert!(!adopted_bob_sas.is_cancelled());
+    }
+
+    #[async_test]
+    async fn test_simultaneous_sas_starts_keep_lexicographically_smaller_start() {
+        let (_alice, alice_store, bob, bob_store) = setup_stores().await;
+        let bob_device_data = DeviceData::from_account(&bob);
+
+        let alice_request = build_test_request(&alice_store, bob_id(), None);
+        let bob_request = build_incoming_verification_request(&bob_store, &alice_request).await;
+        do_accept_request(&bob_request, bob_device_data, &alice_request, None);
+
+        let (alice_sas, alice_start_request) = alice_request.start_sas().await.unwrap().unwrap();
+        let (bob_local_sas, bob_start_request) = bob_request.start_sas().await.unwrap().unwrap();
+        assert!(!bob_local_sas.we_started());
+
+        let alice_start: OutgoingContent = alice_start_request.try_into().unwrap();
+        let alice_start = StartContent::try_from(&alice_start).unwrap();
+        bob_request.receive_start(alice_id(), &alice_start).await.unwrap();
+
+        let bob_start: OutgoingContent = bob_start_request.try_into().unwrap();
+        let bob_start = StartContent::try_from(&bob_start).unwrap();
+        alice_request.receive_start(bob_id(), &bob_start).await.unwrap();
+
+        assert_let!(
+            VerificationRequestState::Transitioned { verification: Verification::SasV1(sas), .. } =
+                bob_request.state()
+        );
+        let adopted_bob_sas = sas;
+        assert_matches!(adopted_bob_sas.state(), SasState::Started { .. });
+        assert_matches!(alice_sas.state(), SasState::Created { .. });
+        assert!(bob_local_sas.accept().is_none());
+
+        let accept_request = adopted_bob_sas.accept().unwrap();
+        let accept_content: OutgoingContent = accept_request.try_into().unwrap();
+        let accept_content = AcceptContent::try_from(&accept_content).unwrap();
+        alice_sas.receive_any_event(bob_id(), &accept_content.into()).unwrap();
+
+        assert_matches!(alice_sas.state(), SasState::Accepted { .. });
+        assert_matches!(adopted_bob_sas.state(), SasState::Accepted { .. });
+        assert!(!alice_sas.is_cancelled());
+        assert!(!adopted_bob_sas.is_cancelled());
     }
 
     #[async_test]
