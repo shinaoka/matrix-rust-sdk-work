@@ -72,7 +72,7 @@ use matrix_sdk::{
 };
 pub use room_list::*;
 use ruma::{
-    OwnedRoomId, RoomId, UInt, api::client::sync::sync_events::v5 as http, assign,
+    OwnedRoomId, RoomId, UInt, UserId, api::client::sync::sync_events::v5 as http, assign,
     events::StateEventType,
 };
 pub use state::*;
@@ -111,6 +111,27 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
 /// subscriptions that must be added to `DEFAULT_REQUIRED_STATE`.
 const DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE: &[(StateEventType, &str)] =
     &[(StateEventType::RoomPinnedEvents, "")];
+
+// An authenticated user's exact state key is equivalent to `$ME` and remains
+// compatible with servers that advertise MSC4186 without expanding the
+// placeholder. Without an authenticated user, preserve `$ME` as the fallback.
+fn required_state_for_user(
+    required_state: &[(StateEventType, &str)],
+    own_user_id: Option<&UserId>,
+) -> Vec<(StateEventType, String)> {
+    required_state
+        .iter()
+        .map(|(state_event, value)| {
+            let value = if *state_event == StateEventType::RoomMember && *value == "$ME" {
+                own_user_id.map_or(*value, UserId::as_str)
+            } else {
+                value
+            };
+
+            (state_event.clone(), value.to_owned())
+        })
+        .collect()
+}
 
 /// The default Sliding Sync connection ID for the room list service.
 pub(crate) const DEFAULT_CONNECTION_ID: &str = "room-list";
@@ -296,12 +317,10 @@ impl RoomListService {
                             .add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
                     )
                     .timeline_limit(timeline_limit)
-                    .required_state(
-                        DEFAULT_REQUIRED_STATE
-                            .iter()
-                            .map(|(state_event, value)| (state_event.clone(), (*value).to_owned()))
-                            .collect(),
-                    )
+                    .required_state(required_state_for_user(
+                        DEFAULT_REQUIRED_STATE,
+                        client.user_id(),
+                    ))
                     .filters(Some(assign!(http::request::ListFilters::default(), {
                         // As defined in the [SlidingSync MSC](https://github.com/matrix-org/matrix-spec-proposals/blob/9450ced7fb9cf5ea9077d029b3adf36aebfa8709/proposals/3575-sync.md?plain=1#L444)
                         // If unset, both invited and joined rooms are returned. If false, no invited rooms are
@@ -585,9 +604,8 @@ impl RoomListService {
     ) -> RoomSubscriptionGeneration {
         // Calculate the settings for the room subscriptions.
         let settings = assign!(http::request::RoomSubscription::default(), {
-            required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
-                (state_event.clone(), (*value).to_owned())
-            })
+            required_state: required_state_for_user(DEFAULT_REQUIRED_STATE, self.client.user_id())
+            .into_iter()
             .chain(
                 DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
                     (state_event.clone(), (*value).to_owned())
@@ -781,9 +799,51 @@ mod tests {
     use futures_util::{StreamExt, pin_mut};
     use matrix_sdk::{SlidingSyncMode, test_utils::mocks::MatrixMockServer};
     use matrix_sdk_test::{TestError, async_test};
-    use ruma::{api::client::sync::sync_events::v5, assign, room_id, uint};
+    use ruma::{
+        api::client::sync::sync_events::v5, assign, events::StateEventType, room_id, uint, user_id,
+    };
 
-    use super::{ALL_ROOMS_LIST_NAME, Error, RoomListService, RoomSubscriptionState, State};
+    use super::{
+        ALL_ROOMS_LIST_NAME, Error, RoomListService, RoomSubscriptionState, State,
+        required_state_for_user,
+    };
+
+    #[test]
+    fn required_state_expands_only_own_membership_placeholder() {
+        let own_user_id = user_id!("@compat:example.org");
+        let required_state = [
+            (StateEventType::RoomMember, "$ME"),
+            (StateEventType::RoomMember, "$LAZY"),
+            (StateEventType::RoomMember, "*"),
+            (StateEventType::RoomName, "$ME"),
+            (StateEventType::SpaceChild, "*"),
+        ];
+
+        assert_eq!(
+            required_state_for_user(&required_state, Some(own_user_id)),
+            vec![
+                (StateEventType::RoomMember, own_user_id.to_string()),
+                (StateEventType::RoomMember, "$LAZY".to_owned()),
+                (StateEventType::RoomMember, "*".to_owned()),
+                (StateEventType::RoomName, "$ME".to_owned()),
+                (StateEventType::SpaceChild, "*".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn required_state_preserves_own_membership_placeholder_without_user() {
+        let required_state =
+            [(StateEventType::RoomMember, "$ME"), (StateEventType::RoomMember, "$LAZY")];
+
+        assert_eq!(
+            required_state_for_user(&required_state, None),
+            vec![
+                (StateEventType::RoomMember, "$ME".to_owned()),
+                (StateEventType::RoomMember, "$LAZY".to_owned()),
+            ]
+        );
+    }
 
     #[test]
     fn room_subscription_state_debug_redacts_active_room_ids() {
