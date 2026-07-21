@@ -565,9 +565,26 @@ impl BaseClient {
         &self,
         response: api::sync::sync_events::v3::Response,
     ) -> Result<SyncResponse> {
-        self.receive_sync_response_with_requested_required_states(
+        self.receive_sync_response_with_requested_required_states_and_sync_token(
             response,
             &RequestedRequiredStates::default(),
+            true,
+        )
+        .await
+    }
+
+    /// Receive and persist a sync response while optionally preserving the
+    /// previously stored sync token.
+    #[doc(hidden)]
+    pub async fn receive_sync_response_with_sync_token(
+        &self,
+        response: api::sync::sync_events::v3::Response,
+        save_sync_token: bool,
+    ) -> Result<SyncResponse> {
+        self.receive_sync_response_with_requested_required_states_and_sync_token(
+            response,
+            &RequestedRequiredStates::default(),
+            save_sync_token,
         )
         .await
     }
@@ -584,10 +601,26 @@ impl BaseClient {
         response: api::sync::sync_events::v3::Response,
         requested_required_states: &RequestedRequiredStates,
     ) -> Result<SyncResponse> {
+        self.receive_sync_response_with_requested_required_states_and_sync_token(
+            response,
+            requested_required_states,
+            true,
+        )
+        .await
+    }
+
+    async fn receive_sync_response_with_requested_required_states_and_sync_token(
+        &self,
+        response: api::sync::sync_events::v3::Response,
+        requested_required_states: &RequestedRequiredStates,
+        save_sync_token: bool,
+    ) -> Result<SyncResponse> {
         // The server might respond multiple times with the same sync token, in
         // that case we already received this response and there's nothing to
         // do.
-        if self.state_store.sync_token.read().await.as_ref() == Some(&response.next_batch) {
+        if save_sync_token
+            && self.state_store.sync_token.read().await.as_ref() == Some(&response.next_batch)
+        {
             info!("Got the same sync response twice");
             return Ok(SyncResponse::default());
         }
@@ -607,7 +640,9 @@ impl BaseClient {
         #[cfg(feature = "e2e-encryption")]
         let olm_machine = self.olm_machine().await;
 
-        let mut context = Context::new(StateChanges::new(response.next_batch.clone()));
+        let sync_token = save_sync_token.then(|| response.next_batch.clone());
+        let mut context =
+            Context::new(StateChanges { sync_token: sync_token.clone(), ..Default::default() });
 
         #[cfg(feature = "e2e-encryption")]
         let processors::e2ee::to_device::Output { processed_to_device_events: to_device } =
@@ -772,7 +807,7 @@ impl BaseClient {
             &self.state_store,
             &state_store_guard,
             &self.ignore_user_list_changes,
-            Some(response.next_batch.clone()),
+            sync_token,
         )
         .await?;
 

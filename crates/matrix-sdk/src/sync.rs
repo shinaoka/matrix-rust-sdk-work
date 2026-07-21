@@ -151,13 +151,24 @@ impl Client {
         &self,
         response: sync_events::v3::Response,
     ) -> Result<BaseSyncResponse> {
+        self.process_sync_with_sync_token(response, true).await
+    }
+
+    pub(crate) async fn process_sync_with_sync_token(
+        &self,
+        response: sync_events::v3::Response,
+        save_sync_token: bool,
+    ) -> Result<BaseSyncResponse> {
         subscribe_to_room_latest_events(
             self,
             response.rooms.join.keys().chain(response.rooms.leave.keys()),
         )
         .await;
 
-        let response = Box::pin(self.base_client().receive_sync_response(response)).await?;
+        let response = Box::pin(
+            self.base_client().receive_sync_response_with_sync_token(response, save_sync_token),
+        )
+        .await?;
 
         // Some new keys might have been received, so trigger a backup if needed.
         #[cfg(feature = "e2e-encryption")]

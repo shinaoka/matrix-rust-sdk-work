@@ -2909,7 +2909,11 @@ impl Client {
 
         let response = self.send(request).with_request_config(request_config).await?;
         let next_batch = response.next_batch.clone();
-        let response = self.process_sync(response).await?;
+        let response = if sync_settings.save_sync_token {
+            self.process_sync(response).await?
+        } else {
+            self.process_sync_with_sync_token(response, false).await?
+        };
 
         #[cfg(feature = "e2e-encryption")]
         if let Err(e) = self.send_outgoing_requests().await {
@@ -3675,7 +3679,11 @@ struct PreJoinRoomInfo {
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) mod tests {
     use std::{
-        sync::{Arc, mpsc},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            mpsc,
+        },
         thread,
         time::Duration,
     };
@@ -3723,7 +3731,7 @@ pub(crate) mod tests {
     use crate::{
         Error, TransmissionProgress,
         client::{WeakClient, caches::CachedValue, futures::SendMediaUploadRequest},
-        config::{RequestConfig, SyncSettings},
+        config::{RequestConfig, SyncSettings, SyncToken},
         futures::SendRequest,
         media::MediaError,
         test_utils::{client::MockClientBuilder, mocks::MatrixMockServer},
@@ -4856,6 +4864,100 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[async_test]
+    async fn test_non_persisting_sync_preserves_canonical_token_after_store_reopen() {
+        let server = MatrixMockServer::new().await;
+        let store = tempfile::tempdir().unwrap();
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(store.path(), None))
+            .build()
+            .await;
+
+        let canonical = {
+            let sync = server.mock_sync().ok(|_| {}).mock_once().mount_as_scoped().await;
+            let response = client.sync_once(SyncSettings::new()).await.unwrap();
+            drop(sync);
+            response.next_batch
+        };
+        assert_eq!(client.sync_token().await.as_deref(), Some(canonical.as_str()));
+
+        let restricted = {
+            let sync = server.mock_sync().ok(|_| {}).mock_once().mount_as_scoped().await;
+            let response = client
+                .sync_once(SyncSettings::new().token(SyncToken::NoToken).save_sync_token(false))
+                .await
+                .unwrap();
+            drop(sync);
+            response.next_batch
+        };
+        assert_ne!(restricted, canonical);
+        assert_eq!(client.sync_token().await.as_deref(), Some(canonical.as_str()));
+
+        drop(client);
+        let reopened = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(store.path(), None))
+            .build()
+            .await;
+        assert_eq!(reopened.sync_token().await.as_deref(), Some(canonical.as_str()));
+    }
+
+    #[async_test]
+    async fn test_non_persisting_sync_keeps_fresh_store_without_token() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sync = server.mock_sync().ok(|_| {}).mock_once().mount_as_scoped().await;
+
+        client
+            .sync_once(SyncSettings::new().token(SyncToken::NoToken).save_sync_token(false))
+            .await
+            .unwrap();
+        drop(sync);
+
+        assert_eq!(client.sync_token().await, None);
+    }
+
+    #[async_test]
+    async fn test_non_persisting_sync_still_processes_to_device_events() {
+        use ruma::events::dummy::ToDeviceDummyEvent;
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        client.add_event_handler({
+            let deliveries = deliveries.clone();
+            move |_event: ToDeviceDummyEvent| {
+                let deliveries = deliveries.clone();
+                async move {
+                    deliveries.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+        });
+        let sync = server
+            .mock_sync()
+            .ok(|builder| {
+                builder.add_to_device_event(json!({
+                    "sender": "@example:localhost",
+                    "type": "m.dummy",
+                    "content": {},
+                }));
+            })
+            .mock_once()
+            .mount_as_scoped()
+            .await;
+
+        client
+            .sync_once(SyncSettings::new().token(SyncToken::NoToken).save_sync_token(false))
+            .await
+            .unwrap();
+        drop(sync);
+
+        assert_eq!(deliveries.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(client.sync_token().await, None);
     }
 
     #[async_test]

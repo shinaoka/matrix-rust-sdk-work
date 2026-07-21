@@ -551,7 +551,10 @@ impl VerificationRequest {
         self.cancel_with_code(CancelCode::User)
     }
 
-    fn cancel_with_code(&self, cancel_code: CancelCode) -> Option<OutgoingVerificationRequest> {
+    pub(crate) fn cancel_with_code(
+        &self,
+        cancel_code: CancelCode,
+    ) -> Option<OutgoingVerificationRequest> {
         let mut guard = self.inner.write();
 
         let send_to_everyone = self.we_started() && matches!(*guard, InnerRequest::Created(_));
