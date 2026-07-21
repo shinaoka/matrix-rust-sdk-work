@@ -61,6 +61,7 @@ pub struct SyncSettings {
     pub(crate) timeout: Option<Duration>,
     pub(crate) ignore_timeout_on_first_sync: bool,
     pub(crate) token: SyncToken,
+    pub(crate) save_sync_token: bool,
     pub(crate) full_state: bool,
     pub(crate) set_presence: PresenceState,
 }
@@ -79,6 +80,7 @@ impl fmt::Debug for SyncSettings {
             timeout,
             ignore_timeout_on_first_sync,
             token: _,
+            save_sync_token,
             full_state,
             set_presence,
         } = self;
@@ -86,6 +88,7 @@ impl fmt::Debug for SyncSettings {
             .maybe_field("filter", filter)
             .maybe_field("timeout", timeout)
             .field("ignore_timeout_on_first_sync", ignore_timeout_on_first_sync)
+            .field("save_sync_token", save_sync_token)
             .field("full_state", full_state)
             .field("set_presence", set_presence)
             .finish()
@@ -101,6 +104,7 @@ impl SyncSettings {
             timeout: Some(DEFAULT_SYNC_TIMEOUT),
             ignore_timeout_on_first_sync: false,
             token: SyncToken::default(),
+            save_sync_token: true,
             full_state: false,
             set_presence: PresenceState::Online,
         }
@@ -114,6 +118,17 @@ impl SyncSettings {
     #[must_use]
     pub fn token(mut self, token: impl Into<SyncToken>) -> Self {
         self.token = token.into();
+        self
+    }
+
+    /// Set whether a successful response replaces the client's stored sync token.
+    ///
+    /// This should only be disabled for specialized filtered sync requests whose
+    /// response token is not a valid baseline for the client's normal sync stream.
+    /// All response state, including to-device events, is still processed and stored.
+    #[must_use]
+    pub fn save_sync_token(mut self, save: bool) -> Self {
+        self.save_sync_token = save;
         self
     }
 

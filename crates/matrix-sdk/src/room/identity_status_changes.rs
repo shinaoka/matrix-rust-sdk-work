@@ -499,6 +499,10 @@ mod tests {
     async fn test_multiple_identity_changes_are_reported() {
         // Given a room containing just us
         let mut t = TestSetup::new_just_me_room().await;
+        assert!(
+            t.members_are_synced(),
+            "the synthetic room contains its complete membership and must not fetch /members"
+        );
 
         // And Bob's identity is unpinned
         t.unpin_bob().await;
@@ -658,6 +662,10 @@ mod tests {
 
             pub(super) fn bob_user_id(&self) -> &UserId {
                 &self.bob_user_id
+            }
+
+            pub(super) fn members_are_synced(&self) -> bool {
+                self.room.are_members_synced()
             }
 
             pub(super) async fn pin_bob(&self) {
@@ -902,6 +910,7 @@ mod tests {
                 .build_sync_response();
             client.process_sync(create_room_sync_response).await.unwrap();
             let room = client.get_room(&DEFAULT_TEST_ROOM_ID).expect("Room should exist");
+            room.inner.mark_members_synced();
             assert_eq!(room.state(), RoomState::Joined);
             room
         }

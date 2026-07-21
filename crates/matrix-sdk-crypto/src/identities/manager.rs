@@ -13,21 +13,20 @@
 // limitations under the License.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
     time::Duration,
 };
 
 use futures_util::future::join_all;
-use itertools::Itertools;
 use matrix_sdk_common::{executor::spawn, failures_cache::FailuresCache};
 use ruma::{
     OwnedDeviceId, OwnedServerName, OwnedTransactionId, OwnedUserId, ServerName, TransactionId,
     UserId, api::client::keys::get_keys::v3::Response as KeysQueryResponse, serde::Raw,
 };
-use tokio::sync::Mutex;
-use tracing::{Level, debug, enabled, info, instrument, trace, warn};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     CryptoStoreError, LocalTrust, OwnUserIdentity, SignatureError, UserIdentity,
@@ -74,21 +73,93 @@ pub(crate) struct IdentityManager {
 
     pub(crate) key_query_manager: Arc<KeyQueryManager>,
 
-    /// Details of the current "in-flight" key query request, if any
-    keys_query_request_details: Arc<Mutex<Option<KeysQueryRequestDetails>>>,
+    /// Details of the in-flight key-query requests, keyed by request ID.
+    keys_query_request_details:
+        Arc<StdRwLock<HashMap<OwnedTransactionId, KeysQueryRequestDetails>>>,
+
+    #[cfg(test)]
+    post_key_query_commit_pause: Arc<StdRwLock<Option<IdentityManagerTestPause>>>,
+
+    #[cfg(test)]
+    post_key_query_inner_processing_pause: Arc<StdRwLock<Option<IdentityManagerTestPause>>>,
+
+    #[cfg(test)]
+    pre_key_query_metadata_commit_pause: Arc<StdRwLock<Option<IdentityManagerTestPause>>>,
+
+    #[cfg(test)]
+    pre_key_query_response_gate_pause: Arc<StdRwLock<Option<IdentityManagerTestPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct IdentityManagerTestPause {
+    entered: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
 }
 
 /// Details of an in-flight key query request
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct KeysQueryRequestDetails {
     /// The sequence number, to be passed to
     /// `Store.mark_tracked_users_as_up_to_date`.
     sequence_number: SequenceNumber,
 
-    /// A single batch of queries returned by the Store is broken up into one or
-    /// more actual KeysQueryRequests, each with their own request id. We
-    /// record the outstanding request ids here.
-    request_ids: HashSet<OwnedTransactionId>,
+    /// The stable request returned again until its response is consumed.
+    request: KeysQueryRequest,
+
+    /// The users covered by this exact request. A failed response may omit
+    /// every requested user from `device_keys`.
+    users: HashSet<OwnedUserId>,
+
+    /// Serializes complete response-associated processing for this exact
+    /// stable request ID.
+    response_gate: Arc<AsyncMutex<()>>,
+}
+
+/// A lease which serializes complete response-associated processing for one
+/// stable key-query request ID.
+pub(crate) struct KeyQueryResponseLease {
+    keys_query_request_details:
+        Arc<StdRwLock<HashMap<OwnedTransactionId, KeysQueryRequestDetails>>>,
+    request_id: OwnedTransactionId,
+    response_gate: Option<Arc<AsyncMutex<()>>>,
+    _response_guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl KeyQueryResponseLease {
+    /// Return the exact users still covered by this lease after acquiring its
+    /// response gate. A removed or replaced entry carries no obligation.
+    pub(crate) fn covered_users(&self) -> HashSet<OwnedUserId> {
+        let Some(response_gate) = &self.response_gate else {
+            return HashSet::new();
+        };
+
+        self.keys_query_request_details
+            .read()
+            .expect("key-query request details lock")
+            .get(&self.request_id)
+            .filter(|details| Arc::ptr_eq(&details.response_gate, response_gate))
+            .map(|details| details.users.clone())
+            .unwrap_or_default()
+    }
+
+    /// Consume the stable metadata after successful identity processing and
+    /// verification recovery. Pointer matching prevents an obsolete lease from
+    /// removing a newer entry which happens to reuse the same request ID.
+    pub(crate) fn consume(self) {
+        let Some(response_gate) = &self.response_gate else {
+            return;
+        };
+
+        let mut request_details =
+            self.keys_query_request_details.write().expect("key-query request details lock");
+        let remove = request_details
+            .get(&self.request_id)
+            .is_some_and(|details| Arc::ptr_eq(&details.response_gate, response_gate));
+        if remove {
+            request_details.remove(&self.request_id);
+        }
+    }
 }
 
 // Helper type to handle key query response
@@ -102,13 +173,21 @@ impl IdentityManager {
     const MAX_KEY_QUERY_USERS: usize = 250;
 
     pub fn new(store: Store) -> Self {
-        let keys_query_request_details = Mutex::new(None);
+        let keys_query_request_details = StdRwLock::new(HashMap::new());
 
         IdentityManager {
             store,
             key_query_manager: Default::default(),
             failures: Default::default(),
             keys_query_request_details: keys_query_request_details.into(),
+            #[cfg(test)]
+            post_key_query_commit_pause: Default::default(),
+            #[cfg(test)]
+            post_key_query_inner_processing_pause: Default::default(),
+            #[cfg(test)]
+            pre_key_query_metadata_commit_pause: Default::default(),
+            #[cfg(test)]
+            pre_key_query_response_gate_pause: Default::default(),
         }
     }
 
@@ -132,12 +211,7 @@ impl IdentityManager {
         request_id: &TransactionId,
         response: &KeysQueryResponse,
     ) -> OlmResult<(DeviceChanges, IdentityChanges)> {
-        debug!(
-            ?request_id,
-            users = ?response.device_keys.keys().collect::<BTreeSet<_>>(),
-            failures = ?response.failures,
-            "Handling a `/keys/query` response"
-        );
+        debug!("Handling a `/keys/query` response");
 
         // Parse the strings into server names and filter out our own server. We should
         // never get failures from our own server but let's remove it as a
@@ -168,6 +242,9 @@ impl IdentityManager {
 
         self.store.save_changes(changes).await?;
 
+        #[cfg(test)]
+        self.pause_after_key_query_commit_for_test().await;
+
         // Update the sender data on any existing inbound group sessions based on the
         // changes in this response.
         //
@@ -186,38 +263,159 @@ impl IdentityManager {
         // at the same time as `OlmMachine::mark_request_as_sent`).
         self.update_sender_data_from_device_changes(&devices).await?;
 
-        // if this request is one of those we expected to be in flight, pass the
-        // sequence number back to the store so that it can mark devices up to
-        // date
-        let sequence_number = {
-            let mut request_details = self.keys_query_request_details.lock().await;
+        // If this request is one of those we expected to be in flight, pass its
+        // sequence number back to the store so that it can mark devices up to date.
+        // This lookup is deliberately non-consuming: the outer OlmMachine response
+        // owner retains the stable request metadata through verification recovery.
+        let request_details = self
+            .keys_query_request_details
+            .read()
+            .expect("key-query request details lock")
+            .get(request_id)
+            .cloned();
 
-            request_details.as_mut().and_then(|details| {
-                if details.request_ids.remove(request_id) {
-                    Some(details.sequence_number)
-                } else {
-                    None
-                }
-            })
-        };
-
-        if let Some(sequence_number) = sequence_number {
+        if let Some(request_details) = &request_details {
             let cache = self.store.cache().await?;
             self.key_query_manager
                 .synced(&cache)
                 .await?
                 .mark_tracked_users_as_up_to_date(
                     response.device_keys.keys().map(Deref::deref),
-                    sequence_number,
+                    request_details.sequence_number,
                 )
                 .await?;
         }
 
-        if enabled!(Level::DEBUG) {
-            debug_log_keys_query_response(&devices, &identities, request_id);
-        }
+        debug!("Finished handling of the `/keys/query` response");
 
         Ok((devices, identities))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_post_key_query_commit_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) {
+        *self.post_key_query_commit_pause.write().expect("test pause lock") =
+            Some(IdentityManagerTestPause { entered, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_post_key_query_inner_processing_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) {
+        *self.post_key_query_inner_processing_pause.write().expect("test pause lock") =
+            Some(IdentityManagerTestPause { entered, release });
+    }
+
+    #[cfg(test)]
+    fn set_pre_key_query_metadata_commit_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) {
+        *self.pre_key_query_metadata_commit_pause.write().expect("test pause lock") =
+            Some(IdentityManagerTestPause { entered, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pre_key_query_response_gate_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) {
+        *self.pre_key_query_response_gate_pause.write().expect("test pause lock") =
+            Some(IdentityManagerTestPause { entered, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn users_for_key_query_request(
+        &self,
+        request_id: &TransactionId,
+    ) -> HashSet<OwnedUserId> {
+        self.keys_query_request_details
+            .read()
+            .expect("key-query request details lock")
+            .get(request_id)
+            .map(|details| details.users.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn key_query_request_count_for_test(&self) -> usize {
+        self.keys_query_request_details.read().expect("key-query request details lock").len()
+    }
+
+    /// Acquire the stable request ID's response gate, then return a lease which
+    /// can revalidate exact response coverage and consume the metadata.
+    pub(crate) async fn acquire_key_query_response_lease(
+        &self,
+        request_id: &TransactionId,
+    ) -> KeyQueryResponseLease {
+        let response_gate = self
+            .keys_query_request_details
+            .read()
+            .expect("key-query request details lock")
+            .get(request_id)
+            .map(|details| Arc::clone(&details.response_gate));
+
+        #[cfg(test)]
+        if response_gate.is_some() {
+            self.pause_before_key_query_response_gate_for_test().await;
+        }
+
+        let response_guard = match &response_gate {
+            Some(response_gate) => Some(Arc::clone(response_gate).lock_owned().await),
+            None => None,
+        };
+
+        KeyQueryResponseLease {
+            keys_query_request_details: Arc::clone(&self.keys_query_request_details),
+            request_id: request_id.to_owned(),
+            response_gate,
+            _response_guard: response_guard,
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_after_key_query_commit_for_test(&self) {
+        let pause = self.post_key_query_commit_pause.write().expect("test pause lock").take();
+        if let Some(pause) = pause {
+            pause.entered.wait().await;
+            pause.release.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_key_query_inner_processing_for_test(&self) {
+        let pause =
+            self.post_key_query_inner_processing_pause.write().expect("test pause lock").take();
+        if let Some(pause) = pause {
+            pause.entered.wait().await;
+            pause.release.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_before_key_query_metadata_commit_for_test(&self) {
+        let pause =
+            self.pre_key_query_metadata_commit_pause.write().expect("test pause lock").take();
+        if let Some(pause) = pause {
+            pause.entered.wait().await;
+            pause.release.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_before_key_query_response_gate_for_test(&self) {
+        let pause = self.pre_key_query_response_gate_pause.write().expect("test pause lock").take();
+        if let Some(pause) = pause {
+            pause.entered.wait().await;
+            pause.release.wait().await;
+        }
     }
 
     async fn update_or_create_device(
@@ -229,13 +427,8 @@ impl IdentityManager {
 
         if let Some(mut device) = old_device {
             match device.update_device(&device_keys) {
-                Err(e) => {
-                    warn!(
-                        user_id = ?device.user_id(),
-                        device_id = ?device.device_id(),
-                        error = ?e,
-                        "Rejecting device update",
-                    );
+                Err(_) => {
+                    warn!("Rejecting device update");
                     Ok(DeviceChange::None)
                 }
                 Ok(true) => Ok(DeviceChange::Updated(device)),
@@ -254,11 +447,8 @@ impl IdentityManager {
                             d.set_trust_state(LocalTrust::Verified);
 
                             trace!(
-                                user_id = ?d.user_id(),
-                                device_id = ?d.device_id(),
-                                keys = ?d.keys(),
                                 "Adding our own device to the device store, \
-                                marking it as locally verified",
+                                 marking it as locally verified"
                             );
 
                             Ok(DeviceChange::New(d))
@@ -266,23 +456,13 @@ impl IdentityManager {
                             Ok(DeviceChange::None)
                         }
                     } else {
-                        trace!(
-                            user_id = ?d.user_id(),
-                            device_id = ?d.device_id(),
-                            keys = ?d.keys(),
-                            "Adding a new device to the device store",
-                        );
+                        trace!("Adding a new device to the device store");
 
                         Ok(DeviceChange::New(d))
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        user_id = ?device_keys.user_id,
-                        device_id = ?device_keys.device_id,
-                        error = ?e,
-                        "Rejecting a previously unseen device",
-                    );
+                Err(_) => {
+                    warn!("Rejecting a previously unseen device");
 
                     Ok(DeviceChange::None)
                 }
@@ -306,23 +486,14 @@ impl IdentityManager {
         ) {
             Ok(device_keys) => {
                 if user_id != device_keys.user_id || device_id != device_keys.device_id {
-                    warn!(
-                        ?user_id,
-                        ?device_id,
-                        device_key_user = ?device_keys.user_id,
-                        device_key_device_id = ?device_keys.device_id,
-                        "Mismatch in the device keys payload",
-                    );
+                    warn!("Mismatch in the device keys payload");
                     None
                 } else {
                     Some(spawn(Self::update_or_create_device(store.clone(), device_keys)))
                 }
             }
-            Err(e) => {
-                warn!(
-                    ?user_id, ?device_id, error = ?e,
-                    "Device keys failed to deserialize",
-                );
+            Err(_) => {
+                warn!("Device keys failed to deserialize");
                 None
             }
         });
@@ -347,15 +518,7 @@ impl IdentityManager {
         let own_user_id = store.static_account().user_id();
         for device_id in deleted_devices_set {
             if user_id == *own_user_id && *device_id == &own_device_id {
-                let identity_keys = store.static_account().identity_keys();
-
-                warn!(
-                    user_id = ?own_user_id,
-                    device_id = ?own_device_id,
-                    curve25519_key = ?identity_keys.curve25519,
-                    ed25519_key = ?identity_keys.ed25519,
-                    "Our own device might have been deleted"
-                );
+                warn!("Our own device might have been deleted");
             } else if let Some(device) = stored_devices.get(*device_id) {
                 device.mark_as_deleted();
                 changes.deleted.push(device.clone());
@@ -424,7 +587,7 @@ impl IdentityManager {
         let result = private_identity.clear_if_differs(identity).await;
 
         if result.any_differ() {
-            info!(cleared = ?result, "Removed some or all of our private cross signing keys");
+            info!("Removed some or all of our private cross signing keys");
             Some((*private_identity).clone())
         } else {
             // If the master key didn't rotate above (`clear_if_differs`),
@@ -602,11 +765,8 @@ impl IdentityManager {
                     None
                 }
             }
-            Err(e) => {
-                warn!(
-                    error = ?e,
-                    "Couldn't update or create new user identity"
-                );
+            Err(_) => {
+                warn!("Couldn't update or create new user identity");
                 None
             }
         }
@@ -639,11 +799,7 @@ impl IdentityManager {
         };
 
         if user_signing.user_id() != self.user_id() {
-            warn!(
-                expected = ?self.user_id(),
-                got = ?user_signing.user_id(),
-                "User ID mismatch in our user-signing key",
-            );
+            warn!("User ID mismatch in our user-signing key");
             return Err(SignatureError::UserIdMismatch);
         }
 
@@ -667,7 +823,7 @@ impl IdentityManager {
     ///   verification status of updated identity.
     /// * `key_set_info` - The identity info as returned by the `/keys/query`
     ///   response.
-    #[instrument(skip_all, fields(user_id))]
+    #[instrument(skip_all)]
     async fn update_or_create_identity(
         &self,
         response: &KeysQueryResponse,
@@ -678,7 +834,7 @@ impl IdentityManager {
     ) -> StoreResult<()> {
         let KeySetInfo { user_id, master_key, self_signing } = key_set_info;
         if master_key.user_id() != user_id || self_signing.user_id() != user_id {
-            warn!(?user_id, "User ID mismatch in one of the cross signing keys");
+            warn!("User ID mismatch in one of the cross signing keys");
         } else if let Some(i) = self.store.get_user_identity(&user_id).await? {
             // an identity we knew about before, which is being updated
             match self
@@ -693,15 +849,15 @@ impl IdentityManager {
                 .await
             {
                 Ok(IdentityUpdateResult::Updated(identity)) => {
-                    trace!(?identity, "Updated a user identity");
+                    trace!("Updated a user identity");
                     changes.changed.push(identity);
                 }
                 Ok(IdentityUpdateResult::Unchanged(identity)) => {
-                    trace!(?identity, "Received an unchanged user identity");
+                    trace!("Received an unchanged user identity");
                     changes.unchanged.push(identity);
                 }
-                Err(e) => {
-                    warn!(error = ?e, "Couldn't update an existing user identity");
+                Err(_) => {
+                    warn!("Couldn't update an existing user identity");
                 }
             }
         } else {
@@ -717,11 +873,11 @@ impl IdentityManager {
                 .await
             {
                 Ok(identity) => {
-                    trace!(?identity, "Created new user identity");
+                    trace!("Created new user identity");
                     changes.new.push(identity);
                 }
-                Err(e) => {
-                    warn!(error = ?e, "Couldn't create new user identity");
+                Err(_) => {
+                    warn!("Couldn't create new user identity");
                 }
             }
         }
@@ -829,67 +985,97 @@ impl IdentityManager {
     pub async fn users_for_key_query(
         &self,
     ) -> StoreResult<BTreeMap<OwnedTransactionId, KeysQueryRequest>> {
-        // Forget about any previous key queries in flight.
-        *self.keys_query_request_details.lock().await = None;
-
         // We always want to track our own user, but in case we aren't in an encrypted
         // room yet, we won't be tracking ourselves yet. This ensures we are always
         // tracking ourselves.
         //
         // The check for emptiness is done first for performance.
-        let (users, sequence_number) = {
+        let users = {
             let cache = self.store.cache().await?;
             let key_query_manager = self.key_query_manager.synced(&cache).await?;
 
-            let (users, sequence_number) = key_query_manager.users_for_key_query().await;
+            let (users, _) = key_query_manager.users_for_key_query().await;
 
             if users.is_empty() && !key_query_manager.tracked_users().contains(self.user_id()) {
                 key_query_manager.mark_user_as_changed(self.user_id()).await?;
-                key_query_manager.users_for_key_query().await
+                key_query_manager.users_for_key_query().await.0
             } else {
-                (users, sequence_number)
+                users
             }
         };
 
         if users.is_empty() {
-            Ok(BTreeMap::new())
-        } else {
-            // Let's remove users that are part of the `FailuresCache`. The cache, which is
-            // a TTL cache, remembers users for which a previous `/key/query` request has
-            // failed. We don't retry a `/keys/query` for such users for a
-            // certain amount of time.
-            let users = users.into_iter().filter(|u| !self.failures.contains(u.server_name()));
-
-            // We don't want to create a single `/keys/query` request with an infinite
-            // amount of users. Some servers will likely bail out after a
-            // certain amount of users and the responses will be large. In the
-            // case of a transmission error, we'll have to retransmit the large
-            // response.
-            //
-            // Convert the set of users into multiple /keys/query requests.
-            let requests: BTreeMap<_, _> = users
-                .chunks(Self::MAX_KEY_QUERY_USERS)
-                .into_iter()
-                .map(|user_chunk| {
-                    let request_id = TransactionId::new();
-                    let request = KeysQueryRequest::new(user_chunk);
-
-                    debug!(?request_id, users = ?request.device_keys.keys(), "Created a /keys/query request");
-
-                    (request_id, request)
-                })
-                .collect();
-
-            // Collect the request IDs, these will be used later in the
-            // `receive_keys_query_response()` method to figure out if the user can be
-            // marked as up-to-date/non-dirty.
-            let request_ids = requests.keys().cloned().collect();
-            let request_details = KeysQueryRequestDetails { sequence_number, request_ids };
-
-            *self.keys_query_request_details.lock().await = Some(request_details);
-
-            Ok(requests)
+            return Ok(BTreeMap::new());
         }
+
+        #[cfg(test)]
+        self.pause_before_key_query_metadata_commit_for_test().await;
+
+        let cache = self.store.cache().await?;
+        let key_query_manager = self.key_query_manager.synced(&cache).await?;
+        let requests = key_query_manager
+            .with_users_for_key_query_snapshot(|users, sequence_number| {
+                // Revalidate the dirty snapshot immediately before registration while
+                // key-query completion is excluded. No await occurs while the stable
+                // request registry is locked.
+                let users: HashSet<_> = users
+                    .into_iter()
+                    .filter(|user| !self.failures.contains(user.server_name()))
+                    .collect();
+                if users.is_empty() {
+                    return BTreeMap::new();
+                }
+
+                let mut request_details = self
+                    .keys_query_request_details
+                    .write()
+                    .expect("key-query request details lock");
+                let mut requests = BTreeMap::new();
+                let mut covered_users = HashSet::new();
+
+                // Return any stable in-flight request which covers a user that is still
+                // dirty. Reusing the request ID keeps repeated or concurrent collection
+                // bounded to the tracked users and preserves exact response coverage.
+                for (request_id, details) in request_details.iter() {
+                    if details.users.iter().any(|user| users.contains(user)) {
+                        requests.insert(request_id.clone(), details.request.clone());
+                    }
+                    covered_users.extend(details.users.iter().cloned());
+                }
+
+                let uncovered_users: Vec<_> = users.difference(&covered_users).cloned().collect();
+
+                // We don't want to create a single `/keys/query` request with an infinite
+                // amount of users. Some servers will likely bail out after a
+                // certain amount of users and the responses will be large. In the
+                // case of a transmission error, we'll have to retransmit the large
+                // response.
+                //
+                // Convert the set of users into multiple /keys/query requests.
+                for user_chunk in uncovered_users.chunks(Self::MAX_KEY_QUERY_USERS) {
+                    let request_id = TransactionId::new();
+                    let request = KeysQueryRequest::new(user_chunk.iter().cloned());
+                    let users = request.device_keys.keys().cloned().collect();
+
+                    debug!("Created a /keys/query request");
+
+                    request_details.insert(
+                        request_id.clone(),
+                        KeysQueryRequestDetails {
+                            sequence_number,
+                            request: request.clone(),
+                            users,
+                            response_gate: Default::default(),
+                        },
+                    );
+                    requests.insert(request_id, request);
+                }
+
+                requests
+            })
+            .await;
+
+        Ok(requests)
     }
 
     /// Receive the list of users that contained changed devices from the
@@ -905,6 +1091,14 @@ impl IdentityManager {
         users: impl Iterator<Item = &UserId>,
     ) -> StoreResult<()> {
         self.key_query_manager.synced(cache).await?.mark_tracked_users_as_changed(users).await
+    }
+
+    pub(crate) async fn mark_user_as_changed(
+        &self,
+        cache: &StoreCache,
+        user: &UserId,
+    ) -> StoreResult<()> {
+        self.key_query_manager.synced(cache).await?.mark_user_as_changed(user).await
     }
 
     /// See the docs for [`OlmMachine::update_tracked_users()`].
@@ -1086,7 +1280,7 @@ impl IdentityManager {
 
     /// Given a device, look for [`InboundGroupSession`]s whose sender data is
     /// in the given state, and update it.
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn update_sender_data_for_sessions_for_device(
         &self,
         device: &DeviceData,
@@ -1124,7 +1318,7 @@ impl IdentityManager {
 
     /// Update the sender data on the given inbound group session, using the
     /// given device data.
-    #[instrument(skip(self, device, session), fields(session_id = session.session_id()))]
+    #[instrument(skip_all)]
     async fn update_sender_data_for_session(
         &self,
         session: &mut InboundGroupSession,
@@ -1132,18 +1326,14 @@ impl IdentityManager {
     ) -> Result<(), CryptoStoreError> {
         match SenderDataFinder::find_using_device_data(&self.store, device.clone(), session).await {
             Ok(sender_data) => {
-                debug!("Updating existing InboundGroupSession with new SenderData {sender_data:?}");
+                debug!("Updating existing InboundGroupSession with new SenderData");
                 session.sender_data = sender_data;
             }
             Err(SessionDeviceCheckError::CryptoStoreError(e)) => {
                 return Err(e);
             }
-            Err(SessionDeviceCheckError::MismatchedIdentityKeys(e)) => {
-                warn!(
-                    ?session,
-                    ?device,
-                    "cannot update existing InboundGroupSession due to ownership error: {e}",
-                );
+            Err(SessionDeviceCheckError::MismatchedIdentityKeys(_)) => {
+                warn!("cannot update existing InboundGroupSession due to ownership error");
             }
         }
 
@@ -1171,46 +1361,6 @@ impl IdentityManager {
 
         Ok(())
     }
-}
-
-/// Log information about what changed after processing a /keys/query response.
-/// Only does anything if the DEBUG log level is enabled.
-fn debug_log_keys_query_response(
-    devices: &DeviceChanges,
-    identities: &IdentityChanges,
-    request_id: &TransactionId,
-) {
-    #[allow(unknown_lints, clippy::unwrap_or_default)] // false positive
-    let changed_devices = devices.changed.iter().fold(BTreeMap::new(), |mut acc, d| {
-        acc.entry(d.user_id()).or_insert_with(BTreeSet::new).insert(d.device_id());
-        acc
-    });
-
-    #[allow(unknown_lints, clippy::unwrap_or_default)] // false positive
-    let new_devices = devices.new.iter().fold(BTreeMap::new(), |mut acc, d| {
-        acc.entry(d.user_id()).or_insert_with(BTreeSet::new).insert(d.device_id());
-        acc
-    });
-
-    #[allow(unknown_lints, clippy::unwrap_or_default)] // false positive
-    let deleted_devices = devices.deleted.iter().fold(BTreeMap::new(), |mut acc, d| {
-        acc.entry(d.user_id()).or_insert_with(BTreeSet::new).insert(d.device_id());
-        acc
-    });
-
-    let new_identities = identities.new.iter().map(|i| i.user_id()).collect::<BTreeSet<_>>();
-    let changed_identities =
-        identities.changed.iter().map(|i| i.user_id()).collect::<BTreeSet<_>>();
-
-    debug!(
-        ?request_id,
-        ?new_devices,
-        ?changed_devices,
-        ?deleted_devices,
-        ?new_identities,
-        ?changed_identities,
-        "Finished handling of the `/keys/query` response"
-    );
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -1520,7 +1670,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::ops::Deref;
+    use std::{ops::Deref, sync::Arc, time::Duration};
 
     use futures_util::pin_mut;
     use matrix_sdk_test::{async_test, ruma_response_from_json, test_json};
@@ -1554,6 +1704,138 @@ pub(crate) mod tests {
         });
 
         ruma_response_from_json(&response)
+    }
+
+    #[test]
+    fn key_query_response_diagnostics_are_private_safe() {
+        let source = include_str!("manager.rs");
+        for message in [
+            "\"Handling a `/keys/query` response\"",
+            "\"Finished handling of the `/keys/query` response\"",
+        ] {
+            let message_position = source.find(message).expect("key-query response diagnostic");
+            let invocation_start = source[..message_position]
+                .rfind("debug!(")
+                .expect("key-query response debug invocation");
+            let invocation = &source[invocation_start..message_position + message.len()];
+            for forbidden in [
+                "request_id",
+                "device_keys",
+                "failures",
+                "new_devices",
+                "changed_devices",
+                "deleted_devices",
+                "new_identities",
+                "changed_identities",
+            ] {
+                assert!(
+                    !invocation.contains(forbidden),
+                    "key-query response diagnostic exposed {forbidden}: {invocation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_query_response_nested_diagnostics_are_private_safe() {
+        let source = include_str!("manager.rs");
+
+        for message in [
+            "Rejecting device update",
+            "Adding our own device",
+            "Adding a new device to the device store",
+            "Rejecting a previously unseen device",
+            "Mismatch in the device keys payload",
+            "Device keys failed to deserialize",
+            "Our own device might have been deleted",
+            "Removed some or all of our private cross signing keys",
+            "Couldn't update or create new user identity",
+            "User ID mismatch in our user-signing key",
+            "User ID mismatch in one of the cross signing keys",
+            "Updated a user identity",
+            "Received an unchanged user identity",
+            "Couldn't update an existing user identity",
+            "Created new user identity",
+            "Couldn't create new user identity",
+            "Updating existing InboundGroupSession with new SenderData",
+            "cannot update existing InboundGroupSession due to ownership error",
+        ] {
+            let message_position = source.find(message).expect("nested key-query diagnostic");
+            let invocation_start = ["debug!(", "info!(", "trace!(", "warn!("]
+                .into_iter()
+                .filter_map(|macro_start| source[..message_position].rfind(macro_start))
+                .max()
+                .expect("nested key-query diagnostic invocation");
+            let invocation_end = message_position
+                + source[message_position..]
+                    .find(");")
+                    .expect("end of nested key-query diagnostic")
+                + 2;
+            let invocation = &source[invocation_start..invocation_end];
+
+            for forbidden in [
+                "?user",
+                "?device",
+                "user_id =",
+                "device_id =",
+                "keys =",
+                "error =",
+                "?identity",
+                "?session",
+                "cleared =",
+                "curve25519",
+                "ed25519",
+                "expected =",
+                "got =",
+                "{sender_data",
+                "{e}",
+            ] {
+                assert!(
+                    !invocation.contains(forbidden),
+                    "nested key-query diagnostic exposed {forbidden}: {invocation}"
+                );
+            }
+        }
+
+        for function_name in [
+            "update_or_create_identity",
+            "update_sender_data_for_sessions_for_device",
+            "update_sender_data_for_session",
+        ] {
+            let function_position =
+                source.find(&format!("async fn {function_name}")).expect("nested key-query helper");
+            let attribute_start = source[..function_position]
+                .rfind("#[instrument(")
+                .expect("nested key-query helper instrument attribute");
+            let attribute_end = attribute_start
+                + source[attribute_start..]
+                    .find(']')
+                    .expect("end of nested key-query helper instrument attribute")
+                + 1;
+            let attribute = &source[attribute_start..attribute_end];
+            assert_eq!(
+                attribute, "#[instrument(skip_all)]",
+                "nested key-query helper must not record arguments: {function_name}: {attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_query_creation_diagnostic_is_private_safe() {
+        let source = include_str!("manager.rs");
+        let message = "\"Created a /keys/query request\"";
+        let message_position = source.find(message).expect("key-query creation diagnostic");
+        let invocation_start = source[..message_position]
+            .rfind("debug!(")
+            .expect("key-query creation debug invocation");
+        let invocation = &source[invocation_start..message_position + message.len()];
+
+        for forbidden in ["request_id", "users =", "device_keys"] {
+            assert!(
+                !invocation.contains(forbidden),
+                "key-query creation diagnostic exposed {forbidden}: {invocation}"
+            );
+        }
     }
 
     #[async_test]
@@ -1763,6 +2045,167 @@ pub(crate) mod tests {
         );
     }
 
+    #[async_test]
+    async fn test_repeated_key_query_collection_preserves_prior_request_coverage() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
+
+        let first_requests = manager.users_for_key_query().await.unwrap();
+        assert!(!first_requests.is_empty());
+
+        let second_requests = manager.users_for_key_query().await.unwrap();
+        assert!(!second_requests.is_empty());
+
+        for (request_id, request) in first_requests {
+            let covered_users = manager.users_for_key_query_request(&request_id);
+            assert_eq!(
+                covered_users,
+                request.device_keys.keys().cloned().collect(),
+                "collecting another key query must not erase prior request coverage"
+            );
+        }
+    }
+
+    #[async_test]
+    async fn test_cancelled_key_query_collection_preserves_prior_request_coverage() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
+
+        let first_requests = manager.users_for_key_query().await.unwrap();
+        let (first_request_id, first_request) = first_requests.into_iter().next().unwrap();
+
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        manager.set_pre_key_query_metadata_commit_pause_for_test(entered.clone(), release);
+
+        let manager_for_collection = manager.clone();
+        let collection =
+            tokio::spawn(async move { manager_for_collection.users_for_key_query().await });
+        entered.wait().await;
+        collection.abort();
+        assert!(collection.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            manager.users_for_key_query_request(&first_request_id),
+            first_request.device_keys.keys().cloned().collect(),
+            "cancelling a later collection must not erase prior request coverage"
+        );
+    }
+
+    #[async_test]
+    async fn test_concurrent_key_query_collection_reuses_bounded_request_metadata() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
+        let first_requests = manager.users_for_key_query().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        manager.set_pre_key_query_metadata_commit_pause_for_test(entered.clone(), release.clone());
+
+        let manager_for_collection = manager.clone();
+        let paused_collection =
+            tokio::spawn(async move { manager_for_collection.users_for_key_query().await });
+        entered.wait().await;
+
+        let concurrent_requests = manager.users_for_key_query().await.unwrap();
+        release.wait().await;
+        let paused_requests = paused_collection.await.unwrap().unwrap();
+
+        let first_ids: Vec<_> = first_requests.keys().collect();
+        assert_eq!(concurrent_requests.keys().collect::<Vec<_>>(), first_ids);
+        assert_eq!(paused_requests.keys().collect::<Vec<_>>(), first_ids);
+    }
+
+    #[async_test]
+    async fn test_key_query_collection_revalidates_dirty_snapshot_before_registration() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
+        let (request_id, _) = manager.users_for_key_query().await.unwrap().pop_first().unwrap();
+
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        manager.set_pre_key_query_metadata_commit_pause_for_test(entered.clone(), release.clone());
+        let collecting_manager = manager.clone();
+        let collection =
+            tokio::spawn(async move { collecting_manager.users_for_key_query().await });
+        entered.wait().await;
+
+        let response_lease = manager.acquire_key_query_response_lease(&request_id).await;
+        manager.receive_keys_query_response(&request_id, &own_key_query()).await.unwrap();
+        response_lease.consume();
+        assert_eq!(manager.key_query_request_count_for_test(), 0);
+
+        release.wait().await;
+        let stale_collection = collection.await.unwrap().unwrap();
+        assert!(
+            stale_collection.is_empty(),
+            "a collector must not register requests from a dirty snapshot cleaned during its await"
+        );
+        assert_eq!(
+            manager.key_query_request_count_for_test(),
+            0,
+            "the stale collector must leave no unreachable request metadata"
+        );
+
+        for _ in 0..3 {
+            let cache = manager.store.cache().await.unwrap();
+            manager.receive_device_changes(&cache, [user_id()].into_iter()).await.unwrap();
+            let requests = manager.users_for_key_query().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(manager.key_query_request_count_for_test(), 1);
+            let (request_id, _) = requests.into_iter().next().unwrap();
+            let response_lease = manager.acquire_key_query_response_lease(&request_id).await;
+            manager.receive_keys_query_response(&request_id, &own_key_query()).await.unwrap();
+            response_lease.consume();
+            assert_eq!(manager.key_query_request_count_for_test(), 0);
+        }
+    }
+
+    #[async_test]
+    async fn test_key_query_response_gates_are_per_request_id() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
+        let (first_request_id, _) =
+            manager.users_for_key_query().await.unwrap().pop_first().unwrap();
+        let second_request_id = TransactionId::new();
+        {
+            let mut request_details =
+                manager.keys_query_request_details.write().expect("key-query request details lock");
+            let mut second_details = request_details
+                .get(&first_request_id)
+                .expect("first key-query request metadata")
+                .clone();
+            second_details.response_gate = Default::default();
+            request_details.insert(second_request_id.clone(), second_details);
+        }
+
+        let first_lease = manager.acquire_key_query_response_lease(&first_request_id).await;
+        let second_lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.acquire_key_query_response_lease(&second_request_id),
+        )
+        .await
+        .expect("a different request ID must not wait for the first response gate");
+
+        drop(second_lease);
+        drop(first_lease);
+    }
+
+    #[async_test]
+    async fn test_key_query_response_preserves_request_metadata_for_outer_owner() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
+        let (request_id, request) =
+            manager.users_for_key_query().await.unwrap().pop_first().unwrap();
+
+        assert_eq!(
+            manager.users_for_key_query_request(&request_id),
+            request.device_keys.keys().cloned().collect()
+        );
+
+        manager.receive_keys_query_response(&request_id, &own_key_query()).await.unwrap();
+
+        assert_eq!(
+            manager.users_for_key_query_request(&request_id),
+            request.device_keys.keys().cloned().collect(),
+            "identity processing must not consume outer recovery metadata"
+        );
+    }
+
     /// If a user is invalidated while a /keys/query request is in flight, that
     /// user is not removed from the list of outdated users when the
     /// response is received
@@ -1783,14 +2226,18 @@ pub(crate) mod tests {
         }
 
         // the response from the query arrives
+        let response_lease = manager.acquire_key_query_response_lease(&reqid).await;
         manager.receive_keys_query_response(&reqid, &other_key_query()).await.unwrap();
+        response_lease.consume();
 
         // alice should *still* be in the list of key queries
         let (reqid, req) = manager.users_for_key_query().await.unwrap().pop_first().unwrap();
         assert!(req.device_keys.contains_key(alice));
 
         // another key query response
+        let response_lease = manager.acquire_key_query_response_lease(&reqid).await;
         manager.receive_keys_query_response(&reqid, &other_key_query()).await.unwrap();
+        response_lease.consume();
 
         // finally alice should not be in the list
         let queries = manager.users_for_key_query().await.unwrap();

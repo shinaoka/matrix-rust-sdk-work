@@ -401,9 +401,7 @@ mod live_tail_refresh {
                 factory.text_msg("new-2").event_id(event_id!("$live-tail-new-2")),
                 factory.text_msg("new-1").event_id(event_id!("$live-tail-new-1")),
                 factory.text_msg("edge").event_id(event_id!("$live-tail-edge")),
-                factory
-                    .text_msg("older anchor")
-                    .event_id(event_id!("$live-tail-older-anchor")),
+                factory.text_msg("older anchor").event_id(event_id!("$live-tail-older-anchor")),
             ]))
             .expect(1)
             .named("tokenless-live-tail-overlap")
@@ -443,12 +441,7 @@ mod live_tail_refresh {
         }
         assert_eq!(
             event_ids(&projected),
-            [
-                "$live-tail-older-anchor",
-                "$live-tail-edge",
-                "$live-tail-new-1",
-                "$live-tail-new-2"
-            ]
+            ["$live-tail-older-anchor", "$live-tail-edge", "$live-tail-new-1", "$live-tail-new-2"]
         );
         assert_eq!(
             event_ids(room_event_cache.events().await.unwrap())
@@ -502,9 +495,7 @@ mod live_tail_refresh {
             .match_limit(128)
             .ok(RoomMessagesResponseTemplate::default().events(vec![
                 factory.text_msg("edge").event_id(event_id!("$unchanged-edge")),
-                factory
-                    .text_msg("older anchor")
-                    .event_id(event_id!("$unchanged-older-anchor")),
+                factory.text_msg("older anchor").event_id(event_id!("$unchanged-older-anchor")),
             ]))
             .expect(1)
             .named("tokenless-live-tail-unchanged")
@@ -727,9 +718,7 @@ mod live_tail_refresh {
                 vec![
                     factory.text_msg("cancelled").event_id(event_id!("$cancelled-network-event")),
                     factory.text_msg("edge").event_id(event_id!("$cancel-edge")),
-                    factory
-                        .text_msg("older anchor")
-                        .event_id(event_id!("$cancel-older-anchor")),
+                    factory.text_msg("older anchor").event_id(event_id!("$cancel-older-anchor")),
                 ],
             ))
             .expect(1)
@@ -764,9 +753,7 @@ mod live_tail_refresh {
             .ok(RoomMessagesResponseTemplate::default().events(vec![
                 factory.text_msg("committed").event_id(event_id!("$commit-after-cancel")),
                 factory.text_msg("edge").event_id(event_id!("$cancel-edge")),
-                factory
-                    .text_msg("older anchor")
-                    .event_id(event_id!("$cancel-older-anchor")),
+                factory.text_msg("older anchor").event_id(event_id!("$cancel-older-anchor")),
             ]))
             .expect(1)
             .named("finish-live-tail-commit-after-cancellation")

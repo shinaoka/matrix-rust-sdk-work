@@ -743,7 +743,10 @@ mod tests {
     };
 
     use assert_matches2::assert_let;
-    use matrix_sdk_common::{deserialized_responses::EncryptionInfo, locks::Mutex};
+    use matrix_sdk_common::{
+        deserialized_responses::{EncryptionInfo, ProcessedToDeviceEvent},
+        locks::Mutex,
+    };
     use matrix_sdk_test::SyncResponseBuilder;
     use ruma::{
         event_id,
@@ -888,6 +891,76 @@ mod tests {
         assert_eq!(received_event.event_type().to_string(), "m.custom.to.device.type");
         let info = captured_info.lock().clone();
         assert!(info.is_none());
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_cancelled_partial_raw_handler_fanout_is_at_least_once_on_redelivery()
+    -> crate::Result<()> {
+        let client = logged_in_client(None).await;
+        let first_attempts = Arc::new(AtomicU8::new(0));
+        let second_attempts = Arc::new(AtomicU8::new(0));
+        let first_completed = Arc::new(tokio::sync::Barrier::new(2));
+        let second_entered = Arc::new(tokio::sync::Barrier::new(2));
+
+        client.add_event_handler({
+            let attempts = first_attempts.clone();
+            let completed = first_completed.clone();
+            move |_event: AnyToDeviceEvent| {
+                let attempts = attempts.clone();
+                let completed = completed.clone();
+                async move {
+                    if attempts.fetch_add(1, SeqCst) == 0 {
+                        completed.wait().await;
+                    }
+                }
+            }
+        });
+        client.add_event_handler({
+            let attempts = second_attempts.clone();
+            let entered = second_entered.clone();
+            move |_event: AnyToDeviceEvent| {
+                let attempts = attempts.clone();
+                let entered = entered.clone();
+                async move {
+                    if attempts.fetch_add(1, SeqCst) == 0 {
+                        entered.wait().await;
+                        future::pending::<()>().await;
+                    }
+                }
+            }
+        });
+
+        let raw = Raw::from_json_string(
+            json!({
+                "sender": "@alice:example.com",
+                "type": "m.custom.to.device.partial-fanout",
+                "content": {},
+            })
+            .to_string(),
+        )?;
+        let event = ProcessedToDeviceEvent::PlainText(raw);
+        let first = tokio::spawn({
+            let client = client.clone();
+            let event = event.clone();
+            async move { client.handle_sync_to_device_events(&[event]).await }
+        });
+        first_completed.wait().await;
+        second_entered.wait().await;
+        first.abort();
+        assert!(first.await.expect_err("the partial fanout must be cancelled").is_cancelled());
+
+        client.handle_sync_to_device_events(&[event]).await?;
+        assert_eq!(
+            first_attempts.load(SeqCst),
+            2,
+            "a handler that completed before cancellation may run again on raw redelivery"
+        );
+        assert_eq!(
+            second_attempts.load(SeqCst),
+            2,
+            "the handler cancelled mid-flight must remain retryable on raw redelivery"
+        );
         Ok(())
     }
 

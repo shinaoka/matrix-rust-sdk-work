@@ -20,6 +20,7 @@
 use std::ops::Deref;
 use std::{
     collections::{BTreeMap, HashSet},
+    fmt,
     io::{Cursor, Read, Write},
     iter,
     path::{Path, PathBuf},
@@ -1092,6 +1093,24 @@ impl Encryption {
 
         olm.get_verification_request(user_id, flow_id)
             .map(|r| VerificationRequest { inner: r, client: self.client.clone() })
+    }
+
+    /// Subscribe to materialized incoming to-device verification requests.
+    ///
+    /// This is a single-owner bounded stream. A later subscription replaces and
+    /// closes the previous one. Normal delivery and sender-key recovery share
+    /// one bounded queue, and the stable low-level handle is wrapped directly.
+    pub async fn subscribe_to_incoming_verification_requests(
+        &self,
+    ) -> Option<impl Stream<Item = IncomingVerificationRequestDelivery> + use<>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref()?;
+        let client = self.client.clone();
+
+        Some(
+            olm.subscribe_to_incoming_verification_requests()
+                .map(move |inner| wrap_incoming_verification_request(client.clone(), inner)),
+        )
     }
 
     /// Get a specific device of a user.
@@ -2246,6 +2265,41 @@ impl Encryption {
     }
 }
 
+/// An incoming verification request whose application delivery is not yet committed.
+///
+/// Dropping this value without calling [`Self::commit`] returns the request to the bounded
+/// bounded stream for a later subscriber.
+pub struct IncomingVerificationRequestDelivery {
+    request: VerificationRequest,
+    inner: Option<matrix_sdk_base::crypto::IncomingVerificationRequestDelivery>,
+}
+
+impl fmt::Debug for IncomingVerificationRequestDelivery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("IncomingVerificationRequestDelivery").finish_non_exhaustive()
+    }
+}
+
+impl IncomingVerificationRequestDelivery {
+    /// The incoming verification request handle.
+    pub fn request(&self) -> &VerificationRequest {
+        &self.request
+    }
+
+    /// Commit successful application delivery of this request.
+    pub fn commit(mut self) {
+        self.inner.take().expect("incoming delivery is committed only once").commit();
+    }
+}
+
+fn wrap_incoming_verification_request(
+    client: Client,
+    inner: matrix_sdk_base::crypto::IncomingVerificationRequestDelivery,
+) -> IncomingVerificationRequestDelivery {
+    let request = VerificationRequest { inner: inner.request().clone(), client };
+    IncomingVerificationRequestDelivery { request, inner: Some(inner) }
+}
+
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::{
@@ -2258,6 +2312,7 @@ mod tests {
         time::Duration,
     };
 
+    use futures_util::StreamExt;
     use matrix_sdk_test::{
         DEFAULT_TEST_ROOM_ID, JoinedRoomBuilder, SyncResponseBuilder, async_test,
         event_factory::EventFactory,
@@ -2283,6 +2338,52 @@ mod tests {
             client::mock_matrix_session, logged_in_client, no_retry_test_client, set_client_session,
         },
     };
+
+    #[async_test]
+    async fn test_incoming_verification_request_stream_is_single_owner() {
+        let client = logged_in_client(None).await;
+        let mut first = client
+            .encryption()
+            .subscribe_to_incoming_verification_requests()
+            .await
+            .expect("a logged-in client has an Olm machine");
+        let _replacement = client
+            .encryption()
+            .subscribe_to_incoming_verification_requests()
+            .await
+            .expect("a logged-in client has an Olm machine");
+
+        assert!(first.next().await.is_none());
+    }
+
+    #[async_test]
+    async fn test_verification_request_wrap_preserves_the_base_handle() {
+        let client = logged_in_client(None).await;
+        let olm = client.olm_machine().await;
+        let olm = olm.as_ref().expect("a logged-in client has an Olm machine");
+        let user_id = client.user_id().expect("a logged-in client has a user id");
+        let device_id = client.device_id().expect("a logged-in client has a device id");
+        let device = olm
+            .get_device(user_id, device_id, None)
+            .await
+            .expect("the crypto store read succeeds")
+            .expect("the current device is present in the crypto store");
+        let (base, _) = device.request_verification_with_methods(vec![
+            ruma::events::key::verification::VerificationMethod::SasV1,
+        ]);
+        let flow_id = base.flow_id().as_str().to_owned();
+
+        let wrapped = super::VerificationRequest { inner: base, client: client.clone() };
+
+        assert_eq!(wrapped.flow_id(), flow_id);
+
+        let delivery = super::IncomingVerificationRequestDelivery { request: wrapped, inner: None };
+        assert_eq!(
+            format!("{delivery:?}"),
+            "IncomingVerificationRequestDelivery { .. }",
+            "the client wrapper must not delegate Debug to request or crypto delivery internals"
+        );
+    }
 
     #[async_test]
     async fn test_reaction_sending() {

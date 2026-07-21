@@ -101,6 +101,7 @@ pub use store::{
     CryptoStoreError, SecretImportError, SecretInfo,
     types::{CrossSigningKeyExport, TrackedUser},
 };
+pub use verification::IncomingVerificationRequestDelivery;
 pub use verification::{
     AcceptSettings, AcceptedProtocols, CancelInfo, Emoji, EmojiShortAuthString, Sas, SasState,
     Verification, VerificationRequest, VerificationRequestState, format_emojis,

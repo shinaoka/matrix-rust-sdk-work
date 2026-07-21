@@ -343,6 +343,17 @@ impl SyncedKeyQueryManager<'_> {
         self.manager.users_for_key_query.lock().await.users_for_key_query()
     }
 
+    /// Read the current dirty-user snapshot and run a synchronous operation
+    /// while the snapshot remains protected from key-query completion.
+    pub(crate) async fn with_users_for_key_query_snapshot<R>(
+        &self,
+        operation: impl FnOnce(HashSet<OwnedUserId>, SequenceNumber) -> R,
+    ) -> R {
+        let users_for_key_query = self.manager.users_for_key_query.lock().await;
+        let (users, sequence_number) = users_for_key_query.users_for_key_query();
+        operation(users, sequence_number)
+    }
+
     /// See the docs for [`crate::OlmMachine::tracked_users()`].
     pub fn tracked_users(&self) -> HashSet<OwnedUserId> {
         self.cache.tracked_users.read().iter().cloned().collect()

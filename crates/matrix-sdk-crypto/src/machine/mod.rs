@@ -546,6 +546,28 @@ impl OlmMachine {
             }
         }
 
+        let pending_verification_retry_users =
+            self.inner.verification_machine.pending_to_device_key_query_retry_users();
+        if !pending_verification_retry_users.is_empty() {
+            match self.inner.store.cache().await {
+                Ok(cache) => {
+                    for user in pending_verification_retry_users {
+                        match self.inner.identity_manager.mark_user_as_changed(&cache, &user).await
+                        {
+                            Ok(()) => self
+                                .inner
+                                .verification_machine
+                                .mark_pending_to_device_key_query_scheduled(&user),
+                            Err(_) => {
+                                error!("Error rescheduling a verification sender key query")
+                            }
+                        }
+                    }
+                }
+                Err(_) => error!("Error acquiring crypto cache for verification key-query retry"),
+            }
+        }
+
         for request in self
             .inner
             .identity_manager
@@ -811,7 +833,69 @@ impl OlmMachine {
         request_id: &TransactionId,
         response: &KeysQueryResponse,
     ) -> OlmResult<(DeviceChanges, IdentityChanges)> {
-        self.inner.identity_manager.receive_keys_query_response(request_id, response).await
+        let mut queried_users: HashSet<_> = response.device_keys.keys().cloned().collect();
+        let response_lease =
+            self.inner.identity_manager.acquire_key_query_response_lease(request_id).await;
+        queried_users.extend(response_lease.covered_users());
+        let mut pending_response_claim = self
+            .inner
+            .verification_machine
+            .claim_pending_to_device_key_query_response(&queried_users);
+        let changes =
+            self.inner.identity_manager.receive_keys_query_response(request_id, response).await?;
+        #[cfg(test)]
+        self.inner.identity_manager.pause_after_key_query_inner_processing_for_test().await;
+        self.inner.verification_machine.record_pending_to_device_key_query_commit(
+            &queried_users,
+            pending_response_claim.token(),
+        );
+        let replay_result = loop {
+            let result = self
+                .inner
+                .verification_machine
+                .retry_pending_to_device_requests_for_response(
+                    &queried_users,
+                    pending_response_claim.token(),
+                )
+                .await;
+            if result.is_err() || !pending_response_claim.finish_waiting_for_external_update() {
+                break result;
+            }
+        };
+        if replay_result.is_err() {
+            pending_response_claim.release_for_retry();
+            #[cfg(test)]
+            let cache = if self
+                .inner
+                .verification_machine
+                .should_fail_post_key_query_recovery_cache_acquisition_for_test()
+            {
+                Err(CryptoStoreError::AccountUnset)
+            } else {
+                self.inner.store.cache().await
+            };
+            #[cfg(not(test))]
+            let cache = self.inner.store.cache().await;
+            match cache {
+                Ok(cache) => {
+                    for user in &queried_users {
+                        match self.inner.identity_manager.mark_user_as_changed(&cache, user).await {
+                            Ok(()) => self
+                                .inner
+                                .verification_machine
+                                .mark_pending_to_device_key_query_scheduled(user),
+                            Err(_) => {
+                                error!("Error rescheduling a verification sender key query")
+                            }
+                        }
+                    }
+                }
+                Err(_) => error!("Error acquiring crypto cache for verification key-query retry"),
+            }
+        } else {
+            response_lease.consume();
+        }
+        Ok(changes)
     }
 
     /// Get a request to upload E2EE keys to the server.
@@ -1425,9 +1509,39 @@ impl OlmMachine {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn handle_verification_event(&self, event: &ToDeviceEvents) {
-        if let Err(e) = self.inner.verification_machine.receive_any_event(event).await {
-            error!("Error handling a verification event: {e:?}");
+        let cache = self.inner.store.cache().await.expect("test crypto store cache is available");
+        let _ = self.handle_verification_event_with_cache(&cache, event).await;
+    }
+
+    async fn handle_verification_event_with_cache(
+        &self,
+        cache: &StoreCache,
+        event: &ToDeviceEvents,
+    ) {
+        match self.inner.verification_machine.receive_to_device_event(event).await {
+            Ok(crate::verification::VerificationEventResult::Handled) => {}
+            Ok(crate::verification::VerificationEventResult::RequestMaterialized(request)) => {
+                drop(request);
+            }
+            Ok(crate::verification::VerificationEventResult::UnknownSenderQueued {
+                sender,
+                query_needed,
+            }) => {
+                if query_needed {
+                    match self.inner.identity_manager.mark_user_as_changed(cache, &sender).await {
+                        Ok(()) => self
+                            .inner
+                            .verification_machine
+                            .mark_pending_to_device_key_query_scheduled(&sender),
+                        Err(_) => error!("Error scheduling a verification sender key query"),
+                    }
+                }
+            }
+            Err(_) => {
+                error!("Error handling a verification event");
+            }
         }
     }
 
@@ -1459,11 +1573,29 @@ impl OlmMachine {
         self.inner.verification_machine.get_requests(user_id)
     }
 
+    /// Subscribe to materialized incoming to-device verification requests.
+    ///
+    /// This is a single-owner, bounded subscription. Creating a new subscription
+    /// closes the previous one. Normal delivery and sender-key recovery share
+    /// one bounded lease queue.
+    pub fn subscribe_to_incoming_verification_requests(
+        &self,
+    ) -> impl futures_core::Stream<Item = crate::verification::IncomingVerificationRequestDelivery>
+    + Unpin
+    + use<> {
+        self.inner.verification_machine.subscribe_to_incoming_verification_requests()
+    }
+
     /// Given a to-device event that has either been decrypted or arrived in
     /// plaintext, handle it.
     ///
     /// Here, we only process events that are allowed to arrive in plaintext.
-    async fn handle_to_device_event(&self, changes: &mut Changes, event: &ToDeviceEvents) {
+    async fn handle_to_device_event(
+        &self,
+        cache: &StoreCache,
+        changes: &mut Changes,
+        event: &ToDeviceEvents,
+    ) {
         use crate::types::events::ToDeviceEvents::*;
 
         match event {
@@ -1483,7 +1615,7 @@ impl OlmMachine {
             | KeyVerificationReady(..)
             | KeyVerificationDone(..)
             | KeyVerificationStart(..) => {
-                self.handle_verification_event(event).await;
+                self.handle_verification_event_with_cache(cache, event).await;
             }
 
             // We don't process custom or dummy events at all
@@ -1562,7 +1694,7 @@ impl OlmMachine {
                 .await
             }
             e => {
-                self.handle_to_device_event(changes, &e).await;
+                self.handle_to_device_event(transaction.cache(), changes, &e).await;
                 Some(ProcessedToDeviceEvent::PlainText(raw_event))
             }
         }
@@ -1635,7 +1767,7 @@ impl OlmMachine {
 
         match decrypted.result.raw_event.deserialize_as() {
             Ok(event) => {
-                self.handle_to_device_event(changes, &event).await;
+                self.handle_to_device_event(transaction.cache(), changes, &event).await;
 
                 raw_event = event
                     .serialize_zeroized()

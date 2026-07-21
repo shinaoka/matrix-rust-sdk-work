@@ -24,6 +24,8 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use as_variant::as_variant;
 use event_enums::OutgoingContent;
+pub use machine::IncomingVerificationRequestDelivery;
+pub(crate) use machine::VerificationEventResult;
 pub use machine::VerificationMachine;
 #[cfg(feature = "qrcode")]
 pub use qrcode::{QrVerification, QrVerificationState, ScanError};
