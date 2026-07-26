@@ -136,9 +136,14 @@ where
     /// Will return `None` if the position doesn't match a known chunk in the
     /// linked chunk, or if the chunk is a gap.
     pub fn ordering(&self, event_pos: Position) -> Option<usize> {
-        // Check the precondition: there must not be any pending updates for this
-        // reader.
-        debug_assert!(self.updates.read().unwrap().is_reader_up_to_date(self.token));
+        // There must not be any pending updates for this reader. Some callers
+        // can ask for best-effort ordering from read-only event-cache paths,
+        // where flushing the tracker is not possible. Returning `None` keeps
+        // those paths conservative instead of panicking in debug builds or
+        // computing from stale order metadata in release builds.
+        if !self.updates.read().unwrap().is_reader_up_to_date(self.token) {
+            return None;
+        }
 
         // Find the chunk that contained the event.
         let mut ordering = 0;
@@ -272,6 +277,19 @@ mod tests {
             assert_eq!(tracker.ordering(Position::new(ChunkIdentifier::new(0), 0)), None);
             assert_eq!(tracker.ordering(Position::new(ChunkIdentifier::new(3), 0)), None);
         }
+    }
+
+    #[async_test]
+    async fn test_ordering_returns_none_when_reader_has_pending_updates() {
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
+
+        linked_chunk.push_items_back(['a', 'b', 'c']);
+        let tracker = linked_chunk.order_tracker(None).unwrap();
+        let pos_b = linked_chunk.item_position(|c| *c == 'b').unwrap();
+
+        linked_chunk.push_items_back(['d']);
+
+        assert_eq!(tracker.ordering(pos_b), None);
     }
 
     #[async_test]
