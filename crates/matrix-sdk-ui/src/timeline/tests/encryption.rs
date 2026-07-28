@@ -31,16 +31,22 @@ use matrix_sdk::{
 };
 use matrix_sdk_base::{
     crypto::{decrypt_room_key_export, types::events::UtdCause},
-    deserialized_responses::{TimelineEvent, UnableToDecryptReason},
+    deserialized_responses::{
+        TimelineEvent, UnableToDecryptInfo as DeserializedUnableToDecryptInfo,
+        UnableToDecryptReason,
+    },
 };
 use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{
     RoomId, UserId, assign, event_id,
-    events::room::encrypted::{
-        EncryptedEventScheme, MegolmV1AesSha2ContentInit, Relation, Replacement,
-        RoomEncryptedEventContent,
+    events::{
+        relation::Thread,
+        room::encrypted::{
+            EncryptedEventScheme, MegolmV1AesSha2ContentInit, Relation, Replacement,
+            RoomEncryptedEventContent,
+        },
     },
-    room_id,
+    owned_event_id, room_id,
     serde::Raw,
     user_id,
 };
@@ -48,11 +54,11 @@ use serde_json::{json, value::to_raw_value};
 use stream_assert::{assert_next_matches, assert_pending};
 use tokio::time::sleep;
 
-use super::TestTimeline;
+use super::{TestTimeline, TestTimelineBuilder};
 use crate::{
     timeline::{
-        EncryptedMessage, MsgLikeContent, MsgLikeKind, RoomExt, TimelineDetails,
-        TimelineItemContent,
+        EncryptedMessage, MsgLikeContent, MsgLikeKind, RoomExt, TimelineDetails, TimelineFocus,
+        TimelineItemContent, event_item::RemoteEventOrigin,
     },
     unable_to_decrypt_hook::{UnableToDecryptHook, UnableToDecryptInfo, UtdHookManager},
 };
@@ -209,6 +215,69 @@ async fn test_retry_message_decryption() {
         assert_eq!(utds[0].event_id, event.event_id().unwrap());
         assert!(utds[0].time_to_decrypt.is_none());
     }
+}
+
+#[async_test]
+async fn test_thread_focus_keeps_unable_to_decrypt_thread_reply() {
+    const SESSION_ID: &str = "gM8i47Xhu0q52xLfgUXzanCMpLinoyVyH7R58cBuVBU";
+
+    let room_id = room_id!("!DovneieKSTkdHKpIXy:morpheus.localhost");
+    let event_factory = EventFactory::new().room(room_id);
+    let root_event_id = owned_event_id!("$thread_root:example.com");
+    let reply_event_id = event_id!("$thread_reply:example.com");
+    let timeline = TestTimelineBuilder::new()
+        .focus(TimelineFocus::Thread { root_event_id: root_event_id.clone() })
+        .build();
+    let mut stream = timeline.subscribe_events().await;
+
+    let root = event_factory.text_msg("thread root").event_id(&root_event_id).sender(&ALICE);
+    timeline.handle_live_event(root).await;
+
+    let root = assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { value } => value);
+    assert_eq!(root.event_id().unwrap(), &root_event_id);
+
+    let encrypted_reply = event_factory
+        .event(RoomEncryptedEventContent::new(
+            EncryptedEventScheme::MegolmV1AesSha2(
+                MegolmV1AesSha2ContentInit {
+                    ciphertext: "not-decryptable".to_owned(),
+                    sender_key: "DeHIg4gwhClxzFYcmNntPNF9YtsdZbmMy8+3kzCMXHA".to_owned(),
+                    device_id: "NLAZCWIOCO".into(),
+                    session_id: SESSION_ID.into(),
+                }
+                .into(),
+            ),
+            Some(Relation::Thread(Thread::plain(root_event_id.clone(), root_event_id.clone()))),
+        ))
+        .event_id(reply_event_id)
+        .sender(&BOB)
+        .into_raw();
+    let encrypted_reply = TimelineEvent::from_utd(
+        encrypted_reply,
+        DeserializedUnableToDecryptInfo {
+            session_id: Some(SESSION_ID.to_owned()),
+            reason: UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
+        },
+    );
+    timeline
+        .handle_event_update(
+            vec![VectorDiff::PushBack { value: encrypted_reply }],
+            RemoteEventOrigin::Sync,
+        )
+        .await;
+
+    let reply = assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { value } => value);
+    assert_eq!(reply.event_id().unwrap(), reply_event_id);
+    assert_let!(
+        TimelineItemContent::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::UnableToDecrypt(EncryptedMessage::MegolmV1AesSha2 {
+                session_id,
+                ..
+            }),
+            ..
+        }) = reply.content()
+    );
+    assert_eq!(session_id, SESSION_ID);
 }
 
 // There has been a regression when the `retry_event_decryption` function

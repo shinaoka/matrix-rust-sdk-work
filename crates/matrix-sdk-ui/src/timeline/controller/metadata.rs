@@ -19,6 +19,7 @@ use std::{
 
 use imbl::Vector;
 use matrix_sdk::deserialized_responses::EncryptionInfo;
+use matrix_sdk_common::serde_helpers::extract_thread_root;
 use ruma::{
     EventId, OwnedEventId, OwnedUserId,
     events::{
@@ -446,6 +447,11 @@ impl TimelineMetadata {
                 }
 
                 (in_reply_to, thread_root)
+            }
+
+            AnyMessageLikeEventContent::RoomEncrypted(_) => {
+                let thread_root = remote_ctx.and_then(|ctx| extract_thread_root(ctx.raw_event));
+                (None, thread_root)
             }
 
             _ => (None, None),
