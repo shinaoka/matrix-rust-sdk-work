@@ -1491,8 +1491,10 @@ impl TimelineController {
                 // Use the event-focused cache from the event cache layer.
                 let event_cache_thread_mode = match thread_mode {
                     TimelineEventFocusThreadMode::ForceThread => EventFocusThreadMode::ForceThread,
-                    TimelineEventFocusThreadMode::Automatic { .. } => {
-                        EventFocusThreadMode::Automatic
+                    TimelineEventFocusThreadMode::Automatic { hide_threaded_events } => {
+                        EventFocusThreadMode::Automatic {
+                            hide_threaded_events: *hide_threaded_events,
+                        }
                     }
                 };
 

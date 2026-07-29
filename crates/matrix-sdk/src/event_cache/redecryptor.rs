@@ -1829,7 +1829,7 @@ mod tests {
             .get_or_create_event_focused_cache(
                 focused_event_id.to_owned(),
                 20,
-                EventFocusThreadMode::Automatic,
+                EventFocusThreadMode::Automatic { hide_threaded_events: true },
             )
             .await
             .unwrap();

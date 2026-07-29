@@ -755,6 +755,60 @@ async fn test_focused_timeline_handles_other_thread_event_when_forcing_threaded_
 }
 
 #[async_test]
+async fn test_focused_timeline_keeps_threaded_events_when_requested() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let user_id = client.user_id().unwrap();
+
+    let previous_thread_event_id = event_id!("$prev:example.org");
+    let thread_root_id = event_id!("$root-id:example.org");
+
+    let f = EventFactory::new().room(room_id).sender(user_id);
+    let focus_event = f.text_msg("Focus").into_event();
+    let focus_event_id = focus_event.event_id().unwrap().clone();
+
+    server
+        .mock_room_event_context()
+        .room(room_id)
+        .ok(RoomContextResponseTemplate::new(focus_event)
+            .events_before(vec![
+                f.text_msg("Room before").into_event(),
+                f.text_msg("Thread before")
+                    .in_thread(thread_root_id, previous_thread_event_id)
+                    .into_event(),
+            ])
+            .events_after(vec![
+                f.text_msg("Room after").into_event(),
+                f.text_msg("Thread after")
+                    .in_thread(thread_root_id, previous_thread_event_id)
+                    .into_event(),
+            ]))
+        .mock_once()
+        .mount()
+        .await;
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(TimelineFocus::Event {
+            target: focus_event_id,
+            num_context_events: 10,
+            thread_mode: TimelineEventFocusThreadMode::Automatic { hide_threaded_events: false },
+        })
+        .build()
+        .await
+        .expect("Could not build focused timeline");
+
+    let (items, _) = timeline.subscribe().await;
+    let bodies = items
+        .iter()
+        .filter_map(|item| item.as_event()?.content().as_message().map(|message| message.body()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(bodies, ["Thread before", "Room before", "Focus", "Room after", "Thread after"]);
+}
+
+#[async_test]
 async fn test_focused_timeline_filters_out_threaded_events() {
     let room_id = room_id!("!a98sd12bjh:example.org");
     let server = MatrixMockServer::new().await;

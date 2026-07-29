@@ -73,7 +73,11 @@ pub enum EventFocusThreadMode {
     ///
     /// If the event is part of a thread, the linked chunk will be filtered to
     /// on-thread events.
-    Automatic,
+    Automatic {
+        /// When the target event is not part of a thread, whether to hide
+        /// in-thread replies from the room context.
+        hide_threaded_events: bool,
+    },
 }
 
 /// The mode of pagination for an event-focused linked chunk.
@@ -158,7 +162,7 @@ impl EventFocusedCacheInner {
                 thread_root
             }
 
-            EventFocusThreadMode::Automatic => {
+            EventFocusThreadMode::Automatic { .. } => {
                 trace!(
                     "automatic thread mode enabled, checking if focused event is part of a thread"
                 );
@@ -214,8 +218,10 @@ impl EventFocusedCacheInner {
             let backward_token = tokens.previous.into_token();
             let forward_token = tokens.next.into_token();
 
-            let hide_thread_events =
-                matches!(thread_mode, EventFocusThreadMode::Automatic) && thread_root.is_none();
+            let hide_thread_events = match thread_mode {
+                EventFocusThreadMode::Automatic { hide_threaded_events } => hide_threaded_events,
+                EventFocusThreadMode::ForceThread => false,
+            };
 
             self.pagination_mode = EventFocusedPaginationMode::Room { hide_thread_events };
 
