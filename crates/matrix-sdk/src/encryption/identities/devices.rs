@@ -17,10 +17,17 @@ use std::{collections::BTreeMap, ops::Deref};
 use matrix_sdk_base::crypto::{
     Device as BaseDevice, DeviceData, LocalTrust, UserDevices as BaseUserDevices,
     store::CryptoStoreError,
+    types::{DeviceKeys, SelfSigningPubkey},
 };
-use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, events::key::verification::VerificationMethod};
+use ruma::{
+    DeviceId, OwnedDeviceId, OwnedDeviceKeyId, OwnedUserId,
+    events::key::verification::VerificationMethod,
+};
 
-use super::ManualVerifyError;
+use super::{
+    ManualVerifyError, record_signature_upload_failure_details, signature_upload_error,
+    signature_upload_failure_summary, signature_upload_request_summary,
+};
 use crate::{
     Client,
     encryption::verification::{SasVerification, VerificationRequest},
@@ -97,6 +104,14 @@ impl DeviceUpdates {
 pub struct Device {
     pub(crate) inner: BaseDevice,
     pub(crate) client: Client,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DeviceVerificationUploadDiagnostics {
+    pub(crate) signed_device_keys: Option<DeviceKeys>,
+    pub(crate) preupload_self_signing_key: Option<SelfSigningPubkey>,
+    pub(crate) preupload_self_signing_key_id: Option<OwnedDeviceKeyId>,
+    pub(crate) preupload_self_signing_signature_valid: Option<bool>,
 }
 
 impl Deref for Device {
@@ -289,10 +304,49 @@ impl Device {
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn verify(&self) -> Result<(), ManualVerifyError> {
-        let request = self.inner.verify().await?;
-        self.client.send(request).await?;
+        self.verify_with_diagnostics().await.map(|_| ())
+    }
 
-        Ok(())
+    pub(crate) async fn verify_with_diagnostics(
+        &self,
+    ) -> Result<DeviceVerificationUploadDiagnostics, ManualVerifyError> {
+        let request = self.inner.verify().await?;
+        let signed_device_keys = request.signed_keys.get(self.user_id()).and_then(|signed_keys| {
+            signed_keys
+                .iter()
+                .find(|(key_id, _)| *key_id == self.device_id().as_str())
+                .and_then(|(_, raw)| serde_json::from_str::<DeviceKeys>(raw.get()).ok())
+        });
+        let preupload_self_signing_key = self
+            .client
+            .encryption()
+            .get_user_identity(self.user_id())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|identity| identity.underlying_identity().own())
+            .map(|identity| identity.self_signing_key().clone());
+        let preupload_self_signing_key_id = preupload_self_signing_key
+            .as_ref()
+            .and_then(|key| key.keys().iter().next().map(|(key_id, _)| key_id.clone()));
+        let preupload_self_signing_signature_valid = preupload_self_signing_key
+            .as_ref()
+            .zip(signed_device_keys.as_ref())
+            .map(|(key, device)| key.verify_device_keys(device).is_ok());
+        let request_summary = signature_upload_request_summary(&request);
+        let response = self.client.send(request).await?;
+        let failure_summary = signature_upload_failure_summary(&response);
+        if let Some(error) = signature_upload_error(request_summary, failure_summary) {
+            record_signature_upload_failure_details("device_verify", request_summary, &response);
+            return Err(error);
+        }
+
+        Ok(DeviceVerificationUploadDiagnostics {
+            signed_device_keys,
+            preupload_self_signing_key,
+            preupload_self_signing_key_id,
+            preupload_self_signing_signature_valid,
+        })
     }
 
     /// Is the device considered to be verified.

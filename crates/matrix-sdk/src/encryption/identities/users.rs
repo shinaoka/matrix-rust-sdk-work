@@ -23,7 +23,10 @@ use ruma::{
     events::{key::verification::VerificationMethod, room::message::RoomMessageEventContent},
 };
 
-use super::{ManualVerifyError, RequestVerificationError};
+use super::{
+    ManualVerifyError, RequestVerificationError, record_signature_upload_failure_details,
+    signature_upload_error, signature_upload_failure_summary, signature_upload_request_summary,
+};
 use crate::{Client, encryption::verification::VerificationRequest};
 
 /// Updates about [`UserIdentity`]s which got received over the `/keys/query`
@@ -361,7 +364,17 @@ impl UserIdentity {
             CryptoUserIdentity::Other(identity) => identity.verify().await?,
         };
 
-        self.client.send(request).await?;
+        let request_summary = signature_upload_request_summary(&request);
+        let response = self.client.send(request).await?;
+        let failure_summary = signature_upload_failure_summary(&response);
+        if let Some(error) = signature_upload_error(request_summary, failure_summary) {
+            record_signature_upload_failure_details(
+                "user_identity_verify",
+                request_summary,
+                &response,
+            );
+            return Err(error);
+        }
 
         Ok(())
     }

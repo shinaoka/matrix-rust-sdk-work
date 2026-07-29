@@ -92,6 +92,7 @@
 
 use futures_core::{Future, Stream};
 use futures_util::StreamExt as _;
+use matrix_sdk_base::crypto::types::{CrossSigningKey, DeviceKeys, SelfSigningPubkey, Signatures};
 use ruma::{
     api::client::keys::get_keys,
     events::{
@@ -128,6 +129,30 @@ use crate::encryption::{AuthData, CrossSigningResetAuthType, CrossSigningResetHa
 #[derive(Debug)]
 pub struct Recovery {
     pub(super) client: Client,
+}
+
+/// Read-only comparison of the homeserver's current-device signature state and
+/// the SDK projection after an explicit `/keys/query`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct RecoveryDeviceSignatureInspection {
+    pub query_failure_count: usize,
+    pub server_device_count: usize,
+    pub authoritative_device_present: bool,
+    pub authoritative_device_deserialized: bool,
+    pub authoritative_signature_count: usize,
+    pub self_signing_key_present: bool,
+    pub self_signing_key_deserialized: bool,
+    pub authoritative_self_signing_signature_valid: bool,
+    pub authoritative_self_signing_signature_present: bool,
+    pub authoritative_self_signing_signature_parseable: bool,
+    pub cached_self_signing_key_present: bool,
+    pub cached_self_signing_key_matches_authoritative: bool,
+    pub cached_device_present: bool,
+    pub cached_keys_match_authoritative: bool,
+    pub cached_signed_content_matches_authoritative: bool,
+    pub cached_signature_count: usize,
+    pub cached_cross_signed_by_owner: bool,
 }
 
 impl Recovery {
@@ -175,6 +200,105 @@ impl Recovery {
     /// ```
     pub fn state_stream(&self) -> impl Stream<Item = RecoveryState> + use<> {
         self.client.inner.e2ee.recovery_state.subscribe_reset()
+    }
+
+    /// Force an out-of-band query for the own user's keys and compare the raw
+    /// homeserver response with the device projection written to the crypto
+    /// store. This does not publish or modify server-side keys.
+    pub async fn inspect_current_device_signature_state(
+        &self,
+    ) -> Result<RecoveryDeviceSignatureInspection> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
+        let own_user_id = olm_machine.user_id();
+        let own_device_id = olm_machine.device_id();
+
+        let (request_id, request) = olm_machine.query_keys_for_users([own_user_id]);
+        let response = self.client.keys_query(&request_id, request.device_keys).await?;
+
+        let server_devices = response.device_keys.get(own_user_id);
+        let authoritative_raw = server_devices.and_then(|devices| devices.get(own_device_id));
+        let authoritative_device =
+            authoritative_raw.and_then(|raw| raw.deserialize_as::<DeviceKeys>().ok());
+        let authoritative_signature_count =
+            authoritative_device.as_ref().map_or(0, |device| device.signatures.signature_count());
+
+        let self_signing_raw = response.self_signing_keys.get(own_user_id);
+        let self_signing_key = self_signing_raw
+            .and_then(|raw| raw.deserialize_as::<CrossSigningKey>().ok())
+            .and_then(|key| SelfSigningPubkey::try_from(key).ok());
+        let authoritative_self_signing_signature_valid = self_signing_key
+            .as_ref()
+            .zip(authoritative_device.as_ref())
+            .is_some_and(|(key, device)| key.verify_device_keys(device).is_ok());
+        let authoritative_self_signing_key_id = self_signing_key
+            .as_ref()
+            .and_then(|key| key.keys().iter().next().map(|(key_id, _)| key_id));
+        let authoritative_self_signing_signature_present = authoritative_self_signing_key_id
+            .zip(authoritative_device.as_ref())
+            .is_some_and(|(key_id, device)| {
+                device
+                    .signatures
+                    .get(own_user_id)
+                    .is_some_and(|signatures| signatures.contains_key(key_id))
+            });
+        let authoritative_self_signing_signature_parseable =
+            authoritative_self_signing_key_id.zip(authoritative_device.as_ref()).is_some_and(
+                |(key_id, device)| device.signatures.get_signature(own_user_id, key_id).is_some(),
+            );
+        let cached_self_signing_key = self
+            .client
+            .encryption()
+            .get_user_identity(own_user_id)
+            .await
+            .map_err(crate::Error::from)?
+            .and_then(|identity| identity.underlying_identity().own())
+            .map(|identity| identity.self_signing_key().clone());
+        let cached_self_signing_key_matches_authoritative =
+            cached_self_signing_key.as_ref().zip(self_signing_key.as_ref()).is_some_and(
+                |(cached, authoritative)| cached.get_first_key() == authoritative.get_first_key(),
+            );
+
+        let cached_device =
+            self.client.encryption().get_own_device().await.map_err(crate::Error::from)?;
+        let cached_signature_count =
+            cached_device.as_ref().map_or(0, |device| device.signatures().signature_count());
+        let cached_cross_signed_by_owner =
+            cached_device.as_ref().is_some_and(|device| device.is_cross_signed_by_owner());
+        let cached_keys_match_authoritative = cached_device
+            .as_ref()
+            .zip(authoritative_device.as_ref())
+            .is_some_and(|(cached, authoritative)| cached.as_device_keys() == authoritative);
+        let cached_signed_content_matches_authoritative = cached_device
+            .as_ref()
+            .zip(authoritative_device.as_ref())
+            .is_some_and(|(cached, authoritative)| {
+                let mut cached = cached.as_device_keys().clone();
+                let mut authoritative = authoritative.clone();
+                cached.signatures = Signatures::default();
+                authoritative.signatures = Signatures::default();
+                cached == authoritative
+            });
+
+        Ok(RecoveryDeviceSignatureInspection {
+            query_failure_count: response.failures.len(),
+            server_device_count: server_devices.map_or(0, |devices| devices.len()),
+            authoritative_device_present: authoritative_raw.is_some(),
+            authoritative_device_deserialized: authoritative_device.is_some(),
+            authoritative_signature_count,
+            self_signing_key_present: self_signing_raw.is_some(),
+            self_signing_key_deserialized: self_signing_key.is_some(),
+            authoritative_self_signing_signature_valid,
+            authoritative_self_signing_signature_present,
+            authoritative_self_signing_signature_parseable,
+            cached_self_signing_key_present: cached_self_signing_key.is_some(),
+            cached_self_signing_key_matches_authoritative,
+            cached_device_present: cached_device.is_some(),
+            cached_keys_match_authoritative,
+            cached_signed_content_matches_authoritative,
+            cached_signature_count,
+            cached_cross_signed_by_owner,
+        })
     }
 
     /// Enable secret storage *and* backups.

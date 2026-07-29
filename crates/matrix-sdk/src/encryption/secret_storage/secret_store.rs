@@ -14,7 +14,9 @@
 
 use std::fmt;
 
-use matrix_sdk_base::crypto::{CrossSigningKeyExport, secret_storage::SecretStorageKey};
+use matrix_sdk_base::crypto::{
+    CrossSigningKeyExport, secret_storage::SecretStorageKey, types::DeviceKeys,
+};
 use ruma::{
     events::{
         GlobalAccountDataEventType, secret::request::SecretName,
@@ -32,6 +34,28 @@ use zeroize::Zeroize;
 
 use super::{DecryptionError, Result, SecretStorageError};
 use crate::{Client, encryption::backups::EnableBackupError};
+
+fn optional_bool_token(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
+fn device_signed_content(device: &DeviceKeys) -> Option<serde_json::Value> {
+    let mut value = serde_json::to_value(device).ok()?;
+    let object = value.as_object_mut()?;
+    object.remove("signatures");
+    object.remove("unsigned");
+    Some(value)
+}
+
+fn signed_content_matches(left: &DeviceKeys, right: &DeviceKeys) -> bool {
+    device_signed_content(left)
+        .zip(device_signed_content(right))
+        .is_some_and(|(left, right)| left == right)
+}
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// Secure key/value storage for Matrix users.
@@ -441,13 +465,107 @@ impl SecretStore {
             // verify our own device so other devices and user identities trust
             // it if the trust our user identity.
             if let Some(own_device) = self.client.encryption().get_own_device().await? {
-                own_device.verify().await?;
+                let upload_diagnostics = own_device.verify_with_diagnostics().await?;
 
                 // Another /keys/query request to ensure that the signatures we uploaded using
                 // `own_device.verify()` are attached to the `Device` we have in storage.
                 let (request_id, request) =
                     olm_machine.query_keys_for_users([olm_machine.user_id()]);
-                self.client.keys_query(&request_id, request.device_keys).await?;
+                let query_response =
+                    self.client.keys_query(&request_id, request.device_keys).await?;
+
+                let refreshed_device = self.client.encryption().get_own_device().await?;
+                let refreshed_device_keys =
+                    refreshed_device.as_ref().map(|device| device.as_device_keys());
+                let refreshed_self_signing_key = self
+                    .client
+                    .encryption()
+                    .get_user_identity(olm_machine.user_id())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|identity| identity.underlying_identity().own())
+                    .map(|identity| identity.self_signing_key().clone());
+                let refreshed_self_signing_key_id = refreshed_self_signing_key
+                    .as_ref()
+                    .and_then(|key| key.keys().iter().next().map(|(key_id, _)| key_id.clone()));
+                let refreshed_self_signing_signature_valid = refreshed_self_signing_key
+                    .as_ref()
+                    .zip(refreshed_device_keys)
+                    .map(|(key, device)| key.verify_device_keys(device).is_ok());
+                let signed_content_matches_refreshed = upload_diagnostics
+                    .signed_device_keys
+                    .as_ref()
+                    .zip(refreshed_device_keys)
+                    .map(|(uploaded, refreshed)| signed_content_matches(uploaded, refreshed));
+                let exact_device_keys_match_refreshed = upload_diagnostics
+                    .signed_device_keys
+                    .as_ref()
+                    .zip(refreshed_device_keys)
+                    .map(|(uploaded, refreshed)| uploaded == refreshed);
+                let self_signing_key_id_matches_refreshed = upload_diagnostics
+                    .preupload_self_signing_key_id
+                    .as_ref()
+                    .zip(refreshed_self_signing_key_id.as_ref())
+                    .map(|(preupload, refreshed)| preupload == refreshed);
+                let preupload_signature_valid_with_refreshed_key = refreshed_self_signing_key
+                    .as_ref()
+                    .zip(upload_diagnostics.signed_device_keys.as_ref())
+                    .map(|(key, device)| key.verify_device_keys(device).is_ok());
+                let refreshed_signature_valid_with_preupload_key = upload_diagnostics
+                    .preupload_self_signing_key
+                    .as_ref()
+                    .zip(refreshed_device_keys)
+                    .map(|(key, device)| key.verify_device_keys(device).is_ok());
+                let preupload_signature_matches_refreshed = upload_diagnostics
+                    .preupload_self_signing_key_id
+                    .as_ref()
+                    .zip(refreshed_self_signing_key_id.as_ref())
+                    .filter(|(preupload, refreshed)| preupload == refreshed)
+                    .and_then(|(key_id, _)| {
+                        upload_diagnostics
+                            .signed_device_keys
+                            .as_ref()
+                            .and_then(|device| {
+                                device.signatures.get_signature(olm_machine.user_id(), key_id)
+                            })
+                            .zip(refreshed_device_keys.and_then(|device| {
+                                device.signatures.get_signature(olm_machine.user_id(), key_id)
+                            }))
+                            .map(|(preupload, refreshed)| preupload == refreshed)
+                    });
+                let preupload_signature_count = upload_diagnostics
+                    .signed_device_keys
+                    .as_ref()
+                    .map_or(0, |device| device.signatures.signature_count());
+                let refreshed_signature_count =
+                    refreshed_device_keys.map_or(0, |device| device.signatures.signature_count());
+
+                eprintln!(
+                    "[koushi] sdk.recovery_verification stage=standard_signature_round_trip_finished \
+                     preupload_target_present={} preupload_signature_count={} \
+                     preupload_self_signing_signature_valid={} query_failure_count={} \
+                     refreshed_device_present={} refreshed_signature_count={} \
+                     signed_content_matches_refreshed={} exact_device_keys_match_refreshed={} \
+                     self_signing_key_id_matches_refreshed={} \
+                     preupload_signature_matches_refreshed={} \
+                     preupload_signature_valid_with_refreshed_key={} \
+                     refreshed_signature_valid_with_preupload_key={} \
+                     refreshed_self_signing_signature_valid={}",
+                    upload_diagnostics.signed_device_keys.is_some(),
+                    preupload_signature_count,
+                    optional_bool_token(upload_diagnostics.preupload_self_signing_signature_valid),
+                    query_response.failures.len(),
+                    refreshed_device_keys.is_some(),
+                    refreshed_signature_count,
+                    optional_bool_token(signed_content_matches_refreshed),
+                    optional_bool_token(exact_device_keys_match_refreshed),
+                    optional_bool_token(self_signing_key_id_matches_refreshed),
+                    optional_bool_token(preupload_signature_matches_refreshed),
+                    optional_bool_token(preupload_signature_valid_with_refreshed_key),
+                    optional_bool_token(refreshed_signature_valid_with_preupload_key),
+                    optional_bool_token(refreshed_self_signing_signature_valid),
+                );
 
                 info!("Successfully signed our own device, the device is now verified");
             } else {
