@@ -289,6 +289,35 @@ impl RoomEventCache {
         Ok(cache)
     }
 
+    /// Rebuild an event-focused cache from the homeserver and replace any
+    /// cached instance for the same focus. This is intentionally separate
+    /// from [`Self::get_or_create_event_focused_cache`]: callers use it only
+    /// after observing that a previously reused cache is still empty.
+    #[instrument(skip(self), fields(room_id = %self.inner.room_id, event_id = %event_id, thread_mode = ?thread_mode))]
+    pub async fn refresh_event_focused_cache(
+        &self,
+        event_id: OwnedEventId,
+        num_context_events: u16,
+        thread_mode: EventFocusThreadMode,
+    ) -> Result<EventFocusedCache> {
+        let room = self.inner.weak_room.get().ok_or(EventCacheError::ClientDropped)?;
+        let linked_chunk_update_sender =
+            self.inner.state.read().await?.state.linked_chunk_update_sender.clone();
+        let room_id = room.room_id().to_owned();
+        let weak_room = WeakRoom::new(WeakClient::from_client(&room.client()), room_id);
+        let cache = EventFocusedCache::new(weak_room, event_id.clone(), linked_chunk_update_sender);
+
+        trace!("refreshing an empty event-focused cache");
+        cache.start_from(room, num_context_events, thread_mode).await?;
+
+        self.inner.state.write().await?.insert_event_focused_cache(
+            event_id,
+            thread_mode,
+            cache.clone(),
+        );
+        Ok(cache)
+    }
+
     /// Get an event-focused cache for this event and thread mode, if it exists.
     ///
     /// Otherwise, returns `None`.
@@ -720,7 +749,72 @@ mod tests {
         room_id, user_id,
     };
 
-    use crate::test_utils::logged_in_client;
+    use crate::event_cache::EventFocusThreadMode;
+    use crate::test_utils::{
+        logged_in_client,
+        mocks::{MatrixMockServer, RoomContextResponseTemplate},
+    };
+
+    #[async_test]
+    async fn test_refresh_event_focused_cache_replaces_the_reused_snapshot() {
+        let room_id = room_id!("!focused:example.org");
+        let target_event_id = event_id!("$focused");
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let factory = EventFactory::new().room(room_id).sender(user_id!("@alice:example.org"));
+        let mode = EventFocusThreadMode::Automatic { hide_threaded_events: false };
+
+        server
+            .mock_room_event_context()
+            .room(room_id)
+            .ok(RoomContextResponseTemplate::new(
+                factory.text_msg("first").event_id(target_event_id).into_event(),
+            ))
+            .mock_once()
+            .mount()
+            .await;
+        let room = server.sync_joined_room(&client, room_id).await;
+        client.event_cache().subscribe().unwrap();
+        let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+        let first = room_cache
+            .get_or_create_event_focused_cache(target_event_id.to_owned(), 20, mode)
+            .await
+            .unwrap();
+        let (first_events, _) = first.subscribe().await;
+        assert_eq!(
+            first_events[0].kind.raw().get_field::<serde_json::Value>("content").unwrap().and_then(
+                |content| content.get("body").and_then(|body| body.as_str()).map(str::to_owned)
+            ),
+            Some("first".to_owned())
+        );
+
+        server
+            .mock_room_event_context()
+            .room(room_id)
+            .ok(RoomContextResponseTemplate::new(
+                factory.text_msg("second").event_id(target_event_id).into_event(),
+            ))
+            .mock_once()
+            .mount()
+            .await;
+        let refreshed = room_cache
+            .refresh_event_focused_cache(target_event_id.to_owned(), 20, mode)
+            .await
+            .unwrap();
+        let (refreshed_events, _) = refreshed.subscribe().await;
+        assert_eq!(
+            refreshed_events[0]
+                .kind
+                .raw()
+                .get_field::<serde_json::Value>("content")
+                .unwrap()
+                .and_then(|content| content
+                    .get("body")
+                    .and_then(|body| body.as_str())
+                    .map(str::to_owned)),
+            Some("second".to_owned())
+        );
+    }
 
     #[async_test]
     async fn test_find_event_by_id_with_edit_relation() {

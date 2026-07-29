@@ -1498,14 +1498,36 @@ impl TimelineController {
                     }
                 };
 
-                let cache = room_event_cache
-                    .get_or_create_event_focused_cache(
-                        event_id.clone(),
-                        *num_context_events,
-                        event_cache_thread_mode,
-                    )
+                let cache = match room_event_cache
+                    .get_event_focused_cache(event_id.clone(), event_cache_thread_mode)
                     .await
-                    .map_err(PaginationError::EventCache)?;
+                    .map_err(PaginationError::EventCache)?
+                {
+                    Some(cache) => {
+                        let (cached_events, cached_receiver) = cache.subscribe().await;
+                        drop(cached_receiver);
+                        if cached_events.is_empty() {
+                            room_event_cache
+                                .refresh_event_focused_cache(
+                                    event_id.clone(),
+                                    *num_context_events,
+                                    event_cache_thread_mode,
+                                )
+                                .await
+                                .map_err(PaginationError::EventCache)?
+                        } else {
+                            cache
+                        }
+                    }
+                    None => room_event_cache
+                        .get_or_create_event_focused_cache(
+                            event_id.clone(),
+                            *num_context_events,
+                            event_cache_thread_mode,
+                        )
+                        .await
+                        .map_err(PaginationError::EventCache)?,
+                };
 
                 let (events, receiver) = cache.subscribe().await;
 
