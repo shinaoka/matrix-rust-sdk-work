@@ -189,7 +189,9 @@ impl From<TimelineEventFocusThreadMode> for EventFocusThreadMode {
     fn from(val: TimelineEventFocusThreadMode) -> Self {
         match val {
             TimelineEventFocusThreadMode::ForceThread => EventFocusThreadMode::ForceThread,
-            TimelineEventFocusThreadMode::Automatic { .. } => EventFocusThreadMode::Automatic,
+            TimelineEventFocusThreadMode::Automatic { hide_threaded_events } => {
+                EventFocusThreadMode::Automatic { hide_threaded_events }
+            }
         }
     }
 }
