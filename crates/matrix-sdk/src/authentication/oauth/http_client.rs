@@ -28,7 +28,7 @@ pub(super) struct OAuthHttpClient {
     ///
     /// This is a workaround to bypass some checks that require an HTTPS URL,
     /// but we can only mock HTTP URLs.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(super) insecure_rewrite_https_to_http: bool,
 }
 
@@ -39,7 +39,7 @@ impl<'c> AsyncHttpClient<'c> for OAuthHttpClient {
 
     fn call(&'c self, request: HttpRequest) -> Self::Future {
         Box::pin(async move {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             let request = if self.insecure_rewrite_https_to_http
                 && request.uri().scheme().is_some_and(|scheme| *scheme == http::uri::Scheme::HTTPS)
             {

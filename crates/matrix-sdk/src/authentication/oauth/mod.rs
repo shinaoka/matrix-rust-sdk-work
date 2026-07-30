@@ -286,7 +286,7 @@ impl OAuth {
     pub(crate) fn new(client: Client) -> Self {
         let http_client = OAuthHttpClient {
             inner: ReqwestClient::from(client.inner.http_client.inner.clone()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             insecure_rewrite_https_to_http: false,
         };
         Self { client, http_client }
@@ -296,8 +296,9 @@ impl OAuth {
     ///
     /// This is a workaround to bypass some checks that require an HTTPS URL,
     /// but we can only mock HTTP URLs.
-    #[cfg(test)]
-    pub(crate) fn insecure_rewrite_https_to_http(mut self) -> Self {
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn insecure_rewrite_https_to_http(mut self) -> Self {
         self.http_client.insecure_rewrite_https_to_http = true;
         self
     }
