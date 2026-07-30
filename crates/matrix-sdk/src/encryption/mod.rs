@@ -1292,8 +1292,15 @@ impl Encryption {
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn request_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentity>> {
-        let olm = self.client.olm_machine().await;
-        let Some(olm) = olm.as_ref() else { return Ok(None) };
+        // Keep the OlmMachine for this request, but release the client lock
+        // before `/keys/query`. The response path reacquires that lock; holding
+        // its read guard across the request deadlocks when regeneration has
+        // already queued a writer.
+        let olm = {
+            let guard = self.client.olm_machine().await;
+            guard.as_ref().cloned()
+        };
+        let Some(olm) = olm else { return Ok(None) };
 
         let (request_id, request) = olm.query_keys_for_users(iter::once(user_id));
         self.client.keys_query(&request_id, request.device_keys).await?;
@@ -2354,6 +2361,61 @@ mod tests {
             .expect("a logged-in client has an Olm machine");
 
         assert!(first.next().await.is_none());
+    }
+
+    #[async_test]
+    async fn test_request_user_identity_does_not_deadlock_with_olm_regeneration() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+        let user_id = client.user_id().expect("a logged-in client has a user id").to_owned();
+        let initial_request_count = server.received_requests().await.unwrap().len();
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/(r0|v3)/keys/query$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({}))
+                    .set_delay(Duration::from_millis(250)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let request_client = client.clone();
+        let request_task = tokio::spawn(async move {
+            request_client.encryption().request_user_identity(&user_id).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if server.received_requests().await.unwrap().len() > initial_request_count {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the delayed keys query should reach the server");
+
+        let regeneration_client = client.clone();
+        let regeneration_task =
+            tokio::spawn(
+                async move { regeneration_client.base_client().regenerate_olm(None).await },
+            );
+        tokio::task::yield_now().await;
+
+        let (identity, regeneration) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(request_task, regeneration_task)
+        })
+        .await
+        .expect("the keys query and queued Olm writer must not deadlock");
+
+        identity
+            .expect("the identity task should not panic")
+            .expect("the delayed empty keys query should settle");
+        regeneration
+            .expect("the regeneration task should not panic")
+            .expect("Olm regeneration should settle");
     }
 
     #[async_test]
