@@ -791,6 +791,9 @@ pub struct SyncServiceBuilder {
     /// defined span, for example if there is more than one active sync
     /// service.
     parent_span: Span,
+
+    /// Application-owned permit shared with any provisional encryption sync.
+    encryption_sync_permit: Option<Arc<AsyncMutex<EncryptionSyncPermit>>>,
 }
 
 impl SyncServiceBuilder {
@@ -802,6 +805,7 @@ impl SyncServiceBuilder {
             room_list_conn_id: DEFAULT_CONNECTION_ID.to_owned(),
             room_list_timeline_limit: DEFAULT_LIST_TIMELINE_LIMIT,
             parent_span: Span::none(),
+            encryption_sync_permit: None,
         }
     }
 
@@ -841,6 +845,16 @@ impl SyncServiceBuilder {
         self
     }
 
+    /// Use an application-owned encryption-sync permit so another lifecycle
+    /// owner can hand off to this service without an overlap window.
+    pub fn with_encryption_sync_permit(
+        mut self,
+        permit: Arc<AsyncMutex<EncryptionSyncPermit>>,
+    ) -> Self {
+        self.encryption_sync_permit = Some(permit);
+        self
+    }
+
     /// Finish setting up the [`SyncService`].
     ///
     /// This creates the underlying sliding syncs, and will *not* start them in
@@ -854,9 +868,11 @@ impl SyncServiceBuilder {
             room_list_conn_id,
             room_list_timeline_limit,
             parent_span,
+            encryption_sync_permit,
         } = self;
 
-        let encryption_sync_permit = Arc::new(AsyncMutex::new(EncryptionSyncPermit::new()));
+        let encryption_sync_permit = encryption_sync_permit
+            .unwrap_or_else(|| Arc::new(AsyncMutex::new(EncryptionSyncPermit::new())));
 
         let room_list = RoomListService::new_with(
             client.clone(),

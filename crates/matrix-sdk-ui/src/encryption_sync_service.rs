@@ -46,7 +46,9 @@ use tracing::{debug, instrument, trace};
 pub struct EncryptionSyncPermit(());
 
 impl EncryptionSyncPermit {
-    pub(crate) fn new() -> Self {
+    /// Creates a permit token to place behind an application-owned shared
+    /// mutex when serializing encryption sync owners.
+    pub fn new() -> Self {
         Self(())
     }
 }
