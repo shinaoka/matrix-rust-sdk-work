@@ -797,11 +797,12 @@ mod tests {
     use std::future::ready;
 
     use futures_util::{StreamExt, pin_mut};
-    use matrix_sdk::{SlidingSyncMode, test_utils::mocks::MatrixMockServer};
+    use matrix_sdk::{SlidingSyncMode, ThreadingSupport, test_utils::mocks::MatrixMockServer};
     use matrix_sdk_test::{TestError, async_test};
     use ruma::{
         api::client::sync::sync_events::v5, assign, events::StateEventType, room_id, uint, user_id,
     };
+    use serde_json::Value;
 
     use super::{
         ALL_ROOMS_LIST_NAME, Error, RoomListService, RoomSubscriptionState, State,
@@ -876,6 +877,93 @@ mod tests {
                 .await,
             Some(true)
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_rooms_request_matches_element_x_26_07_28() -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().with_thread_subscriptions().ok().up_to_n_times(3).mount().await;
+        let client = server
+            .client_builder()
+            .no_server_versions()
+            .on_builder(|builder| {
+                builder
+                    .with_threading_support(ThreadingSupport::Enabled { with_subscriptions: true })
+            })
+            .build()
+            .await;
+        let room_list = RoomListService::new(client).await?;
+
+        let _mock_guard = server
+            .mock_sliding_sync()
+            .ok({
+                let mut response = v5::Response::new("0".to_owned());
+                response.lists.insert(
+                    ALL_ROOMS_LIST_NAME.to_owned(),
+                    assign!(v5::response::List::default(), { count: uint!(0) }),
+                );
+                response
+            })
+            .mount_as_scoped()
+            .await;
+        let sync = room_list.sync();
+        pin_mut!(sync);
+        sync.next().await.expect("first room-list sync result")?;
+
+        let requests = server.received_requests().await.expect("captured requests");
+        let request = requests
+            .iter()
+            .find(|request| {
+                request.url.path().ends_with("/sync") && request.method.as_str() == "POST"
+            })
+            .expect("first room-list sliding-sync request");
+        let body: Value = serde_json::from_slice(&request.body)?;
+
+        assert_eq!(
+            request.url.path(),
+            "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync"
+        );
+        assert_eq!(request.url.query(), Some("timeout=0"));
+        assert_eq!(body["conn_id"], "room-list");
+
+        let lists = body["lists"].as_object().expect("request lists object");
+        assert_eq!(lists.keys().map(String::as_str).collect::<Vec<_>>(), ["all_rooms"]);
+        let all_rooms = &body["lists"]["all_rooms"];
+        let invite_filter = all_rooms["filters"].get("is_invite");
+        assert!(invite_filter.is_none() || invite_filter.is_some_and(Value::is_null));
+        assert_eq!(all_rooms["timeline_limit"], 1);
+        assert_eq!(
+            all_rooms["required_state"],
+            serde_json::json!([
+                ["m.room.name", ""],
+                ["m.room.encryption", ""],
+                ["m.room.member", "$LAZY"],
+                ["m.room.member", "@example:localhost"],
+                ["m.room.topic", ""],
+                ["m.room.avatar", ""],
+                ["m.room.canonical_alias", ""],
+                ["m.room.power_levels", ""],
+                ["org.matrix.msc3401.call.member", "*"],
+                ["m.room.join_rules", ""],
+                ["m.room.tombstone", ""],
+                ["m.room.create", ""],
+                ["m.room.history_visibility", ""],
+                ["io.element.functional_members", ""],
+                ["m.space.parent", "*"],
+                ["m.space.child", "*"],
+                ["org.matrix.msc3672.beacon_info", "*"],
+            ])
+        );
+
+        let extensions = &body["extensions"];
+        assert_eq!(extensions["account_data"]["enabled"], true);
+        assert_eq!(extensions["receipts"]["enabled"], true);
+        assert_eq!(extensions["receipts"]["rooms"], serde_json::json!(["*"]));
+        assert_eq!(extensions["typing"]["enabled"], true);
+        assert_eq!(extensions["io.element.msc4308.thread_subscriptions"]["enabled"], true);
+        assert_eq!(extensions["io.element.msc4308.thread_subscriptions"]["limit"], 10);
 
         Ok(())
     }
