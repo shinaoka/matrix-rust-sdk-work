@@ -161,6 +161,7 @@ impl RoomSubscriptionGeneration {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RoomSubscriptionCheckpoint {
     subscription_generation: RoomSubscriptionGeneration,
+    response_sequence: u64,
     room_id: OwnedRoomId,
     timeline: Option<matrix_sdk::event_cache::RoomTimelineSyncObservation>,
 }
@@ -169,6 +170,11 @@ impl RoomSubscriptionCheckpoint {
     /// Generation of the subscription request that produced this response.
     pub fn subscription_generation(&self) -> RoomSubscriptionGeneration {
         self.subscription_generation
+    }
+
+    /// Exact committed `all_rooms` response that produced this checkpoint.
+    pub fn response_sequence(&self) -> u64 {
+        self.response_sequence
     }
 
     /// Room associated with this checkpoint.
@@ -187,6 +193,7 @@ impl fmt::Debug for RoomSubscriptionCheckpoint {
         formatter
             .debug_struct("RoomSubscriptionCheckpoint")
             .field("subscription_generation", &self.subscription_generation)
+            .field("response_sequence", &self.response_sequence)
             .field("has_timeline", &self.timeline.is_some())
             .finish()
     }
@@ -429,8 +436,9 @@ impl RoomListService {
                 match sync.next().await {
                     // Got a successful result while syncing.
                     Some(Ok(update_summary)) => {
-                        self.publish_room_subscription_checkpoints(
-                            subscription_iteration,
+                        let room_subscription_checkpoints = self
+                            .collect_room_subscription_checkpoints(
+                            &subscription_iteration,
                             &update_summary.rooms,
                         )
                         .await;
@@ -454,7 +462,12 @@ impl RoomListService {
                             .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))?;
                         self.committed_all_rooms_response.advance_after(
                             range_fully_loaded,
-                            |response_sequence| {
+                            move |response_sequence| {
+                                self.publish_room_subscription_checkpoints(
+                                    subscription_iteration,
+                                    room_subscription_checkpoints,
+                                    response_sequence,
+                                );
                                 self.all_rooms_observed_ids.accumulate(
                                     response_sequence,
                                     range_fully_loaded,
@@ -749,11 +762,11 @@ impl RoomListService {
         }
     }
 
-    async fn publish_room_subscription_checkpoints(
+    async fn collect_room_subscription_checkpoints(
         &self,
-        iteration: RoomSubscriptionIteration,
+        iteration: &RoomSubscriptionIteration,
         updated_rooms: &[OwnedRoomId],
-    ) {
+    ) -> Vec<(OwnedRoomId, Option<matrix_sdk::event_cache::RoomTimelineSyncObservation>)> {
         let mut additions = Vec::new();
         for room_id in updated_rooms {
             if !iteration.active_rooms.contains(room_id) {
@@ -771,16 +784,18 @@ impl RoomListService {
             } else {
                 None
             };
-            additions.push((
-                room_id.clone(),
-                RoomSubscriptionCheckpoint {
-                    subscription_generation: iteration.generation,
-                    room_id: room_id.clone(),
-                    timeline,
-                },
-            ));
+            additions.push((room_id.clone(), timeline));
         }
 
+        additions
+    }
+
+    fn publish_room_subscription_checkpoints(
+        &self,
+        iteration: RoomSubscriptionIteration,
+        additions: Vec<(OwnedRoomId, Option<matrix_sdk::event_cache::RoomTimelineSyncObservation>)>,
+        response_sequence: u64,
+    ) {
         if additions.is_empty() {
             return;
         }
@@ -794,7 +809,17 @@ impl RoomListService {
             return;
         }
         let mut retained = (*self.room_subscription_checkpoints.get()).clone();
-        retained.extend(additions);
+        retained.extend(additions.into_iter().map(|(room_id, timeline)| {
+            (
+                room_id.clone(),
+                RoomSubscriptionCheckpoint {
+                    subscription_generation: iteration.generation,
+                    response_sequence,
+                    room_id,
+                    timeline,
+                },
+            )
+        }));
         self.room_subscription_checkpoints.set(Arc::new(retained));
     }
 
@@ -861,7 +886,8 @@ mod tests {
 
     use super::{
         ALL_ROOMS_LIST_NAME, Error, RoomListRangeLoadingState, RoomListService,
-        RoomSubscriptionState, State, filters::new_filter_non_left, required_state_for_user,
+        RoomSubscriptionCheckpoint, RoomSubscriptionGeneration, RoomSubscriptionState, State,
+        filters::new_filter_non_left, required_state_for_user,
     };
     use crate::sync_service::{State as SyncServiceState, SyncService};
 
@@ -959,6 +985,115 @@ mod tests {
         assert!(!format!("{latest:?}").contains("private-reconnect-pos"));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn room_checkpoint_and_global_commit_share_the_exact_response_sequence()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_list_service = RoomListService::new(client).await?;
+        let room_id = room_id!("!response-correlation:example.org");
+        let committed = room_list_service.committed_all_rooms_response();
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+
+        {
+            let _initial_guard = server
+                .mock_sliding_sync()
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pos": "initial",
+                    "lists": { "all_rooms": { "count": 1 } },
+                    "rooms": { room_id: { "initial": true } }
+                })))
+                .mount_as_scoped()
+                .await;
+            sync.next().await.expect("initial room-list sync result")?;
+        }
+
+        let generation = room_list_service.subscribe_to_rooms_with_generation(&[room_id]).await;
+
+        {
+            let _update_guard = server
+                .mock_sliding_sync()
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pos": "with-gap",
+                    "lists": { "all_rooms": { "count": 1 } },
+                    "rooms": {
+                        room_id: {
+                            "timeline": [{
+                                "event_id": "$correlated-event:example.org",
+                                "sender": "@alice:example.org",
+                                "type": "m.room.message",
+                                "content": { "body": "private body", "msgtype": "m.text" },
+                                "origin_server_ts": 1
+                            }],
+                            "prev_batch": "private-gap-token"
+                        }
+                    }
+                })))
+                .mount_as_scoped()
+                .await;
+            sync.next().await.expect("timeline room-list sync result")?;
+        }
+
+        let update_commit = committed.get();
+        let update_checkpoint = room_list_service
+            .room_subscription_checkpoints()
+            .get()
+            .get(room_id)
+            .cloned()
+            .expect("timeline checkpoint");
+        assert_eq!(update_checkpoint.subscription_generation(), generation);
+        assert_eq!(update_checkpoint.response_sequence(), update_commit.sequence());
+        assert!(
+            update_checkpoint.timeline().is_some_and(|timeline| timeline.inserted_gap().is_some())
+        );
+
+        {
+            let _no_update_guard = server
+                .mock_sliding_sync()
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pos": "without-timeline-update",
+                    "lists": { "all_rooms": { "count": 1 } },
+                    "rooms": { room_id: {} }
+                })))
+                .mount_as_scoped()
+                .await;
+            sync.next().await.expect("no-update room-list sync result")?;
+        }
+
+        let no_update_commit = committed.get();
+        let no_update_checkpoint = room_list_service
+            .room_subscription_checkpoints()
+            .get()
+            .get(room_id)
+            .cloned()
+            .expect("no-update checkpoint");
+        assert_eq!(no_update_checkpoint.subscription_generation(), generation);
+        assert_eq!(no_update_checkpoint.response_sequence(), no_update_commit.sequence());
+        assert!(no_update_checkpoint.response_sequence() > update_checkpoint.response_sequence());
+        assert!(no_update_checkpoint.timeline().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn room_subscription_checkpoint_debug_is_private_safe() {
+        let room_id = room_id!("!private-checkpoint:example.org");
+        let checkpoint = RoomSubscriptionCheckpoint {
+            subscription_generation: RoomSubscriptionGeneration(7),
+            response_sequence: 11,
+            room_id: room_id.to_owned(),
+            timeline: None,
+        };
+
+        let debug = format!("{checkpoint:?}");
+        assert!(debug.contains("subscription_generation"));
+        assert!(debug.contains("response_sequence: 11"));
+        assert!(debug.contains("has_timeline: false"));
+        assert!(!debug.contains(room_id.as_str()));
+        assert!(!debug.contains("private-checkpoint"));
     }
 
     #[tokio::test]
