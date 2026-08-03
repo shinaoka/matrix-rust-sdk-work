@@ -51,6 +51,7 @@
 //! [`RoomListService::state`] provides a way to get a stream of the state
 //! machine's state, which can be pretty helpful for the client app.
 
+mod all_rooms;
 pub mod filters;
 mod room_list;
 pub mod sorters;
@@ -78,6 +79,9 @@ use ruma::{
 pub use state::*;
 use thiserror::Error;
 use tracing::{debug, error, warn};
+
+pub use self::all_rooms::CommittedAllRoomsResponse;
+use self::all_rooms::CommittedAllRoomsResponseObservable;
 
 /// The default `required_state` constant value for sliding sync lists and
 /// sliding sync room subscriptions.
@@ -228,6 +232,8 @@ pub struct RoomListService {
     room_subscription_state: Arc<Mutex<RoomSubscriptionState>>,
     room_subscription_checkpoints:
         SharedObservable<Arc<BTreeMap<OwnedRoomId, RoomSubscriptionCheckpoint>>>,
+
+    committed_all_rooms_response: CommittedAllRoomsResponseObservable,
 }
 
 impl RoomListService {
@@ -368,6 +374,7 @@ impl RoomListService {
             state_machine,
             room_subscription_state: Default::default(),
             room_subscription_checkpoints: SharedObservable::new(Arc::new(BTreeMap::new())),
+            committed_all_rooms_response: CommittedAllRoomsResponseObservable::new(),
         })
     }
 
@@ -422,6 +429,12 @@ impl RoomListService {
                             &update_summary.rooms,
                         )
                         .await;
+
+                        // `SlidingSync::sync` returns only after client response handling,
+                        // including the event-cache commit, and a successful v5 response has
+                        // committed its required `pos`. Publish only coarse process-local
+                        // evidence after that work has completed.
+                        self.committed_all_rooms_response.advance();
                         debug!(state = ?next_state, "New state");
 
                         // Update the state.
@@ -573,6 +586,11 @@ impl RoomListService {
     /// Get a [`RoomList`] for all rooms.
     pub async fn all_rooms(&self) -> Result<RoomList, Error> {
         self.list_for(ALL_ROOMS_LIST_NAME).await
+    }
+
+    /// Subscribe to coarse evidence of successfully committed `all_rooms` responses.
+    pub fn committed_all_rooms_response(&self) -> Subscriber<CommittedAllRoomsResponse> {
+        self.committed_all_rooms_response.subscribe()
     }
 
     /// Get a [`Room`] if it exists.
@@ -794,7 +812,7 @@ pub enum SyncIndicator {
 
 #[cfg(test)]
 mod tests {
-    use std::future::ready;
+    use std::{future::ready, time::Duration};
 
     use futures_util::{StreamExt, pin_mut};
     use matrix_sdk::{SlidingSyncMode, ThreadingSupport, test_utils::mocks::MatrixMockServer};
@@ -803,11 +821,109 @@ mod tests {
         api::client::sync::sync_events::v5, assign, events::StateEventType, room_id, uint, user_id,
     };
     use serde_json::Value;
+    use wiremock::ResponseTemplate;
 
     use super::{
         ALL_ROOMS_LIST_NAME, Error, RoomListService, RoomSubscriptionState, State,
         required_state_for_user,
     };
+    use crate::sync_service::{State as SyncServiceState, SyncService};
+
+    #[tokio::test]
+    async fn committed_all_rooms_response_observable_waits_for_committed_response()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sync_service = SyncService::builder(client.clone()).build().await?;
+        let room_list_service = sync_service.room_list_service();
+        let mut committed = room_list_service.committed_all_rooms_response();
+        let mut event_cache_commits =
+            client.event_cache().subscribe_to_committed_room_updates_responses();
+
+        assert_eq!(committed.get().sequence(), 0);
+        assert!(!committed.get().pos_present());
+
+        let _mock_guard = server
+            .mock_sliding_sync()
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(Duration::from_millis(100)).set_body_json(
+                    serde_json::json!({
+                        "pos": "private-pos-value",
+                        "lists": { "all_rooms": { "count": 0, "ops": [] } }
+                    }),
+                ),
+            )
+            .mount_as_scoped()
+            .await;
+
+        let mut sync_state = sync_service.state();
+        sync_service.start().await;
+        assert!(matches!(sync_state.next().await, Some(SyncServiceState::Running)));
+        assert_eq!(committed.get().sequence(), 0);
+        assert!(!committed.get().pos_present());
+
+        tokio::time::timeout(Duration::from_secs(2), committed.next())
+            .await
+            .expect("committed all-rooms response observable timed out")
+            .expect("committed all-rooms response observable ended");
+
+        let latest = committed.get();
+        assert_eq!(latest.sequence(), 1);
+        assert!(latest.pos_present());
+        assert!(
+            event_cache_commits.borrow_and_update().is_some(),
+            "the all-rooms observable must advance after the event-cache response commit"
+        );
+        let debug = format!("{latest:?}");
+        assert!(!debug.contains("private-pos-value"));
+        assert!(!debug.contains("room_id"));
+
+        sync_service.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_all_rooms_response_observable_ignores_failure_then_advances()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_list_service = RoomListService::new(client).await?;
+        let committed = room_list_service.committed_all_rooms_response();
+
+        {
+            let _failure_guard =
+                server.mock_sliding_sync().error_unrecognized().mount_as_scoped().await;
+            let sync = room_list_service.sync();
+            pin_mut!(sync);
+            assert!(matches!(sync.next().await, Some(Err(_))));
+        }
+
+        assert_eq!(committed.get().sequence(), 0);
+        assert!(!committed.get().pos_present());
+
+        let _success_guard = server
+            .mock_sliding_sync()
+            .ok({
+                let mut response = v5::Response::new("private-reconnect-pos".to_owned());
+                response.lists.insert(
+                    ALL_ROOMS_LIST_NAME.to_owned(),
+                    assign!(v5::response::List::default(), { count: uint!(0) }),
+                );
+                response
+            })
+            .mount_as_scoped()
+            .await;
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+        sync.next().await.expect("reconnect room-list sync result")?;
+
+        let latest = committed.get();
+        assert_eq!(latest.sequence(), 1);
+        assert!(latest.pos_present());
+        assert!(!format!("{latest:?}").contains("private-reconnect-pos"));
+
+        Ok(())
+    }
 
     #[test]
     fn required_state_expands_only_own_membership_placeholder() {
