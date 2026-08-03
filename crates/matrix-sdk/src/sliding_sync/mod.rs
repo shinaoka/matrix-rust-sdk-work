@@ -339,12 +339,14 @@ impl SlidingSync {
 
         let update_summary = {
             // Update the rooms.
+            let rooms_from_response =
+                sliding_sync_response.rooms.keys().cloned().collect::<Vec<_>>();
             let updated_rooms = {
                 let mut updated_rooms = Vec::with_capacity(
-                    sliding_sync_response.rooms.len() + sync_response.rooms.joined.len(),
+                    rooms_from_response.len() + sync_response.rooms.joined.len(),
                 );
 
-                updated_rooms.extend(sliding_sync_response.rooms.keys().cloned());
+                updated_rooms.extend(rooms_from_response.iter().cloned());
 
                 // There might be other rooms that were only mentioned in the sliding sync
                 // extensions part of the response, and thus would result in rooms present in
@@ -393,7 +395,7 @@ impl SlidingSync {
                 updated_lists
             };
 
-            UpdateSummary { lists: updated_lists, rooms: updated_rooms }
+            UpdateSummary { lists: updated_lists, rooms: updated_rooms, rooms_from_response }
         };
 
         // Everything went well, we can update the position markers.
@@ -898,6 +900,10 @@ pub struct UpdateSummary {
     pub lists: Vec<String>,
     /// The rooms that have seen updates
     pub rooms: Vec<OwnedRoomId>,
+    /// The rooms present in the top-level Sliding Sync response, excluding
+    /// rooms updated only through extensions.
+    #[doc(hidden)]
+    pub rooms_from_response: Vec<OwnedRoomId>,
 }
 
 /// Define what kind of poll timeout [`SlidingSync`] must use.
@@ -1754,7 +1760,7 @@ mod tests {
                 )])
             });
 
-            let _summary = {
+            let summary = {
                 let mut pos_guard = sliding_sync.inner.position.clone().lock_owned().await;
                 sliding_sync
                     .handle_response(
@@ -1764,6 +1770,7 @@ mod tests {
                     )
                     .await?
             };
+            assert_eq!(summary.rooms_from_response, [room.clone()]);
         }
 
         let server_response = assign!(http::Response::new("1".to_owned()), {
@@ -1806,6 +1813,7 @@ mod tests {
         };
 
         assert!(summary.rooms.contains(&room));
+        assert!(summary.rooms_from_response.is_empty());
 
         Ok(())
     }

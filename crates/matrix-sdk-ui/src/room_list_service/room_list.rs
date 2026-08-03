@@ -12,7 +12,7 @@
 // See the License for that specific language governing permissions and
 // limitations under the License.
 
-use std::{future::ready, ops::Deref, sync::Arc};
+use std::{fmt, future::ready, ops::Deref, sync::Arc};
 
 use async_cell::sync::AsyncCell;
 use async_rx::StreamExt as _;
@@ -20,10 +20,10 @@ use async_stream::stream;
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::{Vector, VectorDiff};
 use eyeball_im_util::vector::VectorObserverExt;
-use futures_util::{Stream, StreamExt as _, pin_mut, stream};
+use futures_util::{Stream, StreamExt as _, pin_mut};
 use matrix_sdk::{
     Client, Room, RoomRecencyStamp, RoomState, SlidingSync, SlidingSyncList,
-    task_monitor::BackgroundTaskHandle,
+    SlidingSyncListLoadingState, task_monitor::BackgroundTaskHandle,
 };
 use matrix_sdk_base::{RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons};
 use ruma::MilliSecondsSinceUnixEpoch;
@@ -35,6 +35,7 @@ use tracing::{error, trace};
 
 use super::{
     Error, State,
+    all_rooms::AllRoomsObservedIdsObservable,
     filters::BoxedFilterFn,
     sorters::{
         new_sorter_latest_event, new_sorter_lexicographic, new_sorter_name, new_sorter_recency,
@@ -49,6 +50,73 @@ pub struct RoomList {
     sliding_sync_list: SlidingSyncList,
     loading_state: SharedObservable<RoomListLoadingState>,
     _loading_state_task: BackgroundTaskHandle,
+    range_loading_state: SharedObservable<RoomListRangeLoadingState>,
+    _range_loading_state_task: BackgroundTaskHandle,
+    all_rooms_observed_ids: AllRoomsObservedIdsObservable,
+}
+
+/// A point-in-time projection of the entries currently owned by `all_rooms`.
+///
+/// Before the service's first successful response, the entries are a
+/// provisional cache projection and [`Self::response_sequence`] returns
+/// `None`. During recovery, the previous authoritative projection remains
+/// visible until the first successful response replaces it. Authoritative
+/// entries are filtered by the observed top-level Sliding Sync rooms and their
+/// response metadata can be correlated with
+/// [`super::CommittedAllRoomsResponse::sequence`].
+#[derive(Clone)]
+pub struct RoomListEntriesSnapshot {
+    entries: Vector<RoomListItem>,
+    response_sequence: Option<u64>,
+    range_fully_loaded: Option<bool>,
+    maximum_number_of_rooms: Option<u32>,
+}
+
+impl RoomListEntriesSnapshot {
+    /// The current room entries.
+    pub fn entries(&self) -> &Vector<RoomListItem> {
+        &self.entries
+    }
+
+    /// Consume this snapshot and return its room entries.
+    pub fn into_entries(self) -> Vector<RoomListItem> {
+        self.entries
+    }
+
+    /// The committed response sequence that owns this projection, or `None`
+    /// while it is still a provisional cache projection.
+    pub fn response_sequence(&self) -> Option<u64> {
+        self.response_sequence
+    }
+
+    /// Whether the snapshot is owned by an observed Sliding Sync response.
+    pub fn is_authoritative(&self) -> bool {
+        self.response_sequence.is_some()
+    }
+
+    /// Whether the room range was fully loaded by the response owning this
+    /// snapshot, or `None` while the projection is provisional.
+    pub fn range_fully_loaded(&self) -> Option<bool> {
+        self.range_fully_loaded
+    }
+
+    /// The maximum number of rooms reported by the response owning this
+    /// snapshot, if authority and a list count are available.
+    pub fn maximum_number_of_rooms(&self) -> Option<u32> {
+        self.maximum_number_of_rooms
+    }
+}
+
+impl fmt::Debug for RoomListEntriesSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RoomListEntriesSnapshot")
+            .field("response_sequence", &self.response_sequence)
+            .field("range_fully_loaded", &self.range_fully_loaded)
+            .field("maximum_number_of_rooms", &self.maximum_number_of_rooms)
+            .field("entry_count", &self.entries.len())
+            .finish()
+    }
 }
 
 impl RoomList {
@@ -57,6 +125,7 @@ impl RoomList {
         sliding_sync: &Arc<SlidingSync>,
         sliding_sync_list_name: &str,
         room_list_service_state: Subscriber<State>,
+        all_rooms_observed_ids: AllRoomsObservedIdsObservable,
     ) -> Result<Self, Error> {
         let sliding_sync_list = sliding_sync
             .on_list(sliding_sync_list_name, |list| ready(list.clone()))
@@ -70,6 +139,12 @@ impl RoomList {
                 },
                 None => RoomListLoadingState::NotLoaded,
             });
+        let range_loading_state = SharedObservable::new(RoomListRangeLoadingState::from_states(
+            &sliding_sync_list.state(),
+            &room_list_service_state.get(),
+        ));
+        let range_sliding_sync_list = sliding_sync_list.clone();
+        let mut range_room_list_service_state = room_list_service_state.clone();
 
         Ok(Self {
             client: client.clone(),
@@ -108,6 +183,39 @@ impl RoomList {
                     }
                 })
                 .abort_on_drop(),
+            range_loading_state: range_loading_state.clone(),
+            _range_loading_state_task: client
+                .task_monitor()
+                .spawn_infinite_task("room_list::range_loading_state_task", async move {
+                    let (mut current_list_state, range_loading_state_stream) =
+                        range_sliding_sync_list.state_stream();
+                    let mut current_service_state = range_room_list_service_state.get();
+                    range_loading_state.set(RoomListRangeLoadingState::from_states(
+                        &current_list_state,
+                        &current_service_state,
+                    ));
+                    pin_mut!(range_loading_state_stream);
+
+                    loop {
+                        select! {
+                            state = range_loading_state_stream.next() => {
+                                let Some(state) = state else { break };
+                                current_list_state = state;
+                            }
+                            state = range_room_list_service_state.next() => {
+                                let Some(state) = state else { break };
+                                current_service_state = state;
+                            }
+                        }
+
+                        range_loading_state.set(RoomListRangeLoadingState::from_states(
+                            &current_list_state,
+                            &current_service_state,
+                        ));
+                    }
+                })
+                .abort_on_drop(),
+            all_rooms_observed_ids,
         })
     }
 
@@ -120,9 +228,40 @@ impl RoomList {
         self.loading_state.subscribe_reset()
     }
 
-    /// Get a stream of rooms.
-    fn entries(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
-        self.client.rooms_stream()
+    /// Get a subscriber to the coarse loading state of the underlying room range.
+    ///
+    /// This method sends the current range loading state as the first update.
+    pub fn range_loading_state(&self) -> Subscriber<RoomListRangeLoadingState> {
+        self.range_loading_state.subscribe_reset()
+    }
+
+    /// Read the current `all_rooms` entries without waiting for stream delivery.
+    ///
+    /// This snapshot is updated before the matching committed-response evidence
+    /// is published, so consumers can reconcile from it without depending on
+    /// the scheduling order of dynamic-entry reset delivery.
+    pub fn current_entries_snapshot(&self) -> RoomListEntriesSnapshot {
+        let observed_ids = self.all_rooms_observed_ids.current();
+        let (rooms, _) = self.client.rooms_stream();
+        let entries = rooms
+            .into_iter()
+            .filter(|room| {
+                matches!(room.state(), RoomState::Joined | RoomState::Invited)
+                    && observed_ids
+                        .as_ref()
+                        .map_or(true, |observed| observed.contains(room.room_id()))
+            })
+            .map(Into::into)
+            .collect();
+
+        RoomListEntriesSnapshot {
+            entries,
+            response_sequence: observed_ids.as_ref().map(|observed| observed.response_sequence()),
+            range_fully_loaded: observed_ids.as_ref().map(|observed| observed.range_fully_loaded()),
+            maximum_number_of_rooms: observed_ids
+                .as_ref()
+                .and_then(|observed| observed.maximum_number_of_rooms()),
+        }
     }
 
     /// Get a configurable stream of rooms.
@@ -141,8 +280,9 @@ impl RoomList {
         page_size: usize,
     ) -> (impl Stream<Item = Vec<VectorDiff<RoomListItem>>> + '_, RoomListDynamicEntriesController)
     {
-        let room_info_notable_update_receiver = self.client.room_info_notable_update_receiver();
+        let client = self.client.clone();
         let list = self.sliding_sync_list.clone();
+        let all_rooms_observed_ids = self.all_rooms_observed_ids.clone();
 
         let filter_fn_cell = AsyncCell::shared();
 
@@ -158,38 +298,91 @@ impl RoomList {
 
         let stream = stream! {
             loop {
-                let filter_fn = filter_fn_cell.take().await;
+                let filter_fn = Arc::new(filter_fn_cell.take().await);
+                let client = client.clone();
+                let filter_fn = filter_fn.clone();
+                let limit_stream = limit_stream.clone();
+                let authority_stream = all_rooms_observed_ids
+                    .subscribe_visible_room_ids()
+                    .map(move |visible_room_ids| {
+                        let client = client.clone();
+                        let filter_fn = filter_fn.clone();
+                        let limit_stream = limit_stream.clone();
 
-                let (raw_values, raw_stream) = self.entries();
-                let values = raw_values.into_iter().map(Into::into).collect::<Vector<RoomListItem>>();
+                        stream! {
+                            let (raw_values, raw_stream) = client.rooms_stream();
+                            let values = raw_values
+                                .into_iter()
+                                .map(Into::into)
+                                .collect::<Vector<RoomListItem>>();
 
-                // Combine normal stream events with other updates from rooms
-                let stream = merge_stream_and_receiver(values.clone(), raw_stream, room_info_notable_update_receiver.resubscribe());
+                            // Combine normal stream events with other updates from rooms.
+                            let stream = merge_stream_and_receiver(
+                                values.clone(),
+                                raw_stream,
+                                client.room_info_notable_update_receiver(),
+                            );
+                            let visible_room_ids_for_filter = visible_room_ids.clone();
 
-                let (values, stream) = (values, stream)
-                    .filter(filter_fn)
-                    .sort_by(new_sorter_lexicographic(vec![
-                        // Sort by latest event's kind, i.e. put the rooms with a
-                        // **local** latest event first.
-                        Box::new(new_sorter_latest_event()),
-                        // Sort rooms by their recency (either by looking
-                        // at their latest event's timestamp, or their
-                        // `recency_stamp`).
-                        Box::new(new_sorter_recency()),
-                        // Finally, sort by name.
-                        Box::new(new_sorter_name()),
-                    ]))
-                    .dynamic_head_with_initial_value(page_size, limit_stream.clone());
+                            let (values, stream) = (values, stream)
+                                .filter(move |room| {
+                                    visible_room_ids_for_filter.as_ref().map_or(true, |room_ids| {
+                                        room_ids.contains(room.room_id())
+                                    }) && filter_fn(room)
+                                })
+                                .sort_by(new_sorter_lexicographic(vec![
+                                    // Sort by latest event's kind, i.e. put the rooms with a
+                                    // **local** latest event first.
+                                    Box::new(new_sorter_latest_event()),
+                                    // Sort rooms by their recency (either by looking
+                                    // at their latest event's timestamp, or their
+                                    // `recency_stamp`).
+                                    Box::new(new_sorter_recency()),
+                                    // Finally, sort by name.
+                                    Box::new(new_sorter_name()),
+                                ]))
+                                .dynamic_head_with_initial_value(page_size, limit_stream);
 
-                // Clearing the stream before chaining with the real stream.
-                yield stream::once(ready(vec![VectorDiff::Reset { values }]))
-                    .chain(stream);
+                            yield vec![VectorDiff::Reset { values }];
+                            pin_mut!(stream);
+                            while let Some(diffs) = stream.next().await {
+                                yield diffs;
+                            }
+                        }
+                    });
+
+                yield authority_stream.fuse().switch();
             }
         }
         .fuse()
         .switch();
 
         (stream, dynamic_entries_controller)
+    }
+}
+
+/// The coarse loading state of the room range backing a [`RoomList`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomListRangeLoadingState {
+    /// The complete room range has not been loaded yet.
+    PartiallyLoaded,
+
+    /// The complete room range has been loaded.
+    FullyLoaded,
+}
+
+impl RoomListRangeLoadingState {
+    pub(super) fn from_states(
+        list_state: &SlidingSyncListLoadingState,
+        service_state: &State,
+    ) -> Self {
+        if *list_state == SlidingSyncListLoadingState::FullyLoaded
+            && matches!(service_state, State::Running)
+        {
+            Self::FullyLoaded
+        } else {
+            Self::PartiallyLoaded
+        }
     }
 }
 

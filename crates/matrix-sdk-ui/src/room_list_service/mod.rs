@@ -81,7 +81,7 @@ use thiserror::Error;
 use tracing::{debug, error, warn};
 
 pub use self::all_rooms::CommittedAllRoomsResponse;
-use self::all_rooms::CommittedAllRoomsResponseObservable;
+use self::all_rooms::{AllRoomsObservedIdsObservable, CommittedAllRoomsResponseObservable};
 
 /// The default `required_state` constant value for sliding sync lists and
 /// sliding sync room subscriptions.
@@ -234,6 +234,7 @@ pub struct RoomListService {
         SharedObservable<Arc<BTreeMap<OwnedRoomId, RoomSubscriptionCheckpoint>>>,
 
     committed_all_rooms_response: CommittedAllRoomsResponseObservable,
+    all_rooms_observed_ids: AllRoomsObservedIdsObservable,
 }
 
 impl RoomListService {
@@ -375,6 +376,7 @@ impl RoomListService {
             room_subscription_state: Default::default(),
             room_subscription_checkpoints: SharedObservable::new(Arc::new(BTreeMap::new())),
             committed_all_rooms_response: CommittedAllRoomsResponseObservable::new(),
+            all_rooms_observed_ids: AllRoomsObservedIdsObservable::new(),
         })
     }
 
@@ -412,6 +414,9 @@ impl RoomListService {
 
                 // Calculate the next state, and run the associated actions.
                 let next_state = self.state_machine.next(&self.sliding_sync).await?;
+                if matches!(next_state, State::SettingUp | State::Recovering) {
+                    self.all_rooms_observed_ids.begin_cycle();
+                }
 
                 // Bind the event-cache baseline to this exact sync iteration,
                 // rather than to the earlier subscription API call. An older
@@ -434,7 +439,30 @@ impl RoomListService {
                         // including the event-cache commit, and a successful v5 response has
                         // committed its required `pos`. Publish only coarse process-local
                         // evidence after that work has completed.
-                        self.committed_all_rooms_response.advance();
+                        let (range_fully_loaded, maximum_number_of_rooms) = self
+                            .sliding_sync
+                            .on_list(ALL_ROOMS_LIST_NAME, |list| {
+                                std::future::ready((
+                                    RoomListRangeLoadingState::from_states(
+                                        &list.state(),
+                                        &next_state,
+                                    ) == RoomListRangeLoadingState::FullyLoaded,
+                                    list.maximum_number_of_rooms(),
+                                ))
+                            })
+                            .await
+                            .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))?;
+                        self.committed_all_rooms_response.advance_after(
+                            range_fully_loaded,
+                            |response_sequence| {
+                                self.all_rooms_observed_ids.accumulate(
+                                    response_sequence,
+                                    range_fully_loaded,
+                                    maximum_number_of_rooms,
+                                    &update_summary.rooms_from_response,
+                                );
+                            },
+                        );
                         debug!(state = ?next_state, "New state");
 
                         // Update the state.
@@ -580,7 +608,14 @@ impl RoomListService {
     }
 
     async fn list_for(&self, sliding_sync_list_name: &str) -> Result<RoomList, Error> {
-        RoomList::new(&self.client, &self.sliding_sync, sliding_sync_list_name, self.state()).await
+        RoomList::new(
+            &self.client,
+            &self.sliding_sync,
+            sliding_sync_list_name,
+            self.state(),
+            self.all_rooms_observed_ids.clone(),
+        )
+        .await
     }
 
     /// Get a [`RoomList`] for all rooms.
@@ -814,7 +849,8 @@ pub enum SyncIndicator {
 mod tests {
     use std::{future::ready, time::Duration};
 
-    use futures_util::{StreamExt, pin_mut};
+    use eyeball_im::{Vector, VectorDiff};
+    use futures_util::{FutureExt, StreamExt, pin_mut};
     use matrix_sdk::{SlidingSyncMode, ThreadingSupport, test_utils::mocks::MatrixMockServer};
     use matrix_sdk_test::{TestError, async_test};
     use ruma::{
@@ -824,8 +860,8 @@ mod tests {
     use wiremock::ResponseTemplate;
 
     use super::{
-        ALL_ROOMS_LIST_NAME, Error, RoomListService, RoomSubscriptionState, State,
-        required_state_for_user,
+        ALL_ROOMS_LIST_NAME, Error, RoomListRangeLoadingState, RoomListService,
+        RoomSubscriptionState, State, filters::new_filter_non_left, required_state_for_user,
     };
     use crate::sync_service::{State as SyncServiceState, SyncService};
 
@@ -922,6 +958,550 @@ mod tests {
         assert!(latest.pos_present());
         assert!(!format!("{latest:?}").contains("private-reconnect-pos"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_rooms_range_loading_state_becomes_full_only_after_final_growing_range()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_list_service = RoomListService::new(client).await?;
+        let all_rooms = room_list_service.all_rooms().await?;
+        let mut range_state = all_rooms.range_loading_state();
+        let committed = room_list_service.committed_all_rooms_response();
+
+        assert_eq!(range_state.next().await, Some(RoomListRangeLoadingState::PartiallyLoaded));
+        assert!(!committed.get().range_fully_loaded());
+
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+
+        for pos in ["selective", "growing-partial"] {
+            let _mock_guard = server
+                .mock_sliding_sync()
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pos": pos,
+                    "lists": { "all_rooms": { "count": 150, "ops": [] } },
+                    "rooms": {}
+                })))
+                .mount_as_scoped()
+                .await;
+
+            sync.next().await.expect("room-list sync result")?;
+            tokio::task::yield_now().await;
+
+            while let Some(Some(state)) = range_state.next().now_or_never() {
+                assert_eq!(state, RoomListRangeLoadingState::PartiallyLoaded);
+            }
+            assert!(!committed.get().range_fully_loaded());
+        }
+
+        let mut current_range_state = all_rooms.range_loading_state();
+        assert_eq!(
+            current_range_state.next().await,
+            Some(RoomListRangeLoadingState::PartiallyLoaded)
+        );
+
+        let _mock_guard = server
+            .mock_sliding_sync()
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pos": "growing-full",
+                "lists": { "all_rooms": { "count": 150, "ops": [] } },
+                "rooms": {}
+            })))
+            .mount_as_scoped()
+            .await;
+
+        sync.next().await.expect("final room-list sync result")?;
+        assert!(committed.get().range_fully_loaded());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), range_state.next()).await?,
+            Some(RoomListRangeLoadingState::FullyLoaded)
+        );
+
+        let requests = server.received_requests().await.expect("captured requests");
+        let ranges = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/sync"))
+            .map(|request| {
+                let body: Value = serde_json::from_slice(&request.body).expect("sync request JSON");
+                body["lists"]["all_rooms"]["ranges"].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            [
+                serde_json::json!([[0, 19]]),
+                serde_json::json!([[0, 99]]),
+                serde_json::json!([[0, 149]]),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_entries_add_one_page_expands_two_four_five() -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_list_service = RoomListService::new(client).await?;
+        let all_rooms = room_list_service.all_rooms().await?;
+        let (entries, controller) = all_rooms.entries_with_dynamic_adapters(2);
+        pin_mut!(entries);
+
+        let _mock_guard = server
+            .mock_sliding_sync()
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pos": "five-rooms",
+                "lists": { "all_rooms": { "count": 5, "ops": [] } },
+                "rooms": {
+                    "!room-0:example.org": { "initial": true, "bump_stamp": 1 },
+                    "!room-1:example.org": { "initial": true, "bump_stamp": 2 },
+                    "!room-2:example.org": { "initial": true, "bump_stamp": 3 },
+                    "!room-3:example.org": { "initial": true, "bump_stamp": 4 },
+                    "!room-4:example.org": { "initial": true, "bump_stamp": 5 }
+                }
+            })))
+            .mount_as_scoped()
+            .await;
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+        sync.next().await.expect("room-list sync result")?;
+        tokio::task::yield_now().await;
+
+        assert!(controller.set_filter(Box::new(new_filter_non_left())));
+        let mut visible = Vector::new();
+        for expected_len in [2, 4, 5] {
+            let diffs = tokio::time::timeout(Duration::from_secs(2), entries.next())
+                .await?
+                .expect("dynamic entries stream ended");
+            for diff in diffs {
+                diff.apply(&mut visible);
+            }
+            assert_eq!(visible.len(), expected_len);
+            controller.add_one_page();
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fully_loaded_all_rooms_entries_exclude_cache_only_omitted_room()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let cache_only_room_id = room_id!("!cache-only:example.org");
+        let live_room_id = room_id!("!live:example.org");
+        server.sync_joined_room(&client, cache_only_room_id).await;
+
+        let room_list_service = RoomListService::new(client).await?;
+        let all_rooms = room_list_service.all_rooms().await?;
+        let mut committed = room_list_service.committed_all_rooms_response();
+        let mut range_state = all_rooms.range_loading_state();
+        assert_eq!(range_state.next().await, Some(RoomListRangeLoadingState::PartiallyLoaded));
+
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+        for pos in ["selective", "growing-full"] {
+            let _mock_guard = server
+                .mock_sliding_sync()
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pos": pos,
+                    "lists": {
+                        "all_rooms": {
+                            "count": 1
+                        }
+                    },
+                    "rooms": {
+                        "!live:example.org": { "initial": true, "bump_stamp": 1 }
+                    }
+                })))
+                .mount_as_scoped()
+                .await;
+
+            sync.next().await.expect("room-list sync result")?;
+            tokio::time::timeout(Duration::from_secs(2), committed.next())
+                .await?
+                .expect("committed all-rooms response stream ended");
+        }
+
+        let requests = server.received_requests().await.expect("captured requests");
+        let final_request = requests
+            .iter()
+            .filter(|request| {
+                request.url.path() == "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync"
+            })
+            .last()
+            .expect("final all-rooms request");
+        let final_body: Value = serde_json::from_slice(&final_request.body)?;
+        assert_eq!(final_body["lists"]["all_rooms"]["ranges"], serde_json::json!([[0, 0]]));
+
+        assert!(committed.get().range_fully_loaded());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match range_state.next().await {
+                    Some(RoomListRangeLoadingState::FullyLoaded) => break,
+                    Some(RoomListRangeLoadingState::PartiallyLoaded) => continue,
+                    None => panic!("room range loading-state stream ended"),
+                }
+            }
+        })
+        .await?;
+
+        let (entries, controller) = all_rooms.entries_with_dynamic_adapters(usize::MAX);
+        pin_mut!(entries);
+        assert!(controller.set_filter(Box::new(new_filter_non_left())));
+        let diffs = tokio::time::timeout(Duration::from_secs(2), entries.next())
+            .await?
+            .expect("dynamic entries stream ended");
+        let mut visible = Vector::new();
+        for diff in diffs {
+            diff.apply(&mut visible);
+        }
+
+        assert!(visible.iter().any(|room| room.room_id() == live_room_id));
+        assert!(visible.iter().all(|room| room.room_id() != cache_only_room_id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_rooms_entries_reset_when_first_response_acquires_authority()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let cache_only_room_id = room_id!("!cache-only:example.org");
+        let live_room_id = room_id!("!live:example.org");
+        server.sync_joined_room(&client, cache_only_room_id).await;
+
+        let room_list_service = RoomListService::new(client).await?;
+        let all_rooms = room_list_service.all_rooms().await?;
+        let (entries, controller) = all_rooms.entries_with_dynamic_adapters(usize::MAX);
+        pin_mut!(entries);
+        assert!(controller.set_filter(Box::new(new_filter_non_left())));
+
+        let mut visible = Vector::new();
+        let initial = tokio::time::timeout(Duration::from_secs(2), entries.next())
+            .await?
+            .expect("dynamic entries stream ended before initial cache projection");
+        for diff in initial {
+            diff.apply(&mut visible);
+        }
+        assert!(visible.iter().any(|room| room.room_id() == cache_only_room_id));
+
+        let _mock_guard = server
+            .mock_sliding_sync()
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pos": "first-authority",
+                "lists": { "all_rooms": { "count": 1 } },
+                "rooms": {
+                    "!live:example.org": { "initial": true, "bump_stamp": 1 }
+                }
+            })))
+            .mount_as_scoped()
+            .await;
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+        sync.next().await.expect("room-list sync result")?;
+
+        let authority_update = tokio::time::timeout(Duration::from_secs(2), entries.next())
+            .await?
+            .expect("dynamic entries stream ended before authority reset");
+        assert!(authority_update.iter().any(|diff| matches!(diff, VectorDiff::Reset { .. })));
+        for diff in authority_update {
+            diff.apply(&mut visible);
+        }
+        assert!(visible.iter().any(|room| room.room_id() == live_room_id));
+        assert!(visible.iter().all(|room| room.room_id() != cache_only_room_id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_response_correlates_fresh_snapshot_before_entries_reset_is_polled()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let cache_only_room_id = room_id!("!cache-only:example.org");
+        let live_room_id = room_id!("!live:example.org");
+        server.sync_joined_room(&client, cache_only_room_id).await;
+
+        let room_list_service = RoomListService::new(client).await?;
+        let all_rooms = room_list_service.all_rooms().await?;
+        let mut committed = room_list_service.committed_all_rooms_response();
+        let provisional = all_rooms.current_entries_snapshot();
+        assert!(!provisional.is_authoritative());
+        assert_eq!(provisional.entries().len(), 1);
+        assert_eq!(provisional.entries()[0].room_id(), cache_only_room_id);
+
+        // Keep the dynamic stream alive with its cache-only Reset applied, but do not
+        // poll it after the response. This reproduces a committed consumer winning
+        // the scheduling race against authority Reset delivery.
+        let (entries, controller) = all_rooms.entries_with_dynamic_adapters(usize::MAX);
+        pin_mut!(entries);
+        assert!(controller.set_filter(Box::new(new_filter_non_left())));
+        let mut stale_visible = Vector::new();
+        for diff in tokio::time::timeout(Duration::from_secs(2), entries.next())
+            .await?
+            .expect("dynamic entries stream ended before provisional reset")
+        {
+            diff.apply(&mut stale_visible);
+        }
+        assert_eq!(stale_visible.len(), 1);
+        assert_eq!(stale_visible[0].room_id(), cache_only_room_id);
+
+        let _mock_guard = server
+            .mock_sliding_sync()
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pos": "same-count-replacement",
+                "lists": { "all_rooms": { "count": 1 } },
+                "rooms": {
+                    "!live:example.org": { "initial": true, "bump_stamp": 1 }
+                }
+            })))
+            .mount_as_scoped()
+            .await;
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+        sync.next().await.expect("room-list sync result")?;
+
+        let committed = tokio::time::timeout(Duration::from_secs(2), committed.next())
+            .await?
+            .expect("committed all-rooms response stream ended");
+        let authoritative = all_rooms.current_entries_snapshot();
+        assert!(authoritative.is_authoritative());
+        assert_eq!(authoritative.response_sequence(), Some(committed.sequence()));
+        assert_eq!(authoritative.entries().len(), 1);
+        assert_eq!(authoritative.entries()[0].room_id(), live_room_id);
+        assert!(authoritative.entries().iter().all(|room| room.room_id() != cache_only_room_id));
+        let debug = format!("{authoritative:?}");
+        assert!(!debug.contains(cache_only_room_id.as_str()));
+        assert!(!debug.contains(live_room_id.as_str()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_keeps_authority_until_next_response_replaces_observed_rooms()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let cache_only_room_id = room_id!("!cache-only:example.org");
+        let previous_live_room_id = room_id!("!previous-live:example.org");
+        let recovered_live_room_id = room_id!("!recovered-live:example.org");
+        server.sync_joined_room(&client, cache_only_room_id).await;
+
+        let room_list_service = RoomListService::new(client).await?;
+        let all_rooms = room_list_service.all_rooms().await?;
+        let mut committed = room_list_service.committed_all_rooms_response();
+
+        let _initial_mock_guard = server
+            .mock_sliding_sync()
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pos": "initial-authority",
+                "lists": { "all_rooms": { "count": 1 } },
+                "rooms": {
+                    "!previous-live:example.org": { "initial": true, "bump_stamp": 1 }
+                }
+            })))
+            .mount_as_scoped()
+            .await;
+        let initial_sync = room_list_service.sync();
+        pin_mut!(initial_sync);
+        initial_sync.next().await.expect("initial room-list sync result")?;
+        let initial_committed = tokio::time::timeout(Duration::from_secs(2), committed.next())
+            .await?
+            .expect("initial committed response stream ended");
+
+        let initial = all_rooms.current_entries_snapshot();
+        assert_eq!(initial.response_sequence(), Some(initial_committed.sequence()));
+        assert_eq!(initial.entries().len(), 1);
+        assert_eq!(initial.entries()[0].room_id(), previous_live_room_id);
+
+        let (entries, controller) = all_rooms.entries_with_dynamic_adapters(usize::MAX);
+        pin_mut!(entries);
+        assert!(controller.set_filter(Box::new(new_filter_non_left())));
+        let mut visible = Vector::new();
+        for diff in tokio::time::timeout(Duration::from_secs(2), entries.next())
+            .await?
+            .expect("dynamic entries stream ended before authoritative reset")
+        {
+            diff.apply(&mut visible);
+        }
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].room_id(), previous_live_room_id);
+
+        room_list_service.state_machine.set(State::Error { from: Box::new(State::Running) });
+        drop(_initial_mock_guard);
+
+        let _recovery_mock_guard = server
+            .mock_sliding_sync()
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(Duration::from_millis(100)).set_body_json(
+                    serde_json::json!({
+                        "pos": "recovered-authority",
+                        "lists": { "all_rooms": { "count": 1 } },
+                        "rooms": {
+                            "!recovered-live:example.org": {
+                                "initial": true,
+                                "bump_stamp": 2
+                            }
+                        }
+                    }),
+                ),
+            )
+            .mount_as_scoped()
+            .await;
+        let recovery_sync = room_list_service.sync();
+        pin_mut!(recovery_sync);
+
+        assert!(recovery_sync.next().now_or_never().is_none());
+        let during_recovery = all_rooms.current_entries_snapshot();
+        assert_eq!(during_recovery.response_sequence(), Some(initial_committed.sequence()));
+        assert_eq!(during_recovery.entries().len(), 1);
+        assert_eq!(during_recovery.entries()[0].room_id(), previous_live_room_id);
+        assert!(during_recovery.entries().iter().all(|room| room.room_id() != cache_only_room_id));
+        assert!(entries.next().now_or_never().is_none());
+
+        tokio::time::timeout(Duration::from_secs(2), recovery_sync.next())
+            .await?
+            .expect("recovery room-list sync result")?;
+        let recovered_committed = tokio::time::timeout(Duration::from_secs(2), committed.next())
+            .await?
+            .expect("recovery committed response stream ended");
+        let recovered = all_rooms.current_entries_snapshot();
+        assert_eq!(recovered.response_sequence(), Some(recovered_committed.sequence()));
+        assert_eq!(recovered.entries().len(), 1);
+        assert_eq!(recovered.entries()[0].room_id(), recovered_live_room_id);
+        assert!(recovered.entries().iter().all(|room| room.room_id() != previous_live_room_id));
+        assert!(recovered.entries().iter().all(|room| room.room_id() != cache_only_room_id));
+
+        for diff in tokio::time::timeout(Duration::from_secs(2), entries.next())
+            .await?
+            .expect("dynamic entries stream ended before recovered reset")
+        {
+            diff.apply(&mut visible);
+        }
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].room_id(), recovered_live_room_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn entries_snapshot_correlates_newer_partial_range_and_room_count()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_list_service = RoomListService::new(client).await?;
+        let all_rooms = room_list_service.all_rooms().await?;
+        let mut committed = room_list_service.committed_all_rooms_response();
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+
+        for pos in ["initial-selective", "initial-full"] {
+            let _mock_guard = server
+                .mock_sliding_sync()
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pos": pos,
+                    "lists": { "all_rooms": { "count": 1 } },
+                    "rooms": {
+                        "!previous-live:example.org": { "initial": true, "bump_stamp": 1 }
+                    }
+                })))
+                .mount_as_scoped()
+                .await;
+            sync.next().await.expect("initial room-list sync result")?;
+            tokio::time::timeout(Duration::from_secs(2), committed.next())
+                .await?
+                .expect("initial committed response stream ended");
+        }
+
+        let full_committed = committed.get();
+        assert!(full_committed.range_fully_loaded());
+
+        // Delay the consumer's snapshot read until after a newer response has
+        // replaced the full-range evidence.
+        room_list_service.state_machine.set(State::Error { from: Box::new(State::Running) });
+        let _partial_mock_guard = server
+            .mock_sliding_sync()
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pos": "newer-partial",
+                "lists": { "all_rooms": { "count": 2 } },
+                "rooms": {
+                    "!new-live:example.org": { "initial": true, "bump_stamp": 2 }
+                }
+            })))
+            .mount_as_scoped()
+            .await;
+        sync.next().await.expect("partial recovery room-list sync result")?;
+        let partial_committed = tokio::time::timeout(Duration::from_secs(2), committed.next())
+            .await?
+            .expect("partial committed response stream ended");
+        assert!(!partial_committed.range_fully_loaded());
+
+        let partial = all_rooms.current_entries_snapshot();
+        assert!(partial_committed.sequence() > full_committed.sequence());
+        assert_eq!(partial.response_sequence(), Some(partial_committed.sequence()));
+        assert_eq!(partial.range_fully_loaded(), Some(false));
+        assert_eq!(partial.maximum_number_of_rooms(), Some(2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unchanged_room_ids_advance_sequence_without_resetting_dynamic_entries()
+    -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_list_service = RoomListService::new(client).await?;
+        let all_rooms = room_list_service.all_rooms().await?;
+        let mut committed = room_list_service.committed_all_rooms_response();
+        let (entries, controller) = all_rooms.entries_with_dynamic_adapters(usize::MAX);
+        pin_mut!(entries);
+        assert!(controller.set_filter(Box::new(new_filter_non_left())));
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+
+        let mut previous_sequence = 0;
+        for pos in ["same-rooms-1", "same-rooms-2"] {
+            let _mock_guard = server
+                .mock_sliding_sync()
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pos": pos,
+                    "lists": { "all_rooms": { "count": 1 } },
+                    "rooms": {
+                        "!stable:example.org": { "initial": true, "bump_stamp": 1 }
+                    }
+                })))
+                .mount_as_scoped()
+                .await;
+            sync.next().await.expect("room-list sync result")?;
+            let response = tokio::time::timeout(Duration::from_secs(2), committed.next())
+                .await?
+                .expect("committed response stream ended");
+            assert!(response.sequence() > previous_sequence);
+            previous_sequence = response.sequence();
+
+            if pos == "same-rooms-1" {
+                tokio::time::timeout(Duration::from_secs(2), entries.next())
+                    .await?
+                    .expect("initial dynamic entries reset");
+            } else if let Ok(Some(diffs)) =
+                tokio::time::timeout(Duration::from_millis(100), entries.next()).await
+            {
+                assert!(
+                    diffs.iter().all(|diff| !matches!(diff, VectorDiff::Reset { .. })),
+                    "an unchanged authority room-ID set must not reset the full dynamic list"
+                );
+            }
+        }
+
+        assert_eq!(
+            all_rooms.current_entries_snapshot().response_sequence(),
+            Some(previous_sequence)
+        );
         Ok(())
     }
 
