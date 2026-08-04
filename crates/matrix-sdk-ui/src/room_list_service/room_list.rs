@@ -252,12 +252,7 @@ impl RoomList {
         let (rooms, _) = self.client.rooms_stream();
         let entries = rooms
             .into_iter()
-            .filter(|room| {
-                matches!(room.state(), RoomState::Joined | RoomState::Invited)
-                    && observed_ids.as_ref().map_or(true, |observed| {
-                        observed.contains(room.room_id()) || room.state() == RoomState::Invited
-                    })
-            })
+            .filter(|room| matches!(room.state(), RoomState::Joined | RoomState::Invited))
             .map(Into::into)
             .collect();
 
@@ -287,9 +282,8 @@ impl RoomList {
         page_size: usize,
     ) -> (impl Stream<Item = Vec<VectorDiff<RoomListItem>>> + '_, RoomListDynamicEntriesController)
     {
-        let client = self.client.clone();
         let list = self.sliding_sync_list.clone();
-        let all_rooms_observed_ids = self.all_rooms_observed_ids.clone();
+        let room_info_notable_update_receiver = self.client.room_info_notable_update_receiver();
 
         let filter_fn_cell = AsyncCell::shared();
 
@@ -305,64 +299,32 @@ impl RoomList {
 
         let stream = stream! {
             loop {
-                let filter_fn = Arc::new(filter_fn_cell.take().await);
-                let client = client.clone();
-                let filter_fn = filter_fn.clone();
-                let limit_stream = limit_stream.clone();
-                let authority_stream = all_rooms_observed_ids
-                    .subscribe_visible_room_ids()
-                    .map(move |visible_room_ids| {
-                        let client = client.clone();
-                        let filter_fn = filter_fn.clone();
-                        let limit_stream = limit_stream.clone();
+                let filter_fn = filter_fn_cell.take().await;
+                let (raw_values, raw_stream) = self.client.rooms_stream();
+                let values = raw_values
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<Vector<RoomListItem>>();
 
-                        stream! {
-                            let (raw_values, raw_stream) = client.rooms_stream();
-                            let values = raw_values
-                                .into_iter()
-                                .map(Into::into)
-                                .collect::<Vector<RoomListItem>>();
+                // The client room store is the cache-first source of visible rooms.
+                // Sliding Sync's response-local `rooms` map only contains changed
+                // room payloads and must never filter this collection.
+                let stream = merge_stream_and_receiver(
+                    values.clone(),
+                    raw_stream,
+                    room_info_notable_update_receiver.resubscribe(),
+                );
+                let (values, stream) = (values, stream)
+                    .filter(filter_fn)
+                    .sort_by(new_sorter_lexicographic(vec![
+                        Box::new(new_sorter_latest_event()),
+                        Box::new(new_sorter_recency()),
+                        Box::new(new_sorter_name()),
+                    ]))
+                    .dynamic_head_with_initial_value(page_size, limit_stream.clone());
 
-                            // Combine normal stream events with other updates from rooms.
-                            let stream = merge_stream_and_receiver(
-                                values.clone(),
-                                raw_stream,
-                                client.room_info_notable_update_receiver(),
-                            );
-                            let visible_room_ids_for_filter = visible_room_ids.clone();
-
-                            let (values, stream) = (values, stream)
-                                .filter(move |room| {
-                                    visible_room_ids_for_filter.as_ref().map_or(true, |room_ids| {
-                                        room_ids.contains(room.room_id())
-                                            || matches!(
-                                                room.clone().into_inner().state(),
-                                                RoomState::Invited
-                                            )
-                                    }) && filter_fn(room)
-                                })
-                                .sort_by(new_sorter_lexicographic(vec![
-                                    // Sort by latest event's kind, i.e. put the rooms with a
-                                    // **local** latest event first.
-                                    Box::new(new_sorter_latest_event()),
-                                    // Sort rooms by their recency (either by looking
-                                    // at their latest event's timestamp, or their
-                                    // `recency_stamp`).
-                                    Box::new(new_sorter_recency()),
-                                    // Finally, sort by name.
-                                    Box::new(new_sorter_name()),
-                                ]))
-                                .dynamic_head_with_initial_value(page_size, limit_stream);
-
-                            yield vec![VectorDiff::Reset { values }];
-                            pin_mut!(stream);
-                            while let Some(diffs) = stream.next().await {
-                                yield diffs;
-                            }
-                        }
-                    });
-
-                yield authority_stream.fuse().switch();
+                yield futures_util::stream::once(ready(vec![VectorDiff::Reset { values }]))
+                    .chain(stream);
             }
         }
         .fuse()

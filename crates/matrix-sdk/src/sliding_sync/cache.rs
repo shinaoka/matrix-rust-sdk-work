@@ -7,7 +7,7 @@
 use matrix_sdk_base::{StateStore, StoreError};
 use matrix_sdk_common::timer;
 use ruma::UserId;
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 
 use super::{FrozenSlidingSyncList, SlidingSync, SlidingSyncPositionMarkers};
 #[cfg(doc)]
@@ -149,6 +149,23 @@ pub(super) struct RestoredFields {
     pub pos: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToDeviceTokenFormat {
+    Absent,
+    Sliding,
+    Legacy,
+}
+
+fn classify_to_device_token(token: Option<String>) -> (Option<String>, ToDeviceTokenFormat) {
+    match token {
+        None => (None, ToDeviceTokenFormat::Absent),
+        Some(token) if !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit()) => {
+            (Some(token), ToDeviceTokenFormat::Sliding)
+        }
+        Some(_) => (None, ToDeviceTokenFormat::Legacy),
+    }
+}
+
 /// A sliding sync position marker that can be persisted or restored from a
 /// store.
 #[cfg(feature = "e2e-encryption")]
@@ -176,11 +193,22 @@ pub(super) async fn restore_sliding_sync_state(
         let mut restored_fields = RestoredFields::default();
 
         if let Some(olm_machine) = &*_client.olm_machine().await {
-            match olm_machine.store().next_batch_token().await? {
-                Some(token) => {
-                    restored_fields.to_device_token = Some(token);
+            let (to_device_token, token_format) =
+                classify_to_device_token(olm_machine.store().next_batch_token().await?);
+            restored_fields.to_device_token = to_device_token;
+
+            match token_format {
+                ToDeviceTokenFormat::Absent => {
+                    trace!("Couldn't read the previous to-device token from the crypto store")
                 }
-                None => trace!("Couldn't read the previous to-device token from the crypto store"),
+                ToDeviceTokenFormat::Sliding => {
+                    trace!("Restored a Sliding Sync to-device token from the crypto store")
+                }
+                ToDeviceTokenFormat::Legacy => info!(
+                    to_device_token_format = "legacy",
+                    legacy_to_device_token_migration_applied = true,
+                    "Ignored a classic-sync token before a Sliding Sync request"
+                ),
             }
 
             let instance_storage_key = format_storage_key_for_sliding_sync(_storage_key);
@@ -211,6 +239,24 @@ mod tests {
         format_storage_key_prefix, restore_sliding_sync_state, store_sliding_sync_state,
     };
     use crate::{Result, test_utils::logged_in_client};
+
+    #[test]
+    fn sliding_sync_to_device_token_classification() {
+        use super::{ToDeviceTokenFormat, classify_to_device_token};
+
+        assert_eq!(classify_to_device_token(None), (None, ToDeviceTokenFormat::Absent));
+        assert_eq!(
+            classify_to_device_token(Some("42".to_owned())),
+            (Some("42".to_owned()), ToDeviceTokenFormat::Sliding)
+        );
+
+        for legacy in ["s123_4_5", "", "１２"] {
+            assert_eq!(
+                classify_to_device_token(Some(legacy.to_owned())),
+                (None, ToDeviceTokenFormat::Legacy)
+            );
+        }
+    }
 
     #[allow(clippy::await_holding_lock)]
     #[async_test]

@@ -19,7 +19,9 @@ use std::{
 };
 
 use eyeball::{SharedObservable, Subscriber};
-use ruma::{OwnedRoomId, RoomId};
+use ruma::OwnedRoomId;
+#[cfg(test)]
+use ruma::RoomId;
 
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct AllRoomsObservedIds {
@@ -34,6 +36,7 @@ impl AllRoomsObservedIds {
         self.response_sequence
     }
 
+    #[cfg(test)]
     pub(super) fn contains(&self, room_id: &RoomId) -> bool {
         self.room_ids.contains(room_id)
     }
@@ -62,7 +65,6 @@ impl fmt::Debug for AllRoomsObservedIds {
 #[derive(Clone)]
 pub(super) struct AllRoomsObservedIdsObservable {
     latest: SharedObservable<Option<AllRoomsObservedIds>>,
-    visible_room_ids: SharedObservable<Option<Arc<BTreeSet<OwnedRoomId>>>>,
     replace_on_next_response: Arc<Mutex<bool>>,
     retained_local_room_ids: Arc<Mutex<BTreeSet<OwnedRoomId>>>,
 }
@@ -71,7 +73,6 @@ impl AllRoomsObservedIdsObservable {
     pub(super) fn new() -> Self {
         Self {
             latest: SharedObservable::new(None),
-            visible_room_ids: SharedObservable::new(None),
             replace_on_next_response: Arc::new(Mutex::new(false)),
             retained_local_room_ids: Arc::new(Mutex::new(BTreeSet::new())),
         }
@@ -79,12 +80,6 @@ impl AllRoomsObservedIdsObservable {
 
     pub(super) fn current(&self) -> Option<AllRoomsObservedIds> {
         self.latest.get()
-    }
-
-    pub(super) fn subscribe_visible_room_ids(
-        &self,
-    ) -> Subscriber<Option<Arc<BTreeSet<OwnedRoomId>>>> {
-        self.visible_room_ids.subscribe_reset()
     }
 
     pub(super) fn begin_cycle(&self) {
@@ -113,7 +108,6 @@ impl AllRoomsObservedIdsObservable {
             maximum_number_of_rooms,
             room_ids: room_ids.clone(),
         }));
-        self.visible_room_ids.set_if_not_eq(Some(room_ids));
     }
 
     /// Extend the current observed-ID set without replacing its response
@@ -135,7 +129,6 @@ impl AllRoomsObservedIdsObservable {
         let room_ids = Arc::new(room_ids);
         observed.room_ids = room_ids.clone();
         self.latest.set(Some(observed));
-        self.visible_room_ids.set_if_not_eq(Some(room_ids));
     }
 
     /// Retain a room returned by a successful local operation across the next

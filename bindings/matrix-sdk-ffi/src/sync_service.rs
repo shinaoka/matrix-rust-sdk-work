@@ -46,7 +46,7 @@ impl From<MatrixSyncServiceState> for SyncServiceState {
             MatrixSyncServiceState::Running => Self::Running,
             MatrixSyncServiceState::Terminated => Self::Terminated,
             MatrixSyncServiceState::Error(_error) => Self::Error,
-            MatrixSyncServiceState::Offline => Self::Offline,
+            MatrixSyncServiceState::Offline(_) => Self::Offline,
         }
     }
 }

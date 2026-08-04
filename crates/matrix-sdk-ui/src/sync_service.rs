@@ -94,7 +94,7 @@ pub enum State {
     ///
     /// Calling [`SyncService::stop()`] will abort the offline mode and the
     /// [`SyncService`] will go into the [`State::Idle`] mode.
-    Offline,
+    Offline(Arc<Error>),
 }
 
 enum MaybeAcquiredPermit {
@@ -312,7 +312,7 @@ impl SyncTaskSupervisor {
 
                 if let Some(error) = report.error {
                     if offline_mode {
-                        state.set(State::Offline);
+                        state.set(State::Offline(Arc::new(error)));
 
                         let client = room_list_service.client();
 
@@ -564,7 +564,7 @@ impl SyncServiceInner {
 ///     match state {
 ///         State::Idle => eprintln!("The sync service is idle."),
 ///         State::Running => eprintln!("The sync has started to run."),
-///         State::Offline => eprintln!(
+///         State::Offline(_) => eprintln!(
 ///             "We have entered the offline mode, the server seems to be
 ///              unavailable"
 ///         ),
@@ -634,7 +634,7 @@ impl SyncService {
             // If we're already running, there's nothing to do.
             State::Running => {}
             // If we're in the offline mode, first stop the service and then start it again.
-            State::Offline => {
+            State::Offline(_) => {
                 inner
                     .restart(self.room_list_service.clone(), self.encryption_sync_permit.clone())
                     .await
@@ -662,7 +662,7 @@ impl SyncService {
                 // No need to stop if we were not running.
                 return;
             }
-            State::Running | State::Offline => {}
+            State::Running | State::Offline(_) => {}
         }
 
         inner.stop().await;
@@ -916,4 +916,20 @@ pub enum Error {
     /// An error had occurred in the sync task supervisor, likely due to a bug.
     #[error("the supervisor channel has run into an unexpected error")]
     Supervisor,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, State};
+    use std::sync::Arc;
+
+    #[test]
+    fn offline_state_preserves_the_failure_for_diagnostics() {
+        let state = State::Offline(Arc::new(Error::Supervisor));
+
+        match state {
+            State::Offline(error) => assert!(matches!(&*error, Error::Supervisor)),
+            _ => panic!("expected offline state"),
+        }
+    }
 }

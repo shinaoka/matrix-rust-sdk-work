@@ -1223,8 +1223,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fully_loaded_all_rooms_entries_exclude_cache_only_omitted_room()
-    -> Result<(), TestError> {
+    async fn fully_loaded_all_rooms_entries_preserve_persisted_joined_room() -> Result<(), TestError>
+    {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
         let cache_only_room_id = room_id!("!cache-only:example.org");
@@ -1297,13 +1297,13 @@ mod tests {
         }
 
         assert!(visible.iter().any(|room| room.room_id() == live_room_id));
-        assert!(visible.iter().all(|room| room.room_id() != cache_only_room_id));
+        assert!(visible.iter().any(|room| room.room_id() == cache_only_room_id));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn all_rooms_entries_reset_when_first_response_acquires_authority()
+    async fn all_rooms_entries_preserve_cache_when_first_response_acquires_authority()
     -> Result<(), TestError> {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
@@ -1343,13 +1343,13 @@ mod tests {
 
         let authority_update = tokio::time::timeout(Duration::from_secs(2), entries.next())
             .await?
-            .expect("dynamic entries stream ended before authority reset");
-        assert!(authority_update.iter().any(|diff| matches!(diff, VectorDiff::Reset { .. })));
+            .expect("dynamic entries stream ended before live room update");
+        assert!(authority_update.iter().all(|diff| !matches!(diff, VectorDiff::Reset { .. })));
         for diff in authority_update {
             diff.apply(&mut visible);
         }
         assert!(visible.iter().any(|room| room.room_id() == live_room_id));
-        assert!(visible.iter().all(|room| room.room_id() != cache_only_room_id));
+        assert!(visible.iter().any(|room| room.room_id() == cache_only_room_id));
 
         Ok(())
     }
@@ -1408,9 +1408,9 @@ mod tests {
         let authoritative = all_rooms.current_entries_snapshot();
         assert!(authoritative.is_authoritative());
         assert_eq!(authoritative.response_sequence(), Some(committed.sequence()));
-        assert_eq!(authoritative.entries().len(), 1);
-        assert_eq!(authoritative.entries()[0].room_id(), live_room_id);
-        assert!(authoritative.entries().iter().all(|room| room.room_id() != cache_only_room_id));
+        assert_eq!(authoritative.entries().len(), 2);
+        assert!(authoritative.entries().iter().any(|room| room.room_id() == live_room_id));
+        assert!(authoritative.entries().iter().any(|room| room.room_id() == cache_only_room_id));
         let debug = format!("{authoritative:?}");
         assert!(!debug.contains(cache_only_room_id.as_str()));
         assert!(!debug.contains(live_room_id.as_str()));
@@ -1419,7 +1419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_keeps_authority_until_next_response_replaces_observed_rooms()
+    async fn recovery_keeps_persisted_rooms_while_response_metadata_advances()
     -> Result<(), TestError> {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
@@ -1452,8 +1452,9 @@ mod tests {
 
         let initial = all_rooms.current_entries_snapshot();
         assert_eq!(initial.response_sequence(), Some(initial_committed.sequence()));
-        assert_eq!(initial.entries().len(), 1);
-        assert_eq!(initial.entries()[0].room_id(), previous_live_room_id);
+        assert_eq!(initial.entries().len(), 2);
+        assert!(initial.entries().iter().any(|room| room.room_id() == previous_live_room_id));
+        assert!(initial.entries().iter().any(|room| room.room_id() == cache_only_room_id));
 
         let (entries, controller) = all_rooms.entries_with_dynamic_adapters(usize::MAX);
         pin_mut!(entries);
@@ -1465,8 +1466,9 @@ mod tests {
         {
             diff.apply(&mut visible);
         }
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].room_id(), previous_live_room_id);
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().any(|room| room.room_id() == previous_live_room_id));
+        assert!(visible.iter().any(|room| room.room_id() == cache_only_room_id));
 
         room_list_service.state_machine.set(State::Error { from: Box::new(State::Running) });
         drop(_initial_mock_guard);
@@ -1495,9 +1497,11 @@ mod tests {
         assert!(recovery_sync.next().now_or_never().is_none());
         let during_recovery = all_rooms.current_entries_snapshot();
         assert_eq!(during_recovery.response_sequence(), Some(initial_committed.sequence()));
-        assert_eq!(during_recovery.entries().len(), 1);
-        assert_eq!(during_recovery.entries()[0].room_id(), previous_live_room_id);
-        assert!(during_recovery.entries().iter().all(|room| room.room_id() != cache_only_room_id));
+        assert_eq!(during_recovery.entries().len(), 2);
+        assert!(
+            during_recovery.entries().iter().any(|room| room.room_id() == previous_live_room_id)
+        );
+        assert!(during_recovery.entries().iter().any(|room| room.room_id() == cache_only_room_id));
         assert!(entries.next().now_or_never().is_none());
 
         tokio::time::timeout(Duration::from_secs(2), recovery_sync.next())
@@ -1508,10 +1512,10 @@ mod tests {
             .expect("recovery committed response stream ended");
         let recovered = all_rooms.current_entries_snapshot();
         assert_eq!(recovered.response_sequence(), Some(recovered_committed.sequence()));
-        assert_eq!(recovered.entries().len(), 1);
-        assert_eq!(recovered.entries()[0].room_id(), recovered_live_room_id);
-        assert!(recovered.entries().iter().all(|room| room.room_id() != previous_live_room_id));
-        assert!(recovered.entries().iter().all(|room| room.room_id() != cache_only_room_id));
+        assert_eq!(recovered.entries().len(), 3);
+        assert!(recovered.entries().iter().any(|room| room.room_id() == recovered_live_room_id));
+        assert!(recovered.entries().iter().any(|room| room.room_id() == previous_live_room_id));
+        assert!(recovered.entries().iter().any(|room| room.room_id() == cache_only_room_id));
 
         for diff in tokio::time::timeout(Duration::from_secs(2), entries.next())
             .await?
@@ -1519,8 +1523,10 @@ mod tests {
         {
             diff.apply(&mut visible);
         }
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].room_id(), recovered_live_room_id);
+        assert_eq!(visible.len(), 3);
+        assert!(visible.iter().any(|room| room.room_id() == recovered_live_room_id));
+        assert!(visible.iter().any(|room| room.room_id() == previous_live_room_id));
+        assert!(visible.iter().any(|room| room.room_id() == cache_only_room_id));
 
         Ok(())
     }
@@ -1638,6 +1644,40 @@ mod tests {
             all_rooms.current_entries_snapshot().response_sequence(),
             Some(previous_sequence)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumed_incremental_response_preserves_persisted_rooms() -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let first_room_id = room_id!("!persisted-one:example.org");
+        let second_room_id = room_id!("!persisted-two:example.org");
+        server.sync_joined_room(&client, first_room_id).await;
+        server.sync_joined_room(&client, second_room_id).await;
+
+        let room_list_service = RoomListService::new(client).await?;
+        let all_rooms = room_list_service.all_rooms().await?;
+        assert_eq!(all_rooms.current_entries_snapshot().entries().len(), 2);
+
+        let _mock_guard = server
+            .mock_sliding_sync()
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pos": "resumed-incremental",
+                "lists": { "all_rooms": { "count": 2 } },
+                "rooms": {}
+            })))
+            .mount_as_scoped()
+            .await;
+        let sync = room_list_service.sync();
+        pin_mut!(sync);
+        sync.next().await.expect("resumed room-list sync result")?;
+
+        let resumed = all_rooms.current_entries_snapshot();
+        assert_eq!(resumed.entries().len(), 2);
+        assert!(resumed.entries().iter().any(|room| room.room_id() == first_room_id));
+        assert!(resumed.entries().iter().any(|room| room.room_id() == second_room_id));
+
         Ok(())
     }
 

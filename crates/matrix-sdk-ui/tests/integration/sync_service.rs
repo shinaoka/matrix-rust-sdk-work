@@ -220,7 +220,7 @@ async fn test_sync_service_offline_mode() {
 
         sync_service.start().await;
         assert_next_matches!(states, State::Running);
-        assert_next_matches_with_timeout!(states, 2000, State::Offline);
+        assert_next_matches_with_timeout!(states, 2000, State::Offline(_));
     }
 
     mock_server.mock_versions().ok().expect(1..).mount().await;
@@ -242,7 +242,7 @@ async fn test_sync_service_offline_mode_stopping() {
     sync_service.start().await;
     assert_next_matches!(states, State::Running);
 
-    assert_next_matches_with_timeout!(states, 2000, State::Offline);
+    assert_next_matches_with_timeout!(states, 2000, State::Offline(_));
     sync_service.stop().await;
     assert_next_matches_with_timeout!(states, 2000, State::Idle);
 }
@@ -260,10 +260,10 @@ async fn test_sync_service_offline_mode_restarting() {
 
     sync_service.start().await;
     assert_next_matches!(states, State::Running);
-    assert_next_matches_with_timeout!(states, 2000, State::Offline);
+    assert_next_matches_with_timeout!(states, 2000, State::Offline(_));
 
     sync_service.start().await;
 
     assert_next_matches_with_timeout!(states, 2000, State::Running);
-    assert_next_matches_with_timeout!(states, 2000, State::Offline);
+    assert_next_matches_with_timeout!(states, 2000, State::Offline(_));
 }

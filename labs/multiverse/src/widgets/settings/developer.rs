@@ -60,7 +60,7 @@ impl DeveloperSettingsView {
                                 sync_service::State::Idle
                                 | sync_service::State::Terminated
                                 | sync_service::State::Error(_)
-                                | sync_service::State::Offline => sync_service.start().await,
+                                | sync_service::State::Offline(_) => sync_service.start().await,
                             }
                         }
                         SendQueue => {
@@ -87,7 +87,7 @@ impl Widget for &mut DeveloperSettingsView {
             sync_service::State::Idle
             | sync_service::State::Terminated
             | sync_service::State::Error(_)
-            | sync_service::State::Offline => ListItem::new("Sync [ ]"),
+            | sync_service::State::Offline(_) => ListItem::new("Sync [ ]"),
         };
 
         let send_queue_item = if self.client.send_queue().is_enabled() {
