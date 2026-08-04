@@ -64,6 +64,7 @@ pub(super) struct AllRoomsObservedIdsObservable {
     latest: SharedObservable<Option<AllRoomsObservedIds>>,
     visible_room_ids: SharedObservable<Option<Arc<BTreeSet<OwnedRoomId>>>>,
     replace_on_next_response: Arc<Mutex<bool>>,
+    retained_local_room_ids: Arc<Mutex<BTreeSet<OwnedRoomId>>>,
 }
 
 impl AllRoomsObservedIdsObservable {
@@ -72,6 +73,7 @@ impl AllRoomsObservedIdsObservable {
             latest: SharedObservable::new(None),
             visible_room_ids: SharedObservable::new(None),
             replace_on_next_response: Arc::new(Mutex::new(false)),
+            retained_local_room_ids: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -102,6 +104,7 @@ impl AllRoomsObservedIdsObservable {
         } else {
             self.latest.get().map(|observed| observed.room_ids.as_ref().clone()).unwrap_or_default()
         };
+        observed.extend(self.retained_local_room_ids.lock().unwrap().iter().cloned());
         observed.extend(room_ids.iter().cloned());
         let room_ids = Arc::new(observed);
         self.latest.set_if_not_eq(Some(AllRoomsObservedIds {
@@ -111,6 +114,36 @@ impl AllRoomsObservedIdsObservable {
             room_ids: room_ids.clone(),
         }));
         self.visible_room_ids.set_if_not_eq(Some(room_ids));
+    }
+
+    /// Extend the current observed-ID set without replacing its response
+    /// metadata. Local operations use this while the matching response is
+    /// still being published.
+    pub(super) fn remember_ids<I>(&self, room_ids_to_remember: I)
+    where
+        I: IntoIterator<Item = OwnedRoomId>,
+    {
+        let Some(mut observed) = self.latest.get() else {
+            return;
+        };
+        let mut room_ids = observed.room_ids.as_ref().clone();
+        let original_len = room_ids.len();
+        room_ids.extend(room_ids_to_remember);
+        if room_ids.len() == original_len {
+            return;
+        }
+        let room_ids = Arc::new(room_ids);
+        observed.room_ids = room_ids.clone();
+        self.latest.set(Some(observed));
+        self.visible_room_ids.set_if_not_eq(Some(room_ids));
+    }
+
+    /// Retain a room returned by a successful local operation across the next
+    /// response replacement. The operation has already established the room
+    /// locally, while its list position may arrive in a later response.
+    pub(super) fn remember_local_room_id(&self, room_id: OwnedRoomId) {
+        self.retained_local_room_ids.lock().unwrap().insert(room_id.clone());
+        self.remember_ids([room_id]);
     }
 }
 
@@ -145,6 +178,7 @@ pub struct CommittedAllRoomsResponse {
     sequence: u64,
     pos_present: bool,
     range_fully_loaded: bool,
+    rooms_from_response_count: u32,
 }
 
 impl CommittedAllRoomsResponse {
@@ -161,6 +195,12 @@ impl CommittedAllRoomsResponse {
     /// Whether the complete growing room range was loaded by this committed response.
     pub fn range_fully_loaded(self) -> bool {
         self.range_fully_loaded
+    }
+
+    /// Return the number of room objects present in the committed response.
+    /// This is a count-only diagnostic; it intentionally exposes no IDs.
+    pub fn rooms_from_response_count(self) -> u32 {
+        self.rooms_from_response_count
     }
 }
 
@@ -181,8 +221,12 @@ impl CommittedAllRoomsResponseObservable {
         self.latest.subscribe()
     }
 
-    pub(super) fn advance_after<F>(&self, range_fully_loaded: bool, before_publish: F)
-    where
+    pub(super) fn advance_after<F>(
+        &self,
+        range_fully_loaded: bool,
+        rooms_from_response_count: u32,
+        before_publish: F,
+    ) where
         F: FnOnce(u64),
     {
         let mut sequence = self.sequence.lock().unwrap();
@@ -192,6 +236,7 @@ impl CommittedAllRoomsResponseObservable {
             sequence: *sequence,
             pos_present: true,
             range_fully_loaded,
+            rooms_from_response_count,
         });
     }
 }
@@ -202,5 +247,30 @@ impl fmt::Debug for CommittedAllRoomsResponseObservable {
             .debug_struct("CommittedAllRoomsResponseObservable")
             .field("latest", &self.latest.get())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruma::room_id;
+
+    #[test]
+    fn local_operation_rooms_survive_response_replacement() {
+        let observed_ids = AllRoomsObservedIdsObservable::new();
+        observed_ids.accumulate(7, true, Some(1), &[room_id!("!joined:example.org").to_owned()]);
+        observed_ids.remember_local_room_id(room_id!("!local:example.org").to_owned());
+        observed_ids.begin_cycle();
+        observed_ids.accumulate(
+            8,
+            true,
+            Some(1),
+            &[room_id!("!replacement:example.org").to_owned()],
+        );
+
+        let observed = observed_ids.current().expect("observed IDs");
+        assert!(observed.contains(room_id!("!local:example.org")));
+        assert!(!observed.contains(room_id!("!joined:example.org")));
+        assert!(observed.contains(room_id!("!replacement:example.org")));
     }
 }

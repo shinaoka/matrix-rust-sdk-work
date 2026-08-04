@@ -240,6 +240,13 @@ impl RoomList {
     /// This snapshot is updated before the matching committed-response evidence
     /// is published, so consumers can reconcile from it without depending on
     /// the scheduling order of dynamic-entry reset delivery.
+    /// Remember a room returned by a successful local room operation so the
+    /// same live `all_rooms` projection can expose it before the next list
+    /// response replaces the observed range.
+    pub fn remember_room_id(&self, room_id: ruma::OwnedRoomId) {
+        self.all_rooms_observed_ids.remember_local_room_id(room_id);
+    }
+
     pub fn current_entries_snapshot(&self) -> RoomListEntriesSnapshot {
         let observed_ids = self.all_rooms_observed_ids.current();
         let (rooms, _) = self.client.rooms_stream();

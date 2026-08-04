@@ -462,6 +462,7 @@ impl RoomListService {
                             .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))?;
                         self.committed_all_rooms_response.advance_after(
                             range_fully_loaded,
+                            update_summary.rooms_from_response.len().try_into().unwrap_or(u32::MAX),
                             move |response_sequence| {
                                 self.publish_room_subscription_checkpoints(
                                     subscription_iteration,
