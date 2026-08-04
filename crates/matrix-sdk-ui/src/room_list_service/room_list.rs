@@ -254,9 +254,9 @@ impl RoomList {
             .into_iter()
             .filter(|room| {
                 matches!(room.state(), RoomState::Joined | RoomState::Invited)
-                    && observed_ids
-                        .as_ref()
-                        .map_or(true, |observed| observed.contains(room.room_id()))
+                    && observed_ids.as_ref().map_or(true, |observed| {
+                        observed.contains(room.room_id()) || room.state() == RoomState::Invited
+                    })
             })
             .map(Into::into)
             .collect();
@@ -335,6 +335,10 @@ impl RoomList {
                                 .filter(move |room| {
                                     visible_room_ids_for_filter.as_ref().map_or(true, |room_ids| {
                                         room_ids.contains(room.room_id())
+                                            || matches!(
+                                                room.clone().into_inner().state(),
+                                                RoomState::Invited
+                                            )
                                     }) && filter_fn(room)
                                 })
                                 .sort_by(new_sorter_lexicographic(vec![
