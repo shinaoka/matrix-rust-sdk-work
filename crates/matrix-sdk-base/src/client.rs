@@ -28,8 +28,8 @@ use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, EncryptionSettings, OlmError, OlmMachine,
-    TrustRequirement, store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
-    types::requests::ToDeviceRequest,
+    RoomKeyReshareResult, RoomKeyReshareTarget, TrustRequirement, store::DynCryptoStore,
+    store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
 use ruma::DeviceId;
@@ -1034,37 +1034,74 @@ impl BaseClient {
     /// Get a to-device request that will share a room key with users in a room.
     #[cfg(feature = "e2e-encryption")]
     pub async fn share_room_key(&self, room_id: &RoomId) -> Result<Vec<Arc<ToDeviceRequest>>> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
         match self.olm_machine().await.as_ref() {
             Some(o) => {
-                let Some(room) = self.get_room(room_id) else {
-                    return Err(Error::InsufficientData);
-                };
-
-                let history_visibility = room.history_visibility_or_default();
-                let Some(room_encryption_event) = room.encryption_settings() else {
-                    return Err(Error::EncryptionNotEnabled);
-                };
-
-                // Don't share the group session with members that are invited
-                // if the history visibility is set to `Joined`
-                let filter = if history_visibility == HistoryVisibility::Joined {
-                    RoomMemberships::JOIN
-                } else {
-                    RoomMemberships::ACTIVE
-                };
-
-                let members = self.state_store.get_user_ids(room_id, filter).await?;
-
-                let Some(settings) = EncryptionSettings::from_possibly_redacted(
-                    room_encryption_event,
-                    history_visibility,
-                    self.room_key_recipient_strategy.clone(),
-                ) else {
-                    return Err(Error::EncryptionNotEnabled);
-                };
-
                 Ok(o.share_room_key(room_id, members.iter().map(Deref::deref), settings).await?)
             }
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    async fn room_key_share_context(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(Vec<OwnedUserId>, EncryptionSettings)> {
+        let Some(room) = self.get_room(room_id) else {
+            return Err(Error::InsufficientData);
+        };
+        let history_visibility = room.history_visibility_or_default();
+        let Some(room_encryption_event) = room.encryption_settings() else {
+            return Err(Error::EncryptionNotEnabled);
+        };
+        let filter = if history_visibility == HistoryVisibility::Joined {
+            RoomMemberships::JOIN
+        } else {
+            RoomMemberships::ACTIVE
+        };
+        let members = self.state_store.get_user_ids(room_id, filter).await?;
+        let Some(settings) = EncryptionSettings::from_possibly_redacted(
+            room_encryption_event,
+            history_visibility,
+            self.room_key_recipient_strategy.clone(),
+        ) else {
+            return Err(Error::EncryptionNotEnabled);
+        };
+        Ok((members, settings))
+    }
+
+    /// Return the current outbound group-session identifier, if one exists.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn current_outbound_group_session_id(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<String>> {
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine.current_outbound_group_session_id(room_id).await),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Force-share the current outbound room key with eligible target devices.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn force_reshare_room_key(
+        &self,
+        room_id: &RoomId,
+        expected_session_id: Option<&str>,
+        target: RoomKeyReshareTarget,
+    ) -> Result<RoomKeyReshareResult> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .force_reshare_room_key(
+                    room_id,
+                    expected_session_id,
+                    target,
+                    members.iter().map(Deref::deref),
+                    settings,
+                )
+                .await?),
             None => panic!("Olm machine wasn't started"),
         }
     }

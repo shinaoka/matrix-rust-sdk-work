@@ -38,6 +38,11 @@ use matrix_sdk_base::crypto::types::events::room::encrypted::EncryptedEvent;
 use matrix_sdk_base::crypto::{
     IdentityStatusChange, RoomIdentityProvider, UserIdentity, types::events::CryptoContextInfo,
 };
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_base::crypto::{
+    RoomKeyReshareResult as CryptoRoomKeyReshareResult,
+    RoomKeyReshareTarget as CryptoRoomKeyReshareTarget,
+};
 pub use matrix_sdk_base::store::StoredThreadSubscription;
 use matrix_sdk_base::{
     ComposerDraft, DmRoomDefinition, EncryptionState, RoomInfoNotableUpdateReasons,
@@ -144,6 +149,60 @@ use ruma::{
     time::Instant,
     uint,
 };
+
+/// Eligible device class for a forced re-share of the current room key.
+#[cfg(feature = "e2e-encryption")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomKeyReshareTarget {
+    /// Devices belonging to the current user, except this device.
+    OwnOtherDevices,
+    /// Devices belonging to other room members.
+    PeerDevices,
+    /// Every eligible device except this device.
+    AllEligible,
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl From<RoomKeyReshareTarget> for CryptoRoomKeyReshareTarget {
+    fn from(value: RoomKeyReshareTarget) -> Self {
+        match value {
+            RoomKeyReshareTarget::OwnOtherDevices => Self::OwnOtherDevices,
+            RoomKeyReshareTarget::PeerDevices => Self::PeerDevices,
+            RoomKeyReshareTarget::AllEligible => Self::AllEligible,
+        }
+    }
+}
+
+/// Opaque identity of the current outbound group session.
+#[cfg(feature = "e2e-encryption")]
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct OutboundGroupSessionToken(String);
+
+#[cfg(feature = "e2e-encryption")]
+impl std::fmt::Debug for OutboundGroupSessionToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OutboundGroupSessionToken(<redacted>)")
+    }
+}
+
+/// Result of attempting to force-share the current outbound room key.
+#[cfg(feature = "e2e-encryption")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomKeyReshareResult {
+    /// One or more room-key requests were sent.
+    Sent {
+        /// Number of to-device requests sent.
+        request_count: usize,
+        /// Number of recipient devices across those requests.
+        recipient_count: usize,
+    },
+    /// No current outbound session exists.
+    NoSession,
+    /// No target device is currently eligible.
+    NoRecipients,
+    /// The current session changed before this attempt ran.
+    StaleSession,
+}
 #[cfg(feature = "experimental-encrypted-state-events")]
 use ruma::{
     events::room::encrypted::unstable_state::OriginalSyncStateRoomEncryptedEvent,
@@ -2450,6 +2509,52 @@ impl Room {
         Ok(())
     }
 
+    /// Return an opaque token for this room's current outbound group session.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn current_outbound_group_session_token(
+        &self,
+    ) -> Result<Option<OutboundGroupSessionToken>> {
+        self.ensure_room_joined()?;
+        Ok(self
+            .client
+            .base_client()
+            .current_outbound_group_session_id(self.room_id())
+            .await?
+            .map(OutboundGroupSessionToken))
+    }
+
+    /// Force-share the current outbound room key without creating a session.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn force_reshare_room_key(
+        &self,
+        expected: Option<&OutboundGroupSessionToken>,
+        target: RoomKeyReshareTarget,
+    ) -> Result<RoomKeyReshareResult> {
+        self.ensure_room_joined()?;
+        let result = self
+            .client
+            .base_client()
+            .force_reshare_room_key(
+                self.room_id(),
+                expected.map(|token| token.0.as_str()),
+                target.into(),
+            )
+            .await?;
+        Ok(match result {
+            CryptoRoomKeyReshareResult::Sent { requests, recipient_count } => {
+                let request_count = requests.len();
+                for request in requests {
+                    let response = self.client.send_to_device(&request).await?;
+                    self.client.mark_request_as_sent(&request.txn_id, &response).await?;
+                }
+                RoomKeyReshareResult::Sent { request_count, recipient_count }
+            }
+            CryptoRoomKeyReshareResult::NoSession => RoomKeyReshareResult::NoSession,
+            CryptoRoomKeyReshareResult::NoRecipients => RoomKeyReshareResult::NoRecipients,
+            CryptoRoomKeyReshareResult::StaleSession => RoomKeyReshareResult::StaleSession,
+        })
+    }
+
     /// Share this room's current Megolm key with eligible devices.
     ///
     /// This is intended for UI recovery actions after another device reports
@@ -2457,7 +2562,7 @@ impl Room {
     /// same as the normal send preshare path.
     #[cfg(feature = "e2e-encryption")]
     pub async fn reshare_room_key(&self) -> Result<()> {
-        self.share_room_key().await
+        self.force_reshare_room_key(None, RoomKeyReshareTarget::AllEligible).await.map(|_| ())
     }
 
     /// Wait for the room to be fully synced.
@@ -4830,6 +4935,13 @@ mod tests {
             mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
         },
     };
+
+    #[cfg(feature = "e2e-encryption")]
+    #[test]
+    fn test_room_key_reshare_token_debug_is_redacted() {
+        let token = super::OutboundGroupSessionToken("secret-session-id".to_owned());
+        assert_eq!(format!("{token:?}"), "OutboundGroupSessionToken(<redacted>)");
+    }
 
     #[cfg(all(feature = "sqlite", feature = "e2e-encryption"))]
     #[async_test]

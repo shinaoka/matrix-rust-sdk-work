@@ -65,6 +65,51 @@ use crate::{
     },
 };
 
+/// Eligible device class for a forced re-share of the current room key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomKeyReshareTarget {
+    /// Devices belonging to the current user, except this device.
+    OwnOtherDevices,
+    /// Devices belonging to other room members.
+    PeerDevices,
+    /// Every eligible device except this device.
+    AllEligible,
+}
+
+impl RoomKeyReshareTarget {
+    fn matches(
+        self,
+        own_user_id: &UserId,
+        own_device_id: &DeviceId,
+        user_id: &UserId,
+        device_id: &DeviceId,
+    ) -> bool {
+        match self {
+            Self::OwnOtherDevices => user_id == own_user_id && device_id != own_device_id,
+            Self::PeerDevices => user_id != own_user_id,
+            Self::AllEligible => user_id != own_user_id || device_id != own_device_id,
+        }
+    }
+}
+
+/// Result of attempting to force-share the current outbound room key.
+#[derive(Debug)]
+pub enum RoomKeyReshareResult {
+    /// New room-key requests were queued.
+    Sent {
+        /// Requests that the caller must send and mark as sent.
+        requests: Vec<Arc<ToDeviceRequest>>,
+        /// Number of device recipients across the requests.
+        recipient_count: usize,
+    },
+    /// No current outbound session exists.
+    NoSession,
+    /// No target device is currently eligible for a new request.
+    NoRecipients,
+    /// The current session does not match the caller's expected session.
+    StaleSession,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct GroupSessionCache {
     store: Store,
@@ -153,6 +198,13 @@ pub(crate) struct GroupSessionManager {
 }
 
 impl GroupSessionManager {
+    pub(crate) async fn current_outbound_group_session_id(
+        &self,
+        room_id: &RoomId,
+    ) -> Option<String> {
+        self.sessions.get_or_load(room_id).await.map(|session| session.session_id().to_owned())
+    }
+
     const MAX_TO_DEVICE_MESSAGES: usize = 250;
 
     pub fn new(store: Store) -> Self {
@@ -810,6 +862,64 @@ impl GroupSessionManager {
         Ok(requests)
     }
 
+    /// Force-share the current outbound session without creating or rotating it.
+    pub async fn force_reshare_room_key(
+        &self,
+        room_id: &RoomId,
+        expected_session_id: Option<&str>,
+        target: RoomKeyReshareTarget,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<RoomKeyReshareResult> {
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok(RoomKeyReshareResult::NoSession);
+        };
+        if expected_session_id.is_some_and(|expected| expected != outbound.session_id()) {
+            return Ok(RoomKeyReshareResult::StaleSession);
+        }
+
+        let encryption_settings = encryption_settings.into();
+        let CollectRecipientsResult { devices, .. } =
+            self.collect_session_recipients(users, &encryption_settings, &outbound).await?;
+        let account = self.store.static_account();
+        let devices = {
+            let sharing = outbound.sharing_view();
+            devices
+                .into_values()
+                .flatten()
+                .filter(|device| {
+                    let target_matches = target.matches(
+                        account.user_id(),
+                        account.device_id(),
+                        device.user_id(),
+                        device.device_id(),
+                    );
+                    target_matches && !sharing.has_pending_share(device)
+                })
+                .collect::<Vec<_>>()
+        };
+        if devices.is_empty() {
+            return Ok(RoomKeyReshareResult::NoRecipients);
+        }
+
+        let previous_request_ids =
+            outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
+        let mut changes = Changes::default();
+        let _unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        let requests = outbound
+            .pending_requests()
+            .into_iter()
+            .filter(|request| !previous_request_ids.contains(&request.txn_id))
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            return Ok(RoomKeyReshareResult::NoRecipients);
+        }
+        let recipient_count = requests.iter().map(|request| request.message_count()).sum();
+        self.store.save_changes(changes).await?;
+        Self::log_room_key_sharing_result(&requests);
+        Ok(RoomKeyReshareResult::Sent { requests, recipient_count })
+    }
+
     /// Collect the devices belonging to the given user, and send the details of
     /// a room key bundle to those devices.
     ///
@@ -1106,7 +1216,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        DecryptionSettings, EncryptionSettings, LocalTrust, OlmMachine, TrustRequirement,
+        DecryptionSettings, EncryptionSettings, LocalTrust, OlmMachine, RoomKeyReshareResult,
+        RoomKeyReshareTarget, TrustRequirement,
         identities::DeviceData,
         machine::{
             EncryptionSyncChanges, test_helpers::get_machine_pair_with_setup_sessions_test_helper,
@@ -1284,6 +1395,125 @@ mod tests {
             .map(|r| r.message_count())
             .sum();
         assert_eq!(withheld_count, 2);
+    }
+
+    #[async_test]
+    async fn test_force_reshare_reuses_current_session_without_repeating_pending_requests() {
+        let machine = machine_with_shared_room_key_test_helper().await;
+        let room_id = room_id!("!test:localhost");
+        let keys_claim = keys_claim_response();
+        let users = || keys_claim.one_time_keys.keys().map(Deref::deref);
+        let outbound =
+            machine.inner.group_session_manager.get_outbound_group_session(room_id).unwrap();
+        let session_id = outbound.session_id().to_owned();
+
+        assert!(
+            machine
+                .share_room_key(room_id, users(), EncryptionSettings::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let first = machine
+            .force_reshare_room_key(
+                room_id,
+                Some(&session_id),
+                RoomKeyReshareTarget::AllEligible,
+                users(),
+                EncryptionSettings::default(),
+            )
+            .await
+            .unwrap();
+        let RoomKeyReshareResult::Sent { requests, recipient_count } = first else {
+            panic!("expected forced requests");
+        };
+        assert!(!requests.is_empty());
+        assert!(recipient_count > 0);
+        assert_eq!(outbound.session_id(), session_id);
+
+        assert!(matches!(
+            machine
+                .force_reshare_room_key(
+                    room_id,
+                    Some(&session_id),
+                    RoomKeyReshareTarget::AllEligible,
+                    users(),
+                    EncryptionSettings::default(),
+                )
+                .await
+                .unwrap(),
+            RoomKeyReshareResult::NoRecipients
+        ));
+    }
+
+    #[async_test]
+    async fn test_force_reshare_rejects_missing_and_stale_sessions_without_creating_one() {
+        let machine = machine().await;
+        let room_id = room_id!("!missing:localhost");
+        let keys_claim = keys_claim_response();
+        let users = || keys_claim.one_time_keys.keys().map(Deref::deref);
+
+        assert!(matches!(
+            machine
+                .force_reshare_room_key(
+                    room_id,
+                    None,
+                    RoomKeyReshareTarget::AllEligible,
+                    users(),
+                    EncryptionSettings::default(),
+                )
+                .await
+                .unwrap(),
+            RoomKeyReshareResult::NoSession
+        ));
+        assert!(machine.inner.group_session_manager.get_outbound_group_session(room_id).is_none());
+
+        let current_room = room_id!("!test:localhost");
+        machine.share_room_key(current_room, users(), EncryptionSettings::default()).await.unwrap();
+        assert!(matches!(
+            machine
+                .force_reshare_room_key(
+                    current_room,
+                    Some("stale"),
+                    RoomKeyReshareTarget::AllEligible,
+                    users(),
+                    EncryptionSettings::default(),
+                )
+                .await
+                .unwrap(),
+            RoomKeyReshareResult::StaleSession
+        ));
+    }
+
+    #[test]
+    fn test_force_reshare_targets_exclude_the_current_device() {
+        let own_user = user_id!("@alice:example.org");
+        let own_device = device_id!("CURRENT");
+        let other_device = device_id!("OTHER");
+        let peer_user = user_id!("@bob:example.org");
+
+        assert!(RoomKeyReshareTarget::OwnOtherDevices.matches(
+            own_user,
+            own_device,
+            own_user,
+            other_device
+        ));
+        assert!(!RoomKeyReshareTarget::OwnOtherDevices.matches(
+            own_user,
+            own_device,
+            peer_user,
+            other_device
+        ));
+        assert!(RoomKeyReshareTarget::PeerDevices.matches(
+            own_user,
+            own_device,
+            peer_user,
+            other_device
+        ));
+        assert!(
+            !RoomKeyReshareTarget::AllEligible.matches(own_user, own_device, own_user, own_device)
+        );
     }
 
     fn count_withheld_from(requests: &[Arc<ToDeviceRequest>], code: WithheldCode) -> usize {

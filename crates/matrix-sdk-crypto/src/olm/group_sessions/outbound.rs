@@ -266,6 +266,15 @@ pub(crate) struct SharingView<'a> {
 }
 
 impl SharingView<'_> {
+    /// Whether a room-key request is currently queued for this device.
+    pub(crate) fn has_pending_share(&self, device: &DeviceData) -> bool {
+        self.to_share_with_set.values().any(|(_, shares)| {
+            shares
+                .get(device.user_id())
+                .is_some_and(|devices| devices.contains_key(device.device_id()))
+        })
+    }
+
     /// Has the session been shared with the given user/device pair (or if not,
     /// is there such a request pending).
     pub(crate) fn get_share_state(&self, device: &DeviceData) -> ShareState {

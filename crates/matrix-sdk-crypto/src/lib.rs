@@ -96,7 +96,7 @@ use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecr
 pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
 use serde::{Deserialize, Serialize};
-pub use session_manager::CollectStrategy;
+pub use session_manager::{CollectStrategy, RoomKeyReshareResult, RoomKeyReshareTarget};
 pub use store::{
     CryptoStoreError, SecretImportError, SecretInfo,
     types::{CrossSigningKeyExport, TrackedUser},

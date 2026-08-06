@@ -1329,6 +1329,32 @@ impl OlmMachine {
         self.inner.group_session_manager.share_room_key(room_id, users, encryption_settings).await
     }
 
+    /// Return the current outbound group-session identifier, if one exists.
+    pub async fn current_outbound_group_session_id(&self, room_id: &RoomId) -> Option<String> {
+        self.inner.group_session_manager.current_outbound_group_session_id(room_id).await
+    }
+
+    /// Force-share the current outbound session without creating or rotating it.
+    pub async fn force_reshare_room_key(
+        &self,
+        room_id: &RoomId,
+        expected_session_id: Option<&str>,
+        target: crate::RoomKeyReshareTarget,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<crate::RoomKeyReshareResult> {
+        self.inner
+            .group_session_manager
+            .force_reshare_room_key(
+                room_id,
+                expected_session_id,
+                target,
+                users,
+                encryption_settings,
+            )
+            .await
+    }
+
     /// Encrypts the given content using Olm for each of the given devices.
     ///
     /// The 1-to-1 session must be established prior to this

@@ -15,9 +15,9 @@
 mod group_sessions;
 mod sessions;
 
-pub use group_sessions::CollectStrategy;
 #[cfg(feature = "experimental-send-custom-to-device")]
 pub(crate) use group_sessions::split_devices_for_share_strategy;
+pub use group_sessions::{CollectStrategy, RoomKeyReshareResult, RoomKeyReshareTarget};
 pub(crate) use group_sessions::{
     GroupSessionCache, GroupSessionManager, withheld_code_for_device_for_share_strategy,
 };
