@@ -1046,15 +1046,20 @@ impl RoomSendQueue {
                 }
 
                 Err(err) => {
-                    if matches!(&err, crate::Error::SecureBackupRequired) {
+                    if matches!(&err, crate::Error::SecureBackupRequired)
+                        && !room.client().send_queue().secure_backup_send_is_admitted()
+                    {
                         // Admission may have closed after this request was
                         // dequeued or while its outbound session was being
                         // backed up. Keep the item pending and let the normal
                         // admission notifier wake it when the gate reopens.
                         queue.mark_as_not_being_sent(&txn_id).await;
+                        notifier.notified().await;
                         continue;
                     }
                     let is_recoverable = match err {
+                        crate::Error::SecureBackupRequired => true,
+
                         crate::Error::Http(ref http_err) => {
                             // All transient errors are recoverable.
                             matches!(

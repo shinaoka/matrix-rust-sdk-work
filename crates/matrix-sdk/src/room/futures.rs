@@ -18,7 +18,7 @@
 
 #[cfg(feature = "experimental-encrypted-state-events")]
 use std::borrow::Borrow;
-use std::future::IntoFuture;
+use std::{future::IntoFuture, time::Duration};
 
 use eyeball::SharedObservable;
 use matrix_sdk_base::deserialized_responses::{AlgorithmInfo, EncryptionInfo};
@@ -596,6 +596,8 @@ pub(crate) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
 
 #[cfg(feature = "e2e-encryption")]
 pub(crate) async fn ensure_room_secure_backup_ready(room: &Room) -> Result<String> {
+    const SECURE_BACKUP_SEND_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
     let before = room
         .client
         .base_client()
@@ -604,12 +606,13 @@ pub(crate) async fn ensure_room_secure_backup_ready(room: &Room) -> Result<Strin
         .map_err(|_| Error::SecureBackupRequired)?
         .ok_or(Error::SecureBackupRequired)?;
 
-    room.client
-        .encryption()
-        .backups()
-        .wait_for_steady_state()
-        .await
-        .map_err(|_| Error::SecureBackupRequired)?;
+    tokio::time::timeout(
+        SECURE_BACKUP_SEND_WAIT_TIMEOUT,
+        room.client.encryption().backups().wait_for_steady_state(),
+    )
+    .await
+    .map_err(|_| Error::SecureBackupRequired)?
+    .map_err(|_| Error::SecureBackupRequired)?;
 
     let after = room
         .client

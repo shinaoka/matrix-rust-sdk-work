@@ -801,6 +801,120 @@ async fn test_backed_up_session_fence_waits_for_upload_and_repeats_after_rotatio
 }
 
 #[async_test]
+async fn test_admitted_durability_failure_emits_recoverable_send_error() -> TestResult {
+    let session = matrix_session_example();
+    let (client, server) = no_retry_test_client_with_server().await;
+    client.restore_session(session).await?;
+
+    setup_create_room_and_send_message_mocks(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("_matrix/client/unstable/room_keys/keys"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    client.encryption().backups().create().await?;
+
+    let room = client
+        .create_room(assign!(CreateRoomRequest::new(), {
+            invite: vec![],
+            is_direct: true,
+        }))
+        .await?;
+    room.enable_encryption().await?;
+    client.send_queue().require_secure_backup_for_encrypted_sends(true);
+    client.send_queue().set_secure_backup_send_admitted(true);
+
+    let queue = room.send_queue();
+    let (_, mut updates) = queue.subscribe().await?;
+    queue.send(RoomMessageEventContent::text_plain("durability failure").into()).await?;
+
+    let txn_id = match timeout(updates.recv(), Duration::from_secs(2)).await?? {
+        RoomSendQueueUpdate::NewLocalEvent(local_echo) => local_echo.transaction_id,
+        update => panic!("expected a local echo, got {update:?}"),
+    };
+
+    let update = timeout(updates.recv(), Duration::from_secs(10)).await??;
+    assert_matches!(
+        update,
+        RoomSendQueueUpdate::SendError {
+            transaction_id,
+            is_recoverable: true,
+            ..
+        } if transaction_id == txn_id
+    );
+    assert!(
+        timeout(updates.recv(), Duration::from_millis(100)).await.is_err(),
+        "the durability failure must emit exactly one send error"
+    );
+
+    let requests = server.received_requests().await.expect("request recording is enabled");
+    assert!(!requests.iter().any(|request| request.url.path().contains("/send/")));
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_closed_admission_keeps_request_pending_without_send_error() -> TestResult {
+    let session = matrix_session_example();
+    let (client, server) = no_retry_test_client_with_server().await;
+    client.restore_session(session).await?;
+
+    setup_create_room_and_send_message_mocks(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("_matrix/client/unstable/room_keys/keys"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(100))
+                .set_body_json(json!({ "count": 1, "etag": "abcdefg" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client.encryption().backups().create().await?;
+
+    let room = client
+        .create_room(assign!(CreateRoomRequest::new(), {
+            invite: vec![],
+            is_direct: true,
+        }))
+        .await?;
+    room.enable_encryption().await?;
+    client.send_queue().require_secure_backup_for_encrypted_sends(true);
+    client.send_queue().set_secure_backup_send_admitted(false);
+
+    let queue = room.send_queue();
+    let (_, mut updates) = queue.subscribe().await?;
+    queue.send(RoomMessageEventContent::text_plain("admission closed").into()).await?;
+
+    let txn_id = match timeout(updates.recv(), Duration::from_secs(2)).await?? {
+        RoomSendQueueUpdate::NewLocalEvent(local_echo) => local_echo.transaction_id,
+        update => panic!("expected a local echo, got {update:?}"),
+    };
+
+    assert!(
+        timeout(updates.recv(), Duration::from_millis(100)).await.is_err(),
+        "closed admission must not emit a send error"
+    );
+    let requests = server.received_requests().await.expect("request recording is enabled");
+    assert!(!requests.iter().any(|request| request.url.path().contains("/send/")));
+
+    client.send_queue().set_secure_backup_send_admitted(true);
+
+    let update = timeout(updates.recv(), Duration::from_secs(10)).await??;
+    assert_matches!(
+        update,
+        RoomSendQueueUpdate::SentEvent { transaction_id, .. } if transaction_id == txn_id
+    );
+
+    server.verify().await;
+    Ok(())
+}
+
+#[async_test]
 async fn test_incremental_upload_of_keys_sliding_sync() -> TestResult {
     use tokio::task::spawn_blocking;
 
