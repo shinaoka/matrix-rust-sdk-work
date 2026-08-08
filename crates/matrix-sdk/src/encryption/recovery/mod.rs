@@ -170,6 +170,12 @@ impl Recovery {
         self.client.inner.e2ee.recovery_state.get()
     }
 
+    /// Return whether recovery was explicitly disabled at the account level,
+    /// as opposed to simply never having been configured.
+    pub async fn is_explicitly_disabled(&self) -> Result<bool> {
+        self.are_backups_marked_as_disabled().await
+    }
+
     /// Get a stream of updates to the [`RecoveryState`].
     ///
     /// This method will send out the current state as the first update.

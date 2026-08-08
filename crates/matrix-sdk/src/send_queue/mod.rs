@@ -175,6 +175,8 @@ use ruma::{
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, broadcast, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn};
 
+#[cfg(feature = "e2e-encryption")]
+use crate::room::futures::{ensure_room_encryption_ready, ensure_room_secure_backup_ready};
 use crate::{
     Client, Media, Room, TransmissionProgress,
     client::WeakClient,
@@ -297,6 +299,29 @@ impl SendQueue {
         self.data().report_media_upload_progress.store(enabled, Ordering::SeqCst);
     }
 
+    /// Require every encrypted event sent by this client's send queues to
+    /// cross the secure-backup durability fence.
+    pub fn require_secure_backup_for_encrypted_sends(&self, required: bool) {
+        self.data().require_secure_backup_for_encrypted_sends.store(required, Ordering::SeqCst);
+    }
+
+    /// Admit or pause encrypted sends governed by the secure-backup policy.
+    pub fn set_secure_backup_send_admitted(&self, admitted: bool) {
+        self.data().secure_backup_send_admitted.store(admitted, Ordering::SeqCst);
+        if admitted {
+            for queue in self.data().rooms.read().unwrap().values() {
+                queue.inner.notifier.notify_one();
+            }
+        }
+    }
+
+    /// Whether the embedding client still admits encrypted sends governed by
+    /// the secure-backup policy. Checked again at the final network boundary
+    /// so a request dequeued before runtime degradation cannot slip through.
+    pub(crate) fn secure_backup_send_is_admitted(&self) -> bool {
+        self.data().secure_backup_send_admitted.load(Ordering::SeqCst)
+    }
+
     /// Subscribe to all updates for all rooms.
     ///
     /// Use [`RoomSendQueue::subscribe`] to subscribe to update for a _specific
@@ -402,6 +427,13 @@ pub(super) struct SendQueueData {
 
     /// Will media upload progress be reported via send queue updates?
     report_media_upload_progress: Arc<AtomicBool>,
+
+    /// Whether encrypted sends must wait for their exact Megolm session to be
+    /// durably backed up. This is an opt-in client policy.
+    require_secure_backup_for_encrypted_sends: AtomicBool,
+
+    /// Whether the embedding client currently admits encrypted sends.
+    secure_backup_send_admitted: AtomicBool,
 }
 
 impl SendQueueData {
@@ -417,6 +449,8 @@ impl SendQueueData {
             error_sender,
             is_dropping: Arc::new(false.into()),
             report_media_upload_progress: Arc::new(false.into()),
+            require_secure_backup_for_encrypted_sends: AtomicBool::new(false),
+            secure_backup_send_admitted: AtomicBool::new(false),
         }
     }
 }
@@ -691,6 +725,29 @@ impl RoomSendQueue {
             if !locally_enabled.load(Ordering::SeqCst) {
                 trace!("not enabled, sleeping");
                 // Wait for an explicit wakeup.
+                notifier.notified().await;
+                continue;
+            }
+
+            #[cfg(feature = "e2e-encryption")]
+            if let Some(active_room) = room.get()
+                && active_room
+                    .client()
+                    .send_queue()
+                    .data()
+                    .require_secure_backup_for_encrypted_sends
+                    .load(Ordering::SeqCst)
+                && !active_room
+                    .client()
+                    .send_queue()
+                    .data()
+                    .secure_backup_send_admitted
+                    .load(Ordering::SeqCst)
+                && active_room
+                    .latest_encryption_state()
+                    .await
+                    .map_or(true, |state| state.is_encrypted())
+            {
                 notifier.notified().await;
                 continue;
             }
@@ -989,6 +1046,14 @@ impl RoomSendQueue {
                 }
 
                 Err(err) => {
+                    if matches!(&err, crate::Error::SecureBackupRequired) {
+                        // Admission may have closed after this request was
+                        // dequeued or while its outbound session was being
+                        // backed up. Keep the item pending and let the normal
+                        // admission notifier wake it when the gate reopens.
+                        queue.mark_as_not_being_sent(&txn_id).await;
+                        continue;
+                    }
                     let is_recoverable = match err {
                         crate::Error::Http(ref http_err) => {
                             // All transient errors are recoverable.
@@ -1072,11 +1137,23 @@ impl RoomSendQueue {
             QueuedRequestKind::Event { content } => {
                 let (event, event_type) = content.into_raw();
 
-                let result = room
+                let send = room
                     .send_raw(&event_type, &event)
                     .with_transaction_id(&request.transaction_id)
-                    .with_request_config(RequestConfig::short_retry())
-                    .await?;
+                    .with_request_config(RequestConfig::short_retry());
+                #[cfg(feature = "e2e-encryption")]
+                let send = if room
+                    .client()
+                    .send_queue()
+                    .data()
+                    .require_secure_backup_for_encrypted_sends
+                    .load(Ordering::SeqCst)
+                {
+                    send.require_backed_up_session()
+                } else {
+                    send
+                };
+                let result = send.await?;
 
                 trace!(txn_id = %request.transaction_id, event_id = %result.response.event_id, "event successfully sent");
 
@@ -1101,6 +1178,22 @@ impl RoomSendQueue {
                 trace!(%relates_to, "uploading media related to event");
 
                 let fut = async move {
+                    #[cfg(feature = "e2e-encryption")]
+                    if room
+                        .client()
+                        .send_queue()
+                        .data()
+                        .require_secure_backup_for_encrypted_sends
+                        .load(Ordering::SeqCst)
+                        && room.latest_encryption_state().await?.is_encrypted()
+                    {
+                        ensure_room_encryption_ready(room).await?;
+                        ensure_room_secure_backup_ready(room).await?;
+                        if !room.client().send_queue().secure_backup_send_is_admitted() {
+                            return Err(crate::Error::SecureBackupRequired);
+                        }
+                    }
+
                     let data = room
                         .client()
                         .media_store()

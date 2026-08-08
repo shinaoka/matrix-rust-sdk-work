@@ -21,7 +21,7 @@ use std::borrow::Borrow;
 use std::future::IntoFuture;
 
 use eyeball::SharedObservable;
-use matrix_sdk_base::deserialized_responses::EncryptionInfo;
+use matrix_sdk_base::deserialized_responses::{AlgorithmInfo, EncryptionInfo};
 use matrix_sdk_common::boxed_into_future;
 use mime::Mime;
 #[cfg(doc)]
@@ -41,6 +41,8 @@ use ruma::{
 use tracing::{Instrument, Span, info, trace};
 
 use super::Room;
+#[cfg(feature = "e2e-encryption")]
+use crate::Error;
 #[cfg(feature = "experimental-encrypted-state-events")]
 use crate::utils::IntoRawStateEventContent;
 use crate::{
@@ -65,13 +67,21 @@ pub struct SendMessageLikeEvent<'a> {
     content: serde_json::Result<serde_json::Value>,
     transaction_id: Option<OwnedTransactionId>,
     request_config: Option<RequestConfig>,
+    require_backed_up_session: bool,
 }
 
 impl<'a> SendMessageLikeEvent<'a> {
     pub(crate) fn new(room: &'a Room, content: impl MessageLikeEventContent) -> Self {
         let event_type = content.event_type().to_string();
         let content = serde_json::to_value(&content);
-        Self { room, event_type, content, transaction_id: None, request_config: None }
+        Self {
+            room,
+            event_type,
+            content,
+            transaction_id: None,
+            request_config: None,
+            require_backed_up_session: false,
+        }
     }
 
     /// Set a transaction ID for this event.
@@ -102,6 +112,13 @@ impl<'a> SendMessageLikeEvent<'a> {
         self.request_config = Some(request_config);
         self
     }
+
+    /// Require the current outbound room key's inbound counterpart to be
+    /// durably backed up before sending an encrypted event.
+    pub fn require_backed_up_session(mut self) -> Self {
+        self.require_backed_up_session = true;
+        self
+    }
 }
 
 impl<'a> IntoFuture for SendMessageLikeEvent<'a> {
@@ -109,10 +126,20 @@ impl<'a> IntoFuture for SendMessageLikeEvent<'a> {
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { room, event_type, content, transaction_id, request_config } = self;
+        let Self {
+            room,
+            event_type,
+            content,
+            transaction_id,
+            request_config,
+            require_backed_up_session,
+        } = self;
         Box::pin(async move {
             let content = content?;
-            assign!(room.send_raw(&event_type, content), { transaction_id, request_config }).await
+            let send = room.send_raw(&event_type, content);
+            let send =
+                if require_backed_up_session { send.require_backed_up_session() } else { send };
+            assign!(send, { transaction_id, request_config }).await
         })
     }
 }
@@ -126,6 +153,7 @@ pub struct SendRawMessageLikeEvent<'a> {
     tracing_span: Span,
     transaction_id: Option<OwnedTransactionId>,
     request_config: Option<RequestConfig>,
+    require_backed_up_session: bool,
 }
 
 impl<'a> SendRawMessageLikeEvent<'a> {
@@ -142,6 +170,7 @@ impl<'a> SendRawMessageLikeEvent<'a> {
             tracing_span: Span::current(),
             transaction_id: None,
             request_config: None,
+            require_backed_up_session: false,
         }
     }
 
@@ -170,6 +199,11 @@ impl<'a> SendRawMessageLikeEvent<'a> {
         self.request_config = Some(request_config);
         self
     }
+
+    pub(crate) fn require_backed_up_session(mut self) -> Self {
+        self.require_backed_up_session = true;
+        self
+    }
 }
 
 impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
@@ -185,6 +219,7 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
             tracing_span,
             transaction_id,
             request_config,
+            require_backed_up_session,
         } = self;
 
         let fut = async move {
@@ -216,11 +251,33 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
 
                     ensure_room_encryption_ready(room).await?;
 
+                    let backed_up_session = if require_backed_up_session {
+                        Some(ensure_room_secure_backup_ready(room).await?)
+                    } else {
+                        None
+                    };
+
                     let olm = room.client.olm_machine().await;
                     let olm = olm.as_ref().expect("Olm machine wasn't started");
 
                     let result =
                         olm.encrypt_room_event_raw(room.room_id(), event_type, &content).await?;
+                    if let Some(expected) = backed_up_session
+                        && !matches!(
+                            &result.encryption_info.algorithm_info,
+                            AlgorithmInfo::MegolmV1AesSha2 {
+                                session_id: Some(actual),
+                                ..
+                            } if actual == &expected
+                        )
+                    {
+                        return Err(Error::SecureBackupRequired);
+                    }
+                    if require_backed_up_session
+                        && !room.client().send_queue().secure_backup_send_is_admitted()
+                    {
+                        return Err(Error::SecureBackupRequired);
+                    }
                     content = result.content.cast();
                     encryption_info = Some(result.encryption_info);
                     event_type = "m.room.encrypted";
@@ -520,7 +577,7 @@ impl<'a> IntoFuture for SendStateEvent<'a> {
 
 /// Ensures the room is ready for encrypted events to be sent.
 #[cfg(feature = "e2e-encryption")]
-async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
+pub(crate) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
     if !room.are_members_synced() {
         room.sync_members().await?;
     }
@@ -535,4 +592,58 @@ async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
     room.preshare_room_key().await?;
 
     Ok(())
+}
+
+#[cfg(feature = "e2e-encryption")]
+pub(crate) async fn ensure_room_secure_backup_ready(room: &Room) -> Result<String> {
+    let before = room
+        .client
+        .base_client()
+        .current_outbound_group_session_id(room.room_id())
+        .await
+        .map_err(|_| Error::SecureBackupRequired)?
+        .ok_or(Error::SecureBackupRequired)?;
+
+    room.client
+        .encryption()
+        .backups()
+        .wait_for_steady_state()
+        .await
+        .map_err(|_| Error::SecureBackupRequired)?;
+
+    let after = room
+        .client
+        .base_client()
+        .current_outbound_group_session_id(room.room_id())
+        .await
+        .map_err(|_| Error::SecureBackupRequired)?
+        .ok_or(Error::SecureBackupRequired)?;
+    if before != after {
+        return Err(Error::SecureBackupRequired);
+    }
+
+    let olm = room.client.olm_machine().await;
+    let olm = olm.as_ref().ok_or(Error::SecureBackupRequired)?;
+    let backup_version =
+        olm.backup_machine().backup_version().await.ok_or(Error::SecureBackupRequired)?;
+
+    let inbound = olm
+        .store()
+        .get_inbound_group_session(room.room_id(), &after)
+        .await
+        .map_err(|_| Error::SecureBackupRequired)?
+        .ok_or(Error::SecureBackupRequired)?;
+
+    let pending = olm
+        .store()
+        .inbound_group_sessions_for_backup(&backup_version, usize::MAX)
+        .await
+        .map_err(|_| Error::SecureBackupRequired)?;
+    if pending.iter().any(|session| {
+        session.room_id() == inbound.room_id() && session.session_id() == inbound.session_id()
+    }) {
+        return Err(Error::SecureBackupRequired);
+    }
+
+    Ok(after)
 }

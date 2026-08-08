@@ -385,6 +385,11 @@ pub enum Error {
     #[error("backups are not enabled")]
     BackupNotEnabled,
 
+    /// An encrypted event opted into the secure-backup durability fence but
+    /// its current room key was not durably backed up.
+    #[error("secure backup is not ready for encrypted sending")]
+    SecureBackupRequired,
+
     /// It's forbidden to ignore your own user.
     #[error("can't ignore the logged-in user")]
     CantIgnoreLoggedInUser,

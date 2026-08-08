@@ -26,6 +26,7 @@ use matrix_sdk::{
         backups::{BackupState, UploadState, futures::SteadyStateError},
         secret_storage::{SecretStorageError, SecretStore},
     },
+    send_queue::RoomSendQueueUpdate,
     test_utils::{
         client::mock_session_tokens, no_retry_test_client_with_server,
         test_client_builder_with_server,
@@ -701,6 +702,99 @@ async fn test_incremental_upload_of_keys() -> TestResult {
         .await;
 
     client.sync_once(Default::default()).await?;
+
+    server.verify().await;
+    Ok(())
+}
+
+#[async_test]
+async fn test_backed_up_session_fence_waits_for_upload_and_repeats_after_rotation() -> TestResult {
+    let session = matrix_session_example();
+    let (client, server) = no_retry_test_client_with_server().await;
+    client.restore_session(session).await?;
+
+    Mock::given(method("PUT"))
+        .and(path("_matrix/client/unstable/room_keys/keys"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(250))
+                .set_body_json(json!({ "count": 1, "etag": "abcdefg" })),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    setup_create_room_and_send_message_mocks(&server).await;
+    client.encryption().backups().create().await?;
+
+    let room = client
+        .create_room(assign!(CreateRoomRequest::new(), {
+            invite: vec![],
+            is_direct: true,
+        }))
+        .await?;
+    room.enable_encryption().await?;
+    client.send_queue().require_secure_backup_for_encrypted_sends(true);
+    let queue = room.send_queue();
+    let (_, mut updates) = queue.subscribe().await?;
+
+    queue.send(RoomMessageEventContent::text_plain("first").into()).await?;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .expect("request recording is enabled")
+            .iter()
+            .any(|request| request.url.path().contains("/send/")),
+        "the encrypted room-message endpoint must remain untouched while backup upload is held"
+    );
+    client.send_queue().set_secure_backup_send_admitted(true);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .expect("request recording is enabled")
+            .iter()
+            .any(|request| request.url.path().contains("/send/")),
+        "admission alone must not bypass the delayed backup upload"
+    );
+    client.send_queue().set_secure_backup_send_admitted(false);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .expect("request recording is enabled")
+            .iter()
+            .any(|request| request.url.path().contains("/send/")),
+        "closing admission after dequeue must still prevent the final send"
+    );
+    client.send_queue().set_secure_backup_send_admitted(true);
+
+    while !matches!(updates.recv().await?, RoomSendQueueUpdate::SentEvent { .. }) {}
+
+    room.discard_room_key().await?;
+    queue.send(RoomMessageEventContent::text_plain("rotated").into()).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.send_queue().set_secure_backup_send_admitted(false);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("request recording is enabled")
+            .iter()
+            .filter(|request| request.url.path().contains("/send/"))
+            .count(),
+        1,
+        "rotation must re-enter the fence and honor admission closing while backup is pending"
+    );
+    client.send_queue().set_secure_backup_send_admitted(true);
+    while !matches!(updates.recv().await?, RoomSendQueueUpdate::SentEvent { .. }) {}
 
     server.verify().await;
     Ok(())

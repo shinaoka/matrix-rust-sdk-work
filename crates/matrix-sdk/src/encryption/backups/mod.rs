@@ -53,12 +53,29 @@ use ruma::{
 };
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 use tracing::{Span, error, info, instrument, trace, warn};
+use zeroize::Zeroizing;
 
 pub mod futures;
 pub(crate) mod types;
 
 use matrix_sdk_base::crypto::olm::ExportedRoomKey;
 pub use types::{BackupState, UploadState};
+
+/// Privacy-safe evidence about the active server backup and the key stored by
+/// this client. No backup version or key material is exposed to callers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerBackupTrust {
+    /// The homeserver has no active backup.
+    Absent,
+    /// The client has no decryption key for the active backup.
+    MissingLocalKey,
+    /// The stored version or public key differs from the active backup.
+    Mismatch,
+    /// The local key matches, but the backup auth data is not trusted.
+    Untrusted,
+    /// Version, public key, and backup auth data are all trusted.
+    Trusted,
+}
 
 use self::futures::WaitForSteadyState;
 use crate::{Client, Error, Room, encryption::BackupDownloadStrategy};
@@ -70,6 +87,44 @@ pub struct Backups {
 }
 
 impl Backups {
+    /// Export the locally stored recovery key without exposing its version or
+    /// any server-side identifier. The returned allocation is zeroized.
+    pub async fn local_recovery_key(&self) -> Result<Option<Zeroizing<String>>, Error> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        let stored = olm_machine.backup_machine().get_backup_keys().await?;
+        Ok(stored.decryption_key.map(|key| Zeroizing::new(key.to_base58())))
+    }
+
+    /// Inspect whether the active server backup is authenticated and matches
+    /// the locally stored decryption key and version.
+    pub async fn inspect_server_trust(&self) -> Result<ServerBackupTrust, Error> {
+        let Some(current) = self.get_current_version().await? else {
+            return Ok(ServerBackupTrust::Absent);
+        };
+
+        let info: RoomKeyBackupInfo = current.algorithm.deserialize_as()?;
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        let backup_machine = olm_machine.backup_machine();
+        let stored = backup_machine.get_backup_keys().await?;
+        let Some(decryption_key) = stored.decryption_key else {
+            return Ok(ServerBackupTrust::MissingLocalKey);
+        };
+        if stored.backup_version.as_deref() != Some(current.version.as_str())
+            || !decryption_key.backup_key_matches(&info)
+        {
+            return Ok(ServerBackupTrust::Mismatch);
+        }
+
+        let verification = backup_machine.verify_backup(info, false).await?;
+        Ok(if verification.trusted() {
+            ServerBackupTrust::Trusted
+        } else {
+            ServerBackupTrust::Untrusted
+        })
+    }
+
     /// Create a new backup version, encrypted with a new backup recovery key.
     ///
     /// The backup recovery key will be persisted locally and shared with

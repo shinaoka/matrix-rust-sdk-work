@@ -2597,6 +2597,10 @@ impl Room {
     /// [`.with_transaction_id()`][SendMessageLikeEvent::with_transaction_id]
     /// on the returned value before `.await`ing it.
     ///
+    /// Call [`SendMessageLikeEvent::require_backed_up_session`] when the caller
+    /// must wait for the current encrypted room key to be durably backed up
+    /// before sending.
+    ///
     /// # Arguments
     ///
     /// * `content` - The content of the message event.
