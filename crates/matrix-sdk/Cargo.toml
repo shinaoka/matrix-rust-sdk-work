@@ -188,7 +188,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 ctor = "0.2.9"
 proptest.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 wiremock.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]

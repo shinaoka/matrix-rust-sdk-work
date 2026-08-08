@@ -390,6 +390,13 @@ pub enum Error {
     #[error("secure backup is not ready for encrypted sending")]
     SecureBackupRequired,
 
+    /// An encrypted send reached the final network boundary after secure-backup
+    /// admission was closed. The send queue requeues this outcome without
+    /// reporting a send failure.
+    #[doc(hidden)]
+    #[error("secure backup send admission is closed")]
+    SecureBackupSendAdmissionClosed,
+
     /// It's forbidden to ignore your own user.
     #[error("can't ignore the logged-in user")]
     CantIgnoreLoggedInUser,

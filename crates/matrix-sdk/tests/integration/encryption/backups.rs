@@ -855,6 +855,123 @@ async fn test_admitted_durability_failure_emits_recoverable_send_error() -> Test
     Ok(())
 }
 
+#[tokio::test]
+async fn test_secure_backup_send_wait_has_five_second_deadline() -> TestResult {
+    let session = matrix_session_example();
+    let (client, server) = no_retry_test_client_with_server().await;
+    client.restore_session(session).await?;
+
+    setup_create_room_and_send_message_mocks(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("_matrix/client/unstable/room_keys/keys"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(60))
+                .set_body_json(json!({ "count": 1, "etag": "abcdefg" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client.encryption().backups().create().await?;
+
+    let room = client
+        .create_room(assign!(CreateRoomRequest::new(), {
+            invite: vec![],
+            is_direct: true,
+        }))
+        .await?;
+    room.enable_encryption().await?;
+    client.send_queue().require_secure_backup_for_encrypted_sends(true);
+    client.send_queue().set_secure_backup_send_admitted(true);
+
+    let queue = room.send_queue();
+    let (_, mut updates) = queue.subscribe().await?;
+    queue.send(RoomMessageEventContent::text_plain("stalled upload").into()).await?;
+
+    let txn_id = match timeout(updates.recv(), Duration::from_secs(2)).await?? {
+        RoomSendQueueUpdate::NewLocalEvent(local_echo) => local_echo.transaction_id,
+        update => panic!("expected a local echo, got {update:?}"),
+    };
+
+    let send_error = spawn(async move {
+        loop {
+            match updates.recv().await.expect("send queue update stream must stay open") {
+                update @ RoomSendQueueUpdate::SendError { .. } => break update,
+                _ => {}
+            }
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if server
+                .received_requests()
+                .await
+                .expect("request recording is enabled")
+                .iter()
+                .any(|request| request.url.path().contains("room_keys/keys"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stalled backup upload must start");
+    tokio::time::pause();
+
+    let requests = server.received_requests().await.expect("request recording is enabled");
+    assert!(
+        requests.iter().any(|request| request.url.path().contains("room_keys/keys")),
+        "the stalled backup upload must have started before advancing the clock"
+    );
+    assert!(!send_error.is_finished(), "the send error must not arrive before the deadline");
+
+    tokio::time::advance(Duration::from_secs(4)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!send_error.is_finished(), "the send error must wait for the full five seconds");
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .expect("request recording is enabled")
+            .iter()
+            .any(|request| request.url.path().contains("/send/")),
+        "the room event must not be sent while durability is pending"
+    );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(send_error.is_finished(), "the five-second durability deadline must settle the send");
+
+    let update = send_error.await.expect("send queue task must finish");
+    assert_matches!(
+        update,
+        RoomSendQueueUpdate::SendError {
+            transaction_id,
+            is_recoverable: true,
+            ..
+        } if transaction_id == txn_id
+    );
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .expect("request recording is enabled")
+            .iter()
+            .any(|request| request.url.path().contains("/send/")),
+        "a timed-out durability wait must not reach the room send endpoint"
+    );
+
+    Ok(())
+}
+
 #[async_test]
 async fn test_closed_admission_keeps_request_pending_without_send_error() -> TestResult {
     let session = matrix_session_example();

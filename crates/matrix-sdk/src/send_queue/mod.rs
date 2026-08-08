@@ -1046,15 +1046,18 @@ impl RoomSendQueue {
                 }
 
                 Err(err) => {
-                    if matches!(&err, crate::Error::SecureBackupRequired)
-                        && !room.client().send_queue().secure_backup_send_is_admitted()
-                    {
+                    if matches!(&err, crate::Error::SecureBackupSendAdmissionClosed) {
                         // Admission may have closed after this request was
                         // dequeued or while its outbound session was being
                         // backed up. Keep the item pending and let the normal
-                        // admission notifier wake it when the gate reopens.
+                        // admission notifier wake it when the gate reopens. Do
+                        // not consult the current admission state to classify
+                        // this outcome: the gate may have reopened before this
+                        // handler got scheduled.
                         queue.mark_as_not_being_sent(&txn_id).await;
-                        notifier.notified().await;
+                        if !room.client().send_queue().secure_backup_send_is_admitted() {
+                            notifier.notified().await;
+                        }
                         continue;
                     }
                     let is_recoverable = match err {
@@ -1195,7 +1198,7 @@ impl RoomSendQueue {
                         ensure_room_encryption_ready(room).await?;
                         ensure_room_secure_backup_ready(room).await?;
                         if !room.client().send_queue().secure_backup_send_is_admitted() {
-                            return Err(crate::Error::SecureBackupRequired);
+                            return Err(crate::Error::SecureBackupSendAdmissionClosed);
                         }
                     }
 

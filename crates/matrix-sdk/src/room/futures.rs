@@ -276,7 +276,7 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                     if require_backed_up_session
                         && !room.client().send_queue().secure_backup_send_is_admitted()
                     {
-                        return Err(Error::SecureBackupRequired);
+                        return Err(Error::SecureBackupSendAdmissionClosed);
                     }
                     content = result.content.cast();
                     encryption_info = Some(result.encryption_info);
