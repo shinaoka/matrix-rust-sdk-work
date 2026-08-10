@@ -36,12 +36,12 @@ pub use identity_status_changes::IdentityStatusChanges;
 use matrix_sdk_base::crypto::types::events::room::encrypted::EncryptedEvent;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{
-    IdentityStatusChange, RoomIdentityProvider, UserIdentity, types::events::CryptoContextInfo,
+    DeviceData, RoomKeyReshareResult as CryptoRoomKeyReshareResult,
+    RoomKeyReshareTarget as CryptoRoomKeyReshareTarget, UnwedgeReshareOutcome,
 };
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{
-    DeviceData, RoomKeyReshareResult as CryptoRoomKeyReshareResult,
-    RoomKeyReshareTarget as CryptoRoomKeyReshareTarget, UnwedgeReshareOutcome,
+    IdentityStatusChange, RoomIdentityProvider, UserIdentity, types::events::CryptoContextInfo,
 };
 pub use matrix_sdk_base::store::StoredThreadSubscription;
 use matrix_sdk_base::{

@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 
 use futures_util::future::try_join_all;
+use matrix_sdk_base::crypto::OlmRecoverySignal;
 use matrix_sdk_base::{
     RequestedRequiredStates, ThreadSubscriptionCatchupToken, sync::SyncResponse, timer,
 };
-use matrix_sdk_base::crypto::OlmRecoverySignal;
 use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use ruma::{
     OwnedRoomId,

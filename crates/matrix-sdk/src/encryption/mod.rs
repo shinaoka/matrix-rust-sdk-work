@@ -969,9 +969,8 @@ impl Encryption {
             let Some(machine) = self.client.olm_machine().await.as_ref().cloned() else {
                 break;
             };
-            let Ok(Some(device)) = machine
-                .device_from_curve_key(&signal.user_id, signal.sender_key)
-                .await
+            let Ok(Some(device)) =
+                machine.device_from_curve_key(&signal.user_id, signal.sender_key).await
             else {
                 continue;
             };
