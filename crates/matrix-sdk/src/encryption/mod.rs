@@ -119,7 +119,8 @@ pub mod verification;
 pub use matrix_sdk_base::crypto::{
     CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, ForwardedRoomKeyAuthOutcome,
     IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
-    KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError,
+    KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError, OlmRecoveryCounters,
+    OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome,
     RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
     RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
     RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters,
@@ -951,6 +952,24 @@ impl Encryption {
             .unwrap_or_default()
     }
 
+    /// Whether the local crypto store holds an inbound group session for the
+    /// given room + Megolm session (issue #478 local recovery source).
+    #[doc(hidden)]
+    pub async fn has_inbound_group_session(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Result<bool> {
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        machine
+            .store()
+            .get_inbound_group_session(room_id, session_id)
+            .await
+            .map(|session| session.is_some())
+            .map_err(Into::into)
+    }
+
     /// Drive the immediate post-unwedge re-share pass (issue #477).
     ///
     /// Consumes the standard Olm recovery signals collected during a sync
@@ -982,8 +1001,9 @@ impl Encryption {
                 let Some(room) = self.client.get_room(&room_id) else {
                     continue;
                 };
-                let outcome = room.reshare_unwedged_key(&device).await;
-                trace!(?outcome, "Post-unwedge room-key re-share outcome");
+                let _outcome = room.reshare_unwedged_key(&device).await;
+                // No identifier-bearing outcome is logged: only the aggregate
+                // privacy-safe counters carry the closed tokens (issue #477).
             }
         }
     }
