@@ -525,7 +525,7 @@ async fn send_room_key_to_device(
     let decryption_settings =
         DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-    receiver
+    let (events, room_keys, _) = receiver
         .receive_sync_changes(
             EncryptionSyncChanges {
                 to_device_events: vec![event],
@@ -536,7 +536,8 @@ async fn send_room_key_to_device(
             },
             &decryption_settings,
         )
-        .await
+        .await?;
+    Ok((events, room_keys))
 }
 
 /// Create an alice, bob pair where alice's device is dehydrated. Create a

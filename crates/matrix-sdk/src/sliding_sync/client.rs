@@ -4,6 +4,7 @@ use futures_util::future::try_join_all;
 use matrix_sdk_base::{
     RequestedRequiredStates, ThreadSubscriptionCatchupToken, sync::SyncResponse, timer,
 };
+use matrix_sdk_base::crypto::OlmRecoverySignal;
 use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use ruma::{
     OwnedRoomId,
@@ -168,12 +169,18 @@ impl Client {
 pub(crate) struct SlidingSyncResponseProcessor {
     client: Client,
     to_device_events: Vec<ProcessedToDeviceEvent>,
+    olm_recovery_signals: Vec<OlmRecoverySignal>,
     response: Option<SyncResponse>,
 }
 
 impl SlidingSyncResponseProcessor {
     pub fn new(client: Client) -> Self {
-        Self { client, to_device_events: Vec::new(), response: None }
+        Self {
+            client,
+            to_device_events: Vec::new(),
+            olm_recovery_signals: Vec::new(),
+            response: None,
+        }
     }
 
     #[cfg(feature = "e2e-encryption")]
@@ -186,7 +193,7 @@ impl SlidingSyncResponseProcessor {
         // `handle_room_response` before this function), so panic is fine.
         assert!(self.response.is_none());
 
-        self.to_device_events = if let Some(to_device_events) = self
+        if let Some((to_device_events, olm_recovery_signals)) = self
             .client
             .base_client()
             .process_sliding_sync_e2ee(
@@ -199,9 +206,10 @@ impl SlidingSyncResponseProcessor {
             // Some new keys might have been received, so trigger a backup if needed.
             self.client.encryption().backups().maybe_trigger_backup();
 
-            to_device_events
+            self.to_device_events = to_device_events;
+            self.olm_recovery_signals = olm_recovery_signals;
         } else {
-            Vec::new()
+            self.to_device_events = Vec::new();
         };
 
         Ok(())
@@ -263,6 +271,13 @@ impl SlidingSyncResponseProcessor {
         response.to_device.extend(self.to_device_events);
 
         self.client.call_sync_response_handlers(&response).await?;
+
+        // #477: room state for this sync was applied above; drive the immediate
+        // post-unwedge re-share for any standard Olm recovery signals observed
+        // in this sync (current membership is authoritative).
+        if !self.olm_recovery_signals.is_empty() {
+            self.client.encryption().on_olm_unwedged(self.olm_recovery_signals).await;
+        }
 
         Ok(response)
     }

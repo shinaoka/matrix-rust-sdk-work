@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod group_sessions;
+pub use group_sessions::UnwedgeReshareOutcome;
 mod sessions;
 
 #[cfg(feature = "experimental-send-custom-to-device")]

@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use matrix_sdk_common::deserialized_responses::{
     ProcessedToDeviceEvent, ToDeviceUnableToDecryptInfo, ToDeviceUnableToDecryptReason,
 };
-use matrix_sdk_crypto::{DecryptionSettings, EncryptionSyncChanges, OlmMachine};
+use matrix_sdk_crypto::{DecryptionSettings, EncryptionSyncChanges, OlmMachine, OlmRecoverySignal};
 use ruma::{
     OneTimeKeyAlgorithm, UInt,
     api::client::sync::sync_events::{DeviceLists, v3, v5},
@@ -98,10 +98,10 @@ async fn process(
         // decrypts to-device events, but leaves room events alone.
         // This makes sure that we have the decryption keys for the room
         // events at hand.
-        let (events, _room_key_updates) =
+        let (events, _room_key_updates, olm_recovery_signals) =
             olm_machine.receive_sync_changes(encryption_sync_changes, decryption_settings).await?;
 
-        Output { processed_to_device_events: events }
+        Output { processed_to_device_events: events, olm_recovery_signals }
     } else {
         // If we have no `OlmMachine`, just return the clear events that were passed in.
         // The encrypted ones are dropped as they are un-usable.
@@ -129,10 +129,14 @@ async fn process(
                     }
                 })
                 .collect(),
+            olm_recovery_signals: Vec::new(),
         }
     })
 }
 
 pub struct Output {
     pub processed_to_device_events: Vec<ProcessedToDeviceEvent>,
+    /// Standard Olm-unwedge recovery signals collected during this sync
+    /// (issue #477).
+    pub olm_recovery_signals: Vec<OlmRecoverySignal>,
 }

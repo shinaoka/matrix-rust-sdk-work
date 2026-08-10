@@ -225,7 +225,7 @@ pub async fn receive_encrypted_to_device_test_helper(
         next_batch_token: None,
     };
 
-    let (decrypted, _) =
+    let (decrypted, _, _) =
         recipient.receive_sync_changes(sync_changes, decryption_settings).await.unwrap();
 
     assert_eq!(1, decrypted.len());

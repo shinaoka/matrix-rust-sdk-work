@@ -431,7 +431,7 @@ where
 {
     let event_json = serde_json::to_string(event).expect("Unable to serialize to-device message");
 
-    machine
+    let (events, room_keys, _) = machine
         .receive_sync_changes(
             EncryptionSyncChanges {
                 to_device_events: vec![serde_json::from_str(&event_json).unwrap()],
@@ -443,7 +443,8 @@ where
             decryption_settings,
         )
         .await
-        .expect("Error receiving to-device event")
+        .expect("Error receiving to-device event");
+    (events, room_keys)
 }
 
 /// Given the `room_keys_received_stream`, check that there is a pending update,

@@ -582,7 +582,7 @@ async fn test_processed_to_device_variants() {
     let decryption_settings =
         DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-    let (processed, _) =
+    let (processed, _, _) =
         bob.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
 
     assert_eq!(4, processed.len());

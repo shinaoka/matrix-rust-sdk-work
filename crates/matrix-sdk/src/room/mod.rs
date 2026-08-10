@@ -40,8 +40,8 @@ use matrix_sdk_base::crypto::{
 };
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{
-    RoomKeyReshareResult as CryptoRoomKeyReshareResult,
-    RoomKeyReshareTarget as CryptoRoomKeyReshareTarget,
+    DeviceData, RoomKeyReshareResult as CryptoRoomKeyReshareResult,
+    RoomKeyReshareTarget as CryptoRoomKeyReshareTarget, UnwedgeReshareOutcome,
 };
 pub use matrix_sdk_base::store::StoredThreadSubscription;
 use matrix_sdk_base::{
@@ -2487,6 +2487,53 @@ impl Room {
                 Ok(())
             })
             .await
+    }
+
+    /// Immediately re-share this room's current Megolm session to the single
+    /// recovered device after its Olm unwedge (issue #477).
+    ///
+    /// Runs under the same per-room serialization as the normal share path
+    /// (store lock + `group_session_deduplicated_handler`), never creates or
+    /// rotates the session, re-evaluates membership and recipient policy, and
+    /// sends + marks any queued requests.
+    #[cfg(feature = "e2e-encryption")]
+    #[instrument(skip_all)]
+    pub(crate) async fn reshare_unwedged_key(
+        &self,
+        device: &DeviceData,
+    ) -> Result<UnwedgeReshareOutcome> {
+        self.ensure_room_joined()?;
+
+        // Take and release the lock on the store, if needs be.
+        let _guard = self.client.encryption().spin_lock_store(Some(60000)).await?;
+
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = std::sync::Arc::clone(&outcome);
+        self.client
+            .locks()
+            .group_session_deduplicated_handler
+            .run(self.room_id().to_owned(), async move {
+                let result = self
+                    .client
+                    .base_client()
+                    .reshare_unwedged_room_key(self.room_id(), device)
+                    .await?;
+                *captured.lock().expect("outcome cell not poisoned") = Some(result.clone());
+                if let UnwedgeReshareOutcome::Queued(requests) = &result {
+                    for request in requests {
+                        let response = self.client.send_to_device(request).await?;
+                        self.client.mark_request_as_sent(&request.txn_id, &response).await?;
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+
+        let result = {
+            let mut guard = outcome.lock().expect("outcome cell not poisoned");
+            guard.take().unwrap_or(UnwedgeReshareOutcome::Failed)
+        };
+        Ok(result)
     }
 
     /// Share a group session for a room.

@@ -66,6 +66,25 @@ use crate::{
     },
 };
 
+/// Outcome of an immediate post-unwedge room-key re-share (issue #477).
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub enum UnwedgeReshareOutcome {
+    /// No active outbound session was shared with the recovered device.
+    NoMatchingSession,
+    /// A re-share for the device is already pending on the session.
+    AlreadyPending,
+    /// Recipient policy (membership/blacklist/dehydrated/trust/rotation
+    /// pending) blocks the re-share.
+    PolicyBlocked,
+    /// The device's wedging index is not newer than the stored share index.
+    NotNeeded,
+    /// The re-share was queued; the requests still need to be sent.
+    Queued(Vec<Arc<ToDeviceRequest>>),
+    /// The recovery re-share failed with an error.
+    Failed,
+}
+
 /// Eligible device class for a forced re-share of the current room key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoomKeyReshareTarget {
@@ -260,6 +279,87 @@ impl GroupSessionManager {
     #[cfg(test)]
     pub fn get_outbound_group_session(&self, room_id: &RoomId) -> Option<OutboundGroupSession> {
         self.sessions.get(room_id)
+    }
+
+    /// Rooms whose active outbound session was previously shared with `device`
+    /// at an `olm_wedging_index` older than the device's current index
+    /// (issue #477). Only the in-memory active session set is scanned; sessions
+    /// not loaded this runtime re-share on their normal next `share_room_key`
+    /// pass.
+    pub(crate) fn unwedged_affected_room_ids(&self, device: &DeviceData) -> Vec<OwnedRoomId> {
+        self.sessions
+            .sessions
+            .read()
+            .iter()
+            .filter_map(|(room_id, session)| {
+                match session.sharing_view().get_share_state(device) {
+                    ShareState::Shared { olm_wedging_index, .. }
+                        if olm_wedging_index < device.olm_wedging_index =>
+                    {
+                        Some(room_id.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Re-share the current Megolm session of `room_id` to the single recovered
+    /// device after its Olm unwedge (issue #477).
+    ///
+    /// Never creates or rotates the session: rotation is left to the normal
+    /// send path. Membership and recipient policy are re-evaluated with the
+    /// current member list, so a device whose user left, or that became
+    /// blacklisted/dehydrated/untrusted, is never sent the key.
+    pub(crate) async fn reshare_unwedged_room_key(
+        &self,
+        room_id: &RoomId,
+        members: &[OwnedUserId],
+        settings: EncryptionSettings,
+        device: &DeviceData,
+    ) -> OlmResult<UnwedgeReshareOutcome> {
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok(UnwedgeReshareOutcome::NoMatchingSession);
+        };
+        let ShareState::Shared { olm_wedging_index, .. } =
+            outbound.sharing_view().get_share_state(device)
+        else {
+            return Ok(UnwedgeReshareOutcome::NoMatchingSession);
+        };
+        if olm_wedging_index >= device.olm_wedging_index {
+            return Ok(UnwedgeReshareOutcome::NotNeeded);
+        }
+        if outbound.sharing_view().has_pending_share(device) {
+            return Ok(UnwedgeReshareOutcome::AlreadyPending);
+        }
+
+        // Re-evaluate full recipient policy with the current member list
+        // (leavers excluded, blacklist/dehydrated/trust filtered) and detect
+        // any policy cause that requires rotation.
+        let CollectRecipientsResult { should_rotate, devices, .. } = self
+            .collect_session_recipients(members.iter().map(|user| user.as_ref()), &settings, &outbound)
+            .await?;
+        if should_rotate {
+            // Leave rotation to the normal send path; never rotate solely to
+            // recover Olm delivery.
+            return Ok(UnwedgeReshareOutcome::PolicyBlocked);
+        }
+        let eligible = devices.get(device.user_id()).is_some_and(|devices| {
+            devices.iter().any(|candidate| candidate.device_id() == device.device_id())
+        });
+        if !eligible {
+            return Ok(UnwedgeReshareOutcome::PolicyBlocked);
+        }
+
+        let mut changes = Changes::default();
+        let withheld = self
+            .encrypt_for_devices(vec![device.clone()], &outbound, &mut changes)
+            .await?;
+        self.handle_withheld_devices(&outbound, withheld)?;
+        if !changes.is_empty() {
+            self.store.save_changes(changes).await?;
+        }
+        Ok(UnwedgeReshareOutcome::Queued(outbound.pending_requests()))
     }
 
     pub async fn encrypt(
@@ -1991,7 +2091,7 @@ mod tests {
             let decryption_settings =
                 DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-            let (decrypted, _) =
+            let (decrypted, _, _) =
                 machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
 
             assert_eq!(1, decrypted.len());
@@ -2061,7 +2161,7 @@ mod tests {
             let decryption_settings =
                 DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-            let (decrypted, _) =
+            let (decrypted, _, _) =
                 machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
 
             assert_eq!(1, decrypted.len());
@@ -2164,7 +2264,7 @@ mod tests {
         let decryption_settings =
             DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-        let (decrypted, _) =
+        let (decrypted, _, _) =
             bob.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
         assert_eq!(1, decrypted.len());
         use crate::types::events::EventType;

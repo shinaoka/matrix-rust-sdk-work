@@ -91,7 +91,7 @@ pub use identities::{
     Device, DeviceData, LocalTrust, OtherUserIdentity, OtherUserIdentityData, OwnUserIdentity,
     OwnUserIdentityData, UserDevices, UserIdentity, UserIdentityData,
 };
-pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine};
+pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine, OlmRecoverySignal};
 use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecryptInfo};
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
@@ -106,7 +106,10 @@ pub use room_key_diagnostics::{
     RoomKeyRotationDiagnostic, RoomKeyRotationReason,
 };
 use serde::{Deserialize, Serialize};
-pub use session_manager::{CollectStrategy, RoomKeyReshareResult, RoomKeyReshareTarget};
+pub use session_manager::{
+    CollectStrategy, RoomKeyReshareResult, RoomKeyReshareTarget, UnwedgeReshareOutcome,
+};
+
 pub use store::{
     CryptoStoreError, SecretImportError, SecretInfo,
     types::{CrossSigningKeyExport, TrackedUser},

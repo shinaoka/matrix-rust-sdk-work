@@ -27,9 +27,10 @@ use futures_util::Stream;
 use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
-    CollectStrategy, DecryptionSettings, EncryptionSettings, OlmError, OlmMachine,
-    RoomKeyReshareResult, RoomKeyReshareTarget, TrustRequirement, store::DynCryptoStore,
-    store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
+    CollectStrategy, DecryptionSettings, DeviceData, EncryptionSettings, OlmError, OlmMachine,
+    RoomKeyReshareResult, RoomKeyReshareTarget, TrustRequirement, UnwedgeReshareOutcome,
+    store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
+    types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
 use ruma::DeviceId;
@@ -645,8 +646,10 @@ impl BaseClient {
             Context::new(StateChanges { sync_token: sync_token.clone(), ..Default::default() });
 
         #[cfg(feature = "e2e-encryption")]
-        let processors::e2ee::to_device::Output { processed_to_device_events: to_device } =
-            processors::e2ee::to_device::from_sync_v2(
+        let processors::e2ee::to_device::Output {
+            processed_to_device_events: to_device,
+            ..
+        } = processors::e2ee::to_device::from_sync_v2(
                 &response,
                 olm_machine.as_ref(),
                 &self.decryption_settings,
@@ -1039,6 +1042,25 @@ impl BaseClient {
             Some(o) => {
                 Ok(o.share_room_key(room_id, members.iter().map(Deref::deref), settings).await?)
             }
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Re-share the current Megolm session of `room_id` to the single recovered
+    /// device after its Olm unwedge (issue #477). Never creates or rotates the
+    /// session; membership and recipient policy are re-evaluated with the
+    /// current member list.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn reshare_unwedged_room_key(
+        &self,
+        room_id: &RoomId,
+        device: &DeviceData,
+    ) -> Result<UnwedgeReshareOutcome> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(o) => Ok(o
+                .reshare_unwedged_room_key(room_id, &members, settings, device)
+                .await?),
             None => panic!("Olm machine wasn't started"),
         }
     }

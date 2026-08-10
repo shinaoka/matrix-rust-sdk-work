@@ -38,7 +38,8 @@ use matrix_sdk_common::{
 use ruma::events::{AnyStateEventContent, StateEventContent};
 use ruma::{
     DeviceId, DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch, OneTimeKeyAlgorithm, OwnedDeviceId,
-    OwnedDeviceKeyId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
+    OwnedDeviceKeyId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt,
+    UserId,
     api::client::{
         dehydrated_device::DehydratedDeviceData,
         keys::{
@@ -87,7 +88,7 @@ use crate::{
         RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyIngressKind, RoomKeyMergeDecision,
         RoomKeyReceiveCounters, RoomKeyReceiveDiagnosticKind, RoomKeyRotationReason,
     },
-    session_manager::{GroupSessionManager, SessionManager},
+    session_manager::{GroupSessionManager, SessionManager, UnwedgeReshareOutcome},
     store::{
         CryptoStoreWrapper, IntoCryptoStore, MemoryStore, Result as StoreResult, SecretImportError,
         Store, StoreTransaction,
@@ -138,6 +139,26 @@ pub struct OlmMachine {
     pub(crate) inner: Arc<OlmMachineInner>,
 }
 
+/// Internal standard Olm-unwedge recovery signal (issue #477).
+///
+/// Collected when a fresh inbound Olm session is accepted for a known,
+/// non-dehydrated sender device (its `olm_wedging_index` advanced). Consumed by
+/// the post-sync re-share pass; never exported into diagnostics.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct OlmRecoverySignal {
+    /// Sender user of the to-device event that created the fresh session.
+    pub user_id: OwnedUserId,
+    /// Sender curve key of the fresh session.
+    pub sender_key: Curve25519PublicKey,
+}
+
+impl OlmRecoverySignal {
+    pub(crate) fn new(user_id: OwnedUserId, sender_key: Curve25519PublicKey) -> Self {
+        Self { user_id, sender_key }
+    }
+}
+
 pub struct OlmMachineInner {
     /// The unique user id that owns this account.
     user_id: OwnedUserId,
@@ -168,6 +189,11 @@ pub struct OlmMachineInner {
     /// A state machine that handles creating room key backups.
     backup_machine: BackupMachine,
     room_key_diagnostics: RoomKeyDiagnosticHub,
+
+    /// Standard Olm-unwedge recovery signals collected during the current sync
+    /// (issue #477): a fresh inbound Olm session was accepted for a known,
+    /// non-dehydrated sender device, whose `olm_wedging_index` advanced.
+    olm_recovery_signals: std::sync::Mutex<Vec<OlmRecoverySignal>>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -286,6 +312,7 @@ impl OlmMachine {
             identity_manager,
             backup_machine,
             room_key_diagnostics,
+            olm_recovery_signals: std::sync::Mutex::new(Vec::new()),
         });
 
         Self { inner }
@@ -1320,6 +1347,42 @@ impl OlmMachine {
         self.inner.group_session_manager.invalidate_group_session(room_id).await
     }
 
+    /// Rooms whose active outbound session was previously shared with `device`
+    /// at an `olm_wedging_index` older than the device's current index
+    /// (issue #477).
+    #[doc(hidden)]
+    pub fn unwedged_affected_room_ids(&self, device: &DeviceData) -> Vec<OwnedRoomId> {
+        self.inner.group_session_manager.unwedged_affected_room_ids(device)
+    }
+
+    /// Resolve a known device by its sender curve key (issue #477).
+    #[doc(hidden)]
+    pub async fn device_from_curve_key(
+        &self,
+        user_id: &UserId,
+        curve_key: Curve25519PublicKey,
+    ) -> StoreResult<Option<Device>> {
+        self.inner.store.get_device_from_curve_key(user_id, curve_key).await
+    }
+
+    /// Re-share the current Megolm session of `room_id` to the single recovered
+    /// device after its Olm unwedge (issue #477). Never creates or rotates the
+    /// session; membership and recipient policy are re-evaluated with the
+    /// current member list.
+    #[doc(hidden)]
+    pub async fn reshare_unwedged_room_key(
+        &self,
+        room_id: &RoomId,
+        members: &[OwnedUserId],
+        settings: EncryptionSettings,
+        device: &DeviceData,
+    ) -> OlmResult<UnwedgeReshareOutcome> {
+        self.inner
+            .group_session_manager
+            .reshare_unwedged_room_key(room_id, members, settings, device)
+            .await
+    }
+
     /// Invalidate a room key because room membership or device eligibility
     /// changed. This is behaviorally identical to [`Self::discard_room_key`]
     /// and only supplies a typed diagnostic reason.
@@ -1873,9 +1936,32 @@ impl OlmMachine {
 
         // New sessions modify the account so we need to save that
         // one as well.
+        let is_new_session = matches!(&decrypted.session, SessionType::New(_));
         match decrypted.session {
             SessionType::New(s) | SessionType::Existing(s) => {
                 changes.sessions.push(s);
+            }
+        }
+
+        // #477: a fresh inbound Olm session for a known, non-dehydrated sender
+        // device is the standard unwedge signal (the device's
+        // `olm_wedging_index` was just advanced). Surface it for the post-sync
+        // recovery re-share pass.
+        if is_new_session {
+            if let Ok(Some(device)) = self
+                .store()
+                .get_device_from_curve_key(&e.sender, decrypted.result.sender_key)
+                .await
+                && !device.is_dehydrated()
+            {
+                self.inner
+                    .olm_recovery_signals
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(OlmRecoverySignal::new(
+                    e.sender.clone(),
+                    decrypted.result.sender_key,
+                ));
             }
         }
 
@@ -1984,7 +2070,7 @@ impl OlmMachine {
         &self,
         sync_changes: EncryptionSyncChanges<'_>,
         decryption_settings: &DecryptionSettings,
-    ) -> OlmResult<(Vec<ProcessedToDeviceEvent>, Vec<RoomKeyInfo>)> {
+    ) -> OlmResult<(Vec<ProcessedToDeviceEvent>, Vec<RoomKeyInfo>, Vec<OlmRecoverySignal>)> {
         let mut store_transaction = self.inner.store.transaction().await;
 
         let (events, changes) = self
@@ -2007,7 +2093,13 @@ impl OlmMachine {
         }
         store_transaction.commit().await?;
 
-        Ok((events, room_key_updates))
+        let olm_recovery_signals = std::mem::take(&mut *self
+            .inner
+            .olm_recovery_signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+
+        Ok((events, room_key_updates, olm_recovery_signals))
     }
 
     /// Initial processing of the changes specified within a sync response.

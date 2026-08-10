@@ -17,6 +17,8 @@
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use matrix_sdk_common::timer;
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_crypto::OlmRecoverySignal;
 use ruma::{
     OwnedRoomId, api::client::sync::sync_events::v5 as http, events::receipt::SyncReceiptEvent,
     serde::Raw,
@@ -47,7 +49,7 @@ impl BaseClient {
         to_device: Option<&http::response::ToDevice>,
         e2ee: &http::response::E2EE,
         state_store_guard: &MutexGuard<'_, ()>,
-    ) -> Result<Option<Vec<ProcessedToDeviceEvent>>> {
+    ) -> Result<Option<(Vec<ProcessedToDeviceEvent>, Vec<OlmRecoverySignal>)>> {
         if to_device.is_none() && e2ee.is_empty() {
             return Ok(None);
         }
@@ -65,14 +67,16 @@ impl BaseClient {
 
         let context = processors::Context::default();
 
-        let processors::e2ee::to_device::Output { processed_to_device_events } =
-            processors::e2ee::to_device::from_msc4186(
-                to_device,
-                e2ee,
-                olm_machine.as_ref(),
-                &self.decryption_settings,
-            )
-            .await?;
+        let processors::e2ee::to_device::Output {
+            processed_to_device_events,
+            olm_recovery_signals,
+        } = processors::e2ee::to_device::from_msc4186(
+            to_device,
+            e2ee,
+            olm_machine.as_ref(),
+            &self.decryption_settings,
+        )
+        .await?;
 
         processors::changes::save_and_apply(
             context,
@@ -83,7 +87,7 @@ impl BaseClient {
         )
         .await?;
 
-        Ok(Some(processed_to_device_events))
+        Ok(Some((processed_to_device_events, olm_recovery_signals)))
     }
 
     /// Process a response from a sliding sync call.

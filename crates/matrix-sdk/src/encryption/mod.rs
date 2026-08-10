@@ -87,7 +87,7 @@ use serde::{Deserialize, de::Error as _};
 use tasks::BundleReceiverTask;
 use tokio::sync::{Mutex, RwLockReadGuard};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tracing::{Span, debug, error, instrument, warn};
+use tracing::{Span, debug, error, instrument, trace, warn};
 use url::Url;
 use vodozemac::Curve25519PublicKey;
 
@@ -949,6 +949,44 @@ impl Encryption {
             .as_ref()
             .map(|machine| machine.room_key_receive_counters())
             .unwrap_or_default()
+    }
+
+    /// Drive the immediate post-unwedge re-share pass (issue #477).
+    ///
+    /// Consumes the standard Olm recovery signals collected during a sync
+    /// (fresh inbound Olm sessions for known devices) and re-shares the current
+    /// Megolm session of each affected room to the recovered device, after room
+    /// state for the sync is applied. Bounded per sync; never rotates sessions
+    /// and never sends to a device lacking prior share-state proof.
+    #[doc(hidden)]
+    pub async fn on_olm_unwedged(&self, signals: Vec<matrix_sdk_base::crypto::OlmRecoverySignal>) {
+        use matrix_sdk_base::crypto::UnwedgeReshareOutcome;
+
+        const MAX_SIGNALS_PER_SYNC: usize = 8;
+        const MAX_ROOMS_PER_SIGNAL: usize = 16;
+
+        for signal in signals.into_iter().take(MAX_SIGNALS_PER_SYNC) {
+            let Some(machine) = self.client.olm_machine().await.as_ref().cloned() else {
+                break;
+            };
+            let Ok(Some(device)) = machine
+                .device_from_curve_key(&signal.user_id, signal.sender_key)
+                .await
+            else {
+                continue;
+            };
+            if device.is_dehydrated() {
+                continue;
+            }
+            let room_ids = machine.unwedged_affected_room_ids(&device);
+            for room_id in room_ids.into_iter().take(MAX_ROOMS_PER_SIGNAL) {
+                let Some(room) = self.client.get_room(&room_id) else {
+                    continue;
+                };
+                let outcome = room.reshare_unwedged_key(&device).await;
+                trace!(?outcome, "Post-unwedge room-key re-share outcome");
+            }
+        }
     }
 
     /// Returns the current encryption settings for this client.
