@@ -2448,11 +2448,9 @@ impl Room {
     /// room if necessary and share a room key that can be shared with them.
     ///
     /// Does nothing if no room key needs to be shared.
-    // TODO: expose this publicly so people can pre-share a group session if
-    // e.g. a user starts to type a message for a room.
     #[cfg(feature = "e2e-encryption")]
     #[instrument(skip_all, fields(room_id = ?self.room_id()))]
-    async fn preshare_room_key(&self) -> Result<()> {
+    pub async fn preshare_room_key(&self) -> Result<()> {
         self.ensure_room_joined()?;
 
         // Take and release the lock on the store, if needs be.
