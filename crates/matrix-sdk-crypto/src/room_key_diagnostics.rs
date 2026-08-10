@@ -255,6 +255,179 @@ pub enum RoomKeyDiagnosticEvent {
     IncomingRequest(IncomingRoomKeyRequestDiagnostic),
     /// Outbound Megolm creation/rotation boundary.
     Rotation(RoomKeyRotationDiagnostic),
+    /// Receive-side room-key lifecycle outcome.
+    Receive(RoomKeyReceiveDiagnostic),
+}
+
+/// The kind of incoming encrypted room-key event, once the decrypted payload
+/// is classified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomKeyIngressKind {
+    /// A direct `m.room_key` to-device event.
+    Direct,
+    /// An `m.forwarded_room_key` to-device event.
+    Forwarded,
+}
+
+/// Closed outcome of the forwarded-room-key authorization gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForwardedRoomKeyAuthOutcome {
+    /// No matching outstanding key request exists for the forwarded key.
+    RejectedNoMatchingRequest,
+    /// The sender device is unknown or not an eligible verified own device.
+    RejectedUntrustedSender,
+    /// The forwarded payload uses an unsupported algorithm.
+    UnsupportedAlgorithm,
+    /// The forwarded key passed authorization and reached the merge stage.
+    Accepted,
+}
+
+/// Closed Megolm merge acceptance decision.
+///
+/// These are *acceptance* decisions made by the store; persistence happens
+/// later at a save boundary. Persistence success is observable through the
+/// post-save room-key broadcast; persistence failure is reported as
+/// [`RoomKeyMergeDecision::StoreFailed`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomKeyMergeDecision {
+    /// No prior session existed; the new session was accepted for storage.
+    AcceptedNew,
+    /// A prior session exists and the incoming copy was accepted as better.
+    AcceptedImproved,
+    /// The incoming copy is equal to the stored one and was ignored.
+    DuplicateIgnored,
+    /// The incoming copy is worse than the stored one and was ignored.
+    WorseIgnored,
+    /// The incoming ratchet does not connect to the stored one; rejected.
+    UnconnectedRejected,
+    /// The incoming session key is invalid and cannot be parsed.
+    InvalidSessionKey,
+    /// Persisting accepted sessions failed at the save boundary.
+    StoreFailed,
+}
+
+/// A receive-side room-key lifecycle outcome, closed and privacy-safe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomKeyReceiveDiagnosticKind {
+    /// An encrypted room-key event was observed after Olm decryption.
+    RoomKeyIngress { kind: RoomKeyIngressKind },
+    /// An encrypted to-device event failed Olm decryption.
+    ToDeviceOlmFailed,
+    /// An Olm session was detected as wedged during to-device decryption.
+    ToDeviceOlmWedged,
+    /// A to-device event from a dehydrated device was rejected.
+    ToDeviceDehydratedRejected,
+    /// A malformed/unsupported encrypted to-device payload was dropped.
+    ToDeviceMalformed,
+    /// A room-key payload used an unsupported algorithm.
+    RoomKeyUnsupportedAlgorithm,
+    /// A forwarded room key hit the authorization gate.
+    ForwardedRoomKeyAuth { outcome: ForwardedRoomKeyAuthOutcome },
+    /// A Megolm merge acceptance decision was made.
+    Merge { decision: RoomKeyMergeDecision },
+}
+
+/// A typed, privacy-safe receive-side room-key diagnostic event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoomKeyReceiveDiagnostic {
+    /// The closed outcome token.
+    pub kind: RoomKeyReceiveDiagnosticKind,
+}
+
+/// Aggregate privacy-safe counters for receive-side room-key handling.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RoomKeyReceiveCounters {
+    /// Direct `m.room_key` events observed after Olm decryption.
+    pub ingress_direct: u64,
+    /// `m.forwarded_room_key` events observed after Olm decryption.
+    pub ingress_forwarded: u64,
+    /// Encrypted to-device events that failed Olm decryption.
+    pub to_device_olm_failed: u64,
+    /// Olm sessions detected as wedged during to-device decryption.
+    pub to_device_olm_wedged: u64,
+    /// To-device events rejected because the sender is dehydrated.
+    pub to_device_dehydrated_rejected: u64,
+    /// Malformed/unsupported encrypted to-device payloads dropped.
+    pub to_device_malformed: u64,
+    /// Room-key payloads with an unsupported algorithm.
+    pub room_key_unsupported_algorithm: u64,
+    /// Forwarded keys rejected because no matching request exists.
+    pub forwarded_rejected_no_matching_request: u64,
+    /// Forwarded keys rejected because the sender is untrusted.
+    pub forwarded_rejected_untrusted_sender: u64,
+    /// Forwarded keys with an unsupported algorithm.
+    pub forwarded_unsupported_algorithm: u64,
+    /// Forwarded keys that passed authorization.
+    pub forwarded_accepted: u64,
+    /// New sessions accepted for storage.
+    pub merge_accepted_new: u64,
+    /// Existing sessions accepted as improved.
+    pub merge_accepted_improved: u64,
+    /// Duplicate copies benignly ignored.
+    pub merge_duplicate_ignored: u64,
+    /// Worse copies ignored.
+    pub merge_worse_ignored: u64,
+    /// Unconnected ratchets rejected.
+    pub merge_unconnected_rejected: u64,
+    /// Invalid session keys rejected.
+    pub merge_invalid_session_key: u64,
+    /// Accepted sessions that failed to persist.
+    pub merge_store_failed: u64,
+}
+
+impl RoomKeyReceiveCounters {
+    fn apply(&mut self, kind: RoomKeyReceiveDiagnosticKind) {
+        match kind {
+            RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
+                kind: RoomKeyIngressKind::Direct,
+            } => self.ingress_direct += 1,
+            RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
+                kind: RoomKeyIngressKind::Forwarded,
+            } => self.ingress_forwarded += 1,
+            RoomKeyReceiveDiagnosticKind::ToDeviceOlmFailed => self.to_device_olm_failed += 1,
+            RoomKeyReceiveDiagnosticKind::ToDeviceOlmWedged => self.to_device_olm_wedged += 1,
+            RoomKeyReceiveDiagnosticKind::ToDeviceDehydratedRejected => {
+                self.to_device_dehydrated_rejected += 1
+            }
+            RoomKeyReceiveDiagnosticKind::ToDeviceMalformed => self.to_device_malformed += 1,
+            RoomKeyReceiveDiagnosticKind::RoomKeyUnsupportedAlgorithm => {
+                self.room_key_unsupported_algorithm += 1
+            }
+            RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                outcome: ForwardedRoomKeyAuthOutcome::RejectedNoMatchingRequest,
+            } => self.forwarded_rejected_no_matching_request += 1,
+            RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                outcome: ForwardedRoomKeyAuthOutcome::RejectedUntrustedSender,
+            } => self.forwarded_rejected_untrusted_sender += 1,
+            RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                outcome: ForwardedRoomKeyAuthOutcome::UnsupportedAlgorithm,
+            } => self.forwarded_unsupported_algorithm += 1,
+            RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                outcome: ForwardedRoomKeyAuthOutcome::Accepted,
+            } => self.forwarded_accepted += 1,
+            RoomKeyReceiveDiagnosticKind::Merge {
+                decision: RoomKeyMergeDecision::AcceptedNew,
+            } => self.merge_accepted_new += 1,
+            RoomKeyReceiveDiagnosticKind::Merge {
+                decision: RoomKeyMergeDecision::AcceptedImproved,
+            } => self.merge_accepted_improved += 1,
+            RoomKeyReceiveDiagnosticKind::Merge {
+                decision: RoomKeyMergeDecision::DuplicateIgnored,
+            } => self.merge_duplicate_ignored += 1,
+            RoomKeyReceiveDiagnosticKind::Merge {
+                decision: RoomKeyMergeDecision::WorseIgnored,
+            } => self.merge_worse_ignored += 1,
+            RoomKeyReceiveDiagnosticKind::Merge {
+                decision: RoomKeyMergeDecision::UnconnectedRejected,
+            } => self.merge_unconnected_rejected += 1,
+            RoomKeyReceiveDiagnosticKind::Merge {
+                decision: RoomKeyMergeDecision::InvalidSessionKey,
+            } => self.merge_invalid_session_key += 1,
+            RoomKeyReceiveDiagnosticKind::Merge {
+                decision: RoomKeyMergeDecision::StoreFailed,
+            } => self.merge_store_failed += 1,
+        }
+    }
 }
 
 /// Observer called synchronously with privacy-safe typed events.
@@ -284,6 +457,7 @@ struct RoomKeyDiagnosticState {
     next_request: u64,
     next_peer: u64,
     next_device: u64,
+    receive_counters: RoomKeyReceiveCounters,
 }
 
 struct RequestDiagnosticState {
@@ -294,6 +468,24 @@ struct RequestDiagnosticState {
 impl RoomKeyDiagnosticHub {
     pub(crate) fn set_observer(&self, observer: Option<RoomKeyDiagnosticObserver>) {
         lock(&self.0).observer = observer;
+    }
+
+    /// Record a receive-side room-key outcome: increment the matching
+    /// aggregate counter and notify the observer with the typed event.
+    pub(crate) fn emit_receive(&self, kind: RoomKeyReceiveDiagnosticKind) {
+        let (observer, event) = {
+            let mut state = lock(&self.0);
+            state.receive_counters.apply(kind);
+            (state.observer.clone(), RoomKeyReceiveDiagnostic { kind })
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::Receive(event));
+        }
+    }
+
+    /// Snapshot of the aggregate receive-side counters.
+    pub(crate) fn receive_counters(&self) -> RoomKeyReceiveCounters {
+        lock(&self.0).receive_counters
     }
 
     pub(crate) fn note_discard(&self, room_id: &RoomId, reason: RoomKeyRotationReason) {
@@ -647,5 +839,101 @@ mod tests {
             hub.classify_rotation_reason(room, false, false, true, true),
             RoomKeyRotationReason::Invalidated
         );
+    }
+
+    #[test]
+    fn receive_counters_accumulate_and_observer_gets_every_event() {
+        let hub = RoomKeyDiagnosticHub::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        hub.set_observer(Some(Arc::new(move |event| lock(&captured).push(event))));
+
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
+            kind: RoomKeyIngressKind::Direct,
+        });
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
+            kind: RoomKeyIngressKind::Forwarded,
+        });
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::ToDeviceOlmFailed);
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::ToDeviceOlmWedged);
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::ToDeviceDehydratedRejected);
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::ToDeviceMalformed);
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyUnsupportedAlgorithm);
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+            outcome: ForwardedRoomKeyAuthOutcome::RejectedNoMatchingRequest,
+        });
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+            outcome: ForwardedRoomKeyAuthOutcome::RejectedUntrustedSender,
+        });
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+            outcome: ForwardedRoomKeyAuthOutcome::UnsupportedAlgorithm,
+        });
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+            outcome: ForwardedRoomKeyAuthOutcome::Accepted,
+        });
+        for decision in [
+            RoomKeyMergeDecision::AcceptedNew,
+            RoomKeyMergeDecision::AcceptedImproved,
+            RoomKeyMergeDecision::DuplicateIgnored,
+            RoomKeyMergeDecision::WorseIgnored,
+            RoomKeyMergeDecision::UnconnectedRejected,
+            RoomKeyMergeDecision::InvalidSessionKey,
+            RoomKeyMergeDecision::StoreFailed,
+        ] {
+            hub.emit_receive(RoomKeyReceiveDiagnosticKind::Merge { decision });
+        }
+
+        let counters = hub.receive_counters();
+        assert_eq!(counters.ingress_direct, 1);
+        assert_eq!(counters.ingress_forwarded, 1);
+        assert_eq!(counters.to_device_olm_failed, 1);
+        assert_eq!(counters.to_device_olm_wedged, 1);
+        assert_eq!(counters.to_device_dehydrated_rejected, 1);
+        assert_eq!(counters.to_device_malformed, 1);
+        assert_eq!(counters.room_key_unsupported_algorithm, 1);
+        assert_eq!(counters.forwarded_rejected_no_matching_request, 1);
+        assert_eq!(counters.forwarded_rejected_untrusted_sender, 1);
+        assert_eq!(counters.forwarded_unsupported_algorithm, 1);
+        assert_eq!(counters.forwarded_accepted, 1);
+        assert_eq!(counters.merge_accepted_new, 1);
+        assert_eq!(counters.merge_accepted_improved, 1);
+        assert_eq!(counters.merge_duplicate_ignored, 1);
+        assert_eq!(counters.merge_worse_ignored, 1);
+        assert_eq!(counters.merge_unconnected_rejected, 1);
+        assert_eq!(counters.merge_invalid_session_key, 1);
+        assert_eq!(counters.merge_store_failed, 1);
+
+        let events = lock(&events);
+        assert_eq!(events.len(), 18);
+        for event in events.iter() {
+            assert!(matches!(event, RoomKeyDiagnosticEvent::Receive(_)));
+        }
+    }
+
+    #[test]
+    fn receive_diagnostics_contain_no_private_identifiers() {
+        let hub = RoomKeyDiagnosticHub::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        hub.set_observer(Some(Arc::new(move |event| lock(&captured).push(event))));
+
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
+            kind: RoomKeyIngressKind::Direct,
+        });
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
+            decision: RoomKeyMergeDecision::AcceptedNew,
+        });
+        hub.emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+            outcome: ForwardedRoomKeyAuthOutcome::RejectedNoMatchingRequest,
+        });
+
+        let debug = format!("{:?}", lock(&events));
+        assert!(!debug.contains("room"));
+        assert!(!debug.contains("user"));
+        assert!(!debug.contains("device"));
+        assert!(!debug.contains("session"));
+        assert!(!debug.contains("PRIVATE"));
+        assert!(!debug.contains("@"));
+        assert!(!debug.contains("!"));
     }
 }

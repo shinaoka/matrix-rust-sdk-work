@@ -50,9 +50,9 @@ use crate::{
     identities::IdentityManager,
     olm::{InboundGroupSession, Session},
     room_key_diagnostics::{
-        IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage, RequestedRoomKeySession,
-        RoomKeyDiagnosticHub, RoomKeyRefusalReason, RoomKeyRequestAction,
-        RoomKeyRequesterDeviceState,
+        ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
+        RequestedRoomKeySession, RoomKeyDiagnosticHub, RoomKeyReceiveDiagnosticKind, RoomKeyMergeDecision,
+        RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState,
     },
     session_manager::GroupSessionCache,
     store::{CryptoStoreError, SecretImportError, Store, caches::StoreCache, types::Changes},
@@ -1411,6 +1411,11 @@ impl GossipMachine {
             }
             Err(e) => {
                 warn!(?sender_key, "Couldn't create a group session from a received room key");
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
+                        decision: RoomKeyMergeDecision::InvalidSessionKey,
+                    });
                 Err(e.into())
             }
         }
@@ -1444,6 +1449,11 @@ impl GossipMachine {
                 algorithm = ?event.content.algorithm(),
                 "Received a forwarded room key with an unsupported algorithm",
             );
+            self.inner
+                .room_key_diagnostics
+                .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                    outcome: ForwardedRoomKeyAuthOutcome::UnsupportedAlgorithm,
+                });
             return Ok(None);
         };
 
@@ -1458,10 +1468,20 @@ impl GossipMachine {
                 algorithm = ?info.algorithm(),
                 "Received a forwarded room key that we didn't request",
             );
+            self.inner
+                .room_key_diagnostics
+                .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                    outcome: ForwardedRoomKeyAuthOutcome::RejectedNoMatchingRequest,
+                });
             return Ok(None);
         };
 
         if self.should_accept_forward(&request, sender_key).await? {
+            self.inner
+                .room_key_diagnostics
+                .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                    outcome: ForwardedRoomKeyAuthOutcome::Accepted,
+                });
             self.accept_forwarded_room_key(&request, sender_key, event).await
         } else {
             warn!(
@@ -1471,7 +1491,11 @@ impl GossipMachine {
                 "Received a forwarded room key from an unknown device, or \
                  from a device that the key request recipient doesn't own",
             );
-
+            self.inner
+                .room_key_diagnostics
+                .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                    outcome: ForwardedRoomKeyAuthOutcome::RejectedUntrustedSender,
+                });
             Ok(None)
         }
     }
@@ -1497,6 +1521,11 @@ impl GossipMachine {
                     algorithm = ?event.content.algorithm(),
                     "Received a forwarded room key with an unsupported algorithm",
                 );
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                        outcome: ForwardedRoomKeyAuthOutcome::UnsupportedAlgorithm,
+                    });
 
                 Ok(None)
             }
@@ -2044,6 +2073,127 @@ mod tests {
             .unwrap();
 
         assert_eq!(second_session.unwrap().first_known_index(), 0);
+    }
+
+    #[async_test]
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn test_forwarded_room_key_without_matching_request_is_rejected_and_counted() {
+        use crate::room_key_diagnostics::{
+            ForwardedRoomKeyAuthOutcome, RoomKeyDiagnosticEvent, RoomKeyReceiveDiagnosticKind,
+        };
+
+        let machine = get_machine_test_helper().await;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        machine
+            .inner
+            .room_key_diagnostics
+            .set_observer(Some(Arc::new(move |event| captured.lock().unwrap().push(event))));
+
+        // A forwarded key for which no request was ever made.
+        let second_account = alice_2_account();
+        let alice_device = DeviceData::from_account(&second_account);
+        let (outbound, session) = account().create_group_session_pair_with_defaults(room_id()).await;
+        let result = outbound.encrypt("m.dummy", &message_like_event_content!({})).await;
+        let _room_event = wrap_encrypted_content(machine.user_id(), result.content);
+        let export = session.export_at_index(10).await;
+        let content: ForwardedRoomKeyContent = export.try_into().unwrap();
+        let event = DecryptedOlmV1Event::new(
+            alice_id(),
+            alice_id(),
+            alice_device.ed25519_key().unwrap(),
+            None,
+            content,
+        );
+
+        let session =
+            machine.receive_forwarded_room_key(alice_device.curve25519_key().unwrap(), &event).await;
+
+        assert!(session.unwrap().is_none());
+
+        let counters = machine.inner.room_key_diagnostics.receive_counters();
+        assert_eq!(counters.forwarded_rejected_no_matching_request, 1);
+        assert_eq!(counters.forwarded_accepted, 0);
+        assert_eq!(counters.merge_accepted_new, 0);
+
+        let events = events.lock().unwrap();
+        match events.last() {
+            Some(RoomKeyDiagnosticEvent::Receive(receive)) => assert_eq!(
+                receive.kind,
+                RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                    outcome: ForwardedRoomKeyAuthOutcome::RejectedNoMatchingRequest,
+                }
+            ),
+            other => panic!("unexpected last event: {other:?}"),
+        }
+    }
+
+    #[async_test]
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn test_forwarded_room_key_from_untrusted_sender_is_rejected_and_counted() {
+        use crate::room_key_diagnostics::{
+            ForwardedRoomKeyAuthOutcome, RoomKeyDiagnosticEvent, RoomKeyReceiveDiagnosticKind,
+        };
+
+        let machine = get_machine_test_helper().await;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        machine
+            .inner
+            .room_key_diagnostics
+            .set_observer(Some(Arc::new(move |event| captured.lock().unwrap().push(event))));
+
+        let bob_owner = account();
+        let second_account = alice_2_account();
+        let alice_device = DeviceData::from_account(&second_account);
+
+        // Bob requested the key (verified own device), so the request check
+        // passes.
+        alice_device.set_trust_state(LocalTrust::Verified);
+        let devices = std::slice::from_ref(&alice_device);
+        machine.inner.store.save_device_data(devices).await.unwrap();
+
+        let (outbound, session) = bob_owner.create_group_session_pair_with_defaults(room_id()).await;
+        let result = outbound.encrypt("m.dummy", &message_like_event_content!({})).await;
+        let room_event = wrap_encrypted_content(machine.user_id(), result.content);
+
+        machine.create_outgoing_key_request(session.room_id(), &room_event).await.unwrap();
+        let requests = machine.outgoing_to_device_requests().await.unwrap();
+        let request = &requests[0];
+        machine.mark_outgoing_request_as_sent(&request.request_id).await.unwrap();
+
+        // The forwarded key arrives from a different, unknown sender device
+        // (another user), so authorization is refused.
+        let stranger = DeviceData::from_account(&bob_account());
+        let export = session.export_at_index(10).await;
+        let content: ForwardedRoomKeyContent = export.try_into().unwrap();
+        let event = DecryptedOlmV1Event::new(
+            bob_id(),
+            bob_id(),
+            stranger.ed25519_key().unwrap(),
+            None,
+            content,
+        );
+
+        let session =
+            machine.receive_forwarded_room_key(stranger.curve25519_key().unwrap(), &event).await;
+        assert!(session.unwrap().is_none());
+
+        let counters = machine.inner.room_key_diagnostics.receive_counters();
+        assert_eq!(counters.forwarded_rejected_untrusted_sender, 1);
+        assert_eq!(counters.forwarded_accepted, 0);
+        assert_eq!(counters.merge_accepted_new, 0);
+
+        let events = events.lock().unwrap();
+        match events.last() {
+            Some(RoomKeyDiagnosticEvent::Receive(receive)) => assert_eq!(
+                receive.kind,
+                RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                    outcome: ForwardedRoomKeyAuthOutcome::RejectedUntrustedSender,
+                }
+            ),
+            other => panic!("unexpected last event: {other:?}"),
+        }
     }
 
     #[async_test]

@@ -95,7 +95,10 @@ pub use caches::{
     thread::pagination::ThreadPagination,
 };
 #[cfg(feature = "e2e-encryption")]
-pub use redecryptor::{DecryptionRetryRequest, RedecryptorReport};
+pub use redecryptor::{
+    DecryptionRetryRequest, RedecryptorReport, RoomKeyLateDecryptionCounters,
+    RoomKeyLateDecryptionDiagnostics,
+};
 
 pub use crate::event_cache::automatic_pagination::AutomaticPagination;
 
@@ -461,7 +464,13 @@ impl EventCache {
                     .take()
                     .expect("We should have initialized the channel an subscribing should happen only once");
 
-                redecryptor::Redecryptor::new(&client, Arc::downgrade(&self.inner), receiver, &self.inner.linked_chunk_update_sender)
+                redecryptor::Redecryptor::new(
+                    &client,
+                    Arc::downgrade(&self.inner),
+                    receiver,
+                    &self.inner.linked_chunk_update_sender,
+                    self.inner.redecryption_channels.late_decryption_counters.clone(),
+                )
             };
 
         let thread_subscriber_task = client
@@ -521,6 +530,34 @@ impl EventCache {
     /// Check whether [`EventCache::subscribe`] has been called.
     pub fn has_subscribed(&self) -> bool {
         self.inner.drop_handles.get().is_some()
+    }
+
+    /// Snapshot the privacy-safe late-decryption state of the redecryptor.
+    ///
+    /// The counters include room-key broadcasts observed, redecryption
+    /// attempts and their outcomes (matched-event buckets, succeeded, still
+    /// undecryptable, failed, store-update failures), stream lag and stream
+    /// recreation. No identifiers or key material are included.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn room_key_receive_diagnostics(&self) -> RoomKeyLateDecryptionDiagnostics {
+        let counters = self
+            .inner
+            .redecryption_channels
+            .late_decryption_counters
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_default();
+        let redecryptor_alive = self
+            .inner
+            .drop_handles
+            .get()
+            .map(|handles| !handles._redecryptor.is_finished())
+            .unwrap_or(false);
+        RoomKeyLateDecryptionDiagnostics {
+            counters,
+            subscribed: self.has_subscribed(),
+            redecryptor_alive,
+        }
     }
 
     /// Return a room-specific view over the [`EventCache`].

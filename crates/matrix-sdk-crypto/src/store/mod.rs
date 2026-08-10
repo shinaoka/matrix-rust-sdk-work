@@ -76,6 +76,7 @@ use crate::{
         Account, ExportedRoomKey, ForwarderData, InboundGroupSession, PrivateCrossSigningIdentity,
         SenderData, Session, StaticAccountData,
     },
+    room_key_diagnostics::{RoomKeyDiagnosticHub, RoomKeyReceiveDiagnosticKind, RoomKeyMergeDecision},
     store::types::{RoomKeyWithheldEntry, SecretsInboxItem},
     types::{
         BackupSecrets, CrossSigningSecrets, MegolmBackupV1Curve25519AesSha2Secrets, RoomKeyExport,
@@ -500,6 +501,11 @@ struct StoreInner {
     /// Static account data that never changes (and thus can be loaded once and
     /// for all when creating the store).
     static_account: StaticAccountData,
+
+    /// Privacy-safe room-key diagnostic hub attached by the owning
+    /// [`OlmMachine`](crate::OlmMachine). Merge acceptance decisions are
+    /// reported here.
+    room_key_diagnostics: std::sync::Mutex<Option<RoomKeyDiagnosticHub>>,
 }
 
 /// Error describing what went wrong when importing private cross signing keys
@@ -570,7 +576,31 @@ impl Store {
                     loaded_tracked_users: Default::default(),
                     account: Default::default(),
                 })),
+                room_key_diagnostics: std::sync::Mutex::new(None),
             }),
+        }
+    }
+
+    /// Attach the privacy-safe room-key diagnostic hub of the owning
+    /// [`OlmMachine`](crate::OlmMachine). Merge acceptance decisions and store
+    /// failures are reported through it. No-op for stores without a machine.
+    pub(crate) fn set_room_key_diagnostics(&self, hub: RoomKeyDiagnosticHub) {
+        *self
+            .inner
+            .room_key_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hub);
+    }
+
+    fn emit_merge_decision(&self, decision: RoomKeyMergeDecision) {
+        if let Some(hub) = self
+            .inner
+            .room_key_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            hub.emit_receive(RoomKeyReceiveDiagnosticKind::Merge { decision });
         }
     }
 
@@ -656,6 +686,7 @@ impl Store {
         // If there is no old session, just use the new session.
         let Some(old_session) = old_session else {
             info!("Received a new megolm room key");
+            self.emit_merge_decision(RoomKeyMergeDecision::AcceptedNew);
             return Ok(Some(session));
         };
 
@@ -671,6 +702,7 @@ impl Store {
                 warn!(
                     "Received a group session with an ratchet that does not connect to the one in the store, discarding"
                 );
+                self.emit_merge_decision(RoomKeyMergeDecision::UnconnectedRejected);
                 None
             }
 
@@ -683,6 +715,7 @@ impl Store {
                     ?trust_level_comparison,
                     "Received a megolm room key that we have a worse version of, merging"
                 );
+                self.emit_merge_decision(RoomKeyMergeDecision::AcceptedImproved);
                 Some(session)
             }
 
@@ -696,12 +729,14 @@ impl Store {
                     "Received a megolm room key that we already have a better version \
                      of, discarding"
                 );
+                self.emit_merge_decision(RoomKeyMergeDecision::WorseIgnored);
                 None
             }
 
             (SessionOrdering::Equal, std::cmp::Ordering::Equal) => {
                 // The new session is the same as what we have.
                 info!("Received a megolm room key that we already have, discarding");
+                self.emit_merge_decision(RoomKeyMergeDecision::DuplicateIgnored);
                 None
             }
 
@@ -712,6 +747,7 @@ impl Store {
                 let result = old_session.with_ratchet(&session);
                 // We'll need to back it up again.
                 result.reset_backup_state();
+                self.emit_merge_decision(RoomKeyMergeDecision::AcceptedImproved);
                 Some(result)
             }
 
@@ -719,6 +755,7 @@ impl Store {
                 // We need to take the ratchet from the old session, and the
                 // sender data from the new session.
                 info!("Upgrading a previously-received megolm session with new sender data");
+                self.emit_merge_decision(RoomKeyMergeDecision::AcceptedImproved);
                 Some(session.with_ratchet(&old_session))
             }
         };
@@ -1541,10 +1578,17 @@ impl Store {
 
         let imported_count = imported_sessions.len();
 
-        self.inner
+        if let Err(error) = self
+            .inner
             .store
             .save_inbound_group_sessions(imported_sessions, from_backup_version)
-            .await?;
+            .await
+        {
+            if imported_count > 0 {
+                self.emit_merge_decision(RoomKeyMergeDecision::StoreFailed);
+            }
+            return Err(error);
+        }
 
         info!(total_count, imported_count, room_keys = ?keys, "Successfully imported room keys");
 
@@ -2021,6 +2065,14 @@ mod tests {
                 inbound.export_at_index(0).await.session_key.to_bytes()
             );
         }
+
+        // The receive-side diagnostics hub reports every decision.
+        let counters = bob.room_key_receive_counters();
+        assert_eq!(counters.merge_accepted_new, 0, "first save was direct, not via merge");
+        assert_eq!(counters.merge_unconnected_rejected, 1);
+        assert_eq!(counters.merge_worse_ignored, 1);
+        assert_eq!(counters.merge_duplicate_ignored, 1);
+        assert_eq!(counters.merge_accepted_improved, 3);
     }
 
     /// Create an [`InboundGroupSession`] for the given room, using the given

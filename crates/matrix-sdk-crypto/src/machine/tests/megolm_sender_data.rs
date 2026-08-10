@@ -364,7 +364,7 @@ async fn forget_devices_for_user(machine: &OlmMachine, other_user: &UserId) {
 /// * `room_id` - room to create a session for.
 /// * `sender_device_keys` - the MSC4147 sender data to include, or `None` to
 ///   omit the sender data
-async fn create_and_share_session_with_custom_sender_data(
+pub(crate) async fn create_and_share_session_with_custom_sender_data(
     alice: &OlmMachine,
     bob: &OlmMachine,
     room_id: &RoomId,
@@ -421,7 +421,7 @@ async fn create_and_share_session_with_custom_sender_data(
 }
 
 /// Pipe a to-device event into an [`OlmMachine`].
-pub async fn receive_to_device_event<C>(
+pub(crate) async fn receive_to_device_event<C>(
     machine: &OlmMachine,
     event: &ToDeviceEvent<C>,
     decryption_settings: &DecryptionSettings,

@@ -84,7 +84,8 @@ use crate::{
         SenderDataFinder, SessionType, StaticAccountData,
     },
     room_key_diagnostics::{
-        RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyRotationReason,
+        RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyReceiveDiagnosticKind,
+        RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters, RoomKeyRotationReason,
     },
     session_manager::{GroupSessionManager, SessionManager},
     store::{
@@ -255,6 +256,7 @@ impl OlmMachine {
         maybe_backup_key: Option<MegolmV1BackupKey>,
     ) -> Self {
         let room_key_diagnostics = RoomKeyDiagnosticHub::default();
+        store.set_room_key_diagnostics(room_key_diagnostics.clone());
         let group_session_manager =
             GroupSessionManager::new(store.clone(), room_key_diagnostics.clone());
 
@@ -1025,6 +1027,11 @@ impl OlmMachine {
             Err(e) => {
                 Span::current().record("session_id", &content.session_id);
                 warn!("Received a room key event which contained an invalid session key: {e}");
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
+                        decision: RoomKeyMergeDecision::InvalidSessionKey,
+                    });
 
                 Ok(None)
             }
@@ -1048,6 +1055,9 @@ impl OlmMachine {
             }
             RoomKeyContent::Unknown(_) => {
                 warn!("Received a room key with an unsupported algorithm");
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyUnsupportedAlgorithm);
                 Ok(None)
             }
         }
@@ -1332,6 +1342,11 @@ impl OlmMachine {
         self.inner.room_key_diagnostics.set_observer(observer);
     }
 
+    /// Snapshot the aggregate privacy-safe receive-side room-key counters.
+    pub fn room_key_receive_counters(&self) -> RoomKeyReceiveCounters {
+        self.inner.room_key_diagnostics.receive_counters()
+    }
+
     /// Get to-device requests to share a room key with users in a room.
     ///
     /// # Arguments
@@ -1508,10 +1523,20 @@ impl OlmMachine {
 
         match &*decrypted.result.event {
             AnyDecryptedOlmEvent::RoomKey(e) => {
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
+                        kind: RoomKeyIngressKind::Direct,
+                    });
                 let session = self.add_room_key(decrypted.result.sender_key, e).await?;
                 decrypted.inbound_group_session = session;
             }
             AnyDecryptedOlmEvent::ForwardedRoomKey(e) => {
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
+                        kind: RoomKeyIngressKind::Forwarded,
+                    });
                 let session = self
                     .inner
                     .key_request_machine
@@ -1560,6 +1585,9 @@ impl OlmMachine {
             }
             AnyDecryptedOlmEvent::Custom(_) => {
                 warn!("Received an unexpected encrypted to-device event");
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyUnsupportedAlgorithm);
             }
         }
 
@@ -1711,6 +1739,22 @@ impl OlmMachine {
         }
     }
 
+    /// Whether the raw to-device event claims the `m.room.encrypted` type.
+    ///
+    /// Used to scope malformed-event diagnostics to the encrypted to-device
+    /// path without fully deserializing the payload.
+    fn is_room_encrypted_event(event: &Raw<AnyToDeviceEvent>) -> bool {
+        #[derive(serde::Deserialize)]
+        struct TypeStub<'a> {
+            #[serde(borrow, rename = "type")]
+            event_type: &'a str,
+        }
+
+        event
+            .deserialize_as_unchecked::<TypeStub<'_>>()
+            .is_ok_and(|stub| stub.event_type == "m.room.encrypted")
+    }
+
     /// Decrypt the supplied to-device event (if needed, and if we can) and
     /// handle it.
     ///
@@ -1733,6 +1777,14 @@ impl OlmMachine {
             Err(e) => {
                 // Skip invalid events.
                 warn!("Received an invalid to-device event: {e}");
+                // Only malformed *encrypted* to-device events belong to the
+                // room-key delivery diagnostics; unrelated invalid events are
+                // not counted here.
+                if Self::is_room_encrypted_event(&raw_event) {
+                    self.inner
+                        .room_key_diagnostics
+                        .emit_receive(RoomKeyReceiveDiagnosticKind::ToDeviceMalformed);
+                }
                 return Some(ProcessedToDeviceEvent::Invalid(raw_event));
             }
         };
@@ -1784,20 +1836,28 @@ impl OlmMachine {
         {
             Ok(decrypted) => decrypted,
             Err(DecryptToDeviceError::OlmError(err)) => {
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::ToDeviceOlmFailed);
+
                 let reason = if let OlmError::UnverifiedSenderDevice = &err {
                     ToDeviceUnableToDecryptReason::UnverifiedSenderDevice
                 } else {
                     ToDeviceUnableToDecryptReason::DecryptionFailure
                 };
 
-                if let OlmError::SessionWedged(sender, curve_key) = err
-                    && let Err(e) =
+                if let OlmError::SessionWedged(sender, curve_key) = err {
+                    self.inner
+                        .room_key_diagnostics
+                        .emit_receive(RoomKeyReceiveDiagnosticKind::ToDeviceOlmWedged);
+                    if let Err(e) =
                         self.inner.session_manager.mark_device_as_wedged(&sender, curve_key).await
-                {
-                    error!(
-                        error = ?e,
-                        "Couldn't mark device to be unwedged",
-                    );
+                    {
+                        error!(
+                            error = ?e,
+                            "Couldn't mark device to be unwedged",
+                        );
+                    }
                 }
 
                 return Some(ProcessedToDeviceEvent::UnableToDecrypt {
@@ -1805,7 +1865,12 @@ impl OlmMachine {
                     utd_info: ToDeviceUnableToDecryptInfo { reason },
                 });
             }
-            Err(DecryptToDeviceError::FromDehydratedDevice) => return None,
+            Err(DecryptToDeviceError::FromDehydratedDevice) => {
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::ToDeviceDehydratedRejected);
+                return None;
+            }
         };
 
         // New sessions modify the account so we need to save that
@@ -1833,6 +1898,9 @@ impl OlmMachine {
             }
             Err(e) => {
                 warn!("Received an invalid encrypted to-device event: {e}");
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::ToDeviceMalformed);
                 raw_event = decrypted.result.raw_event;
             }
         }
@@ -1929,8 +1997,18 @@ impl OlmMachine {
         // refactor this to do it only once.
         let room_key_updates: Vec<_> =
             changes.inbound_group_sessions.iter().map(RoomKeyInfo::from).collect();
+        let had_inbound_sessions = !changes.inbound_group_sessions.is_empty();
 
-        self.store().save_changes(changes).await?;
+        if let Err(error) = self.store().save_changes(changes).await {
+            if had_inbound_sessions {
+                self.inner
+                    .room_key_diagnostics
+                    .emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
+                        decision: RoomKeyMergeDecision::StoreFailed,
+                    });
+            }
+            return Err(error.into());
+        }
         store_transaction.commit().await?;
 
         Ok((events, room_key_updates))
