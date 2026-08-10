@@ -257,6 +257,8 @@ pub enum RoomKeyDiagnosticEvent {
     Rotation(RoomKeyRotationDiagnostic),
     /// Receive-side room-key lifecycle outcome.
     Receive(RoomKeyReceiveDiagnostic),
+    /// Post-unwedge recovery re-share outcome (issue #477).
+    OlmRecovery(OlmRecoveryDiagnostic),
 }
 
 /// The kind of incoming encrypted room-key event, once the decrypted payload
@@ -341,6 +343,45 @@ pub enum RoomKeyReceiveDiagnosticKind {
 pub struct RoomKeyReceiveDiagnostic {
     /// The closed outcome token.
     pub kind: RoomKeyReceiveDiagnosticKind,
+}
+
+/// Closed outcome of the post-unwedge recovery re-share (issue #477).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OlmRecoverySignalOutcome {
+    /// The unwedge signal was observed for a known device.
+    Observed,
+    /// The unwedge signal was ignored: unknown device.
+    IgnoredUnknownDevice,
+    /// The unwedge signal was ignored: dehydrated device.
+    IgnoredDehydrated,
+    /// The recovery pass failed.
+    Failed,
+}
+
+/// Closed outcome of a per-room post-unwedge re-share (issue #477).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OlmRecoveryReshareOutcome {
+    /// The re-share was queued.
+    Queued,
+    /// A re-share was already pending for the device.
+    AlreadyPending,
+    /// No matching active session was shared with the device.
+    NoMatchingSession,
+    /// Recipient policy or pending rotation blocked the re-share.
+    PolicyBlocked,
+    /// The re-share failed.
+    Failed,
+}
+
+/// A typed, privacy-safe post-unwedge recovery diagnostic (issue #477).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OlmRecoveryDiagnostic {
+    /// The signal outcome token.
+    pub signal: OlmRecoverySignalOutcome,
+    /// The per-room re-share outcome token.
+    pub reshare: Option<OlmRecoveryReshareOutcome>,
+    /// Matching active outbound-session count bucket.
+    pub matching_sessions_bucket: u8,
 }
 
 /// Aggregate privacy-safe counters for receive-side room-key handling.
@@ -439,6 +480,47 @@ impl RoomKeyReceiveCounters {
     }
 }
 
+/// Aggregate privacy-safe counters for post-unwedge recovery (issue #477).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OlmRecoveryCounters {
+    /// Unwedge signals observed for known devices.
+    pub signal_observed: u64,
+    /// Unwedge signals ignored because the device is unknown.
+    pub signal_ignored_unknown_device: u64,
+    /// Unwedge signals ignored because the device is dehydrated.
+    pub signal_ignored_dehydrated: u64,
+    /// Recovery signal processing failures.
+    pub signal_failed: u64,
+    /// Matching active outbound-session count buckets.
+    pub matching_sessions_bucket_0: u64,
+    pub matching_sessions_bucket_1: u64,
+    pub matching_sessions_bucket_2_to_5: u64,
+    pub matching_sessions_bucket_6_to_20: u64,
+    pub matching_sessions_bucket_21_plus: u64,
+    /// Re-shares queued.
+    pub reshare_queued: u64,
+    /// Re-shares skipped because one was already pending.
+    pub reshare_already_pending: u64,
+    /// Re-shares skipped because no matching session was shared with the device.
+    pub reshare_no_matching_session: u64,
+    /// Re-shares blocked by recipient policy or pending rotation.
+    pub reshare_policy_blocked: u64,
+    /// Re-shares that failed.
+    pub reshare_failed: u64,
+}
+
+impl OlmRecoveryCounters {
+    fn record_matching_bucket(&mut self, count: usize) {
+        match count {
+            0 => self.matching_sessions_bucket_0 += 1,
+            1 => self.matching_sessions_bucket_1 += 1,
+            2..=5 => self.matching_sessions_bucket_2_to_5 += 1,
+            6..=20 => self.matching_sessions_bucket_6_to_20 += 1,
+            _ => self.matching_sessions_bucket_21_plus += 1,
+        }
+    }
+}
+
 /// Observer called synchronously with privacy-safe typed events.
 pub type RoomKeyDiagnosticObserver = Arc<dyn Fn(RoomKeyDiagnosticEvent) + Send + Sync>;
 
@@ -467,6 +549,7 @@ struct RoomKeyDiagnosticState {
     next_peer: u64,
     next_device: u64,
     receive_counters: RoomKeyReceiveCounters,
+    olm_recovery_counters: OlmRecoveryCounters,
 }
 
 struct RequestDiagnosticState {
@@ -495,6 +578,75 @@ impl RoomKeyDiagnosticHub {
     /// Snapshot of the aggregate receive-side counters.
     pub(crate) fn receive_counters(&self) -> RoomKeyReceiveCounters {
         lock(&self.0).receive_counters
+    }
+
+    /// Record a post-unwedge recovery signal outcome (issue #477): update the
+    /// matching aggregate counter and notify the observer.
+    pub(crate) fn emit_olm_recovery_signal(&self, outcome: OlmRecoverySignalOutcome) {
+        let (observer, event) = {
+            let mut state = lock(&self.0);
+            match outcome {
+                OlmRecoverySignalOutcome::Observed => state.olm_recovery_counters.signal_observed += 1,
+                OlmRecoverySignalOutcome::IgnoredUnknownDevice => {
+                    state.olm_recovery_counters.signal_ignored_unknown_device += 1
+                }
+                OlmRecoverySignalOutcome::IgnoredDehydrated => {
+                    state.olm_recovery_counters.signal_ignored_dehydrated += 1
+                }
+                OlmRecoverySignalOutcome::Failed => state.olm_recovery_counters.signal_failed += 1,
+            }
+            (
+                state.observer.clone(),
+                OlmRecoveryDiagnostic { signal: outcome, reshare: None, matching_sessions_bucket: 0 },
+            )
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::OlmRecovery(event));
+        }
+    }
+
+    /// Record a post-unwedge per-room re-share outcome (issue #477).
+    pub(crate) fn emit_olm_recovery_reshare(
+        &self,
+        signal: OlmRecoverySignalOutcome,
+        matching_sessions: usize,
+        reshare: OlmRecoveryReshareOutcome,
+    ) {
+        let (observer, event) = {
+            let mut state = lock(&self.0);
+            state.olm_recovery_counters.record_matching_bucket(matching_sessions);
+            match reshare {
+                OlmRecoveryReshareOutcome::Queued => state.olm_recovery_counters.reshare_queued += 1,
+                OlmRecoveryReshareOutcome::AlreadyPending => {
+                    state.olm_recovery_counters.reshare_already_pending += 1
+                }
+                OlmRecoveryReshareOutcome::NoMatchingSession => {
+                    state.olm_recovery_counters.reshare_no_matching_session += 1
+                }
+                OlmRecoveryReshareOutcome::PolicyBlocked => {
+                    state.olm_recovery_counters.reshare_policy_blocked += 1
+                }
+                OlmRecoveryReshareOutcome::Failed => {
+                    state.olm_recovery_counters.reshare_failed += 1
+                }
+            }
+            (
+                state.observer.clone(),
+                OlmRecoveryDiagnostic {
+                    signal,
+                    reshare: Some(reshare),
+                    matching_sessions_bucket: matching_bucket_token(matching_sessions),
+                },
+            )
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::OlmRecovery(event));
+        }
+    }
+
+    /// Snapshot of the aggregate post-unwedge recovery counters.
+    pub(crate) fn olm_recovery_counters(&self) -> OlmRecoveryCounters {
+        lock(&self.0).olm_recovery_counters
     }
 
     pub(crate) fn note_discard(&self, room_id: &RoomId, reason: RoomKeyRotationReason) {
@@ -649,6 +801,16 @@ impl RoomKeyDiagnosticHub {
         if let Some(observer) = observer {
             observer(RoomKeyDiagnosticEvent::IncomingRequest(event));
         }
+    }
+}
+
+fn matching_bucket_token(count: usize) -> u8 {
+    match count {
+        0 => 0,
+        1 => 1,
+        2..=5 => 2,
+        6..=20 => 3,
+        _ => 4,
     }
 }
 

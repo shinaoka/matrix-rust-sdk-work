@@ -92,6 +92,7 @@ mod decryption_verification_state;
 mod interactive_verification;
 mod megolm_sender_data;
 mod olm_encryption;
+mod olm_recovery_reshare;
 mod room_key_receive_diagnostics;
 mod room_settings;
 mod send_encrypted_to_device;

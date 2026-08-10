@@ -287,7 +287,8 @@ impl GroupSessionManager {
     /// not loaded this runtime re-share on their normal next `share_room_key`
     /// pass.
     pub(crate) fn unwedged_affected_room_ids(&self, device: &DeviceData) -> Vec<OwnedRoomId> {
-        self.sessions
+        let room_ids: Vec<_> = self
+            .sessions
             .sessions
             .read()
             .iter()
@@ -301,7 +302,11 @@ impl GroupSessionManager {
                     _ => None,
                 }
             })
-            .collect()
+            .collect();
+        self.room_key_diagnostics.emit_olm_recovery_signal(
+            crate::room_key_diagnostics::OlmRecoverySignalOutcome::Observed,
+        );
+        room_ids
     }
 
     /// Re-share the current Megolm session of `room_id` to the single recovered
@@ -359,7 +364,13 @@ impl GroupSessionManager {
         if !changes.is_empty() {
             self.store.save_changes(changes).await?;
         }
-        Ok(UnwedgeReshareOutcome::Queued(outbound.pending_requests()))
+        let outcome = UnwedgeReshareOutcome::Queued(outbound.pending_requests());
+        self.room_key_diagnostics.emit_olm_recovery_reshare(
+            crate::room_key_diagnostics::OlmRecoverySignalOutcome::Observed,
+            1,
+            crate::room_key_diagnostics::OlmRecoveryReshareOutcome::Queued,
+        );
+        Ok(outcome)
     }
 
     pub async fn encrypt(

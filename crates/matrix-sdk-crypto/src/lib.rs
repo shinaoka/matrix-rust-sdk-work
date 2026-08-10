@@ -98,12 +98,13 @@ pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
 pub use room_key_diagnostics::{
     ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome,
-    IncomingRoomKeyRequestStage, RequestedRoomKeySession, RoomKeyCreationOutcome,
-    RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver,
-    RoomKeyFirstShareOutcome, RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters,
-    RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
-    RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
-    RoomKeyRotationDiagnostic, RoomKeyRotationReason,
+    IncomingRoomKeyRequestStage, OlmRecoveryCounters, OlmRecoveryDiagnostic,
+    OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome, RequestedRoomKeySession,
+    RoomKeyCreationOutcome, RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent,
+    RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome, RoomKeyIngressKind, RoomKeyMergeDecision,
+    RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
+    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState,
+    RoomKeyRequesterScope, RoomKeyRotationDiagnostic, RoomKeyRotationReason,
 };
 use serde::{Deserialize, Serialize};
 pub use session_manager::{

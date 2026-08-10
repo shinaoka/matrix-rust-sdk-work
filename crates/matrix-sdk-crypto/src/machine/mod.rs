@@ -85,7 +85,8 @@ use crate::{
         SenderDataFinder, SessionType, StaticAccountData,
     },
     room_key_diagnostics::{
-        RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyIngressKind, RoomKeyMergeDecision,
+        OlmRecoveryCounters, OlmRecoverySignalOutcome, RoomKeyDiagnosticHub,
+        RoomKeyDiagnosticObserver, RoomKeyIngressKind, RoomKeyMergeDecision,
         RoomKeyReceiveCounters, RoomKeyReceiveDiagnosticKind, RoomKeyRotationReason,
     },
     session_manager::{GroupSessionManager, SessionManager, UnwedgeReshareOutcome},
@@ -1406,6 +1407,13 @@ impl OlmMachine {
     /// Snapshot the aggregate privacy-safe receive-side room-key counters.
     pub fn room_key_receive_counters(&self) -> RoomKeyReceiveCounters {
         self.inner.room_key_diagnostics.receive_counters()
+    }
+
+    /// Snapshot the aggregate privacy-safe post-unwedge recovery counters
+    /// (issue #477).
+    #[doc(hidden)]
+    pub fn olm_recovery_counters(&self) -> OlmRecoveryCounters {
+        self.inner.room_key_diagnostics.olm_recovery_counters()
     }
 
     /// Get to-device requests to share a room key with users in a room.
