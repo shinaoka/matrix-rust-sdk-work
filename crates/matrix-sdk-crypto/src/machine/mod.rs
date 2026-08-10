@@ -83,6 +83,9 @@ use crate::{
         KnownSenderData, OlmDecryptionInfo, PrivateCrossSigningIdentity, SenderData,
         SenderDataFinder, SessionType, StaticAccountData,
     },
+    room_key_diagnostics::{
+        RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyRotationReason,
+    },
     session_manager::{GroupSessionManager, SessionManager},
     store::{
         CryptoStoreWrapper, IntoCryptoStore, MemoryStore, Result as StoreResult, SecretImportError,
@@ -163,6 +166,7 @@ pub struct OlmMachineInner {
     identity_manager: IdentityManager,
     /// A state machine that handles creating room key backups.
     backup_machine: BackupMachine,
+    room_key_diagnostics: RoomKeyDiagnosticHub,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -250,7 +254,9 @@ impl OlmMachine {
         user_identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
         maybe_backup_key: Option<MegolmV1BackupKey>,
     ) -> Self {
-        let group_session_manager = GroupSessionManager::new(store.clone());
+        let room_key_diagnostics = RoomKeyDiagnosticHub::default();
+        let group_session_manager =
+            GroupSessionManager::new(store.clone(), room_key_diagnostics.clone());
 
         let users_for_key_claim = Arc::new(StdRwLock::new(BTreeMap::new()));
         let key_request_machine = GossipMachine::new(
@@ -258,6 +264,7 @@ impl OlmMachine {
             identity_manager.clone(),
             group_session_manager.session_cache(),
             users_for_key_claim.clone(),
+            room_key_diagnostics.clone(),
         );
 
         let session_manager =
@@ -276,6 +283,7 @@ impl OlmMachine {
             key_request_machine,
             identity_manager,
             backup_machine,
+            room_key_diagnostics,
         });
 
         Self { inner }
@@ -1298,7 +1306,30 @@ impl OlmMachine {
     /// Returns true if a session was invalidated, false if there was no session
     /// to invalidate.
     pub async fn discard_room_key(&self, room_id: &RoomId) -> StoreResult<bool> {
+        self.inner
+            .room_key_diagnostics
+            .note_discard(room_id, RoomKeyRotationReason::ExplicitDiscard);
         self.inner.group_session_manager.invalidate_group_session(room_id).await
+    }
+
+    /// Invalidate a room key because room membership or device eligibility
+    /// changed. This is behaviorally identical to [`Self::discard_room_key`]
+    /// and only supplies a typed diagnostic reason.
+    pub async fn discard_room_key_for_membership_change(
+        &self,
+        room_id: &RoomId,
+    ) -> StoreResult<bool> {
+        self.inner
+            .room_key_diagnostics
+            .note_discard(room_id, RoomKeyRotationReason::MembershipOrDeviceChange);
+        self.inner.group_session_manager.invalidate_group_session(room_id).await
+    }
+
+    /// Configure a typed, privacy-safe observer for room-key lifecycle events.
+    ///
+    /// Replacing or clearing this observer does not alter key-sharing behavior.
+    pub fn set_room_key_diagnostic_observer(&self, observer: Option<RoomKeyDiagnosticObserver>) {
+        self.inner.room_key_diagnostics.set_observer(observer);
     }
 
     /// Get to-device requests to share a room key with users in a room.

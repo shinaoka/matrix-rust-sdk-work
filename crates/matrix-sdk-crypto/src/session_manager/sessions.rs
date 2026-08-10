@@ -680,6 +680,7 @@ mod tests {
             identity_manager.clone(),
             session_cache,
             users_for_key_claim.clone(),
+            Default::default(),
         );
 
         (SessionManager::new(users_for_key_claim, key_request, store), identity_manager)

@@ -49,6 +49,11 @@ use crate::{
     error::{EventError, OlmError, OlmResult},
     identities::IdentityManager,
     olm::{InboundGroupSession, Session},
+    room_key_diagnostics::{
+        IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage, RequestedRoomKeySession,
+        RoomKeyDiagnosticHub, RoomKeyRefusalReason, RoomKeyRequestAction,
+        RoomKeyRequesterDeviceState,
+    },
     session_manager::GroupSessionCache,
     store::{CryptoStoreError, SecretImportError, Store, caches::StoreCache, types::Changes},
     types::{
@@ -91,6 +96,7 @@ pub(crate) struct GossipMachineInner {
     room_key_requests_enabled: AtomicBool,
 
     identity_manager: IdentityManager,
+    room_key_diagnostics: RoomKeyDiagnosticHub,
 }
 
 impl GossipMachine {
@@ -99,6 +105,7 @@ impl GossipMachine {
         identity_manager: IdentityManager,
         #[allow(unused)] outbound_group_sessions: GroupSessionCache,
         users_for_key_claim: Arc<StdRwLock<BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>>>,
+        room_key_diagnostics: RoomKeyDiagnosticHub,
     ) -> Self {
         let room_key_forwarding_enabled =
             AtomicBool::new(cfg!(feature = "automatic-room-key-forwarding"));
@@ -118,6 +125,7 @@ impl GossipMachine {
                 room_key_forwarding_enabled,
                 room_key_requests_enabled,
                 identity_manager,
+                room_key_diagnostics,
             }),
         }
     }
@@ -207,7 +215,65 @@ impl GossipMachine {
 
     /// Receive a room key request event.
     pub fn receive_incoming_key_request(&self, event: &RoomKeyRequestEvent) {
+        self.emit_key_request_diagnostic(
+            IncomingRoomKeyRequestStage::Received,
+            event,
+            RequestedRoomKeySession::Unknown,
+            RoomKeyRequesterDeviceState::Unknown,
+            None,
+            None,
+            IncomingRoomKeyRequestOutcome::None,
+            RoomKeyRefusalReason::None,
+            None,
+        );
+        if event.sender == self.user_id() && event.content.requesting_device_id == self.device_id()
+        {
+            self.emit_key_request_diagnostic(
+                IncomingRoomKeyRequestStage::Outcome,
+                event,
+                RequestedRoomKeySession::Unknown,
+                RoomKeyRequesterDeviceState::Current,
+                None,
+                None,
+                IncomingRoomKeyRequestOutcome::IgnoredSelf,
+                RoomKeyRefusalReason::None,
+                Some(false),
+            );
+        }
         self.receive_event(event.clone().into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_key_request_diagnostic(
+        &self,
+        stage: IncomingRoomKeyRequestStage,
+        event: &RoomKeyRequestEvent,
+        requested_session_kind: RequestedRoomKeySession,
+        requester_device_state: RoomKeyRequesterDeviceState,
+        inbound_session_present: Option<bool>,
+        matching_outbound_proof_present: Option<bool>,
+        outcome: IncomingRoomKeyRequestOutcome,
+        refusal_reason: RoomKeyRefusalReason,
+        response_created: Option<bool>,
+    ) {
+        let (action, room_and_session) = request_diagnostic_info(event);
+        self.inner.room_key_diagnostics.emit_request(
+            stage,
+            action,
+            &event.sender,
+            &event.content.requesting_device_id,
+            &event.content.request_id,
+            self.user_id(),
+            self.device_id(),
+            room_and_session,
+            requested_session_kind,
+            requester_device_state,
+            inbound_session_present,
+            matching_outbound_proof_present,
+            outcome,
+            refusal_reason,
+            response_created,
+        );
     }
 
     fn receive_event(&self, event: RequestEvent) {
@@ -491,16 +557,44 @@ impl GossipMachine {
         device: Device,
         session: &InboundGroupSession,
         message_index: Option<u32>,
+        requested_session_kind: RequestedRoomKeySession,
+        requester_device_state: RoomKeyRequesterDeviceState,
+        matching_outbound_proof_present: Option<bool>,
     ) -> OlmResult<Option<Session>> {
         info!(?message_index, "Serving a room key request",);
 
         match self.forward_room_key(session, &device, message_index).await {
-            Ok(s) => Ok(Some(s)),
+            Ok(s) => {
+                self.emit_key_request_diagnostic(
+                    IncomingRoomKeyRequestStage::Outcome,
+                    event,
+                    requested_session_kind,
+                    requester_device_state,
+                    Some(true),
+                    matching_outbound_proof_present,
+                    IncomingRoomKeyRequestOutcome::Forwarded,
+                    RoomKeyRefusalReason::None,
+                    Some(true),
+                );
+                Ok(Some(s))
+            }
             Err(OlmError::MissingSession) => {
                 info!(
                     "Key request is missing an Olm session, putting the request in the wait queue",
                 );
                 self.handle_key_share_without_session(device, event.to_owned().into());
+
+                self.emit_key_request_diagnostic(
+                    IncomingRoomKeyRequestStage::Outcome,
+                    event,
+                    requested_session_kind,
+                    requester_device_state,
+                    Some(true),
+                    matching_outbound_proof_present,
+                    IncomingRoomKeyRequestOutcome::QueuedForOlm,
+                    RoomKeyRefusalReason::MissingOlmSession,
+                    Some(false),
+                );
 
                 Ok(None)
             }
@@ -509,9 +603,33 @@ impl GossipMachine {
                     "Can't serve a room key request, the session \
                      can't be exported into a forwarded room key: {e:?}",
                 );
+                self.emit_key_request_diagnostic(
+                    IncomingRoomKeyRequestStage::Outcome,
+                    event,
+                    requested_session_kind,
+                    requester_device_state,
+                    Some(true),
+                    matching_outbound_proof_present,
+                    IncomingRoomKeyRequestOutcome::SdkError,
+                    RoomKeyRefusalReason::SdkError,
+                    Some(false),
+                );
                 Ok(None)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.emit_key_request_diagnostic(
+                    IncomingRoomKeyRequestStage::Outcome,
+                    event,
+                    requested_session_kind,
+                    requester_device_state,
+                    Some(true),
+                    matching_outbound_proof_present,
+                    IncomingRoomKeyRequestOutcome::SdkError,
+                    RoomKeyRefusalReason::SdkError,
+                    Some(false),
+                );
+                Err(e)
+            }
         }
     }
 
@@ -523,6 +641,7 @@ impl GossipMachine {
         cache: &StoreCache,
         event: &RoomKeyRequestEvent,
         session: &InboundGroupSession,
+        requested_session_kind: RequestedRoomKeySession,
     ) -> OlmResult<Option<Session>> {
         use super::KeyForwardDecision;
 
@@ -538,12 +657,67 @@ impl GossipMachine {
                 .mark_user_as_changed(&event.sender)
                 .await?;
 
+            self.emit_key_request_diagnostic(
+                IncomingRoomKeyRequestStage::AuthorizationDecided,
+                event,
+                requested_session_kind,
+                RoomKeyRequesterDeviceState::Unknown,
+                Some(true),
+                None,
+                IncomingRoomKeyRequestOutcome::None,
+                RoomKeyRefusalReason::UnknownDevice,
+                None,
+            );
+            self.emit_key_request_diagnostic(
+                IncomingRoomKeyRequestStage::Outcome,
+                event,
+                requested_session_kind,
+                RoomKeyRequesterDeviceState::Unknown,
+                Some(true),
+                None,
+                IncomingRoomKeyRequestOutcome::Refused,
+                RoomKeyRefusalReason::UnknownDevice,
+                Some(false),
+            );
+
             return Ok(None);
+        };
+
+        let requester_device_state = if device.user_id() == self.user_id() {
+            if device.is_verified() {
+                RoomKeyRequesterDeviceState::VerifiedOwn
+            } else {
+                RoomKeyRequesterDeviceState::UnverifiedOwn
+            }
+        } else {
+            RoomKeyRequesterDeviceState::KnownPeer
         };
 
         match self.should_share_key(&device, session).await {
             Ok(message_index) => {
-                self.try_to_forward_room_key(event, device, session, message_index).await
+                let matching_outbound_proof_present =
+                    (device.user_id() != self.user_id()).then_some(true);
+                self.emit_key_request_diagnostic(
+                    IncomingRoomKeyRequestStage::AuthorizationDecided,
+                    event,
+                    requested_session_kind,
+                    requester_device_state,
+                    Some(true),
+                    matching_outbound_proof_present,
+                    IncomingRoomKeyRequestOutcome::None,
+                    RoomKeyRefusalReason::None,
+                    None,
+                );
+                self.try_to_forward_room_key(
+                    event,
+                    device,
+                    session,
+                    message_index,
+                    requested_session_kind,
+                    requester_device_state,
+                    matching_outbound_proof_present,
+                )
+                .await
             }
             Err(e) => {
                 if let KeyForwardDecision::ChangedSenderKey = e {
@@ -558,6 +732,45 @@ impl GossipMachine {
                     );
                 }
 
+                let refusal_reason = match e {
+                    KeyForwardDecision::MissingOutboundSession => {
+                        RoomKeyRefusalReason::MissingOldOutboundProof
+                    }
+                    KeyForwardDecision::OutboundSessionNotShared => {
+                        RoomKeyRefusalReason::NotOriginalRecipient
+                    }
+                    KeyForwardDecision::UntrustedDevice => RoomKeyRefusalReason::UntrustedOwnDevice,
+                    KeyForwardDecision::ChangedSenderKey => RoomKeyRefusalReason::ChangedSenderKey,
+                };
+                let proof = matches!(
+                    e,
+                    KeyForwardDecision::MissingOutboundSession
+                        | KeyForwardDecision::OutboundSessionNotShared
+                        | KeyForwardDecision::ChangedSenderKey
+                )
+                .then_some(false);
+                self.emit_key_request_diagnostic(
+                    IncomingRoomKeyRequestStage::AuthorizationDecided,
+                    event,
+                    requested_session_kind,
+                    requester_device_state,
+                    Some(true),
+                    proof,
+                    IncomingRoomKeyRequestOutcome::None,
+                    refusal_reason,
+                    None,
+                );
+                self.emit_key_request_diagnostic(
+                    IncomingRoomKeyRequestStage::Outcome,
+                    event,
+                    requested_session_kind,
+                    requester_device_state,
+                    Some(true),
+                    proof,
+                    IncomingRoomKeyRequestOutcome::Refused,
+                    refusal_reason,
+                    Some(false),
+                );
                 Ok(None)
             }
         }
@@ -580,13 +793,49 @@ impl GossipMachine {
         room_id: &RoomId,
         session_id: &str,
     ) -> OlmResult<Option<Session>> {
+        let requested_session_kind = self
+            .inner
+            .outbound_group_sessions
+            .get_or_load(room_id)
+            .await
+            .map(|outbound| {
+                if outbound.session_id() == session_id {
+                    RequestedRoomKeySession::Current
+                } else {
+                    RequestedRoomKeySession::Historical
+                }
+            })
+            .unwrap_or(RequestedRoomKeySession::Unknown);
         let session = self.inner.store.get_inbound_group_session(room_id, session_id).await?;
 
+        self.emit_key_request_diagnostic(
+            IncomingRoomKeyRequestStage::SessionLookup,
+            event,
+            requested_session_kind,
+            RoomKeyRequesterDeviceState::Unknown,
+            Some(session.is_some()),
+            None,
+            IncomingRoomKeyRequestOutcome::None,
+            RoomKeyRefusalReason::None,
+            None,
+        );
+
         if let Some(s) = session {
-            self.answer_room_key_request(cache, event, &s).await
+            self.answer_room_key_request(cache, event, &s, requested_session_kind).await
         } else {
             debug!("Received a room key request for an unknown inbound group session",);
 
+            self.emit_key_request_diagnostic(
+                IncomingRoomKeyRequestStage::Outcome,
+                event,
+                requested_session_kind,
+                RoomKeyRequesterDeviceState::Unknown,
+                Some(false),
+                None,
+                IncomingRoomKeyRequestOutcome::MissingSession,
+                RoomKeyRefusalReason::MissingInboundSession,
+                Some(false),
+            );
             Ok(None)
         }
     }
@@ -599,6 +848,18 @@ impl GossipMachine {
         event: &RoomKeyRequestEvent,
     ) -> OlmResult<Option<Session>> {
         use crate::types::events::room_key_request::{Action, RequestedKeyInfo};
+
+        self.emit_key_request_diagnostic(
+            IncomingRoomKeyRequestStage::Classified,
+            event,
+            RequestedRoomKeySession::Unknown,
+            RoomKeyRequesterDeviceState::Unknown,
+            None,
+            None,
+            IncomingRoomKeyRequestOutcome::None,
+            RoomKeyRefusalReason::None,
+            None,
+        );
 
         if self.inner.room_key_forwarding_enabled.load(Ordering::SeqCst) {
             match &event.content.action {
@@ -618,16 +879,50 @@ impl GossipMachine {
                             algorithm = ?i.algorithm,
                             "Received a room key request for a unsupported algorithm"
                         );
+                        self.emit_key_request_diagnostic(
+                            IncomingRoomKeyRequestStage::Outcome,
+                            event,
+                            RequestedRoomKeySession::Unknown,
+                            RoomKeyRequesterDeviceState::Unknown,
+                            None,
+                            None,
+                            IncomingRoomKeyRequestOutcome::UnsupportedAlgorithm,
+                            RoomKeyRefusalReason::UnsupportedAlgorithm,
+                            Some(false),
+                        );
                         Ok(None)
                     }
                 },
-                // We ignore cancellations here since there's nothing to serve.
-                Action::Cancellation => Ok(None),
+                Action::Cancellation => {
+                    self.emit_key_request_diagnostic(
+                        IncomingRoomKeyRequestStage::Outcome,
+                        event,
+                        RequestedRoomKeySession::Unknown,
+                        RoomKeyRequesterDeviceState::Unknown,
+                        None,
+                        None,
+                        IncomingRoomKeyRequestOutcome::Cancelled,
+                        RoomKeyRefusalReason::None,
+                        Some(false),
+                    );
+                    Ok(None)
+                }
             }
         } else {
             debug!(
                 sender = ?event.sender,
                 "Received a room key request, but room key forwarding has been turned off"
+            );
+            self.emit_key_request_diagnostic(
+                IncomingRoomKeyRequestStage::Outcome,
+                event,
+                RequestedRoomKeySession::Unknown,
+                RoomKeyRequesterDeviceState::Unknown,
+                None,
+                None,
+                IncomingRoomKeyRequestOutcome::ForwardingDisabled,
+                RoomKeyRefusalReason::ForwardingDisabled,
+                Some(false),
             );
             Ok(None)
         }
@@ -1209,6 +1504,26 @@ impl GossipMachine {
     }
 }
 
+fn request_diagnostic_info(
+    event: &RoomKeyRequestEvent,
+) -> (RoomKeyRequestAction, Option<(&RoomId, &str)>) {
+    use crate::types::events::room_key_request::{Action, RequestedKeyInfo};
+
+    match &event.content.action {
+        Action::Cancellation => (RoomKeyRequestAction::Cancellation, None),
+        Action::Request(info) => match info {
+            RequestedKeyInfo::MegolmV1AesSha2(info) => {
+                (RoomKeyRequestAction::Request, Some((&info.room_id, &info.session_id)))
+            }
+            #[cfg(feature = "experimental-algorithms")]
+            RequestedKeyInfo::MegolmV2AesSha2(info) => {
+                (RoomKeyRequestAction::Request, Some((&info.room_id, &info.session_id)))
+            }
+            RequestedKeyInfo::Unknown(_) => (RoomKeyRequestAction::Request, None),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "experimental-push-secrets")]
@@ -1252,6 +1567,10 @@ mod tests {
         EncryptionSettings,
         gossiping::KeyForwardDecision,
         olm::OutboundGroupSession,
+        room_key_diagnostics::{
+            IncomingRoomKeyRequestOutcome, RequestedRoomKeySession, RoomKeyDiagnosticEvent,
+            RoomKeyRefusalReason, RoomKeyRequesterDeviceState,
+        },
         store::{CryptoStore, types::DeviceChanges},
         types::requests::AnyOutgoingRequest,
         types::{
@@ -1314,7 +1633,13 @@ mod tests {
         let session_cache = GroupSessionCache::new(store.clone());
         let identity_manager = IdentityManager::new(store.clone());
 
-        GossipMachine::new(store, identity_manager, session_cache, Default::default())
+        GossipMachine::new(
+            store,
+            identity_manager,
+            session_cache,
+            Default::default(),
+            Default::default(),
+        )
     }
 
     #[cfg(feature = "automatic-room-key-forwarding")]
@@ -1359,7 +1684,13 @@ mod tests {
 
         let identity_manager = IdentityManager::new(store.clone());
 
-        GossipMachine::new(store, identity_manager, session_cache, Default::default())
+        GossipMachine::new(
+            store,
+            identity_manager,
+            session_cache,
+            Default::default(),
+            Default::default(),
+        )
     }
 
     #[cfg(feature = "automatic-room-key-forwarding")]
@@ -1835,6 +2166,11 @@ mod tests {
     async fn test_key_share_cycle(algorithm: EventEncryptionAlgorithm) {
         let (alice_machine, group_session, bob_machine) =
             machines_for_key_share_test_helper(alice_id(), true, algorithm).await;
+        let diagnostics = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&diagnostics);
+        bob_machine.inner.room_key_diagnostics.set_observer(Some(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        })));
 
         // Get the request and convert it into a event.
         let requests = alice_machine.outgoing_to_device_requests().await.unwrap();
@@ -1855,6 +2191,13 @@ mod tests {
         }
         // Now bob does have an outgoing request.
         assert!(!bob_machine.inner.outgoing_requests.read().is_empty());
+        assert!(diagnostics.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RoomKeyDiagnosticEvent::IncomingRequest(event)
+                if event.requested_session_kind == RequestedRoomKeySession::Current
+                    && event.outcome == IncomingRoomKeyRequestOutcome::Forwarded
+                    && event.matching_outbound_proof_present.is_none()
+        )));
 
         // Get the request and convert it to a encrypted to-device event.
         let requests = bob_machine.outgoing_to_device_requests().await.unwrap();
@@ -1914,6 +2257,93 @@ mod tests {
             .unwrap();
 
         assert_eq!(session.session_id(), group_session.session_id())
+    }
+
+    #[async_test]
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn test_historical_verified_own_request_is_forwarded_after_rotation() {
+        let (alice_machine, old_session, responder) = machines_for_key_share_test_helper(
+            alice_id(),
+            true,
+            EventEncryptionAlgorithm::MegolmV1AesSha2,
+        )
+        .await;
+        let diagnostics = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&diagnostics);
+        responder.inner.room_key_diagnostics.set_observer(Some(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        })));
+        responder
+            .inner
+            .store
+            .get_device(alice_id(), alice_device_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .set_trust_state(LocalTrust::Verified);
+        let request = alice_machine.outgoing_to_device_requests().await.unwrap().remove(0);
+        let event = request_to_event(alice_id(), alice_id(), &request);
+        let (new_session, _) = responder
+            .inner
+            .store
+            .static_account()
+            .create_group_session_pair_with_defaults(room_id())
+            .await;
+        assert_ne!(old_session.session_id(), new_session.session_id());
+        responder.inner.outbound_group_sessions.insert(new_session);
+
+        responder.receive_incoming_key_request(&event);
+        let cache = responder.inner.store.cache().await.unwrap();
+        responder.collect_incoming_key_requests(&cache).await.unwrap();
+
+        assert!(diagnostics.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RoomKeyDiagnosticEvent::IncomingRequest(event)
+                if event.requested_session_kind == RequestedRoomKeySession::Historical
+                    && event.requester_device_state == RoomKeyRequesterDeviceState::VerifiedOwn
+                    && event.outcome == IncomingRoomKeyRequestOutcome::Forwarded
+        )));
+    }
+
+    #[async_test]
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn test_historical_peer_request_records_missing_old_outbound_proof() {
+        let (alice_machine, old_session, responder) = machines_for_key_share_test_helper(
+            bob_id(),
+            true,
+            EventEncryptionAlgorithm::MegolmV1AesSha2,
+        )
+        .await;
+        let diagnostics = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&diagnostics);
+        responder.inner.room_key_diagnostics.set_observer(Some(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        })));
+        let request = alice_machine.outgoing_to_device_requests().await.unwrap().remove(0);
+        let event = request_to_event(alice_id(), alice_id(), &request);
+        let (new_session, _) = responder
+            .inner
+            .store
+            .static_account()
+            .create_group_session_pair_with_defaults(room_id())
+            .await;
+        assert_ne!(old_session.session_id(), new_session.session_id());
+        responder.inner.outbound_group_sessions.insert(new_session);
+
+        responder.receive_incoming_key_request(&event);
+        let cache = responder.inner.store.cache().await.unwrap();
+        responder.collect_incoming_key_requests(&cache).await.unwrap();
+
+        assert!(diagnostics.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RoomKeyDiagnosticEvent::IncomingRequest(event)
+                if event.requested_session_kind == RequestedRoomKeySession::Historical
+                    && event.inbound_session_present == Some(true)
+                    && event.matching_outbound_proof_present == Some(false)
+                    && event.outcome == IncomingRoomKeyRequestOutcome::Refused
+                    && event.refusal_reason == RoomKeyRefusalReason::MissingOldOutboundProof
+                    && event.response_created == Some(false)
+        )));
     }
 
     #[async_test]
@@ -2220,6 +2650,11 @@ mod tests {
             EventEncryptionAlgorithm::MegolmV1AesSha2,
         )
         .await;
+        let diagnostics = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&diagnostics);
+        bob_machine.inner.room_key_diagnostics.set_observer(Some(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        })));
 
         // Get the request and convert it into a event.
         let requests = alice_machine.outgoing_to_device_requests().await.unwrap();
@@ -2247,6 +2682,19 @@ mod tests {
         );
         assert!(!bob_machine.inner.users_for_key_claim.read().is_empty());
         assert!(!bob_machine.inner.wait_queue.is_empty());
+        let queued = diagnostics
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|event| match event {
+                RoomKeyDiagnosticEvent::IncomingRequest(event)
+                    if event.outcome == IncomingRoomKeyRequestOutcome::QueuedForOlm =>
+                {
+                    Some((event.request, event.requested_session))
+                }
+                _ => None,
+            })
+            .expect("missing Olm must be an explicit queued outcome");
 
         let (alice_session, bob_session) = alice_machine
             .inner
@@ -2281,6 +2729,20 @@ mod tests {
         // Bob now has an outgoing requests.
         assert!(!bob_machine.outgoing_to_device_requests().await.unwrap().is_empty());
         assert!(bob_machine.inner.wait_queue.is_empty());
+        let forwarded = diagnostics
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|event| match event {
+                RoomKeyDiagnosticEvent::IncomingRequest(event)
+                    if event.outcome == IncomingRoomKeyRequestOutcome::Forwarded =>
+                {
+                    Some((event.request, event.requested_session))
+                }
+                _ => None,
+            })
+            .expect("retry must record its terminal forwarded outcome");
+        assert_eq!(queued, forwarded, "retry must retain request/session correlation");
 
         // Get the request and convert it to a encrypted to-device event.
         let requests = bob_machine.outgoing_to_device_requests().await.unwrap();

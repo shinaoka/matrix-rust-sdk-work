@@ -686,6 +686,15 @@ impl OutboundGroupSession {
         count >= rotation_period_msgs || self.elapsed()
     }
 
+    pub(crate) fn expired_by_message_count(&self) -> bool {
+        let count = self.message_count.load(Ordering::SeqCst);
+        count >= self.settings.rotation_period_msgs.clamp(1, 10_000)
+    }
+
+    pub(crate) fn expired_by_time(&self) -> bool {
+        self.elapsed()
+    }
+
     /// Has the session been invalidated.
     pub fn invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Relaxed)

@@ -27,6 +27,7 @@ mod gossiping;
 mod identities;
 mod machine;
 pub mod olm;
+mod room_key_diagnostics;
 pub mod secret_storage;
 mod session_manager;
 pub mod store;
@@ -95,6 +96,13 @@ use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecr
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
+pub use room_key_diagnostics::{
+    IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
+    RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
+    RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
+    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    RoomKeyRotationDiagnostic, RoomKeyRotationReason,
+};
 use serde::{Deserialize, Serialize};
 pub use session_manager::{CollectStrategy, RoomKeyReshareResult, RoomKeyReshareTarget};
 pub use store::{

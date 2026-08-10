@@ -117,8 +117,13 @@ pub(crate) mod tasks;
 pub mod verification;
 
 pub use matrix_sdk_base::crypto::{
-    CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, KeyExportError, LocalTrust,
-    MediaEncryptionInfo, MegolmError, OlmError, RoomKeyImportResult, SessionCreationError,
+    CrossSigningStatus, CryptoStoreError, DecryptorError, EventError,
+    IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
+    KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError,
+    RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
+    RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
+    RoomKeyImportResult, RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState,
+    RoomKeyRequesterScope, RoomKeyRotationDiagnostic, RoomKeyRotationReason, SessionCreationError,
     SignatureError, VERSION,
     olm::{
         SessionCreationError as MegolmSessionCreationError,
@@ -921,6 +926,17 @@ pub struct Encryption {
 impl Encryption {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
+    }
+
+    /// Configure a typed, privacy-safe observer for incoming room-key requests
+    /// and outbound Megolm session boundaries.
+    pub async fn set_room_key_diagnostic_observer(
+        &self,
+        observer: Option<RoomKeyDiagnosticObserver>,
+    ) {
+        if let Some(machine) = self.client.olm_machine().await.as_ref() {
+            machine.set_room_key_diagnostic_observer(observer);
+        }
     }
 
     /// Returns the current encryption settings for this client.
@@ -2184,7 +2200,7 @@ impl Encryption {
 
             // Attempt to discard the current room key. This won't do anything if we don't have one,
             // but that's fine since we will create a new room key whenever we try to send a message.
-            if let Err(e) = olm.discard_room_key(room.room_id()).await {
+            if let Err(e) = olm.discard_room_key_for_membership_change(room.room_id()).await {
                 warn!(
                     room_id = ?room.room_id(),
                     "Error discarding room key after member leave: {e:?}"

@@ -55,6 +55,7 @@ use crate::{
         InboundGroupSession, OutboundGroupSession, OutboundGroupSessionEncryptionResult,
         SenderData, SenderDataFinder, Session, ShareInfo, ShareState,
     },
+    room_key_diagnostics::{RoomKeyCreationOutcome, RoomKeyDiagnosticHub},
     store::{CryptoStoreWrapper, Result as StoreResult, Store, types::Changes},
     types::{
         events::{
@@ -195,6 +196,7 @@ pub(crate) struct GroupSessionManager {
     store: Store,
     /// The currently active outbound group sessions.
     sessions: GroupSessionCache,
+    room_key_diagnostics: RoomKeyDiagnosticHub,
 }
 
 impl GroupSessionManager {
@@ -207,8 +209,8 @@ impl GroupSessionManager {
 
     const MAX_TO_DEVICE_MESSAGES: usize = 250;
 
-    pub fn new(store: Store) -> Self {
-        Self { store: store.clone(), sessions: GroupSessionCache::new(store) }
+    pub fn new(store: Store, room_key_diagnostics: RoomKeyDiagnosticHub) -> Self {
+        Self { store: store.clone(), sessions: GroupSessionCache::new(store), room_key_diagnostics }
     }
 
     pub async fn invalidate_group_session(&self, room_id: &RoomId) -> StoreResult<bool> {
@@ -356,16 +358,65 @@ impl GroupSessionManager {
         // create a new one.
         if let Some(s) = outbound_session {
             if s.expired() || s.invalidated() {
-                self.create_outbound_group_session(room_id, settings, own_sender_data)
-                    .await
-                    .map(|(o, i)| (o, i.into()))
+                let started = std::time::Instant::now();
+                let reason = self.room_key_diagnostics.classify_rotation_reason(
+                    room_id,
+                    s.expired_by_time(),
+                    s.expired_by_message_count(),
+                    s.invalidated(),
+                    true,
+                );
+                let previous = s.session_id().to_owned();
+                let created =
+                    self.create_outbound_group_session(room_id, settings, own_sender_data).await;
+                match &created {
+                    Ok((outbound, _)) => self.room_key_diagnostics.emit_rotation(
+                        room_id,
+                        Some(&previous),
+                        Some(outbound.session_id()),
+                        reason,
+                        RoomKeyCreationOutcome::Created,
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    ),
+                    Err(_) => self.room_key_diagnostics.emit_rotation(
+                        room_id,
+                        Some(&previous),
+                        None,
+                        reason,
+                        RoomKeyCreationOutcome::Failed,
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    ),
+                }
+                created.map(|(o, i)| (o, i.into()))
             } else {
                 Ok((s, None))
             }
         } else {
-            self.create_outbound_group_session(room_id, settings, own_sender_data)
-                .await
-                .map(|(o, i)| (o, i.into()))
+            let started = std::time::Instant::now();
+            let reason = self
+                .room_key_diagnostics
+                .classify_rotation_reason(room_id, false, false, false, false);
+            let created =
+                self.create_outbound_group_session(room_id, settings, own_sender_data).await;
+            match &created {
+                Ok((outbound, _)) => self.room_key_diagnostics.emit_rotation(
+                    room_id,
+                    None,
+                    Some(outbound.session_id()),
+                    reason,
+                    RoomKeyCreationOutcome::Created,
+                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                ),
+                Err(_) => self.room_key_diagnostics.emit_rotation(
+                    room_id,
+                    None,
+                    None,
+                    reason,
+                    RoomKeyCreationOutcome::Failed,
+                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                ),
+            }
+            created.map(|(o, i)| (o, i.into()))
         }
     }
 
