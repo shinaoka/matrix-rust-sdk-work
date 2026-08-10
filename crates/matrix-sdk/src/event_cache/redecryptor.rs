@@ -1773,6 +1773,26 @@ mod tests {
         // "still UTD" for the raw stored copy, so this is an upper-bound check
         // rather than an exact one.
         assert!(diagnostics.counters.redecryption_remained_utd <= 1);
+
+        // An explicit retry for a session with no matching events must be
+        // observable in the zero-match bucket.
+        event_cache.request_decryption(DecryptionRetryRequest {
+            room_id: room_id.to_owned(),
+            utd_session_ids: BTreeSet::from(["no-such-session".to_owned()]),
+            refresh_info_session_ids: BTreeSet::new(),
+        });
+        let zero_match_seen = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if event_cache.room_key_receive_diagnostics().counters.matching_events_bucket_0 > 0
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(zero_match_seen, "zero-match retry attempt was not counted");
         assert_eq!(diagnostics.counters.redecryption_failed, 0);
         assert_eq!(diagnostics.counters.redecryption_store_failed, 0);
     }
@@ -2006,6 +2026,21 @@ mod tests {
     /// Regression test: the redecryptor must NOT hold the room state write
     /// lock while calling replace_utds() on event-focused caches, otherwise
     /// an ABBA deadlock occurs with concurrent event-focused cache pagination.
+    #[test]
+    fn test_decryption_retry_request_debug_is_privacy_safe() {
+        let request = DecryptionRetryRequest {
+            room_id: ruma::owned_room_id!("!private-room:example.invalid"),
+            utd_session_ids: BTreeSet::from(["PRIVATE-MEGOLM-SESSION".to_owned()]),
+            refresh_info_session_ids: BTreeSet::from(["PRIVATE-REFRESH-SESSION".to_owned()]),
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("private-room"));
+        assert!(!debug.contains("PRIVATE-MEGOLM-SESSION"));
+        assert!(!debug.contains("PRIVATE-REFRESH-SESSION"));
+        assert!(debug.contains("utd_session_ids: 1"));
+        assert!(debug.contains("refresh_info_session_ids: 1"));
+    }
+
     #[async_test]
     async fn test_redecryptor_no_deadlock_with_event_focused_cache_pagination() {
         use crate::{
