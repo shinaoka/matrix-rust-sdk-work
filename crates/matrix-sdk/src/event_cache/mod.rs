@@ -99,6 +99,7 @@ pub use redecryptor::{
     DecryptionRetryRequest, RedecryptorReport, RoomKeyLateDecryptionCounters,
     RoomKeyLateDecryptionDiagnostics,
 };
+pub use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 pub use crate::event_cache::automatic_pagination::AutomaticPagination;
 

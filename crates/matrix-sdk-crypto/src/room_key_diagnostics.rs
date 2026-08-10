@@ -310,7 +310,10 @@ pub enum RoomKeyMergeDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoomKeyReceiveDiagnosticKind {
     /// An encrypted room-key event was observed after Olm decryption.
-    RoomKeyIngress { kind: RoomKeyIngressKind },
+    RoomKeyIngress {
+        /// Direct or forwarded kind.
+        kind: RoomKeyIngressKind,
+    },
     /// An encrypted to-device event failed Olm decryption.
     ToDeviceOlmFailed,
     /// An Olm session was detected as wedged during to-device decryption.
@@ -322,9 +325,15 @@ pub enum RoomKeyReceiveDiagnosticKind {
     /// A room-key payload used an unsupported algorithm.
     RoomKeyUnsupportedAlgorithm,
     /// A forwarded room key hit the authorization gate.
-    ForwardedRoomKeyAuth { outcome: ForwardedRoomKeyAuthOutcome },
+    ForwardedRoomKeyAuth {
+        /// The closed authorization outcome.
+        outcome: ForwardedRoomKeyAuthOutcome,
+    },
     /// A Megolm merge acceptance decision was made.
-    Merge { decision: RoomKeyMergeDecision },
+    Merge {
+        /// The closed merge decision.
+        decision: RoomKeyMergeDecision,
+    },
 }
 
 /// A typed, privacy-safe receive-side room-key diagnostic event.
@@ -378,9 +387,9 @@ pub struct RoomKeyReceiveCounters {
 impl RoomKeyReceiveCounters {
     fn apply(&mut self, kind: RoomKeyReceiveDiagnosticKind) {
         match kind {
-            RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
-                kind: RoomKeyIngressKind::Direct,
-            } => self.ingress_direct += 1,
+            RoomKeyReceiveDiagnosticKind::RoomKeyIngress { kind: RoomKeyIngressKind::Direct } => {
+                self.ingress_direct += 1
+            }
             RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
                 kind: RoomKeyIngressKind::Forwarded,
             } => self.ingress_forwarded += 1,
@@ -405,9 +414,9 @@ impl RoomKeyReceiveCounters {
             RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
                 outcome: ForwardedRoomKeyAuthOutcome::Accepted,
             } => self.forwarded_accepted += 1,
-            RoomKeyReceiveDiagnosticKind::Merge {
-                decision: RoomKeyMergeDecision::AcceptedNew,
-            } => self.merge_accepted_new += 1,
+            RoomKeyReceiveDiagnosticKind::Merge { decision: RoomKeyMergeDecision::AcceptedNew } => {
+                self.merge_accepted_new += 1
+            }
             RoomKeyReceiveDiagnosticKind::Merge {
                 decision: RoomKeyMergeDecision::AcceptedImproved,
             } => self.merge_accepted_improved += 1,
@@ -423,9 +432,9 @@ impl RoomKeyReceiveCounters {
             RoomKeyReceiveDiagnosticKind::Merge {
                 decision: RoomKeyMergeDecision::InvalidSessionKey,
             } => self.merge_invalid_session_key += 1,
-            RoomKeyReceiveDiagnosticKind::Merge {
-                decision: RoomKeyMergeDecision::StoreFailed,
-            } => self.merge_store_failed += 1,
+            RoomKeyReceiveDiagnosticKind::Merge { decision: RoomKeyMergeDecision::StoreFailed } => {
+                self.merge_store_failed += 1
+            }
         }
     }
 }

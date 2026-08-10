@@ -76,7 +76,9 @@ use crate::{
         Account, ExportedRoomKey, ForwarderData, InboundGroupSession, PrivateCrossSigningIdentity,
         SenderData, Session, StaticAccountData,
     },
-    room_key_diagnostics::{RoomKeyDiagnosticHub, RoomKeyReceiveDiagnosticKind, RoomKeyMergeDecision},
+    room_key_diagnostics::{
+        RoomKeyDiagnosticHub, RoomKeyMergeDecision, RoomKeyReceiveDiagnosticKind,
+    },
     store::types::{RoomKeyWithheldEntry, SecretsInboxItem},
     types::{
         BackupSecrets, CrossSigningSecrets, MegolmBackupV1Curve25519AesSha2Secrets, RoomKeyExport,
@@ -585,11 +587,8 @@ impl Store {
     /// [`OlmMachine`](crate::OlmMachine). Merge acceptance decisions and store
     /// failures are reported through it. No-op for stores without a machine.
     pub(crate) fn set_room_key_diagnostics(&self, hub: RoomKeyDiagnosticHub) {
-        *self
-            .inner
-            .room_key_diagnostics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hub);
+        *self.inner.room_key_diagnostics.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(hub);
     }
 
     fn emit_merge_decision(&self, decision: RoomKeyMergeDecision) {

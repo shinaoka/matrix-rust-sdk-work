@@ -97,10 +97,12 @@ use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecr
 pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
 pub use room_key_diagnostics::{
-    IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
-    RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
-    RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
-    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome,
+    IncomingRoomKeyRequestStage, RequestedRoomKeySession, RoomKeyCreationOutcome,
+    RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver,
+    RoomKeyFirstShareOutcome, RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters,
+    RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
+    RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
     RoomKeyRotationDiagnostic, RoomKeyRotationReason,
 };
 use serde::{Deserialize, Serialize};

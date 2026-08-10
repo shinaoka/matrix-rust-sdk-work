@@ -143,6 +143,7 @@ use ruma::{
     push::Action,
     serde::Raw,
 };
+use std::fmt;
 use tokio::sync::{
     broadcast::{self, Sender},
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
@@ -171,7 +172,7 @@ pub(in crate::event_cache) type ResolvedUtd =
 
 /// The information sent across the channel to the long-running task requesting
 /// that the supplied set of sessions be retried.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DecryptionRetryRequest {
     /// The room ID of the room the events belong to.
     pub room_id: OwnedRoomId,
@@ -180,6 +181,18 @@ pub struct DecryptionRetryRequest {
     /// Events that are decrypted but might need to have their
     /// [`EncryptionInfo`] refreshed.
     pub refresh_info_session_ids: BTreeSet<OwnedSessionId>,
+}
+
+impl fmt::Debug for DecryptionRetryRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Privacy: never print room or Megolm session identifiers from a
+        // retry request; only the closed counts.
+        f.debug_struct("DecryptionRetryRequest")
+            .field("room_id", &"RoomId(..)")
+            .field("utd_session_ids", &self.utd_session_ids.len())
+            .field("refresh_info_session_ids", &self.refresh_info_session_ids.len())
+            .finish()
+    }
 }
 
 /// A report coming from the redecryptor.
@@ -644,6 +657,12 @@ impl EventCache {
     ) -> Result<(), EventCacheError> {
         trace!("Retrying to decrypt");
 
+        // Record the matched-event bucket before the empty early return so an
+        // attempt that matches nothing is still observable.
+        counters_bump(&self.inner.redecryption_channels.late_decryption_counters, |c| {
+            c.record_matching_bucket(events.len())
+        });
+
         if events.is_empty() {
             trace!("No relevant events found.");
             return Ok(());
@@ -655,7 +674,6 @@ impl EventCache {
 
         // Let's attempt to decrypt them them.
         let mut decrypted_events = Vec::with_capacity(events.len());
-        counters_bump(&self.inner.redecryption_channels.late_decryption_counters, |c| c.record_matching_bucket(events.len()));
 
         for (event_id, event) in events {
             // If we managed to decrypt the event, and we should have to since we received
@@ -670,13 +688,22 @@ impl EventCache {
                 .await;
             match outcome {
                 RedecryptionAttemptOutcome::Decrypted => {
-                    counters_bump(&self.inner.redecryption_channels.late_decryption_counters, |c| c.redecryption_succeeded += 1);
+                    counters_bump(
+                        &self.inner.redecryption_channels.late_decryption_counters,
+                        |c| c.redecryption_succeeded += 1,
+                    );
                 }
                 RedecryptionAttemptOutcome::StillUtd => {
-                    counters_bump(&self.inner.redecryption_channels.late_decryption_counters, |c| c.redecryption_remained_utd += 1);
+                    counters_bump(
+                        &self.inner.redecryption_channels.late_decryption_counters,
+                        |c| c.redecryption_remained_utd += 1,
+                    );
                 }
                 RedecryptionAttemptOutcome::Failed => {
-                    counters_bump(&self.inner.redecryption_channels.late_decryption_counters, |c| c.redecryption_failed += 1);
+                    counters_bump(
+                        &self.inner.redecryption_channels.late_decryption_counters,
+                        |c| c.redecryption_failed += 1,
+                    );
                 }
             }
             if let Some((decrypted, actions)) = resolved {
@@ -694,7 +721,9 @@ impl EventCache {
         // Replace the events and notify listeners that UTDs have been replaced with
         // decrypted events.
         if let Err(e) = self.on_resolved_utds(room_id, decrypted_events).await {
-            counters_bump(&self.inner.redecryption_channels.late_decryption_counters, |c| c.redecryption_store_failed += 1);
+            counters_bump(&self.inner.redecryption_channels.late_decryption_counters, |c| {
+                c.redecryption_store_failed += 1
+            });
             return Err(e);
         }
 
@@ -894,7 +923,7 @@ impl EventCache {
     /// ```
     pub fn subscribe_to_decryption_reports(
         &self,
-    ) -> impl Stream<Item = Result<RedecryptorReport, BroadcastStreamRecvError>> {
+    ) -> impl Stream<Item = Result<RedecryptorReport, BroadcastStreamRecvError>> + use<> {
         BroadcastStream::new(self.inner.redecryption_channels.utd_reporter.subscribe())
     }
 }
@@ -1053,7 +1082,7 @@ impl Redecryptor {
                             counters_bump(
                                 late_decryption_counters,
                                 |c| {
-                                    c.room_key_updates_broadcast += room_keys.len() as u64;
+                                    c.room_key_updates_broadcast += 1;
                                     c.redecryption_requests += room_keys.len() as u64;
                                 },
                             );
@@ -1690,8 +1719,7 @@ mod tests {
             prepare_room(&matrix_mock_server, &event_factory, &alice, &bob, room_id).await;
 
         let event_cache = bob.event_cache();
-        let (room_cache, _) =
-            event_cache.for_room(room_id).await.expect("room event cache");
+        let (room_cache, _) = event_cache.for_room(room_id).await.expect("room event cache");
         let (_, mut subscriber) = room_cache.subscribe().await.unwrap();
 
         // Deliver the encrypted event as a UTD (room key not yet received).
@@ -1702,9 +1730,7 @@ mod tests {
             })
             .await;
 
-        assert_let_timeout!(
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = subscriber.recv()
-        );
+        assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = subscriber.recv());
 
         let before = event_cache.room_key_receive_diagnostics();
         assert!(before.subscribed);

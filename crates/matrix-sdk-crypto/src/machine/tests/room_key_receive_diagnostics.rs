@@ -26,28 +26,33 @@ use super::megolm_sender_data::{
 use crate::{
     DecryptionSettings, EncryptionSettings, TrustRequirement,
     machine::test_helpers::get_machine_pair_with_setup_sessions_test_helper,
+    olm::SenderData,
     room_key_diagnostics::{
         RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyIngressKind,
         RoomKeyMergeDecision, RoomKeyReceiveDiagnosticKind,
     },
-    olm::SenderData,
 };
 
-fn capture_observer(events: &Arc<std::sync::Mutex<Vec<RoomKeyDiagnosticEvent>>>) -> RoomKeyDiagnosticObserver {
+fn capture_observer(
+    events: &Arc<std::sync::Mutex<Vec<RoomKeyDiagnosticEvent>>>,
+) -> RoomKeyDiagnosticObserver {
     let captured = Arc::clone(events);
     Arc::new(move |event| captured.lock().unwrap().push(event))
 }
 
 #[async_test]
 async fn test_receive_direct_room_key_ingress_and_accepted_new_are_counted() {
-    let (alice, bob) =
-        get_machine_pair_with_setup_sessions_test_helper(user_id!("@a:example.org"), user_id!("@b:example.org"), false).await;
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     bob.set_room_key_diagnostic_observer(Some(capture_observer(&events)));
 
     let room_id = room_id!("!test:example.org");
-    let event =
-        create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
+    let event = create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
     let decryption_settings =
         DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
     receive_to_device_event(&bob, &event, &decryption_settings).await;
@@ -78,19 +83,21 @@ async fn test_receive_direct_room_key_ingress_and_accepted_new_are_counted() {
 
 #[async_test]
 async fn test_receive_duplicate_room_key_is_benignly_ignored() {
-    let (alice, bob) =
-        get_machine_pair_with_setup_sessions_test_helper(user_id!("@a:example.org"), user_id!("@b:example.org"), false).await;
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     bob.set_room_key_diagnostic_observer(Some(capture_observer(&events)));
 
     let room_id = room_id!("!test:example.org");
     let decryption_settings =
         DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
-    let event =
-        create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
+    let event = create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
     receive_to_device_event(&bob, &event, &decryption_settings).await;
-    let event =
-        create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
+    let event = create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
     receive_to_device_event(&bob, &event, &decryption_settings).await;
 
     let counters = bob.room_key_receive_counters();
@@ -103,7 +110,9 @@ async fn test_receive_duplicate_room_key_is_benignly_ignored() {
     match events.last() {
         Some(RoomKeyDiagnosticEvent::Receive(receive)) => assert_eq!(
             receive.kind,
-            RoomKeyReceiveDiagnosticKind::Merge { decision: RoomKeyMergeDecision::DuplicateIgnored }
+            RoomKeyReceiveDiagnosticKind::Merge {
+                decision: RoomKeyMergeDecision::DuplicateIgnored
+            }
         ),
         other => panic!("unexpected last event: {other:?}"),
     }
@@ -128,8 +137,7 @@ async fn test_receive_wedged_olm_counts_wedged_and_never_merges() {
     let decryption_settings =
         DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-    let bob_device =
-        alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap();
+    let bob_device = alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap();
     let (outbound, _) = alice
         .inner
         .group_session_manager
@@ -143,7 +151,11 @@ async fn test_receive_wedged_olm_counts_wedged_and_never_merges() {
     let room_key_content = serde_json::to_value(outbound.as_content().await).unwrap();
     // First share is delivered: Bob establishes his Olm session copy.
     let first = bob_device
-        .encrypt_event_raw("m.room_key", &room_key_content, crate::session_manager::CollectStrategy::AllDevices)
+        .encrypt_event_raw(
+            "m.room_key",
+            &room_key_content,
+            crate::session_manager::CollectStrategy::AllDevices,
+        )
         .await
         .unwrap();
     let event = crate::types::events::ToDeviceEvent::new(alice.user_id().to_owned(), first);
@@ -153,21 +165,31 @@ async fn test_receive_wedged_olm_counts_wedged_and_never_merges() {
     // Alice's stored session far ahead of Bob's copy.
     for _ in 0..2001 {
         let _ = bob_device
-            .encrypt_event_raw("m.room_key", &room_key_content, crate::session_manager::CollectStrategy::AllDevices)
+            .encrypt_event_raw(
+                "m.room_key",
+                &room_key_content,
+                crate::session_manager::CollectStrategy::AllDevices,
+            )
             .await
             .unwrap();
     }
 
     // The next delivered message is beyond the skip window: wedged.
     let late = bob_device
-        .encrypt_event_raw("m.room_key", &room_key_content, crate::session_manager::CollectStrategy::AllDevices)
+        .encrypt_event_raw(
+            "m.room_key",
+            &room_key_content,
+            crate::session_manager::CollectStrategy::AllDevices,
+        )
         .await
         .unwrap();
     let event = crate::types::events::ToDeviceEvent::new(alice.user_id().to_owned(), late);
     let (decrypted, _) = receive_to_device_event(&bob, &event, &decryption_settings).await;
 
     match &decrypted[0] {
-        matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent::UnableToDecrypt { .. } => {}
+        matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent::UnableToDecrypt {
+            ..
+        } => {}
         other => panic!("expected unable-to-decrypt, got {other:?}"),
     }
 
@@ -191,8 +213,12 @@ async fn test_receive_wedged_olm_counts_wedged_and_never_merges() {
 
 #[async_test]
 async fn test_receive_invalid_session_key_is_counted_and_never_merged() {
-    let (alice, bob) =
-        get_machine_pair_with_setup_sessions_test_helper(user_id!("@a:example.org"), user_id!("@b:example.org"), false).await;
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     bob.set_room_key_diagnostic_observer(Some(capture_observer(&events)));
 
@@ -234,7 +260,9 @@ async fn test_receive_invalid_session_key_is_counted_and_never_merged() {
     let (decrypted, _) = receive_to_device_event(&bob, &event, &decryption_settings).await;
 
     match &decrypted[0] {
-        matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent::UnableToDecrypt { .. } => {}
+        matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent::UnableToDecrypt {
+            ..
+        } => {}
         other => panic!("expected unable-to-decrypt, got {other:?}"),
     }
 
@@ -246,26 +274,28 @@ async fn test_receive_invalid_session_key_is_counted_and_never_merged() {
 
     let events = events.lock().unwrap();
     match events.last() {
-        Some(RoomKeyDiagnosticEvent::Receive(receive)) => assert_eq!(
-            receive.kind,
-            RoomKeyReceiveDiagnosticKind::ToDeviceOlmFailed
-        ),
+        Some(RoomKeyDiagnosticEvent::Receive(receive)) => {
+            assert_eq!(receive.kind, RoomKeyReceiveDiagnosticKind::ToDeviceOlmFailed)
+        }
         other => panic!("unexpected last event: {other:?}"),
     }
 }
 
 #[async_test]
 async fn test_receive_diagnostics_never_expose_identifiers_or_material() {
-    let (alice, bob) =
-        get_machine_pair_with_setup_sessions_test_helper(user_id!("@a:example.org"), user_id!("@b:example.org"), false).await;
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     bob.set_room_key_diagnostic_observer(Some(capture_observer(&events)));
 
     let room_id = room_id!("!test:example.org");
     let decryption_settings =
         DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
-    let event =
-        create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
+    let event = create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
     receive_to_device_event(&bob, &event, &decryption_settings).await;
 
     let counters = bob.room_key_receive_counters();
@@ -297,4 +327,3 @@ async fn test_receive_diagnostics_never_expose_identifiers_or_material() {
         assert!(!events_debug.contains(private), "{private} leaked into events");
     }
 }
-

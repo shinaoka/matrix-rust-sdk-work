@@ -117,14 +117,16 @@ pub(crate) mod tasks;
 pub mod verification;
 
 pub use matrix_sdk_base::crypto::{
-    CrossSigningStatus, CryptoStoreError, DecryptorError, EventError,
+    CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, ForwardedRoomKeyAuthOutcome,
     IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
     KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError,
     RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
     RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
-    RoomKeyImportResult, RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState,
-    RoomKeyRequesterScope, RoomKeyRotationDiagnostic, RoomKeyRotationReason, SessionCreationError,
-    SignatureError, VERSION,
+    RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters,
+    RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
+    RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    RoomKeyRotationDiagnostic, RoomKeyRotationReason, SessionCreationError, SignatureError,
+    VERSION,
     olm::{
         SessionCreationError as MegolmSessionCreationError,
         SessionExportError as OlmSessionExportError,
@@ -937,6 +939,16 @@ impl Encryption {
         if let Some(machine) = self.client.olm_machine().await.as_ref() {
             machine.set_room_key_diagnostic_observer(observer);
         }
+    }
+
+    /// Snapshot the aggregate privacy-safe receive-side room-key counters.
+    pub async fn room_key_receive_counters(&self) -> RoomKeyReceiveCounters {
+        self.client
+            .olm_machine()
+            .await
+            .as_ref()
+            .map(|machine| machine.room_key_receive_counters())
+            .unwrap_or_default()
     }
 
     /// Returns the current encryption settings for this client.

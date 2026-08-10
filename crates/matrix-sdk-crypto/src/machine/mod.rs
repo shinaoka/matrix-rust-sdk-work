@@ -84,8 +84,8 @@ use crate::{
         SenderDataFinder, SessionType, StaticAccountData,
     },
     room_key_diagnostics::{
-        RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyReceiveDiagnosticKind,
-        RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters, RoomKeyRotationReason,
+        RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyIngressKind, RoomKeyMergeDecision,
+        RoomKeyReceiveCounters, RoomKeyReceiveDiagnosticKind, RoomKeyRotationReason,
     },
     session_manager::{GroupSessionManager, SessionManager},
     store::{
@@ -1027,11 +1027,9 @@ impl OlmMachine {
             Err(e) => {
                 Span::current().record("session_id", &content.session_id);
                 warn!("Received a room key event which contained an invalid session key: {e}");
-                self.inner
-                    .room_key_diagnostics
-                    .emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
-                        decision: RoomKeyMergeDecision::InvalidSessionKey,
-                    });
+                self.inner.room_key_diagnostics.emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
+                    decision: RoomKeyMergeDecision::InvalidSessionKey,
+                });
 
                 Ok(None)
             }
@@ -1523,20 +1521,20 @@ impl OlmMachine {
 
         match &*decrypted.result.event {
             AnyDecryptedOlmEvent::RoomKey(e) => {
-                self.inner
-                    .room_key_diagnostics
-                    .emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
+                self.inner.room_key_diagnostics.emit_receive(
+                    RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
                         kind: RoomKeyIngressKind::Direct,
-                    });
+                    },
+                );
                 let session = self.add_room_key(decrypted.result.sender_key, e).await?;
                 decrypted.inbound_group_session = session;
             }
             AnyDecryptedOlmEvent::ForwardedRoomKey(e) => {
-                self.inner
-                    .room_key_diagnostics
-                    .emit_receive(RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
+                self.inner.room_key_diagnostics.emit_receive(
+                    RoomKeyReceiveDiagnosticKind::RoomKeyIngress {
                         kind: RoomKeyIngressKind::Forwarded,
-                    });
+                    },
+                );
                 let session = self
                     .inner
                     .key_request_machine
@@ -2001,11 +1999,9 @@ impl OlmMachine {
 
         if let Err(error) = self.store().save_changes(changes).await {
             if had_inbound_sessions {
-                self.inner
-                    .room_key_diagnostics
-                    .emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
-                        decision: RoomKeyMergeDecision::StoreFailed,
-                    });
+                self.inner.room_key_diagnostics.emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
+                    decision: RoomKeyMergeDecision::StoreFailed,
+                });
             }
             return Err(error.into());
         }

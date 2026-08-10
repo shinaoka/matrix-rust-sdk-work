@@ -51,8 +51,9 @@ use crate::{
     olm::{InboundGroupSession, Session},
     room_key_diagnostics::{
         ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
-        RequestedRoomKeySession, RoomKeyDiagnosticHub, RoomKeyReceiveDiagnosticKind, RoomKeyMergeDecision,
-        RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState,
+        RequestedRoomKeySession, RoomKeyDiagnosticHub, RoomKeyMergeDecision,
+        RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason, RoomKeyRequestAction,
+        RoomKeyRequesterDeviceState,
     },
     session_manager::GroupSessionCache,
     store::{CryptoStoreError, SecretImportError, Store, caches::StoreCache, types::Changes},
@@ -1411,11 +1412,9 @@ impl GossipMachine {
             }
             Err(e) => {
                 warn!(?sender_key, "Couldn't create a group session from a received room key");
-                self.inner
-                    .room_key_diagnostics
-                    .emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
-                        decision: RoomKeyMergeDecision::InvalidSessionKey,
-                    });
+                self.inner.room_key_diagnostics.emit_receive(RoomKeyReceiveDiagnosticKind::Merge {
+                    decision: RoomKeyMergeDecision::InvalidSessionKey,
+                });
                 Err(e.into())
             }
         }
@@ -1449,11 +1448,11 @@ impl GossipMachine {
                 algorithm = ?event.content.algorithm(),
                 "Received a forwarded room key with an unsupported algorithm",
             );
-            self.inner
-                .room_key_diagnostics
-                .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+            self.inner.room_key_diagnostics.emit_receive(
+                RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
                     outcome: ForwardedRoomKeyAuthOutcome::UnsupportedAlgorithm,
-                });
+                },
+            );
             return Ok(None);
         };
 
@@ -1468,20 +1467,20 @@ impl GossipMachine {
                 algorithm = ?info.algorithm(),
                 "Received a forwarded room key that we didn't request",
             );
-            self.inner
-                .room_key_diagnostics
-                .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+            self.inner.room_key_diagnostics.emit_receive(
+                RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
                     outcome: ForwardedRoomKeyAuthOutcome::RejectedNoMatchingRequest,
-                });
+                },
+            );
             return Ok(None);
         };
 
         if self.should_accept_forward(&request, sender_key).await? {
-            self.inner
-                .room_key_diagnostics
-                .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+            self.inner.room_key_diagnostics.emit_receive(
+                RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
                     outcome: ForwardedRoomKeyAuthOutcome::Accepted,
-                });
+                },
+            );
             self.accept_forwarded_room_key(&request, sender_key, event).await
         } else {
             warn!(
@@ -1491,11 +1490,11 @@ impl GossipMachine {
                 "Received a forwarded room key from an unknown device, or \
                  from a device that the key request recipient doesn't own",
             );
-            self.inner
-                .room_key_diagnostics
-                .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+            self.inner.room_key_diagnostics.emit_receive(
+                RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
                     outcome: ForwardedRoomKeyAuthOutcome::RejectedUntrustedSender,
-                });
+                },
+            );
             Ok(None)
         }
     }
@@ -1521,11 +1520,11 @@ impl GossipMachine {
                     algorithm = ?event.content.algorithm(),
                     "Received a forwarded room key with an unsupported algorithm",
                 );
-                self.inner
-                    .room_key_diagnostics
-                    .emit_receive(RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
+                self.inner.room_key_diagnostics.emit_receive(
+                    RoomKeyReceiveDiagnosticKind::ForwardedRoomKeyAuth {
                         outcome: ForwardedRoomKeyAuthOutcome::UnsupportedAlgorithm,
-                    });
+                    },
+                );
 
                 Ok(None)
             }
@@ -2093,7 +2092,8 @@ mod tests {
         // A forwarded key for which no request was ever made.
         let second_account = alice_2_account();
         let alice_device = DeviceData::from_account(&second_account);
-        let (outbound, session) = account().create_group_session_pair_with_defaults(room_id()).await;
+        let (outbound, session) =
+            account().create_group_session_pair_with_defaults(room_id()).await;
         let result = outbound.encrypt("m.dummy", &message_like_event_content!({})).await;
         let _room_event = wrap_encrypted_content(machine.user_id(), result.content);
         let export = session.export_at_index(10).await;
@@ -2106,8 +2106,9 @@ mod tests {
             content,
         );
 
-        let session =
-            machine.receive_forwarded_room_key(alice_device.curve25519_key().unwrap(), &event).await;
+        let session = machine
+            .receive_forwarded_room_key(alice_device.curve25519_key().unwrap(), &event)
+            .await;
 
         assert!(session.unwrap().is_none());
 
@@ -2153,7 +2154,8 @@ mod tests {
         let devices = std::slice::from_ref(&alice_device);
         machine.inner.store.save_device_data(devices).await.unwrap();
 
-        let (outbound, session) = bob_owner.create_group_session_pair_with_defaults(room_id()).await;
+        let (outbound, session) =
+            bob_owner.create_group_session_pair_with_defaults(room_id()).await;
         let result = outbound.encrypt("m.dummy", &message_like_event_content!({})).await;
         let room_event = wrap_encrypted_content(machine.user_id(), result.content);
 
