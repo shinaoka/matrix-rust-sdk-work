@@ -981,8 +981,6 @@ impl Encryption {
     /// and never sends to a device lacking prior share-state proof.
     #[doc(hidden)]
     pub async fn on_olm_unwedged(&self, signals: Vec<matrix_sdk_base::crypto::OlmRecoverySignal>) {
-        use matrix_sdk_base::crypto::UnwedgeReshareOutcome;
-
         const MAX_SIGNALS_PER_SYNC: usize = 8;
         const MAX_ROOMS_PER_SIGNAL: usize = 16;
 
@@ -1940,7 +1938,7 @@ impl Encryption {
     pub async fn room_key_withheld_codes(
         &self,
         room_id: &RoomId,
-    ) -> Vec<(String, matrix_sdk_common::deserialized_responses::WithheldCode)> {
+    ) -> Vec<(String, WithheldCode)> {
         use matrix_sdk_base::crypto::store::types::RoomKeyWithheldEntry;
 
         let machine = self.client.olm_machine().await;

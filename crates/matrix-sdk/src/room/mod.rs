@@ -2507,8 +2507,9 @@ impl Room {
         // Take and release the lock on the store, if needs be.
         let _guard = self.client.encryption().spin_lock_store(Some(60000)).await?;
 
-        let outcome = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let captured = std::sync::Arc::clone(&outcome);
+        use std::sync::{Arc, Mutex};
+        let outcome = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&outcome);
         self.client
             .locks()
             .group_session_deduplicated_handler
