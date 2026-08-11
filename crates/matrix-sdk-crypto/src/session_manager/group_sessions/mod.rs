@@ -292,15 +292,13 @@ impl GroupSessionManager {
             .sessions
             .read()
             .iter()
-            .filter_map(|(room_id, session)| {
-                match session.sharing_view().get_share_state(device) {
-                    ShareState::Shared { olm_wedging_index, .. }
-                        if olm_wedging_index < device.olm_wedging_index =>
-                    {
-                        Some(room_id.clone())
-                    }
-                    _ => None,
+            .filter_map(|(room_id, session)| match session.sharing_view().get_share_state(device) {
+                ShareState::Shared { olm_wedging_index, .. }
+                    if olm_wedging_index < device.olm_wedging_index =>
+                {
+                    Some(room_id.clone())
                 }
+                _ => None,
             })
             .collect();
         self.room_key_diagnostics.emit_olm_recovery_signal(
@@ -342,7 +340,11 @@ impl GroupSessionManager {
         // (leavers excluded, blacklist/dehydrated/trust filtered) and detect
         // any policy cause that requires rotation.
         let CollectRecipientsResult { should_rotate, devices, .. } = self
-            .collect_session_recipients(members.iter().map(|user| user.as_ref()), &settings, &outbound)
+            .collect_session_recipients(
+                members.iter().map(|user| user.as_ref()),
+                &settings,
+                &outbound,
+            )
             .await?;
         if should_rotate {
             // Leave rotation to the normal send path; never rotate solely to
@@ -357,9 +359,8 @@ impl GroupSessionManager {
         }
 
         let mut changes = Changes::default();
-        let withheld = self
-            .encrypt_for_devices(vec![device.clone()], &outbound, &mut changes)
-            .await?;
+        let withheld =
+            self.encrypt_for_devices(vec![device.clone()], &outbound, &mut changes).await?;
         self.handle_withheld_devices(&outbound, withheld)?;
         if !changes.is_empty() {
             self.store.save_changes(changes).await?;

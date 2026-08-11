@@ -1956,20 +1956,29 @@ impl OlmMachine {
         // `olm_wedging_index` was just advanced). Surface it for the post-sync
         // recovery re-share pass.
         if is_new_session {
-            if let Ok(Some(device)) = self
+            match self
                 .store()
                 .get_device_from_curve_key(&e.sender, decrypted.result.sender_key)
                 .await
-                && !device.is_dehydrated()
             {
-                self.inner
-                    .olm_recovery_signals
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(OlmRecoverySignal::new(
-                    e.sender.clone(),
-                    decrypted.result.sender_key,
-                ));
+                Ok(Some(device)) if !device.is_dehydrated() => {
+                    self.inner
+                        .olm_recovery_signals
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(OlmRecoverySignal::new(
+                            e.sender.clone(),
+                            decrypted.result.sender_key,
+                        ));
+                }
+                Ok(Some(_)) => self
+                    .inner
+                    .room_key_diagnostics
+                    .emit_olm_recovery_signal(OlmRecoverySignalOutcome::IgnoredDehydrated),
+                _ => self
+                    .inner
+                    .room_key_diagnostics
+                    .emit_olm_recovery_signal(OlmRecoverySignalOutcome::IgnoredUnknownDevice),
             }
         }
 
@@ -2101,11 +2110,13 @@ impl OlmMachine {
         }
         store_transaction.commit().await?;
 
-        let olm_recovery_signals = std::mem::take(&mut *self
-            .inner
-            .olm_recovery_signals
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        let olm_recovery_signals = std::mem::take(
+            &mut *self
+                .inner
+                .olm_recovery_signals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
 
         Ok((events, room_key_updates, olm_recovery_signals))
     }

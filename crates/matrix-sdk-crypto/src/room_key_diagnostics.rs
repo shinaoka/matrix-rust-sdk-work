@@ -493,9 +493,13 @@ pub struct OlmRecoveryCounters {
     pub signal_failed: u64,
     /// Matching active outbound-session count buckets.
     pub matching_sessions_bucket_0: u64,
+    /// Matching count bucket: exactly one session.
     pub matching_sessions_bucket_1: u64,
+    /// Matching count bucket: 2-5 sessions.
     pub matching_sessions_bucket_2_to_5: u64,
+    /// Matching count bucket: 6-20 sessions.
     pub matching_sessions_bucket_6_to_20: u64,
+    /// Matching count bucket: 21+ sessions.
     pub matching_sessions_bucket_21_plus: u64,
     /// Re-shares queued.
     pub reshare_queued: u64,
@@ -586,7 +590,9 @@ impl RoomKeyDiagnosticHub {
         let (observer, event) = {
             let mut state = lock(&self.0);
             match outcome {
-                OlmRecoverySignalOutcome::Observed => state.olm_recovery_counters.signal_observed += 1,
+                OlmRecoverySignalOutcome::Observed => {
+                    state.olm_recovery_counters.signal_observed += 1
+                }
                 OlmRecoverySignalOutcome::IgnoredUnknownDevice => {
                     state.olm_recovery_counters.signal_ignored_unknown_device += 1
                 }
@@ -597,7 +603,11 @@ impl RoomKeyDiagnosticHub {
             }
             (
                 state.observer.clone(),
-                OlmRecoveryDiagnostic { signal: outcome, reshare: None, matching_sessions_bucket: 0 },
+                OlmRecoveryDiagnostic {
+                    signal: outcome,
+                    reshare: None,
+                    matching_sessions_bucket: 0,
+                },
             )
         };
         if let Some(observer) = observer {
@@ -616,7 +626,9 @@ impl RoomKeyDiagnosticHub {
             let mut state = lock(&self.0);
             state.olm_recovery_counters.record_matching_bucket(matching_sessions);
             match reshare {
-                OlmRecoveryReshareOutcome::Queued => state.olm_recovery_counters.reshare_queued += 1,
+                OlmRecoveryReshareOutcome::Queued => {
+                    state.olm_recovery_counters.reshare_queued += 1
+                }
                 OlmRecoveryReshareOutcome::AlreadyPending => {
                     state.olm_recovery_counters.reshare_already_pending += 1
                 }

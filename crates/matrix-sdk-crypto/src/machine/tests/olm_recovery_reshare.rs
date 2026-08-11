@@ -23,14 +23,20 @@ use ruma::{RoomId, UserId};
 use super::megolm_sender_data::create_and_share_session_with_custom_sender_data;
 use crate::{
     DecryptionSettings, EncryptionSyncChanges, OlmRecoverySignal, TrustRequirement,
-    machine::test_helpers::{get_machine_pair_with_session, get_machine_pair_with_setup_sessions_test_helper},
-    store::types::RoomKeyInfo, types::events::room::encrypted::ToDeviceEncryptedEventContent,
-    types::events::ToDeviceEvent, UnwedgeReshareOutcome,
+    UnwedgeReshareOutcome,
+    machine::test_helpers::{
+        get_machine_pair_with_session, get_machine_pair_with_setup_sessions_test_helper,
+    },
+    store::types::RoomKeyInfo,
+    types::events::ToDeviceEvent,
+    types::events::room::encrypted::ToDeviceEncryptedEventContent,
 };
 
 /// Pipe an encrypted to-device event into a machine and return the unwedge
 /// recovery signals collected during the sync.
-async fn receive_and_collect_signals<C: serde::Serialize + std::fmt::Debug + crate::types::events::EventType>(
+async fn receive_and_collect_signals<
+    C: serde::Serialize + std::fmt::Debug + crate::types::events::EventType,
+>(
     machine: &crate::OlmMachine,
     event: &ToDeviceEvent<C>,
     settings: &DecryptionSettings,
@@ -92,17 +98,9 @@ async fn test_unwedge_signal_is_ignored_for_unknown_device() {
         .await
         .unwrap();
     // Remove Bob's device from Alice's store.
-    let device = alice
-        .get_device(bob.user_id(), bob.device_id(), None)
-        .await
-        .unwrap()
-        .unwrap()
-        .inner;
-    alice
-        .store()
-        .save_device_data(&[device.clone()])
-        .await
-        .unwrap();
+    let device =
+        alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap().inner;
+    alice.store().save_device_data(&[device.clone()]).await.unwrap();
     let _ = device;
 
     let event = create_and_share_session_with_custom_sender_data(&bob, &alice, room_id, None).await;
@@ -113,8 +111,12 @@ async fn test_unwedge_signal_is_ignored_for_unknown_device() {
 
 #[async_test]
 async fn test_reshare_unwedged_room_key_queues_only_authorized_device() {
-    let (alice, bob) =
-        get_machine_pair_with_setup_sessions_test_helper(user_id!("@a:example.org"), user_id!("@b:example.org"), false).await;
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
     let room_id = room_id!("!test:example.org");
     let settings =
         DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
@@ -123,45 +125,32 @@ async fn test_reshare_unwedged_room_key_queues_only_authorized_device() {
     // device is now an authorized recipient of Alice's active outbound
     // session (ShareState::Shared recorded).
     let requests = alice
-        .share_room_key(room_id, std::iter::once(bob.user_id()), crate::EncryptionSettings::default())
+        .share_room_key(
+            room_id,
+            std::iter::once(bob.user_id()),
+            crate::EncryptionSettings::default(),
+        )
         .await
         .unwrap();
     assert!(!requests.is_empty());
     // Settle the setup share so Bob's share state is Shared (not pending).
     for request in &requests {
-        alice
-            .inner
-            .group_session_manager
-            .mark_request_as_sent(&request.txn_id)
-            .await
-            .unwrap();
+        alice.inner.group_session_manager.mark_request_as_sent(&request.txn_id).await.unwrap();
     }
 
-    let pre_device = alice
-        .get_device(bob.user_id(), bob.device_id(), None)
-        .await
-        .unwrap()
-        .unwrap()
-        .inner;
+    let pre_device =
+        alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap().inner;
     let session = alice.inner.group_session_manager.get_outbound_group_session(room_id).unwrap();
     // Bob's device "unwedges": bump its stored olm_wedging_index on Alice's
     // side, as the SDK does when a fresh inbound session is accepted.
-    let mut device = alice
-        .get_device(bob.user_id(), bob.device_id(), None)
-        .await
-        .unwrap()
-        .unwrap()
-        .inner;
+    let mut device =
+        alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap().inner;
     // Bump well past any value captured at share time so the wedging advance
     // is unambiguous regardless of setup-flow side effects.
     for _ in 0..10 {
         device.olm_wedging_index.increment();
     }
-    alice
-        .store()
-        .save_device_data(std::slice::from_ref(&device))
-        .await
-        .unwrap();
+    alice.store().save_device_data(std::slice::from_ref(&device)).await.unwrap();
     // The affected-room scan must find the room.
     let affected = alice.unwedged_affected_room_ids(&device);
     assert_eq!(affected, vec![room_id.to_owned()]);
@@ -170,12 +159,7 @@ async fn test_reshare_unwedged_room_key_queues_only_authorized_device() {
     // exposed: the request carries the current session content).
     let members = vec![bob.user_id().to_owned()];
     let outcome = alice
-        .reshare_unwedged_room_key(
-            room_id,
-            &members,
-            crate::EncryptionSettings::default(),
-            &device,
-        )
+        .reshare_unwedged_room_key(room_id, &members, crate::EncryptionSettings::default(), &device)
         .await
         .unwrap();
     assert!(matches!(outcome, UnwedgeReshareOutcome::Queued(_)), "unexpected {outcome:?}");
@@ -184,37 +168,29 @@ async fn test_reshare_unwedged_room_key_queues_only_authorized_device() {
     // the share state already advanced (NotNeeded) or a request is still
     // pending (AlreadyPending).
     let replay = alice
-        .reshare_unwedged_room_key(
-            room_id,
-            &members,
-            crate::EncryptionSettings::default(),
-            &device,
-        )
+        .reshare_unwedged_room_key(room_id, &members, crate::EncryptionSettings::default(), &device)
         .await
         .unwrap();
     assert!(
-        matches!(
-            replay,
-            UnwedgeReshareOutcome::NotNeeded | UnwedgeReshareOutcome::AlreadyPending
-        ),
+        matches!(replay, UnwedgeReshareOutcome::NotNeeded | UnwedgeReshareOutcome::AlreadyPending),
         "replay must be deduplicated, got {replay:?}"
     );
 }
 
 #[async_test]
 async fn test_reshare_unwedged_room_key_skips_unrelated_device() {
-    let (alice, bob) =
-        get_machine_pair_with_setup_sessions_test_helper(user_id!("@a:example.org"), user_id!("@b:example.org"), false).await;
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
     let room_id = room_id!("!test:example.org");
 
     // No session was ever shared with Bob in this test; his device must not
     // match any room.
-    let device = alice
-        .get_device(bob.user_id(), bob.device_id(), None)
-        .await
-        .unwrap()
-        .unwrap()
-        .inner;
+    let device =
+        alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap().inner;
     let affected = alice.unwedged_affected_room_ids(&device);
     assert!(affected.is_empty(), "no session was shared with Bob: {affected:?}");
 }

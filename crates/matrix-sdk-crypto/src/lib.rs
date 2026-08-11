@@ -91,7 +91,10 @@ pub use identities::{
     Device, DeviceData, LocalTrust, OtherUserIdentity, OtherUserIdentityData, OwnUserIdentity,
     OwnUserIdentityData, UserDevices, UserIdentity, UserIdentityData,
 };
-pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine, OlmRecoverySignal};
+pub use machine::{
+    CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine, OlmRecoverySignal,
+};
+pub use matrix_sdk_common::deserialized_responses::WithheldCode;
 use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecryptInfo};
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
@@ -103,13 +106,14 @@ pub use room_key_diagnostics::{
     RoomKeyCreationOutcome, RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent,
     RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome, RoomKeyIngressKind, RoomKeyMergeDecision,
     RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
-    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState,
-    RoomKeyRequesterScope, RoomKeyRotationDiagnostic, RoomKeyRotationReason,
+    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    RoomKeyRotationDiagnostic, RoomKeyRotationReason,
 };
 use serde::{Deserialize, Serialize};
 pub use session_manager::{
     CollectStrategy, RoomKeyReshareResult, RoomKeyReshareTarget, UnwedgeReshareOutcome,
 };
+pub use types::events::room_key_withheld::{RoomKeyWithheldContent, RoomKeyWithheldEvent};
 
 pub use store::{
     CryptoStoreError, SecretImportError, SecretInfo,

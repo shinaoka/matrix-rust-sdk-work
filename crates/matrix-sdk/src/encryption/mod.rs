@@ -42,6 +42,7 @@ use matrix_sdk_base::{
     cross_process_lock::{AcquireCrossProcessLockFn, CrossProcessLock, CrossProcessLockError},
     crypto::{
         CrossSigningBootstrapRequests, OlmMachine,
+        store::types::RoomKeyWithheldInfo,
         store::{
             LockableCryptoStore, SecretImportError,
             types::{RoomKeyBundleInfo, RoomKeyInfo},
@@ -56,6 +57,7 @@ use matrix_sdk_base::{
     },
     sleep::sleep,
 };
+pub use matrix_sdk_common::deserialized_responses::WithheldCode;
 use matrix_sdk_common::{executor::spawn, locks::Mutex as StdMutex};
 use ruma::{
     DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, RoomId, TransactionId,
@@ -87,7 +89,7 @@ use serde::{Deserialize, de::Error as _};
 use tasks::BundleReceiverTask;
 use tokio::sync::{Mutex, RwLockReadGuard};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tracing::{Span, debug, error, instrument, trace, warn};
+use tracing::{Span, debug, error, instrument, warn};
 use url::Url;
 use vodozemac::Curve25519PublicKey;
 
@@ -126,8 +128,8 @@ pub use matrix_sdk_base::crypto::{
     RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters,
     RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
     RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
-    RoomKeyRotationDiagnostic, RoomKeyRotationReason, SessionCreationError, SignatureError,
-    VERSION,
+    RoomKeyRotationDiagnostic, RoomKeyRotationReason, RoomKeyWithheldContent, RoomKeyWithheldEvent,
+    SessionCreationError, SignatureError, VERSION,
     olm::{
         SessionCreationError as MegolmSessionCreationError,
         SessionExportError as OlmSessionExportError,
@@ -1914,6 +1916,51 @@ impl Encryption {
         let olm = olm.as_ref()?;
 
         Some(olm.store().historic_room_key_stream())
+    }
+
+    /// Receive notifications of `m.room_key.withheld` events as a stream
+    /// (issue #460). The crypto store retains only the standard codes
+    /// blacklisted / unverified / unauthorised / unavailable; other codes are
+    /// not correlatable from this stream. Intended for app-owned closed-token
+    /// mapping; do not surface raw content.
+    #[doc(hidden)]
+    pub async fn room_keys_withheld_received_stream(
+        &self,
+    ) -> Option<impl Stream<Item = Vec<RoomKeyWithheldInfo>> + use<>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref()?;
+        Some(olm.store().room_keys_withheld_received_stream())
+    }
+
+    /// Look up the stored withheld events for a room (issue #460), mapped to
+    /// session -> closed code. The crypto store retains only the standard
+    /// codes blacklisted / unverified / unauthorised / unavailable; other
+    /// codes are not correlatable from this source.
+    #[doc(hidden)]
+    pub async fn room_key_withheld_codes(
+        &self,
+        room_id: &RoomId,
+    ) -> Vec<(String, matrix_sdk_common::deserialized_responses::WithheldCode)> {
+        use matrix_sdk_base::crypto::store::types::RoomKeyWithheldEntry;
+
+        let machine = self.client.olm_machine().await;
+        let Some(machine) = machine.as_ref() else {
+            return Vec::new();
+        };
+        let withhelds: Vec<RoomKeyWithheldEntry> =
+            machine.store().get_withheld_sessions_by_room_id(room_id).await.unwrap_or_default();
+        withhelds
+            .into_iter()
+            .filter_map(|entry| {
+                use matrix_sdk_base::crypto::types::events::room_key_withheld::RoomKeyWithheldContent;
+                let session = match &entry.content {
+                    RoomKeyWithheldContent::MegolmV1AesSha2(c) => c.session_id()?,
+                    RoomKeyWithheldContent::Unknown(_) => return None,
+                };
+                let code = entry.content.withheld_code();
+                Some((session.to_owned(), code))
+            })
+            .collect()
     }
 
     /// Get the secret storage manager of the client.
