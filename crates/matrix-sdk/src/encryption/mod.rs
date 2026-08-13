@@ -1935,10 +1935,7 @@ impl Encryption {
     /// codes blacklisted / unverified / unauthorised / unavailable; other
     /// codes are not correlatable from this source.
     #[doc(hidden)]
-    pub async fn room_key_withheld_codes(
-        &self,
-        room_id: &RoomId,
-    ) -> Vec<(String, WithheldCode)> {
+    pub async fn room_key_withheld_codes(&self, room_id: &RoomId) -> Vec<(String, WithheldCode)> {
         use matrix_sdk_base::crypto::store::types::RoomKeyWithheldEntry;
 
         let machine = self.client.olm_machine().await;

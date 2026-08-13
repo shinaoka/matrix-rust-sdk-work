@@ -34,7 +34,7 @@ use ruma::{
 };
 use tracing::debug;
 
-use super::Room;
+use super::{Room, RoomMembersMissingReason};
 use crate::{
     MinimalRoomMemberEvent, StateStore, StoreError,
     deserialized_responses::{DisplayName, MemberEvent},
@@ -65,10 +65,22 @@ impl Room {
 
     /// Mark this Room as still missing member information.
     pub fn mark_members_missing(&self) {
+        self.mark_members_missing_with_reason(RoomMembersMissingReason::Unknown);
+    }
+
+    /// Mark this Room as still missing member information and retain why.
+    pub fn mark_members_missing_with_reason(&self, reason: RoomMembersMissingReason) {
         self.info.update_if(|info| {
-            // notify observable subscribers only if the previous value was false
-            mem::replace(&mut info.members_synced, false)
+            let changed = mem::replace(&mut info.members_synced, false)
+                || info.members_missing_reason != reason;
+            info.members_missing_reason = reason;
+            changed
         })
+    }
+
+    /// Return why members need a full reload.
+    pub fn members_missing_reason(&self) -> RoomMembersMissingReason {
+        self.info.read().members_missing_reason
     }
 
     /// Get the `RoomMember`s of this room that are known to the store, with the

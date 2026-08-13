@@ -46,7 +46,8 @@ use matrix_sdk_base::crypto::{
 pub use matrix_sdk_base::store::StoredThreadSubscription;
 use matrix_sdk_base::{
     ComposerDraft, DmRoomDefinition, EncryptionState, RoomInfoNotableUpdateReasons,
-    RoomMemberships, SendOutsideWasm, StateStoreDataKey, StateStoreDataValue,
+    RoomMembersMissingReason, RoomMemberships, SendOutsideWasm, StateStoreDataKey,
+    StateStoreDataValue,
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState,
     },
@@ -2092,7 +2093,7 @@ impl Room {
         // Force a future room members reload before sending any event to prevent UTDs
         // that can happen when some event is sent after a room member has been invited
         // but before the /sync request could fetch the membership change event.
-        self.mark_members_missing();
+        self.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
 
         Ok(())
     }
@@ -2111,7 +2112,7 @@ impl Room {
         // Force a future room members reload before sending any event to prevent UTDs
         // that can happen when some event is sent after a room member has been invited
         // but before the /sync request could fetch the membership change event.
-        self.mark_members_missing();
+        self.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
 
         Ok(())
     }
@@ -2479,7 +2480,12 @@ impl Room {
                 if let Err(r) = response {
                     let machine = self.client.olm_machine().await;
                     if let Some(machine) = machine.as_ref() {
-                        machine.discard_room_key(self.room_id()).await?;
+                        machine
+                            .discard_room_key_with_reason(
+                                self.room_id(),
+                                matrix_sdk_base::crypto::RoomKeyRotationReason::KeyShareFailure,
+                            )
+                            .await?;
                     }
                     return Err(r);
                 }

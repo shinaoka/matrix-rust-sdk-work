@@ -195,6 +195,14 @@ pub enum RoomKeyRotationReason {
     EncryptionSettingsChanged,
     /// An explicit discard invalidated the prior session.
     ExplicitDiscard,
+    /// A full member-list reload invalidated the prior session, but its trigger is unknown.
+    FullMemberListReload,
+    /// A new Sliding Sync room subscription forced a full member-list reload.
+    RoomSubscription,
+    /// A limited sync response forced a full member-list reload.
+    LimitedSyncResponse,
+    /// Sharing the current room key failed, so it was discarded before retry.
+    KeyShareFailure,
     /// No session was found in the store.
     StoreMissing,
     /// The prior session was invalidated for an unclassified reason.

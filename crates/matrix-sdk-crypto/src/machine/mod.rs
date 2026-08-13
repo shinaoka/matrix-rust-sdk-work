@@ -1342,10 +1342,20 @@ impl OlmMachine {
     /// Returns true if a session was invalidated, false if there was no session
     /// to invalidate.
     pub async fn discard_room_key(&self, room_id: &RoomId) -> StoreResult<bool> {
-        self.inner
-            .room_key_diagnostics
-            .note_discard(room_id, RoomKeyRotationReason::ExplicitDiscard);
-        self.inner.group_session_manager.invalidate_group_session(room_id).await
+        self.discard_room_key_with_reason(room_id, RoomKeyRotationReason::ExplicitDiscard).await
+    }
+
+    /// Discard the active room key and retain a typed diagnostic cause.
+    pub async fn discard_room_key_with_reason(
+        &self,
+        room_id: &RoomId,
+        reason: RoomKeyRotationReason,
+    ) -> StoreResult<bool> {
+        let discarded = self.inner.group_session_manager.invalidate_group_session(room_id).await?;
+        if discarded {
+            self.inner.room_key_diagnostics.note_discard(room_id, reason);
+        }
+        Ok(discarded)
     }
 
     /// Rooms whose active outbound session was previously shared with `device`
@@ -1391,10 +1401,8 @@ impl OlmMachine {
         &self,
         room_id: &RoomId,
     ) -> StoreResult<bool> {
-        self.inner
-            .room_key_diagnostics
-            .note_discard(room_id, RoomKeyRotationReason::MembershipOrDeviceChange);
-        self.inner.group_session_manager.invalidate_group_session(room_id).await
+        self.discard_room_key_with_reason(room_id, RoomKeyRotationReason::MembershipOrDeviceChange)
+            .await
     }
 
     /// Configure a typed, privacy-safe observer for room-key lifecycle events.

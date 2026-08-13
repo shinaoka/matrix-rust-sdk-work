@@ -77,6 +77,20 @@ use crate::{
     utils::{AnyStateEventEnum, RawStateEventWithKeys},
 };
 
+/// Why a room's member list was marked incomplete.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RoomMembersMissingReason {
+    /// The cause is unavailable, for example after restoring persisted state.
+    #[default]
+    Unknown,
+    /// A Sliding Sync room subscription was newly installed.
+    RoomSubscription,
+    /// A limited sync response invalidated the completeness of lazy-loaded members.
+    LimitedSyncResponse,
+    /// The room membership changed or an invite was sent locally.
+    MembershipChange,
+}
+
 /// The default value of the maximum power level.
 const DEFAULT_MAX_POWER_LEVEL: i64 = 100;
 
@@ -594,6 +608,13 @@ pub struct RoomInfo {
     /// Flag remembering if the room members are synced.
     pub(crate) members_synced: bool,
 
+    /// Process-local reason why the member list was marked incomplete.
+    ///
+    /// This is deliberately not persisted: it is diagnostic provenance for the
+    /// next full member reload, not durable room state.
+    #[serde(skip)]
+    pub(crate) members_missing_reason: RoomMembersMissingReason,
+
     /// The prev batch of this room we received during the last sync.
     pub(crate) last_prev_batch: Option<String>,
 
@@ -662,6 +683,7 @@ impl RoomInfo {
             notification_counts: Default::default(),
             summary: Default::default(),
             members_synced: false,
+            members_missing_reason: RoomMembersMissingReason::Unknown,
             last_prev_batch: None,
             sync_info: SyncInfo::NoState,
             encryption_state_synced: false,
@@ -708,16 +730,28 @@ impl RoomInfo {
     /// Mark this Room as having all the members synced.
     pub fn mark_members_synced(&mut self) {
         self.members_synced = true;
+        self.members_missing_reason = RoomMembersMissingReason::Unknown;
     }
 
     /// Mark this Room as still missing member information.
     pub fn mark_members_missing(&mut self) {
+        self.mark_members_missing_with_reason(RoomMembersMissingReason::Unknown);
+    }
+
+    /// Mark this Room as still missing member information and retain why.
+    pub fn mark_members_missing_with_reason(&mut self, reason: RoomMembersMissingReason) {
         self.members_synced = false;
+        self.members_missing_reason = reason;
     }
 
     /// Returns whether the room members are synced.
     pub fn are_members_synced(&self) -> bool {
         self.members_synced
+    }
+
+    /// Return the process-local reason why members need a full reload.
+    pub fn members_missing_reason(&self) -> RoomMembersMissingReason {
+        self.members_missing_reason
     }
 
     /// Mark this Room as still missing some state information.
@@ -1494,7 +1528,7 @@ mod tests {
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     use tokio::time::sleep;
 
-    use super::{BaseRoomInfo, LatestEventValue, RoomInfo, SyncInfo};
+    use super::{BaseRoomInfo, LatestEventValue, RoomInfo, RoomMembersMissingReason, SyncInfo};
     use crate::{
         RawStateEventWithKeys, Room, RoomDisplayName, RoomHero, RoomInfoNotableUpdateReasons,
         RoomState, StateChanges, StateStore,
@@ -1528,6 +1562,7 @@ mod tests {
                 active_service_members: None,
             },
             members_synced: true,
+            members_missing_reason: RoomMembersMissingReason::Unknown,
             last_prev_batch: Some("pb".to_owned()),
             sync_info: SyncInfo::FullySynced,
             encryption_state_synced: true,

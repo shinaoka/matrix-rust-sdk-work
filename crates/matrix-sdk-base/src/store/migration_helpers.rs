@@ -106,6 +106,7 @@ impl RoomInfoV1 {
             notification_counts,
             summary,
             members_synced,
+            members_missing_reason: Default::default(),
             last_prev_batch,
             sync_info,
             encryption_state_synced,
