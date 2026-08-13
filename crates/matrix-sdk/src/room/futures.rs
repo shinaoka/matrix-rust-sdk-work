@@ -257,6 +257,12 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                         None
                     };
 
+                    // Issue #510: before the first room event consumes index
+                    // 0, run the bounded index-0 duplicate share. Never blocks
+                    // the send beyond the short deadline and never changes the
+                    // encrypted content.
+                    ensure_index0_duplicate_share(room).await?;
+
                     let olm = room.client.olm_machine().await;
                     let olm = olm.as_ref().expect("Olm machine wasn't started");
 
@@ -591,6 +597,53 @@ pub(crate) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
 
     room.preshare_room_key().await?;
 
+    Ok(())
+}
+
+/// Issue #510: bounded index-0 duplicate share before the first room event.
+///
+/// After the normal preshare settled, queue and send at most one duplicate
+/// standard `m.room_key` share while the outbound session is still at message
+/// index 0. The send is bounded by a short explicit deadline; a failed or
+/// timed-out duplicate never blocks the message and never downgrades its
+/// encryption. A homeserver acceptance is not a recipient decryption proof.
+#[cfg(feature = "e2e-encryption")]
+pub(crate) async fn ensure_index0_duplicate_share(room: &Room) -> Result<()> {
+    use matrix_sdk_base::crypto::{Index0ReshareDecision, Index0ReshareOutcome};
+
+    // Bounded so a stalled homeserver cannot degrade normal send latency; the
+    // duplicate is best-effort delivery hardening, not a send gate.
+    const INDEX0_RESHARE_DEADLINE: Duration = Duration::from_millis(1500);
+
+    // Opt-in (default off) so the SDK stays upstream-compatible; Koushi
+    // enables it through `ClientBuilder::with_index0_duplicate_share`.
+    if !room.client.index0_duplicate_share_enabled() {
+        return Ok(());
+    }
+
+    let decision = room.client.base_client().reshare_index0_once(room.room_id()).await?;
+    let Index0ReshareDecision::Queued { session_id, requests } = decision else {
+        return Ok(());
+    };
+    if requests.is_empty() {
+        return Ok(());
+    }
+
+    let outcome = tokio::time::timeout(INDEX0_RESHARE_DEADLINE, async {
+        for request in &requests {
+            let response = room.client.send_to_device(request).await?;
+            room.client.mark_request_as_sent(&request.txn_id, &response).await?;
+        }
+        Ok::<(), Error>(())
+    })
+    .await
+    .map(|result| match result {
+        Ok(()) => Index0ReshareOutcome::Sent,
+        Err(_) => Index0ReshareOutcome::Failed,
+    })
+    .unwrap_or(Index0ReshareOutcome::Deadline);
+
+    room.client.note_index0_reshare(room.room_id(), &session_id, outcome).await;
     Ok(())
 }
 

@@ -121,6 +121,7 @@ pub mod verification;
 pub use matrix_sdk_base::crypto::{
     CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, ForwardedRoomKeyAuthOutcome,
     IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
+    Index0InitialShareState, Index0ReshareDiagnostic, Index0ReshareOutcome,
     InitialShareDeviceClass, InitialShareDeviceDiagnostic, InitialShareSessionDiagnostic,
     InitialShareStage, KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError,
     OlmRecoveryCounters, OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome,
@@ -128,9 +129,9 @@ pub use matrix_sdk_base::crypto::{
     RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver,
     RoomKeyFirstShareOutcome, RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMergeDecision,
     RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
-    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState,
-    RoomKeyRequesterScope, RoomKeyRotationDiagnostic, RoomKeyRotationReason, RoomKeyWithheldContent,
-    RoomKeyWithheldEvent, SessionCreationError, SignatureError, VERSION,
+    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    RoomKeyRotationDiagnostic, RoomKeyRotationReason, RoomKeyWithheldContent, RoomKeyWithheldEvent,
+    SessionCreationError, SignatureError, VERSION,
     olm::{
         SessionCreationError as MegolmSessionCreationError,
         SessionExportError as OlmSessionExportError,
@@ -537,6 +538,11 @@ impl Client {
         self.base_client().olm_machine().await
     }
 
+    /// Whether the bounded index-0 duplicate share is enabled (issue #510).
+    pub(crate) fn index0_duplicate_share_enabled(&self) -> bool {
+        self.inner.index0_duplicate_share
+    }
+
     pub(crate) async fn mark_request_as_sent(
         &self,
         request_id: &TransactionId,
@@ -750,6 +756,19 @@ impl Client {
     pub(crate) async fn note_to_device_request_failed(&self, request_id: &TransactionId) {
         if let Some(machine) = self.olm_machine().await.as_ref() {
             machine.note_to_device_request_failed(request_id);
+        }
+    }
+
+    /// Report the send outcome of a queued index-0 duplicate share (issue
+    /// #510). Observation only.
+    pub(crate) async fn note_index0_reshare(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        outcome: matrix_sdk_base::crypto::Index0ReshareOutcome,
+    ) {
+        if let Some(machine) = self.olm_machine().await.as_ref() {
+            machine.note_index0_reshare(room_id, session_id, outcome);
         }
     }
 

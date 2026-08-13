@@ -27,10 +27,10 @@ use futures_util::Stream;
 use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
-    CollectStrategy, DecryptionSettings, DeviceData, EncryptionSettings, OlmError, OlmMachine,
-    RoomKeyReshareResult, RoomKeyReshareTarget, RoomKeyRotationReason, TrustRequirement,
-    UnwedgeReshareOutcome, store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
-    types::requests::ToDeviceRequest,
+    CollectStrategy, DecryptionSettings, DeviceData, EncryptionSettings, Index0ReshareDecision,
+    OlmError, OlmMachine, RoomKeyReshareResult, RoomKeyReshareTarget, RoomKeyRotationReason,
+    TrustRequirement, UnwedgeReshareOutcome, store::DynCryptoStore,
+    store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
 use ruma::DeviceId;
@@ -1073,6 +1073,19 @@ impl BaseClient {
         let (members, settings) = self.room_key_share_context(room_id).await?;
         match self.olm_machine().await.as_ref() {
             Some(o) => Ok(o.reshare_unwedged_room_key(room_id, &members, settings, device).await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Decide and queue the bounded index-0 duplicate share (issue #510),
+    /// re-evaluating recipient policy against the current member list.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn reshare_index0_once(&self, room_id: &RoomId) -> Result<Index0ReshareDecision> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(o) => Ok(o
+                .reshare_index0_once(room_id, members.iter().map(Deref::deref), settings)
+                .await?),
             None => panic!("Olm machine wasn't started"),
         }
     }

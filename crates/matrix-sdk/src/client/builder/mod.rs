@@ -126,6 +126,11 @@ pub struct ClientBuilder {
     decryption_settings: DecryptionSettings,
     #[cfg(feature = "e2e-encryption")]
     enable_share_history_on_invite: bool,
+    /// Whether to run the bounded index-0 duplicate share before the first
+    /// room event of a fresh outbound Megolm session (issue #510). Defaults to
+    /// off so SDK behavior stays upstream-compatible.
+    #[cfg(feature = "e2e-encryption")]
+    index0_duplicate_share: bool,
     cross_process_lock_config: CrossProcessLockConfig,
     threading_support: ThreadingSupport,
     #[cfg(feature = "experimental-search")]
@@ -161,6 +166,8 @@ impl ClientBuilder {
             },
             #[cfg(feature = "e2e-encryption")]
             enable_share_history_on_invite: true,
+            #[cfg(feature = "e2e-encryption")]
+            index0_duplicate_share: false,
             cross_process_lock_config: CrossProcessLockConfig::MultiProcess {
                 holder_name: Self::DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME.to_owned(),
             },
@@ -513,6 +520,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable the bounded index-0 duplicate share (issue #510): before the
+    /// first room event of a newly created outbound Megolm session, queue and
+    /// send at most one duplicate standard `m.room_key` share while the
+    /// session is still at message index 0.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn with_index0_duplicate_share(mut self, enabled: bool) -> Self {
+        self.index0_duplicate_share = enabled;
+        self
+    }
+
     /// Set the cross-process store locks holder name.
     ///
     /// The SDK provides cross-process store locks (see
@@ -660,6 +677,8 @@ impl ClientBuilder {
             self.encryption_settings,
             #[cfg(feature = "e2e-encryption")]
             self.enable_share_history_on_invite,
+            #[cfg(feature = "e2e-encryption")]
+            self.index0_duplicate_share,
             self.cross_process_lock_config,
             #[cfg(feature = "experimental-search")]
             search_index,
