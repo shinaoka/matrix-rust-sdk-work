@@ -48,14 +48,16 @@ use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 #[cfg(feature = "experimental-encrypted-state-events")]
 use crate::types::events::room::encrypted::RoomEncryptedEventContent;
 use crate::{
-    Device, DeviceData, EncryptionSettings, OlmError,
+    Device, DeviceData, EncryptionSettings, LocalTrust, OlmError,
     error::{EventError, MegolmResult, OlmResult},
     identities::device::MaybeEncryptedRoomKey,
     olm::{
         InboundGroupSession, OutboundGroupSession, OutboundGroupSessionEncryptionResult,
-        SenderData, SenderDataFinder, Session, ShareInfo, ShareState,
+        SenderData, SenderDataFinder, Session, ShareInfo, ShareState, StaticAccountData,
     },
-    room_key_diagnostics::{RoomKeyCreationOutcome, RoomKeyDiagnosticHub},
+    room_key_diagnostics::{
+        InitialShareDeviceClass, InitialShareStage, RoomKeyCreationOutcome, RoomKeyDiagnosticHub,
+    },
     store::{CryptoStoreWrapper, Result as StoreResult, Store, types::Changes},
     types::{
         events::{
@@ -202,6 +204,23 @@ impl GroupSessionCache {
         self.sessions_being_shared.write().remove(id)
     }
 
+    /// Find the outbound session that owns the given still-pending to-device
+    /// request (issue #509 failure diagnostics). Checks the being-shared map
+    /// first, then the active sessions.
+    pub(crate) fn find_request_owner(
+        &self,
+        id: &TransactionId,
+    ) -> Option<OutboundGroupSession> {
+        if let Some(session) = self.sessions_being_shared.read().get(id) {
+            return Some(session.clone());
+        }
+        self.sessions
+            .read()
+            .values()
+            .find(|session| session.pending_request_recipients(id).is_some())
+            .cloned()
+    }
+
     fn mark_as_being_shared(&self, id: OwnedTransactionId, session: OutboundGroupSession) {
         self.sessions_being_shared.write().insert(id, session);
     }
@@ -251,6 +270,35 @@ impl GroupSessionManager {
             return Ok(());
         };
 
+        // Issue #509: report the homeserver acceptance and the per-device
+        // share-state commit for every device whose key share this request
+        // carried, using the share index recorded at encryption time. A
+        // homeserver acceptance is never a recipient decryption proof.
+        let share_infos = session.pending_share_infos(request_id);
+        if let Some(share_infos) = share_infos {
+            for (user_id, devices) in &share_infos {
+                for (device_id, info) in devices {
+                    if let ShareInfo::Shared(shared) = info {
+                        let stage = InitialShareStage::ShareStateCommitted {
+                            message_index: shared.message_index,
+                        };
+                        for stage in
+                            [InitialShareStage::HomeserverAccepted, stage]
+                        {
+                            self.room_key_diagnostics.emit_initial_share_device(
+                                session.room_id(),
+                                session.session_id(),
+                                user_id,
+                                device_id,
+                                InitialShareDeviceClass::Unknown,
+                                stage,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let no_olm = session.mark_request_as_sent(request_id);
 
         let mut changes = Changes::default();
@@ -274,6 +322,30 @@ impl GroupSessionManager {
 
         changes.outbound_group_sessions.push(session.clone());
         self.store.save_changes(changes).await
+    }
+
+    /// Report a failed to-device send attempt for a still-pending room-key
+    /// request (issue #509). The request is not removed; a later retry that
+    /// the homeserver accepts still emits `HomeserverAccepted`.
+    pub(crate) fn note_to_device_request_failed(&self, request_id: &TransactionId) {
+        let Some(session) = self.sessions.find_request_owner(request_id) else {
+            return;
+        };
+        let Some(devices) = session.pending_request_recipients(request_id) else {
+            return;
+        };
+        let room_id = session.room_id().to_owned();
+        let session_id = session.session_id().to_owned();
+        for (user_id, device_id) in devices {
+            self.room_key_diagnostics.emit_initial_share_device(
+                &room_id,
+                &session_id,
+                &user_id,
+                &device_id,
+                InitialShareDeviceClass::Unknown,
+                InitialShareStage::RequestFailed,
+            );
+        }
     }
 
     #[cfg(test)]
@@ -302,6 +374,7 @@ impl GroupSessionManager {
             })
             .collect();
         self.room_key_diagnostics.emit_olm_recovery_signal(
+            Some((device.user_id(), device.device_id())),
             crate::room_key_diagnostics::OlmRecoverySignalOutcome::Observed,
         );
         room_ids
@@ -367,6 +440,7 @@ impl GroupSessionManager {
         }
         let outcome = UnwedgeReshareOutcome::Queued(outbound.pending_requests());
         self.room_key_diagnostics.emit_olm_recovery_reshare(
+            Some((device.user_id(), device.device_id())),
             crate::room_key_diagnostics::OlmRecoverySignalOutcome::Observed,
             1,
             crate::room_key_diagnostics::OlmRecoveryReshareOutcome::Queued,
@@ -385,11 +459,24 @@ impl GroupSessionManager {
 
         assert!(!session.expired(), "Session expired");
 
+        // Issue #509: report the first encrypted room event for the session
+        // with the pre-encryption message index and the pending-share state.
+        let session_id = session.session_id().to_owned();
+        let message_index = session.message_index().await;
+        let pending_requests = session.pending_requests().len();
+
         let result = session.encrypt(event_type, content).await;
 
         let mut changes = Changes::default();
         changes.outbound_group_sessions.push(session);
         self.store.save_changes(changes).await?;
+
+        self.room_key_diagnostics.emit_initial_share_session(
+            room_id,
+            &session_id,
+            message_index,
+            pending_requests,
+        );
 
         Ok(result)
     }
@@ -538,20 +625,16 @@ impl GroupSessionManager {
     /// See also [`encrypt_content_for_devices`] which is similar
     /// but is not specific to group sessions, and does not return the
     /// [`ShareInfo`] data.
+    #[allow(clippy::too_many_arguments)]
     async fn encrypt_session_for(
         store: Arc<CryptoStoreWrapper>,
         group_session: OutboundGroupSession,
         devices: Vec<DeviceData>,
+        room_key_diagnostics: RoomKeyDiagnosticHub,
     ) -> OlmResult<(
         EncryptForDevicesResult,
         BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, ShareInfo>>,
     )> {
-        // Use a named type instead of a tuple with rather long type name
-        pub struct DeviceResult {
-            device: DeviceData,
-            maybe_encrypted_room_key: MaybeEncryptedRoomKey,
-        }
-
         let mut result_builder = EncryptForDevicesResultBuilder::default();
         let mut share_infos = BTreeMap::new();
 
@@ -560,9 +643,9 @@ impl GroupSessionManager {
         let encrypt = |store: Arc<CryptoStoreWrapper>,
                        device: DeviceData,
                        session: OutboundGroupSession| async move {
-            let encryption_result = device.maybe_encrypt_room_key(store.as_ref(), session).await?;
+            let encryption_result = device.maybe_encrypt_room_key(store.as_ref(), session).await;
 
-            Ok::<_, OlmError>(DeviceResult { device, maybe_encrypted_room_key: encryption_result })
+            (device, encryption_result)
         };
 
         let tasks: Vec<_> = devices
@@ -573,21 +656,36 @@ impl GroupSessionManager {
         let results = join_all(tasks).await;
 
         for result in results {
-            let result = result.expect("Encryption task panicked")?;
+            let (device, encryption_result) = result.expect("Encryption task panicked");
 
-            match result.maybe_encrypted_room_key {
-                MaybeEncryptedRoomKey::Encrypted { used_session, share_info, message } => {
-                    result_builder.on_successful_encryption(&result.device, *used_session, message);
+            match encryption_result {
+                Ok(MaybeEncryptedRoomKey::Encrypted { used_session, share_info, message }) => {
+                    result_builder.on_successful_encryption(&device, *used_session, message);
 
-                    let user_id = result.device.user_id().to_owned();
-                    let device_id = result.device.device_id().to_owned();
+                    let user_id = device.user_id().to_owned();
+                    let device_id = device.device_id().to_owned();
                     share_infos
                         .entry(user_id)
                         .or_insert_with(BTreeMap::new)
                         .insert(device_id, *share_info);
                 }
-                MaybeEncryptedRoomKey::MissingSession => {
-                    result_builder.on_missing_session(result.device);
+                Ok(MaybeEncryptedRoomKey::MissingSession) => {
+                    result_builder.on_missing_session(device);
+                }
+                Err(error) => {
+                    // Issue #509: report the exact device whose Olm encryption
+                    // failed, then propagate the error exactly as before (the
+                    // whole batch still aborts). The device class was cached by
+                    // the `Eligible` emission in `share_room_key`.
+                    room_key_diagnostics.emit_initial_share_device(
+                        group_session.room_id(),
+                        group_session.session_id(),
+                        device.user_id(),
+                        device.device_id(),
+                        InitialShareDeviceClass::Unknown,
+                        InitialShareStage::OlmEncryptionFailed,
+                    );
+                    return Err(error);
                 }
             }
         }
@@ -616,9 +714,15 @@ impl GroupSessionManager {
         chunk: Vec<DeviceData>,
         outbound: OutboundGroupSession,
         sessions: GroupSessionCache,
+        room_key_diagnostics: RoomKeyDiagnosticHub,
     ) -> OlmResult<(Vec<Session>, Vec<(DeviceData, WithheldCode)>)> {
-        let (result, share_infos) =
-            Self::encrypt_session_for(store, outbound.clone(), chunk).await?;
+        let (result, share_infos) = Self::encrypt_session_for(
+            store,
+            outbound.clone(),
+            chunk,
+            room_key_diagnostics,
+        )
+        .await?;
 
         if let Some(request) = result.to_device_request {
             let id = request.txn_id.clone();
@@ -719,6 +823,7 @@ impl GroupSessionManager {
                     chunk.to_vec(),
                     group_session.clone(),
                     self.sessions.clone(),
+                    self.room_key_diagnostics.clone(),
                 ))
             })
             .collect();
@@ -979,6 +1084,32 @@ impl GroupSessionManager {
             })
             .collect();
 
+        // Issue #509: report the eligible device set selected by policy.
+        for device in &devices {
+            self.room_key_diagnostics.emit_initial_share_device(
+                room_id,
+                outbound.session_id(),
+                device.user_id(),
+                device.device_id(),
+                initial_share_device_class(&account, device),
+                InitialShareStage::Eligible,
+            );
+        }
+        // Issue #509: report devices withheld by recipient policy.
+        for (device, _code) in &withheld_devices {
+            self.room_key_diagnostics.emit_initial_share_device(
+                room_id,
+                outbound.session_id(),
+                device.user_id(),
+                device.device_id(),
+                initial_share_device_class(&account, device),
+                InitialShareStage::Withheld,
+            );
+        }
+
+        let previous_request_ids =
+            outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
+
         // The `encrypt_for_devices()` method adds the to-device requests that will send
         // out the room key to the `OutboundGroupSession`. It doesn't do that
         // for the m.room_key_withheld events since we might have more of those
@@ -986,6 +1117,19 @@ impl GroupSessionManager {
         // returned by the method.
         let unable_to_encrypt_devices =
             self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+
+        // Issue #509: report devices that had no Olm session (the SDK claims a
+        // one-time key and queues an `m.no_olm` withheld notice).
+        for (device, _code) in &unable_to_encrypt_devices {
+            self.room_key_diagnostics.emit_initial_share_device(
+                room_id,
+                outbound.session_id(),
+                device.user_id(),
+                device.device_id(),
+                initial_share_device_class(&account, device),
+                InitialShareStage::OlmMissing,
+            );
+        }
 
         // Merge the withheld recipients.
         withheld_devices.extend(unable_to_encrypt_devices);
@@ -998,6 +1142,41 @@ impl GroupSessionManager {
         // way we're making sure that they are persisted and scoped to the
         // session.
         let requests = outbound.pending_requests();
+
+        // Issue #509: report the Olm-encrypted key and the queued to-device
+        // request per device for the newly created `m.room_key` requests only.
+        for request in requests
+            .iter()
+            .filter(|request| {
+                !previous_request_ids.contains(&request.txn_id)
+                    && request.event_type.to_string() == "m.room.encrypted"
+            })
+        {
+            for (user_id, devices) in &request.messages {
+                for device_id in devices.keys() {
+                    let device_id = match device_id {
+                        DeviceIdOrAllDevices::DeviceId(device_id) => device_id,
+                        DeviceIdOrAllDevices::AllDevices => continue,
+                    };
+                    self.room_key_diagnostics.emit_initial_share_device(
+                        room_id,
+                        outbound.session_id(),
+                        user_id,
+                        device_id,
+                        InitialShareDeviceClass::Unknown,
+                        InitialShareStage::OlmEncrypted,
+                    );
+                    self.room_key_diagnostics.emit_initial_share_device(
+                        room_id,
+                        outbound.session_id(),
+                        user_id,
+                        device_id,
+                        InitialShareDeviceClass::Unknown,
+                        InitialShareStage::RequestQueued,
+                    );
+                }
+            }
+        }
 
         if requests.is_empty() {
             if !outbound.shared() {
@@ -1350,6 +1529,25 @@ fn recipient_list_to_users_and_devices(
         acc.entry(d.user_id()).or_insert_with(BTreeSet::new).insert(d.device_id());
         acc
     })
+}
+
+/// Closed device-policy class for initial-share diagnostics (issue #509).
+fn initial_share_device_class(
+    account: &StaticAccountData,
+    device: &DeviceData,
+) -> InitialShareDeviceClass {
+    use InitialShareDeviceClass as Class;
+    if device.is_dehydrated() {
+        return Class::Dehydrated;
+    }
+    let own = device.user_id() == account.user_id;
+    let verified = device.local_trust_state() == LocalTrust::Verified;
+    match (own, verified) {
+        (true, true) => Class::VerifiedOwn,
+        (true, false) => Class::UnverifiedOwn,
+        (false, true) => Class::VerifiedPeer,
+        (false, false) => Class::UnverifiedPeer,
+    }
 }
 
 #[cfg(test)]

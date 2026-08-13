@@ -121,15 +121,16 @@ pub mod verification;
 pub use matrix_sdk_base::crypto::{
     CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, ForwardedRoomKeyAuthOutcome,
     IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
-    KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError, OlmRecoveryCounters,
-    OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome,
-    RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
-    RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
-    RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters,
-    RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
-    RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
-    RoomKeyRotationDiagnostic, RoomKeyRotationReason, RoomKeyWithheldContent, RoomKeyWithheldEvent,
-    SessionCreationError, SignatureError, VERSION,
+    InitialShareDeviceClass, InitialShareDeviceDiagnostic, InitialShareSessionDiagnostic,
+    InitialShareStage, KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError,
+    OlmRecoveryCounters, OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome,
+    OlmRecoverySignalOutcome, RequestedRoomKeySession, RoomKeyCreationOutcome,
+    RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver,
+    RoomKeyFirstShareOutcome, RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMergeDecision,
+    RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
+    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState,
+    RoomKeyRequesterScope, RoomKeyRotationDiagnostic, RoomKeyRotationReason, RoomKeyWithheldContent,
+    RoomKeyWithheldEvent, SessionCreationError, SignatureError, VERSION,
     olm::{
         SessionCreationError as MegolmSessionCreationError,
         SessionExportError as OlmSessionExportError,
@@ -729,13 +730,27 @@ impl Client {
         &self,
         request: &ToDeviceRequest,
     ) -> HttpResult<ToDeviceResponse> {
+        let txn_id = request.txn_id.clone();
         let request = RumaToDeviceRequest::new_raw(
             request.event_type.clone(),
             request.txn_id.clone(),
             request.messages.clone(),
         );
 
-        self.send(request).await
+        let result = self.send(request).await;
+        if result.is_err() {
+            // Issue #509: report the failed to-device attempt through the
+            // crypto diagnostics. The request stays pending and may be
+            // retried; observation only.
+            self.note_to_device_request_failed(&txn_id).await;
+        }
+        result
+    }
+
+    pub(crate) async fn note_to_device_request_failed(&self, request_id: &TransactionId) {
+        if let Some(machine) = self.olm_machine().await.as_ref() {
+            machine.note_to_device_request_failed(request_id);
+        }
     }
 
     pub(crate) async fn send_verification_request(

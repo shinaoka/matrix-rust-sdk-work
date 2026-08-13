@@ -9,7 +9,7 @@
 //! process-local ordinals owned by one [`OlmMachine`](crate::OlmMachine).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
@@ -267,6 +267,11 @@ pub enum RoomKeyDiagnosticEvent {
     Receive(RoomKeyReceiveDiagnostic),
     /// Post-unwedge recovery re-share outcome (issue #477).
     OlmRecovery(OlmRecoveryDiagnostic),
+    /// Per-device initial-share lifecycle stage (issue #509).
+    InitialShare(InitialShareDeviceDiagnostic),
+    /// Session-scoped initial-share summary at first event encryption (issue
+    /// #509).
+    InitialShareSession(InitialShareSessionDiagnostic),
 }
 
 /// The kind of incoming encrypted room-key event, once the decrypted payload
@@ -390,6 +395,108 @@ pub struct OlmRecoveryDiagnostic {
     pub reshare: Option<OlmRecoveryReshareOutcome>,
     /// Matching active outbound-session count bucket.
     pub matching_sessions_bucket: u8,
+    /// Anonymous device correlation (issue #509). Present when the signal or
+    /// re-share is tied to one device; matches the device alias used by the
+    /// initial-share diagnostics.
+    pub device: Option<RoomKeyDiagnosticAlias>,
+}
+
+/// Device-policy class for initial-share diagnostics (issue #509).
+///
+/// A closed token describing how the device was classified by the sharing
+/// policy. It never contains identifiers or key material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialShareDeviceClass {
+    /// A verified device belonging to this account.
+    VerifiedOwn,
+    /// An unverified device belonging to this account.
+    UnverifiedOwn,
+    /// A verified device belonging to another account.
+    VerifiedPeer,
+    /// An unverified device belonging to another account.
+    UnverifiedPeer,
+    /// A dehydrated device (excluded from sharing).
+    Dehydrated,
+    /// The class could not be established safely.
+    Unknown,
+}
+
+/// Per-device lifecycle stage of the initial room-key share (issue #509).
+///
+/// Stages are closed tokens; a device may observe several stages in order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialShareStage {
+    /// Policy selected this device as an eligible recipient.
+    Eligible,
+    /// No Olm session was available, so a one-time-key claim was needed and
+    /// an `m.no_olm` withheld notice was queued.
+    OlmMissing,
+    /// The room key was successfully encrypted with Olm for this device.
+    OlmEncrypted,
+    /// Olm encryption for this device failed.
+    OlmEncryptionFailed,
+    /// The device was withheld by recipient policy.
+    Withheld,
+    /// The to-device request carrying the key was queued.
+    RequestQueued,
+    /// The homeserver accepted the to-device request. This is not a
+    /// recipient-side decryption acknowledgement.
+    HomeserverAccepted,
+    /// A to-device send attempt failed. The request may be retried and later
+    /// reach [`InitialShareStage::HomeserverAccepted`].
+    RequestFailed,
+    /// The device's share-state was committed for the session at the given
+    /// Megolm message index.
+    ShareStateCommitted {
+        /// The message index at which the key was shared with the device.
+        message_index: u32,
+    },
+}
+
+/// A typed, privacy-safe per-device initial-share diagnostic (issue #509).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialShareDeviceDiagnostic {
+    /// Anonymous session correlation.
+    pub session: RoomKeyDiagnosticAlias,
+    /// Anonymous device correlation, stable across initial share, unwedge
+    /// re-share, and `m.room_key_request` diagnostics for this runtime.
+    pub device: RoomKeyDiagnosticAlias,
+    /// Device-policy class.
+    pub device_class: InitialShareDeviceClass,
+    /// Lifecycle stage reached.
+    pub stage: InitialShareStage,
+    /// Time since this session's initial share was first observed.
+    pub elapsed_ms: u64,
+}
+
+/// A typed, privacy-safe session-scoped initial-share summary (issue #509),
+/// emitted once when the first room event is encrypted for the session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialShareSessionDiagnostic {
+    /// Anonymous session correlation.
+    pub session: RoomKeyDiagnosticAlias,
+    /// Message index of the first encrypted room event.
+    pub first_event_message_index: u32,
+    /// Whether every eligible initial share had settled (no pending to-device
+    /// requests) before the first event was encrypted.
+    pub all_initial_shares_settled_first: bool,
+    /// Pending to-device request count bucket at first-event time.
+    pub pending_requests_bucket: u8,
+    /// Number of eligible own devices.
+    pub eligible_own_devices: u32,
+    /// Number of eligible peer devices.
+    pub eligible_peer_devices: u32,
+    /// Devices whose share-state was committed at message index 0.
+    pub index0_shares_committed: u32,
+    /// Devices whose share-state was committed after index 0.
+    pub after_index0_shares_committed: u32,
+    /// Devices whose to-device request was accepted by the homeserver.
+    pub homeserver_accepted_devices: u32,
+    /// Whether the session was at message index 0 when first shared (true
+    /// when no committed share contradicts it).
+    pub created_at_index0: bool,
+    /// Time since this session's initial share was first observed.
+    pub elapsed_ms: u64,
 }
 
 /// Aggregate privacy-safe counters for receive-side room-key handling.
@@ -562,6 +669,24 @@ struct RoomKeyDiagnosticState {
     next_device: u64,
     receive_counters: RoomKeyReceiveCounters,
     olm_recovery_counters: OlmRecoveryCounters,
+    /// Device-policy class observed at initial-share eligibility (issue #509).
+    device_classes: BTreeMap<RoomKeyDiagnosticAlias, InitialShareDeviceClass>,
+    /// Per-session initial-share tallies (issue #509).
+    initial_shares: BTreeMap<(String, String), InitialShareState>,
+}
+
+/// Per-session initial-share tally (issue #509).
+#[derive(Default)]
+struct InitialShareState {
+    first_seen: Option<Instant>,
+    eligible_own: u32,
+    eligible_peer: u32,
+    eligible_devices: BTreeSet<RoomKeyDiagnosticAlias>,
+    index0_committed: u32,
+    after0_committed: u32,
+    min_committed_index: Option<u32>,
+    accepted_devices: BTreeSet<RoomKeyDiagnosticAlias>,
+    first_event_reported: bool,
 }
 
 struct RequestDiagnosticState {
@@ -594,7 +719,11 @@ impl RoomKeyDiagnosticHub {
 
     /// Record a post-unwedge recovery signal outcome (issue #477): update the
     /// matching aggregate counter and notify the observer.
-    pub(crate) fn emit_olm_recovery_signal(&self, outcome: OlmRecoverySignalOutcome) {
+    pub(crate) fn emit_olm_recovery_signal(
+        &self,
+        device: Option<(&UserId, &DeviceId)>,
+        outcome: OlmRecoverySignalOutcome,
+    ) {
         let (observer, event) = {
             let mut state = lock(&self.0);
             match outcome {
@@ -615,6 +744,9 @@ impl RoomKeyDiagnosticHub {
                     signal: outcome,
                     reshare: None,
                     matching_sessions_bucket: 0,
+                    device: device.map(|(user_id, device_id)| {
+                        device_alias(&mut state, user_id, device_id)
+                    }),
                 },
             )
         };
@@ -626,6 +758,7 @@ impl RoomKeyDiagnosticHub {
     /// Record a post-unwedge per-room re-share outcome (issue #477).
     pub(crate) fn emit_olm_recovery_reshare(
         &self,
+        device: Option<(&UserId, &DeviceId)>,
         signal: OlmRecoverySignalOutcome,
         matching_sessions: usize,
         reshare: OlmRecoveryReshareOutcome,
@@ -656,11 +789,128 @@ impl RoomKeyDiagnosticHub {
                     signal,
                     reshare: Some(reshare),
                     matching_sessions_bucket: matching_bucket_token(matching_sessions),
+                    device: device.map(|(user_id, device_id)| {
+                        device_alias(&mut state, user_id, device_id)
+                    }),
                 },
             )
         };
         if let Some(observer) = observer {
             observer(RoomKeyDiagnosticEvent::OlmRecovery(event));
+        }
+    }
+
+    /// Record a per-device initial-share lifecycle stage (issue #509):
+    /// increment nothing here (aggregates live on the Koushi side), cache the
+    /// device-policy class, and notify the observer.
+    pub(crate) fn emit_initial_share_device(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        user_id: &UserId,
+        device_id: &DeviceId,
+        device_class: InitialShareDeviceClass,
+        stage: InitialShareStage,
+    ) {
+        let (observer, event) = {
+            let mut state = lock(&self.0);
+            let session = session_alias(&mut state, room_id, session_id);
+            let device = device_alias(&mut state, user_id, device_id);
+            // Callers without `DeviceData` pass `Unknown`; fall back to the
+            // class cached by the `Eligible` emission for this device.
+            let device_class = if device_class == InitialShareDeviceClass::Unknown {
+                state.device_classes.get(&device).copied().unwrap_or(InitialShareDeviceClass::Unknown)
+            } else {
+                state.device_classes.insert(device, device_class);
+                device_class
+            };
+            let tally = state.initial_shares.entry((room_id.as_str().to_owned(), session_id.to_owned())).or_default();
+            if tally.first_seen.is_none() {
+                tally.first_seen = Some(Instant::now());
+            }
+            match stage {
+                InitialShareStage::Eligible => match device_class {
+                    InitialShareDeviceClass::VerifiedOwn | InitialShareDeviceClass::UnverifiedOwn => {
+                        if tally.eligible_devices.insert(device) {
+                            tally.eligible_own += 1;
+                        }
+                    }
+                    InitialShareDeviceClass::VerifiedPeer | InitialShareDeviceClass::UnverifiedPeer => {
+                        if tally.eligible_devices.insert(device) {
+                            tally.eligible_peer += 1;
+                        }
+                    }
+                    InitialShareDeviceClass::Dehydrated | InitialShareDeviceClass::Unknown => {}
+                },
+                InitialShareStage::ShareStateCommitted { message_index } => {
+                    tally.min_committed_index =
+                        Some(tally.min_committed_index.map_or(message_index, |min| min.min(message_index)));
+                    if message_index == 0 {
+                        tally.index0_committed += 1;
+                    } else {
+                        tally.after0_committed += 1;
+                    }
+                }
+                InitialShareStage::HomeserverAccepted => {
+                    tally.accepted_devices.insert(device);
+                }
+                _ => {}
+            }
+            let elapsed_ms = tally
+                .first_seen
+                .map(|first| first.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+            (
+                state.observer.clone(),
+                InitialShareDeviceDiagnostic { session, device, device_class, stage, elapsed_ms },
+            )
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::InitialShare(event));
+        }
+    }
+
+    /// Record the session-scoped initial-share summary (issue #509). Emitted
+    /// at most once per session, when its first room event is encrypted.
+    pub(crate) fn emit_initial_share_session(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        first_event_message_index: u32,
+        pending_requests: usize,
+    ) {
+        let (observer, event) = {
+            let mut state = lock(&self.0);
+            let session = session_alias(&mut state, room_id, session_id);
+            let tally = state.initial_shares.entry((room_id.as_str().to_owned(), session_id.to_owned())).or_default();
+            if tally.first_seen.is_none() {
+                tally.first_seen = Some(Instant::now());
+            }
+            if tally.first_event_reported {
+                return;
+            }
+            tally.first_event_reported = true;
+            let elapsed_ms = tally
+                .first_seen
+                .map(|first| first.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+            let event = InitialShareSessionDiagnostic {
+                session,
+                first_event_message_index,
+                all_initial_shares_settled_first: pending_requests == 0,
+                pending_requests_bucket: matching_bucket_token(pending_requests),
+                eligible_own_devices: tally.eligible_own,
+                eligible_peer_devices: tally.eligible_peer,
+                index0_shares_committed: tally.index0_committed,
+                after_index0_shares_committed: tally.after0_committed,
+                homeserver_accepted_devices: tally.accepted_devices.len() as u32,
+                created_at_index0: tally.min_committed_index.is_none_or(|index| index == 0),
+                elapsed_ms,
+            };
+            (state.observer.clone(), event)
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::InitialShareSession(event));
         }
     }
 
@@ -1126,5 +1376,202 @@ mod tests {
         assert!(!debug.contains("PRIVATE"));
         assert!(!debug.contains("@"));
         assert!(!debug.contains("!"));
+    }
+
+    #[test]
+    fn initial_share_stages_are_distinct_and_never_expose_identifiers() {
+        let hub = RoomKeyDiagnosticHub::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        hub.set_observer(Some(Arc::new(move |event| lock(&captured).push(event))));
+
+        let room = room_id!("!private-room:example.invalid");
+        let user = user_id!("@private-user:example.invalid");
+        let device = device_id!("PRIVATE-DEVICE");
+        let stages = [
+            InitialShareStage::Eligible,
+            InitialShareStage::OlmMissing,
+            InitialShareStage::OlmEncrypted,
+            InitialShareStage::OlmEncryptionFailed,
+            InitialShareStage::Withheld,
+            InitialShareStage::RequestQueued,
+            InitialShareStage::HomeserverAccepted,
+            InitialShareStage::RequestFailed,
+            InitialShareStage::ShareStateCommitted { message_index: 0 },
+            InitialShareStage::ShareStateCommitted { message_index: 3 },
+        ];
+        for stage in stages {
+            hub.emit_initial_share_device(
+                room,
+                "PRIVATE-SESSION",
+                user,
+                device,
+                InitialShareDeviceClass::VerifiedPeer,
+                stage,
+            );
+        }
+
+        let captured = lock(&events);
+        let device_events: Vec<_> = captured
+            .iter()
+            .filter_map(|event| match event {
+                RoomKeyDiagnosticEvent::InitialShare(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(device_events.len(), stages.len());
+        for (event, stage) in device_events.iter().zip(stages.iter()) {
+            assert_eq!(&event.stage, stage);
+            assert_eq!(event.device_class, InitialShareDeviceClass::VerifiedPeer);
+            assert_eq!(event.session, device_events[0].session);
+            assert_eq!(event.device, device_events[0].device);
+        }
+
+        let debug = format!("{:?}", captured);
+        for private in [
+            "private-user",
+            "PRIVATE-DEVICE",
+            "PRIVATE-SESSION",
+            "private-room",
+            "example.invalid",
+            "@",
+            "!",
+        ] {
+            assert!(!debug.contains(private), "privacy leak: {private}");
+        }
+    }
+
+    #[test]
+    fn initial_share_session_record_aggregates_device_stages() {
+        let hub = RoomKeyDiagnosticHub::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        hub.set_observer(Some(Arc::new(move |event| lock(&captured).push(event))));
+
+        let room = room_id!("!private-room:example.invalid");
+        let own = user_id!("@own:example.invalid");
+        let peer = user_id!("@peer:example.invalid");
+
+        // One own device and one peer device are eligible.
+        hub.emit_initial_share_device(
+            room,
+            "PRIVATE-SESSION",
+            own,
+            device_id!("OWN-DEVICE"),
+            InitialShareDeviceClass::VerifiedOwn,
+            InitialShareStage::Eligible,
+        );
+        hub.emit_initial_share_device(
+            room,
+            "PRIVATE-SESSION",
+            peer,
+            device_id!("PEER-DEVICE"),
+            InitialShareDeviceClass::VerifiedPeer,
+            InitialShareStage::Eligible,
+        );
+        // One peer device commits at index 0 and one at index 2; the own
+        // device's request is homeserver-accepted.
+        hub.emit_initial_share_device(
+            room,
+            "PRIVATE-SESSION",
+            peer,
+            device_id!("PEER-DEVICE"),
+            InitialShareDeviceClass::Unknown,
+            InitialShareStage::HomeserverAccepted,
+        );
+        hub.emit_initial_share_device(
+            room,
+            "PRIVATE-SESSION",
+            peer,
+            device_id!("PEER-DEVICE"),
+            InitialShareDeviceClass::Unknown,
+            InitialShareStage::ShareStateCommitted { message_index: 0 },
+        );
+        hub.emit_initial_share_device(
+            room,
+            "PRIVATE-SESSION",
+            peer,
+            device_id!("PEER-DEVICE-2"),
+            InitialShareDeviceClass::Unknown,
+            InitialShareStage::ShareStateCommitted { message_index: 2 },
+        );
+        hub.emit_initial_share_device(
+            room,
+            "PRIVATE-SESSION",
+            own,
+            device_id!("OWN-DEVICE"),
+            InitialShareDeviceClass::Unknown,
+            InitialShareStage::HomeserverAccepted,
+        );
+
+        hub.emit_initial_share_session(room, "PRIVATE-SESSION", 0, 0);
+        hub.emit_initial_share_session(room, "PRIVATE-SESSION", 5, 1);
+
+        let captured = lock(&events);
+        let sessions: Vec<_> = captured
+            .iter()
+            .filter_map(|event| match event {
+                RoomKeyDiagnosticEvent::InitialShareSession(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sessions.len(), 1, "the session summary must be emitted at most once");
+        let session = sessions[0];
+        assert_eq!(session.first_event_message_index, 0);
+        assert!(session.all_initial_shares_settled_first);
+        assert_eq!(session.eligible_own_devices, 1);
+        assert_eq!(session.eligible_peer_devices, 1);
+        assert_eq!(session.index0_shares_committed, 1);
+        assert_eq!(session.after_index0_shares_committed, 1);
+        assert_eq!(session.homeserver_accepted_devices, 2);
+        assert!(session.created_at_index0);
+
+        // A second summary for the same session is never emitted, and the
+        // debug output stays free of identifiers.
+        let debug = format!("{:?}", captured);
+        for private in ["private-user", "PRIVATE-SESSION", "private-room", "@", "!"] {
+            assert!(!debug.contains(private), "privacy leak: {private}");
+        }
+    }
+
+    #[test]
+    fn initial_share_class_falls_back_to_the_eligible_class() {
+        let hub = RoomKeyDiagnosticHub::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        hub.set_observer(Some(Arc::new(move |event| lock(&captured).push(event))));
+
+        let room = room_id!("!private-room:example.invalid");
+        let user = user_id!("@private-user:example.invalid");
+        let device = device_id!("PRIVATE-DEVICE");
+        hub.emit_initial_share_device(
+            room,
+            "PRIVATE-SESSION",
+            user,
+            device,
+            InitialShareDeviceClass::UnverifiedPeer,
+            InitialShareStage::Eligible,
+        );
+        // Later stages are emitted without a `DeviceData`; the class must be
+        // preserved from the `Eligible` emission.
+        hub.emit_initial_share_device(
+            room,
+            "PRIVATE-SESSION",
+            user,
+            device,
+            InitialShareDeviceClass::Unknown,
+            InitialShareStage::HomeserverAccepted,
+        );
+
+        let captured = lock(&events);
+        let device_events: Vec<_> = captured
+            .iter()
+            .filter_map(|event| match event {
+                RoomKeyDiagnosticEvent::InitialShare(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(device_events.len(), 2);
+        assert_eq!(device_events[1].device_class, InitialShareDeviceClass::UnverifiedPeer);
     }
 }

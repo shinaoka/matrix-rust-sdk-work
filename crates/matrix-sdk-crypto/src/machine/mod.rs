@@ -1424,6 +1424,13 @@ impl OlmMachine {
         self.inner.room_key_diagnostics.olm_recovery_counters()
     }
 
+    /// Report a failed to-device send attempt for a still-pending room-key
+    /// request (issue #509). Observation only; the request stays pending and
+    /// a later accepted retry still reports `HomeserverAccepted`.
+    pub fn note_to_device_request_failed(&self, request_id: &TransactionId) {
+        self.inner.group_session_manager.note_to_device_request_failed(request_id);
+    }
+
     /// Get to-device requests to share a room key with users in a room.
     ///
     /// # Arguments
@@ -1979,14 +1986,14 @@ impl OlmMachine {
                             decrypted.result.sender_key,
                         ));
                 }
-                Ok(Some(_)) => self
-                    .inner
-                    .room_key_diagnostics
-                    .emit_olm_recovery_signal(OlmRecoverySignalOutcome::IgnoredDehydrated),
-                _ => self
-                    .inner
-                    .room_key_diagnostics
-                    .emit_olm_recovery_signal(OlmRecoverySignalOutcome::IgnoredUnknownDevice),
+                Ok(Some(device)) => self.inner.room_key_diagnostics.emit_olm_recovery_signal(
+                    Some((device.user_id(), device.device_id())),
+                    OlmRecoverySignalOutcome::IgnoredDehydrated,
+                ),
+                _ => self.inner.room_key_diagnostics.emit_olm_recovery_signal(
+                    None,
+                    OlmRecoverySignalOutcome::IgnoredUnknownDevice,
+                ),
             }
         }
 

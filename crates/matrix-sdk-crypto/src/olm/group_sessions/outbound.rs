@@ -38,6 +38,7 @@ use ruma::{
         },
     },
     serde::Raw,
+    to_device::DeviceIdOrAllDevices,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -814,6 +815,37 @@ impl OutboundGroupSession {
     /// Get the list of request ids this session is waiting for to be sent out.
     pub(crate) fn pending_request_ids(&self) -> Vec<OwnedTransactionId> {
         self.to_share_with_set.read().keys().cloned().collect()
+    }
+
+    /// Read the per-device share infos of a still-pending request (issue
+    /// #509). Returns `None` when the request is no longer pending.
+    pub(crate) fn pending_share_infos(
+        &self,
+        request_id: &TransactionId,
+    ) -> Option<ShareInfoSet> {
+        self.to_share_with_set.read().get(request_id).map(|(_, infos)| infos.clone())
+    }
+
+    /// List the user/device recipients of a still-pending request (issue
+    /// #509). Returns `None` when the request is no longer pending.
+    pub(crate) fn pending_request_recipients(
+        &self,
+        request_id: &TransactionId,
+    ) -> Option<Vec<(OwnedUserId, OwnedDeviceId)>> {
+        self.to_share_with_set.read().get(request_id).map(|(request, _)| {
+            request
+                .messages
+                .iter()
+                .flat_map(|(user_id, devices)| {
+                    devices.keys().filter_map(|device_id| match device_id {
+                        DeviceIdOrAllDevices::DeviceId(device_id) => {
+                            Some((user_id.clone(), device_id.clone()))
+                        }
+                        DeviceIdOrAllDevices::AllDevices => None,
+                    })
+                })
+                .collect()
+        })
     }
 
     /// Restore a Session from a previously pickled string.
