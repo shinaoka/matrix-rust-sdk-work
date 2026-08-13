@@ -765,7 +765,7 @@ impl Client {
         &self,
         room_id: &RoomId,
         session_id: &str,
-        outcome: matrix_sdk_base::crypto::Index0ReshareOutcome,
+        outcome: Index0ReshareOutcome,
     ) {
         if let Some(machine) = self.olm_machine().await.as_ref() {
             machine.note_index0_reshare(room_id, session_id, outcome);
