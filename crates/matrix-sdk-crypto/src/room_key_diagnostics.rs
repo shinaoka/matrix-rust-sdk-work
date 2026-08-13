@@ -21,6 +21,12 @@ use ruma::{DeviceId, RoomId, TransactionId, UserId};
 pub struct RoomKeyDiagnosticAlias(u64);
 
 impl RoomKeyDiagnosticAlias {
+    /// Create an alias from an explicit process-local ordinal. Used by
+    /// diagnostics consumers that mirror SDK events in tests.
+    pub const fn new(ordinal: u64) -> Self {
+        Self(ordinal)
+    }
+
     /// Return the anonymous ordinal. This number has meaning only for the
     /// lifetime of the current crypto machine.
     pub fn ordinal(self) -> u64 {
