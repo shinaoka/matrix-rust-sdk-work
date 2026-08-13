@@ -10,7 +10,9 @@ use matrix_sdk::{
     test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory, test_json};
-use ruma::{RoomVersionId, device_id, events::room::message::RoomMessageEventContent, room_id, user_id};
+use ruma::{
+    RoomVersionId, device_id, events::room::message::RoomMessageEventContent, room_id, user_id,
+};
 use wiremock::{
     Mock, Request, ResponseTemplate,
     matchers::{method, path_regex},
@@ -55,10 +57,7 @@ async fn setup_encrypted_room()
         .on_builder(|builder| builder.with_index0_duplicate_share(true))
         .build()
         .await;
-    let bob = server
-        .client_builder_for_crypto_end_to_end(bob_user_id, bob_device_id)
-        .build()
-        .await;
+    let bob = server.client_builder_for_crypto_end_to_end(bob_user_id, bob_device_id).build().await;
     server.exchange_e2ee_identities(&alice, &bob).await;
 
     let room_id = room_id!("!test:example.org");

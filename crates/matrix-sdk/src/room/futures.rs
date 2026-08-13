@@ -621,7 +621,15 @@ pub(crate) async fn ensure_index0_duplicate_share(room: &Room) -> Result<()> {
         return Ok(());
     }
 
-    let decision = room.client.base_client().reshare_index0_once(room.room_id()).await?;
+    // The duplicate is best-effort delivery hardening, not a send gate: a
+    // decision error must never fail or block the user's message.
+    let decision = match room.client.base_client().reshare_index0_once(room.room_id()).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            tracing::warn!(error = ?error, "index-0 duplicate share decision failed; continuing");
+            return Ok(());
+        }
+    };
     let Index0ReshareDecision::Queued { session_id, requests } = decision else {
         return Ok(());
     };
