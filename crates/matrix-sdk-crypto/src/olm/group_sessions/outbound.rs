@@ -819,10 +819,7 @@ impl OutboundGroupSession {
 
     /// Read the per-device share infos of a still-pending request (issue
     /// #509). Returns `None` when the request is no longer pending.
-    pub(crate) fn pending_share_infos(
-        &self,
-        request_id: &TransactionId,
-    ) -> Option<ShareInfoSet> {
+    pub(crate) fn pending_share_infos(&self, request_id: &TransactionId) -> Option<ShareInfoSet> {
         self.to_share_with_set.read().get(request_id).map(|(_, infos)| infos.clone())
     }
 

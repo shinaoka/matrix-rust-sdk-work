@@ -278,6 +278,8 @@ pub enum RoomKeyDiagnosticEvent {
     /// Session-scoped initial-share summary at first event encryption (issue
     /// #509).
     InitialShareSession(InitialShareSessionDiagnostic),
+    /// Bounded index-0 duplicate-share record (issue #510).
+    Index0Reshare(Index0ReshareDiagnostic),
 }
 
 /// The kind of incoming encrypted room-key event, once the decrypted payload
@@ -505,6 +507,57 @@ pub struct InitialShareSessionDiagnostic {
     pub elapsed_ms: u64,
 }
 
+/// Closed state of the initial index-0 share at the duplicate-share decision
+/// point (issue #510).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Index0InitialShareState {
+    /// Every eligible device settled its index-0 share.
+    Accepted,
+    /// Some eligible device did not settle (pending or failed).
+    Failed,
+    /// Every eligible device was withheld by policy.
+    Withheld,
+    /// No eligible recipient existed.
+    NoRecipients,
+}
+
+/// Closed outcome of the bounded index-0 duplicate share (issue #510).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Index0ReshareOutcome {
+    /// The duplicate to-device requests were sent and accepted by the
+    /// homeserver. This is not a recipient decryption proof.
+    Sent,
+    /// The bounded deadline expired before the duplicate settled.
+    Deadline,
+    /// The attempt was cancelled by a fenced identity change (rotation,
+    /// discard, leave, or runtime replacement).
+    Cancelled,
+    /// Recipient policy blocked the duplicate (e.g. rotation pending).
+    PolicyBlocked,
+    /// The duplicate send failed.
+    Failed,
+    /// No duplicate was needed (already attempted, or no eligible
+    /// recipients).
+    NotNeeded,
+}
+
+/// A typed, privacy-safe bounded index-0 duplicate-share record (issue #510).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Index0ReshareDiagnostic {
+    /// Anonymous session correlation.
+    pub session: RoomKeyDiagnosticAlias,
+    /// Closed initial-share state at the decision point.
+    pub initial_share: Index0InitialShareState,
+    /// Closed duplicate-share outcome.
+    pub reshare: Index0ReshareOutcome,
+    /// Eligible own-device count bucket.
+    pub eligible_own_bucket: u8,
+    /// Eligible peer-device count bucket.
+    pub eligible_peer_bucket: u8,
+    /// Time since this session's initial share was first observed.
+    pub elapsed_ms: u64,
+}
+
 /// Aggregate privacy-safe counters for receive-side room-key handling.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RoomKeyReceiveCounters {
@@ -679,6 +732,9 @@ struct RoomKeyDiagnosticState {
     device_classes: BTreeMap<RoomKeyDiagnosticAlias, InitialShareDeviceClass>,
     /// Per-session initial-share tallies (issue #509).
     initial_shares: BTreeMap<(String, String), InitialShareState>,
+    /// Per-(room, session) one-shot flag for the bounded index-0 duplicate
+    /// share (issue #510).
+    index0_reshare_attempted: BTreeSet<(String, String)>,
 }
 
 /// Per-session initial-share tally (issue #509).
@@ -688,6 +744,7 @@ struct InitialShareState {
     eligible_own: u32,
     eligible_peer: u32,
     eligible_devices: BTreeSet<RoomKeyDiagnosticAlias>,
+    withheld_devices: BTreeSet<RoomKeyDiagnosticAlias>,
     index0_committed: u32,
     after0_committed: u32,
     min_committed_index: Option<u32>,
@@ -750,9 +807,8 @@ impl RoomKeyDiagnosticHub {
                     signal: outcome,
                     reshare: None,
                     matching_sessions_bucket: 0,
-                    device: device.map(|(user_id, device_id)| {
-                        device_alias(&mut state, user_id, device_id)
-                    }),
+                    device: device
+                        .map(|(user_id, device_id)| device_alias(&mut state, user_id, device_id)),
                 },
             )
         };
@@ -795,9 +851,8 @@ impl RoomKeyDiagnosticHub {
                     signal,
                     reshare: Some(reshare),
                     matching_sessions_bucket: matching_bucket_token(matching_sessions),
-                    device: device.map(|(user_id, device_id)| {
-                        device_alias(&mut state, user_id, device_id)
-                    }),
+                    device: device
+                        .map(|(user_id, device_id)| device_alias(&mut state, user_id, device_id)),
                 },
             )
         };
@@ -825,23 +880,32 @@ impl RoomKeyDiagnosticHub {
             // Callers without `DeviceData` pass `Unknown`; fall back to the
             // class cached by the `Eligible` emission for this device.
             let device_class = if device_class == InitialShareDeviceClass::Unknown {
-                state.device_classes.get(&device).copied().unwrap_or(InitialShareDeviceClass::Unknown)
+                state
+                    .device_classes
+                    .get(&device)
+                    .copied()
+                    .unwrap_or(InitialShareDeviceClass::Unknown)
             } else {
                 state.device_classes.insert(device, device_class);
                 device_class
             };
-            let tally = state.initial_shares.entry((room_id.as_str().to_owned(), session_id.to_owned())).or_default();
+            let tally = state
+                .initial_shares
+                .entry((room_id.as_str().to_owned(), session_id.to_owned()))
+                .or_default();
             if tally.first_seen.is_none() {
                 tally.first_seen = Some(Instant::now());
             }
             match stage {
                 InitialShareStage::Eligible => match device_class {
-                    InitialShareDeviceClass::VerifiedOwn | InitialShareDeviceClass::UnverifiedOwn => {
+                    InitialShareDeviceClass::VerifiedOwn
+                    | InitialShareDeviceClass::UnverifiedOwn => {
                         if tally.eligible_devices.insert(device) {
                             tally.eligible_own += 1;
                         }
                     }
-                    InitialShareDeviceClass::VerifiedPeer | InitialShareDeviceClass::UnverifiedPeer => {
+                    InitialShareDeviceClass::VerifiedPeer
+                    | InitialShareDeviceClass::UnverifiedPeer => {
                         if tally.eligible_devices.insert(device) {
                             tally.eligible_peer += 1;
                         }
@@ -849,13 +913,19 @@ impl RoomKeyDiagnosticHub {
                     InitialShareDeviceClass::Dehydrated | InitialShareDeviceClass::Unknown => {}
                 },
                 InitialShareStage::ShareStateCommitted { message_index } => {
-                    tally.min_committed_index =
-                        Some(tally.min_committed_index.map_or(message_index, |min| min.min(message_index)));
+                    tally.min_committed_index = Some(
+                        tally
+                            .min_committed_index
+                            .map_or(message_index, |min| min.min(message_index)),
+                    );
                     if message_index == 0 {
                         tally.index0_committed += 1;
                     } else {
                         tally.after0_committed += 1;
                     }
+                }
+                InitialShareStage::Withheld => {
+                    tally.withheld_devices.insert(device);
                 }
                 InitialShareStage::HomeserverAccepted => {
                     tally.accepted_devices.insert(device);
@@ -888,7 +958,10 @@ impl RoomKeyDiagnosticHub {
         let (observer, event) = {
             let mut state = lock(&self.0);
             let session = session_alias(&mut state, room_id, session_id);
-            let tally = state.initial_shares.entry((room_id.as_str().to_owned(), session_id.to_owned())).or_default();
+            let tally = state
+                .initial_shares
+                .entry((room_id.as_str().to_owned(), session_id.to_owned()))
+                .or_default();
             if tally.first_seen.is_none() {
                 tally.first_seen = Some(Instant::now());
             }
@@ -917,6 +990,72 @@ impl RoomKeyDiagnosticHub {
         };
         if let Some(observer) = observer {
             observer(RoomKeyDiagnosticEvent::InitialShareSession(event));
+        }
+    }
+
+    /// Whether the bounded index-0 duplicate share was already attempted for
+    /// this (room, session) pair (issue #510).
+    pub(crate) fn index0_reshare_attempted(&self, room_id: &RoomId, session_id: &str) -> bool {
+        lock(&self.0)
+            .index0_reshare_attempted
+            .contains(&(room_id.as_str().to_owned(), session_id.to_owned()))
+    }
+
+    /// Mark the bounded index-0 duplicate share as attempted (issue #510). At
+    /// most one attempt is made per (room, session) pair per runtime.
+    pub(crate) fn mark_index0_reshare_attempted(&self, room_id: &RoomId, session_id: &str) {
+        lock(&self.0)
+            .index0_reshare_attempted
+            .insert((room_id.as_str().to_owned(), session_id.to_owned()));
+    }
+
+    /// Record a bounded index-0 duplicate-share outcome (issue #510): derive
+    /// the closed initial-share state and eligible count buckets from the
+    /// session tally and notify the observer.
+    pub(crate) fn note_index0_reshare(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        outcome: Index0ReshareOutcome,
+    ) {
+        let (observer, event) = {
+            let mut state = lock(&self.0);
+            let session = session_alias(&mut state, room_id, session_id);
+            let tally =
+                state.initial_shares.get(&(room_id.as_str().to_owned(), session_id.to_owned()));
+            let eligible_own = tally.map_or(0, |tally| tally.eligible_own);
+            let eligible_peer = tally.map_or(0, |tally| tally.eligible_peer);
+            let eligible = eligible_own + eligible_peer;
+            let committed =
+                tally.map_or(0, |tally| tally.index0_committed + tally.after0_committed);
+            let withheld = tally.map_or(0, |tally| tally.withheld_devices.len() as u32);
+            let initial_share = if eligible == 0 {
+                Index0InitialShareState::NoRecipients
+            } else if withheld == eligible {
+                Index0InitialShareState::Withheld
+            } else if committed == eligible {
+                Index0InitialShareState::Accepted
+            } else {
+                Index0InitialShareState::Failed
+            };
+            let elapsed_ms = tally
+                .and_then(|tally| tally.first_seen)
+                .map(|first| first.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+            (
+                state.observer.clone(),
+                Index0ReshareDiagnostic {
+                    session,
+                    initial_share,
+                    reshare: outcome,
+                    eligible_own_bucket: matching_bucket_token(eligible_own as usize),
+                    eligible_peer_bucket: matching_bucket_token(eligible_peer as usize),
+                    elapsed_ms,
+                },
+            )
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::Index0Reshare(event));
         }
     }
 

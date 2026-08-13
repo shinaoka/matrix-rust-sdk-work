@@ -85,11 +85,13 @@ use crate::{
         SenderDataFinder, SessionType, StaticAccountData,
     },
     room_key_diagnostics::{
-        OlmRecoveryCounters, OlmRecoverySignalOutcome, RoomKeyDiagnosticHub,
+        Index0ReshareOutcome, OlmRecoveryCounters, OlmRecoverySignalOutcome, RoomKeyDiagnosticHub,
         RoomKeyDiagnosticObserver, RoomKeyIngressKind, RoomKeyMergeDecision,
         RoomKeyReceiveCounters, RoomKeyReceiveDiagnosticKind, RoomKeyRotationReason,
     },
-    session_manager::{GroupSessionManager, SessionManager, UnwedgeReshareOutcome},
+    session_manager::{
+        GroupSessionManager, Index0ReshareDecision, SessionManager, UnwedgeReshareOutcome,
+    },
     store::{
         CryptoStoreWrapper, IntoCryptoStore, MemoryStore, Result as StoreResult, SecretImportError,
         Store, StoreTransaction,
@@ -1431,6 +1433,31 @@ impl OlmMachine {
         self.inner.group_session_manager.note_to_device_request_failed(request_id);
     }
 
+    /// Decide and queue the bounded index-0 duplicate share (issue #510). See
+    /// [`GroupSessionManager::reshare_index0_once`].
+    pub async fn reshare_index0_once(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<Index0ReshareDecision> {
+        self.inner
+            .group_session_manager
+            .reshare_index0_once(room_id, users, encryption_settings)
+            .await
+    }
+
+    /// Report the send outcome of a queued index-0 duplicate share (issue
+    /// #510): `Sent`, `Failed`, or `Deadline`. Observation only.
+    pub fn note_index0_reshare(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        outcome: Index0ReshareOutcome,
+    ) {
+        self.inner.room_key_diagnostics.note_index0_reshare(room_id, session_id, outcome);
+    }
+
     /// Get to-device requests to share a room key with users in a room.
     ///
     /// # Arguments
@@ -1990,10 +2017,10 @@ impl OlmMachine {
                     Some((device.user_id(), device.device_id())),
                     OlmRecoverySignalOutcome::IgnoredDehydrated,
                 ),
-                _ => self.inner.room_key_diagnostics.emit_olm_recovery_signal(
-                    None,
-                    OlmRecoverySignalOutcome::IgnoredUnknownDevice,
-                ),
+                _ => self
+                    .inner
+                    .room_key_diagnostics
+                    .emit_olm_recovery_signal(None, OlmRecoverySignalOutcome::IgnoredUnknownDevice),
             }
         }
 

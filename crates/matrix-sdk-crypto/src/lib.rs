@@ -101,7 +101,8 @@ pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
 pub use room_key_diagnostics::{
     ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome,
-    IncomingRoomKeyRequestStage, InitialShareDeviceClass, InitialShareDeviceDiagnostic,
+    IncomingRoomKeyRequestStage, Index0InitialShareState, Index0ReshareDiagnostic,
+    Index0ReshareOutcome, InitialShareDeviceClass, InitialShareDeviceDiagnostic,
     InitialShareSessionDiagnostic, InitialShareStage, OlmRecoveryCounters, OlmRecoveryDiagnostic,
     OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome, RequestedRoomKeySession,
     RoomKeyCreationOutcome, RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent,
@@ -112,7 +113,8 @@ pub use room_key_diagnostics::{
 };
 use serde::{Deserialize, Serialize};
 pub use session_manager::{
-    CollectStrategy, RoomKeyReshareResult, RoomKeyReshareTarget, UnwedgeReshareOutcome,
+    CollectStrategy, Index0ReshareDecision, RoomKeyReshareResult, RoomKeyReshareTarget,
+    UnwedgeReshareOutcome,
 };
 pub use types::events::room_key_withheld::{RoomKeyWithheldContent, RoomKeyWithheldEvent};
 

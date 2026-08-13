@@ -19,8 +19,8 @@ use std::{iter, sync::Arc};
 use assert_matches2::assert_let;
 use matrix_sdk_test::async_test;
 use ruma::{
-    api::client::to_device::send_event_to_device::v3::Response as ToDeviceResponse,
-    room_id, user_id,
+    api::client::to_device::send_event_to_device::v3::Response as ToDeviceResponse, room_id,
+    user_id,
 };
 
 use crate::{
@@ -115,9 +115,7 @@ async fn test_initial_share_records_index0_outcome_for_every_eligible_device() {
     assert_let!(Some(InitialShareStage::OlmEncrypted) = iter.next());
     assert_let!(Some(InitialShareStage::RequestQueued) = iter.next());
     assert_let!(Some(InitialShareStage::HomeserverAccepted) = iter.next());
-    assert_let!(
-        Some(InitialShareStage::ShareStateCommitted { message_index: 0 }) = iter.next()
-    );
+    assert_let!(Some(InitialShareStage::ShareStateCommitted { message_index: 0 }) = iter.next());
     assert_eq!(iter.next(), None, "unexpected extra stages for the receiver device");
 
     // The peer device was classified as a peer, never as own.
@@ -173,9 +171,7 @@ async fn test_share_state_is_not_committed_before_the_request_is_acknowledged() 
         .collect();
     assert!(!committed.is_empty(), "no share-state commit recorded after the acknowledgement");
     for event in committed {
-        assert_let!(
-            InitialShareStage::ShareStateCommitted { message_index: 0 } = event.stage
-        );
+        assert_let!(InitialShareStage::ShareStateCommitted { message_index: 0 } = event.stage);
     }
 }
 
@@ -201,10 +197,7 @@ async fn test_first_encrypted_event_correlates_with_the_initial_session() {
     }
 
     let content = ruma::events::room::message::RoomMessageEventContent::text_plain("hello");
-    let _ = alice
-        .encrypt_room_event(room_id, content)
-        .await
-        .unwrap();
+    let _ = alice.encrypt_room_event(room_id, content).await.unwrap();
 
     let guard = events.lock().unwrap();
     let sessions = initial_share_session_events(&guard);
@@ -322,10 +315,8 @@ async fn test_initial_share_diagnostics_never_expose_identifiers_or_material() {
     let bob_device = alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap();
     let _ids = alice.inner.group_session_manager.unwedged_affected_room_ids(&bob_device);
     let recovery_events = recovery.lock().unwrap().clone();
-    let device_aliases: Vec<_> = initial_share_device_events(&events)
-        .into_iter()
-        .map(|event| event.device)
-        .collect();
+    let device_aliases: Vec<_> =
+        initial_share_device_events(&events).into_iter().map(|event| event.device).collect();
     let recovery_device = recovery_events.iter().find_map(|event| match event {
         RoomKeyDiagnosticEvent::OlmRecovery(olm) => olm.device,
         _ => None,
@@ -338,9 +329,7 @@ async fn test_initial_share_diagnostics_never_expose_identifiers_or_material() {
 
 #[async_test]
 async fn test_olm_recovery_reshare_correlates_by_device_alias() {
-    use crate::room_key_diagnostics::{
-        OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome,
-    };
+    use crate::room_key_diagnostics::{OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome};
 
     let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
         user_id!("@a:example.org"),
@@ -369,12 +358,7 @@ async fn test_olm_recovery_reshare_correlates_by_device_alias() {
     let _ = alice
         .inner
         .group_session_manager
-        .reshare_unwedged_room_key(
-            &room_id,
-            &members,
-            EncryptionSettings::default(),
-            &bob_device,
-        )
+        .reshare_unwedged_room_key(&room_id, &members, EncryptionSettings::default(), &bob_device)
         .await;
 
     let recovery_events = recovery.lock().unwrap().clone();

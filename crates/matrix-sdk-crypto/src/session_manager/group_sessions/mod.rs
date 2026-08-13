@@ -56,7 +56,8 @@ use crate::{
         SenderData, SenderDataFinder, Session, ShareInfo, ShareState, StaticAccountData,
     },
     room_key_diagnostics::{
-        InitialShareDeviceClass, InitialShareStage, RoomKeyCreationOutcome, RoomKeyDiagnosticHub,
+        Index0ReshareOutcome, InitialShareDeviceClass, InitialShareStage, RoomKeyCreationOutcome,
+        RoomKeyDiagnosticHub,
     },
     store::{CryptoStoreWrapper, Result as StoreResult, Store, types::Changes},
     types::{
@@ -130,6 +131,28 @@ pub enum RoomKeyReshareResult {
     NoRecipients,
     /// The current session does not match the caller's expected session.
     StaleSession,
+}
+
+/// Decision of the bounded index-0 duplicate share (issue #510).
+#[derive(Debug)]
+pub enum Index0ReshareDecision {
+    /// No duplicate was needed (index already consumed, session absent, or
+    /// already attempted for this session).
+    NotNeeded,
+    /// Recipient policy blocked the duplicate (e.g. rotation pending); the
+    /// session was neither rotated nor replaced.
+    PolicyBlocked,
+    /// The attempt was cancelled by a fenced identity change (the active
+    /// session changed while the decision was being made).
+    Cancelled,
+    /// A duplicate was queued; the requests still need to be sent and marked
+    /// as sent by the caller within the bounded deadline.
+    Queued {
+        /// The outbound session identity the duplicate belongs to.
+        session_id: String,
+        /// New `m.room.encrypted` to-device requests carrying the room key.
+        requests: Vec<Arc<ToDeviceRequest>>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -207,10 +230,7 @@ impl GroupSessionCache {
     /// Find the outbound session that owns the given still-pending to-device
     /// request (issue #509 failure diagnostics). Checks the being-shared map
     /// first, then the active sessions.
-    pub(crate) fn find_request_owner(
-        &self,
-        id: &TransactionId,
-    ) -> Option<OutboundGroupSession> {
+    pub(crate) fn find_request_owner(&self, id: &TransactionId) -> Option<OutboundGroupSession> {
         if let Some(session) = self.sessions_being_shared.read().get(id) {
             return Some(session.clone());
         }
@@ -282,9 +302,7 @@ impl GroupSessionManager {
                         let stage = InitialShareStage::ShareStateCommitted {
                             message_index: shared.message_index,
                         };
-                        for stage in
-                            [InitialShareStage::HomeserverAccepted, stage]
-                        {
+                        for stage in [InitialShareStage::HomeserverAccepted, stage] {
                             self.room_key_diagnostics.emit_initial_share_device(
                                 session.room_id(),
                                 session.session_id(),
@@ -716,13 +734,8 @@ impl GroupSessionManager {
         sessions: GroupSessionCache,
         room_key_diagnostics: RoomKeyDiagnosticHub,
     ) -> OlmResult<(Vec<Session>, Vec<(DeviceData, WithheldCode)>)> {
-        let (result, share_infos) = Self::encrypt_session_for(
-            store,
-            outbound.clone(),
-            chunk,
-            room_key_diagnostics,
-        )
-        .await?;
+        let (result, share_infos) =
+            Self::encrypt_session_for(store, outbound.clone(), chunk, room_key_diagnostics).await?;
 
         if let Some(request) = result.to_device_request {
             let id = request.txn_id.clone();
@@ -1145,13 +1158,10 @@ impl GroupSessionManager {
 
         // Issue #509: report the Olm-encrypted key and the queued to-device
         // request per device for the newly created `m.room_key` requests only.
-        for request in requests
-            .iter()
-            .filter(|request| {
-                !previous_request_ids.contains(&request.txn_id)
-                    && request.event_type.to_string() == "m.room.encrypted"
-            })
-        {
+        for request in requests.iter().filter(|request| {
+            !previous_request_ids.contains(&request.txn_id)
+                && request.event_type.to_string() == "m.room.encrypted"
+        }) {
             for (user_id, devices) in &request.messages {
                 for device_id in devices.keys() {
                     let device_id = match device_id {
@@ -1262,9 +1272,114 @@ impl GroupSessionManager {
         Ok(RoomKeyReshareResult::Sent { requests, recipient_count })
     }
 
-    /// Collect the devices belonging to the given user, and send the details of
-    /// a room key bundle to those devices.
+    /// Decide and queue the bounded index-0 duplicate share (issue #510).
     ///
+    /// For a newly created outbound session still at message index 0, at most
+    /// once per (room, session) per runtime, re-evaluate recipient policy and
+    /// queue a duplicate standard `m.room_key` share. Never creates or rotates
+    /// the session, never sends to the current device, never repeats, and
+    /// never emits a diagnostic when the index-0 window never opened.
+    pub async fn reshare_index0_once(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<Index0ReshareDecision> {
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok(Index0ReshareDecision::NotNeeded);
+        };
+        let session_id = outbound.session_id().to_owned();
+        if outbound.message_index().await != 0 {
+            return Ok(Index0ReshareDecision::NotNeeded);
+        }
+        if self.room_key_diagnostics.index0_reshare_attempted(room_id, &session_id) {
+            self.room_key_diagnostics.note_index0_reshare(
+                room_id,
+                &session_id,
+                Index0ReshareOutcome::NotNeeded,
+            );
+            return Ok(Index0ReshareDecision::NotNeeded);
+        }
+
+        // Re-evaluate membership, trust, blacklist, history visibility, and
+        // collect strategy with the current member list. Rotation stays on the
+        // normal send path; the duplicate never rotates.
+        let settings = encryption_settings.into();
+        let CollectRecipientsResult { should_rotate, devices, .. } =
+            self.collect_session_recipients(users, &settings, &outbound).await?;
+        if should_rotate {
+            self.room_key_diagnostics.mark_index0_reshare_attempted(room_id, &session_id);
+            self.room_key_diagnostics.note_index0_reshare(
+                room_id,
+                &session_id,
+                Index0ReshareOutcome::PolicyBlocked,
+            );
+            return Ok(Index0ReshareDecision::PolicyBlocked);
+        }
+
+        // Fence: the active session must still be the one we decided on.
+        let current = self.sessions.get_or_load(room_id).await;
+        if current.is_none_or(|current| current.session_id() != session_id) {
+            self.room_key_diagnostics.mark_index0_reshare_attempted(room_id, &session_id);
+            self.room_key_diagnostics.note_index0_reshare(
+                room_id,
+                &session_id,
+                Index0ReshareOutcome::Cancelled,
+            );
+            return Ok(Index0ReshareDecision::Cancelled);
+        }
+
+        let account = self.store.static_account();
+        let devices: Vec<_> = devices
+            .into_values()
+            .flatten()
+            .filter(|device| {
+                // Never duplicate to the current device.
+                if device.user_id() == account.user_id && device.device_id() == account.device_id {
+                    return false;
+                }
+                let sharing = outbound.sharing_view();
+                // Target every eligible device that already settled or was
+                // never shared, excluding devices with a pending request and
+                // withheld/changed-key devices.
+                !sharing.has_pending_share(device)
+                    && matches!(
+                        sharing.get_share_state(device),
+                        ShareState::NotShared | ShareState::Shared { .. }
+                    )
+            })
+            .collect();
+        self.room_key_diagnostics.mark_index0_reshare_attempted(room_id, &session_id);
+        if devices.is_empty() {
+            self.room_key_diagnostics.note_index0_reshare(
+                room_id,
+                &session_id,
+                Index0ReshareOutcome::NotNeeded,
+            );
+            return Ok(Index0ReshareDecision::NotNeeded);
+        }
+
+        let previous_request_ids =
+            outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
+        let mut changes = Changes::default();
+        let _unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        let requests = outbound
+            .pending_requests()
+            .into_iter()
+            .filter(|request| {
+                !previous_request_ids.contains(&request.txn_id)
+                    && request.event_type.to_string() == "m.room.encrypted"
+            })
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            return Ok(Index0ReshareDecision::NotNeeded);
+        }
+        self.store.save_changes(changes).await?;
+        Ok(Index0ReshareDecision::Queued { session_id, requests })
+    }
+
+    /// Collect the devices belonging to the given user, and send the details of
+    /// a room key bundle to those devices.    ///
     /// Returns a list of to-device requests which must be sent.
     ///
     /// For security reasons, only "safe" [`CollectStrategy`]s are supported, in

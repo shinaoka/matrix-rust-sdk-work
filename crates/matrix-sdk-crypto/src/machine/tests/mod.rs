@@ -89,6 +89,7 @@ use crate::{
 };
 
 mod decryption_verification_state;
+mod index0_reshare;
 mod initial_share_diagnostics;
 mod interactive_verification;
 mod megolm_sender_data;
