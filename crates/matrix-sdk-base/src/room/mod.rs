@@ -38,8 +38,8 @@ use futures_util::{Stream, StreamExt};
 pub use members::{RoomMember, RoomMembersUpdate, RoomMemberships};
 pub(crate) use room_info::SyncInfo;
 pub use room_info::{
-    BaseRoomInfo, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomRecencyStamp,
-    apply_redaction,
+    BaseRoomInfo, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
+    RoomMembersMissingReason, RoomRecencyStamp, apply_redaction,
 };
 use ruma::{
     EventId, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId,

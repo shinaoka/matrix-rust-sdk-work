@@ -28,8 +28,8 @@ use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, DeviceData, EncryptionSettings, OlmError, OlmMachine,
-    RoomKeyReshareResult, RoomKeyReshareTarget, TrustRequirement, UnwedgeReshareOutcome,
-    store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
+    RoomKeyReshareResult, RoomKeyReshareTarget, RoomKeyRotationReason, TrustRequirement,
+    UnwedgeReshareOutcome, store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
     types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
@@ -63,7 +63,8 @@ use crate::{
     media::store::MediaStoreLock,
     response_processors::{self as processors, Context},
     room::{
-        Room, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMembersUpdate, RoomState,
+        Room, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMembersMissingReason,
+        RoomMembersUpdate, RoomState,
     },
     store::{
         AvatarCache, BaseStateStore, DynStateStore, MemoryStore, Result as StoreResult,
@@ -418,7 +419,7 @@ impl BaseClient {
             room.update_and_save_room_info_with_store_guard(&store_guard, |mut info| {
                 info.mark_as_knocked();
                 info.mark_state_partially_synced();
-                info.mark_members_missing(); // the own member event changed
+                info.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
                 (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
             })
             .await?;
@@ -511,7 +512,7 @@ impl BaseClient {
             room.update_and_save_room_info_with_store_guard(&store_guard, |mut info| {
                 info.mark_as_joined();
                 info.mark_state_partially_synced();
-                info.mark_members_missing(); // the own member event changed
+                info.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
                 (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
             })
             .await?;
@@ -539,7 +540,7 @@ impl BaseClient {
             room.update_and_save_room_info_with_store_guard(&store_guard, |mut info| {
                 info.mark_as_left();
                 info.mark_state_partially_synced();
-                info.mark_members_missing(); // the own member event changed
+                info.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
                 (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
             })
             .await?;
@@ -646,10 +647,8 @@ impl BaseClient {
             Context::new(StateChanges { sync_token: sync_token.clone(), ..Default::default() });
 
         #[cfg(feature = "e2e-encryption")]
-        let processors::e2ee::to_device::Output {
-            processed_to_device_events: to_device,
-            ..
-        } = processors::e2ee::to_device::from_sync_v2(
+        let processors::e2ee::to_device::Output { processed_to_device_events: to_device, .. } =
+            processors::e2ee::to_device::from_sync_v2(
                 &response,
                 olm_machine.as_ref(),
                 &self.decryption_settings,
@@ -884,6 +883,9 @@ impl BaseClient {
             return Ok(());
         };
 
+        #[cfg(feature = "e2e-encryption")]
+        let members_missing_reason = room.members_missing_reason();
+
         let mut chunk = Vec::with_capacity(response.chunk.len());
         let mut context = Context::default();
 
@@ -976,7 +978,19 @@ impl BaseClient {
             // join/leave pairs in our view of the room state. Instead, we should rotate
             // the room key whenever we fully reload the member list as a precaution.
             tracing::debug!("Rotating room key due to full member list reload");
-            if let Err(e) = olm.discard_room_key(room_id).await {
+            let rotation_reason = match members_missing_reason {
+                RoomMembersMissingReason::Unknown => RoomKeyRotationReason::FullMemberListReload,
+                RoomMembersMissingReason::RoomSubscription => {
+                    RoomKeyRotationReason::RoomSubscription
+                }
+                RoomMembersMissingReason::LimitedSyncResponse => {
+                    RoomKeyRotationReason::LimitedSyncResponse
+                }
+                RoomMembersMissingReason::MembershipChange => {
+                    RoomKeyRotationReason::MembershipOrDeviceChange
+                }
+            };
+            if let Err(e) = olm.discard_room_key_with_reason(room_id, rotation_reason).await {
                 tracing::warn!("Error discarding room key: {e:?}");
             }
         }
@@ -1058,9 +1072,7 @@ impl BaseClient {
     ) -> Result<UnwedgeReshareOutcome> {
         let (members, settings) = self.room_key_share_context(room_id).await?;
         match self.olm_machine().await.as_ref() {
-            Some(o) => Ok(o
-                .reshare_unwedged_room_key(room_id, &members, settings, device)
-                .await?),
+            Some(o) => Ok(o.reshare_unwedged_room_key(room_id, &members, settings, device).await?),
             None => panic!("Olm machine wasn't started"),
         }
     }

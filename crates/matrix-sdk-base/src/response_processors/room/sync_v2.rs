@@ -29,7 +29,7 @@ use super::{
     RoomCreationData,
 };
 use crate::{
-    Result, RoomState,
+    Result, RoomMembersMissingReason, RoomState,
     sync::{InvitedRoomUpdate, JoinedRoomUpdate, KnockedRoomUpdate, LeftRoomUpdate, State},
 };
 
@@ -79,7 +79,7 @@ pub async fn update_joined_room(
     ephemeral_events::dispatch(context, &joined_room.ephemeral.events, room_id);
 
     if joined_room.timeline.limited {
-        room_info.mark_members_missing();
+        room_info.mark_members_missing_with_reason(RoomMembersMissingReason::LimitedSyncResponse);
     }
 
     #[cfg(feature = "e2e-encryption")]

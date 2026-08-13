@@ -32,7 +32,7 @@ use std::{
 use async_stream::stream;
 pub use client::{Version, VersionBuilder};
 use futures_core::stream::Stream;
-use matrix_sdk_base::RequestedRequiredStates;
+use matrix_sdk_base::{RequestedRequiredStates, RoomMembersMissingReason};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_common::executor::JoinHandleExt as _;
 use matrix_sdk_common::{executor::spawn, timer};
@@ -838,7 +838,7 @@ fn subscribe_to_rooms(
     for room_id in room_ids {
         if let Entry::Vacant(entry) = room_subscriptions.entry((*room_id).to_owned()) {
             if let Some(room) = client.get_room(room_id) {
-                room.mark_members_missing();
+                room.mark_members_missing_with_reason(RoomMembersMissingReason::RoomSubscription);
             }
 
             entry.insert(settings.clone());

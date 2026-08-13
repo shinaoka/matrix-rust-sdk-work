@@ -41,7 +41,8 @@ use super::{
     RoomCreationData,
 };
 use crate::{
-    Result, Room, RoomHero, RoomInfo, RoomInfoNotableUpdateReasons, RoomState,
+    Result, Room, RoomHero, RoomInfo, RoomInfoNotableUpdateReasons, RoomMembersMissingReason,
+    RoomState,
     store::BaseStateStore,
     sync::{InvitedRoomUpdate, JoinedRoomUpdate, KnockedRoomUpdate, LeftRoomUpdate, State},
     utils::RawStateEventWithKeys,
@@ -360,7 +361,7 @@ fn properties(
     room_info.set_prev_batch(room_response.prev_batch.as_deref());
 
     if room_response.limited {
-        room_info.mark_members_missing();
+        room_info.mark_members_missing_with_reason(RoomMembersMissingReason::LimitedSyncResponse);
     }
 
     if let Some(recency_stamp) = &room_response.bump_stamp {
