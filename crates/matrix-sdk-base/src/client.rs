@@ -28,9 +28,9 @@ use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, DeviceData, EncryptionSettings, Index0ReshareDecision,
-    InitialShareRepairPreparation, OlmError, OlmMachine, RoomKeyReshareResult,
-    RoomKeyReshareTarget, RoomKeyRotationReason, TrustRequirement, UnwedgeReshareOutcome,
-    store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
+    InitialShareRepairPreparation, OlmError, OlmMachine, RoomKeyMemberReloadContext,
+    RoomKeyReshareResult, RoomKeyReshareTarget, RoomKeyRotationReason, TrustRequirement,
+    UnwedgeReshareOutcome, store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
     types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
@@ -871,6 +871,19 @@ impl BaseClient {
         request: &api::membership::get_member_events::v3::Request,
         response: &api::membership::get_member_events::v3::Response,
     ) -> Result<()> {
+        self.receive_all_members_with_request_elapsed(room_id, request, response, None).await
+    }
+
+    /// Receive a full member list while retaining a privacy-safe request
+    /// duration for room-key rotation diagnostics.
+    #[doc(hidden)]
+    pub async fn receive_all_members_with_request_elapsed(
+        &self,
+        room_id: &RoomId,
+        request: &api::membership::get_member_events::v3::Request,
+        response: &api::membership::get_member_events::v3::Response,
+        request_elapsed_ms: Option<u64>,
+    ) -> Result<()> {
         if request.membership.is_some() || request.not_membership.is_some() || request.at.is_some()
         {
             // This function assumes all members are loaded at once to optimise how display
@@ -883,6 +896,9 @@ impl BaseClient {
             // The room is unknown to us: leave early.
             return Ok(());
         };
+
+        let processing_started = Instant::now();
+        let member_reload_diagnostic = room.member_reload_diagnostic_snapshot();
 
         #[cfg(feature = "e2e-encryption")]
         let members_missing_reason = room.members_missing_reason();
@@ -969,6 +985,7 @@ impl BaseClient {
             )
             .await?;
         }
+        room.reset_member_reload_diagnostics();
 
         let _ = room.room_member_updates_sender.send(RoomMembersUpdate::FullReload);
 
@@ -991,7 +1008,22 @@ impl BaseClient {
                     RoomKeyRotationReason::MembershipOrDeviceChange
                 }
             };
-            if let Err(e) = olm.discard_room_key_with_reason(room_id, rotation_reason).await {
+            let reload_context = RoomKeyMemberReloadContext {
+                members_were_synced_before_invalidation: member_reload_diagnostic
+                    .members_were_synced_before_invalidation,
+                invalidation_count: member_reload_diagnostic.invalidation_count,
+                invalidation_age_ms: member_reload_diagnostic.invalidation_age_ms,
+                request_elapsed_ms,
+                response_member_count: response.chunk.len(),
+                processing_elapsed_ms: processing_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            };
+            if let Err(e) = olm
+                .discard_room_key_after_member_reload(room_id, rotation_reason, reload_context)
+                .await
+            {
                 tracing::warn!("Error discarding room key: {e:?}");
             }
         }

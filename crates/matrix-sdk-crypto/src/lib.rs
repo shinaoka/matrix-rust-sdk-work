@@ -108,9 +108,10 @@ pub use room_key_diagnostics::{
     InitialShareStage, OlmRecoveryCounters, OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome,
     OlmRecoverySignalOutcome, RequestedRoomKeySession, RoomKeyCreationOutcome,
     RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver,
-    RoomKeyFirstShareOutcome, RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters,
-    RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
-    RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    RoomKeyFirstShareOutcome, RoomKeyIngressKind, RoomKeyMemberReloadContext,
+    RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision,
+    RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
+    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
     RoomKeyRotationDiagnostic, RoomKeyRotationReason,
 };
 use serde::{Deserialize, Serialize};

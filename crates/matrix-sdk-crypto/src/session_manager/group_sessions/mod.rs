@@ -591,7 +591,7 @@ impl GroupSessionManager {
         if let Some(s) = outbound_session {
             if s.expired() || s.invalidated() {
                 let started = std::time::Instant::now();
-                let reason = self.room_key_diagnostics.classify_rotation_reason(
+                let classification = self.room_key_diagnostics.classify_rotation_reason(
                     room_id,
                     s.expired_by_time(),
                     s.expired_by_message_count(),
@@ -606,16 +606,18 @@ impl GroupSessionManager {
                         room_id,
                         Some(&previous),
                         Some(outbound.session_id()),
-                        reason,
+                        classification.reason,
                         RoomKeyCreationOutcome::Created,
+                        classification.discard_elapsed_ms,
                         started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     ),
                     Err(_) => self.room_key_diagnostics.emit_rotation(
                         room_id,
                         Some(&previous),
                         None,
-                        reason,
+                        classification.reason,
                         RoomKeyCreationOutcome::Failed,
+                        classification.discard_elapsed_ms,
                         started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     ),
                 }
@@ -625,7 +627,7 @@ impl GroupSessionManager {
             }
         } else {
             let started = std::time::Instant::now();
-            let reason = self
+            let classification = self
                 .room_key_diagnostics
                 .classify_rotation_reason(room_id, false, false, false, false);
             let created =
@@ -635,16 +637,18 @@ impl GroupSessionManager {
                     room_id,
                     None,
                     Some(outbound.session_id()),
-                    reason,
+                    classification.reason,
                     RoomKeyCreationOutcome::Created,
+                    classification.discard_elapsed_ms,
                     started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 ),
                 Err(_) => self.room_key_diagnostics.emit_rotation(
                     room_id,
                     None,
                     None,
-                    reason,
+                    classification.reason,
                     RoomKeyCreationOutcome::Failed,
+                    classification.discard_elapsed_ms,
                     started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 ),
             }

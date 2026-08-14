@@ -87,7 +87,8 @@ use crate::{
     room_key_diagnostics::{
         Index0ReshareOutcome, InitialShareRepairClaimOutcome, InitialShareRepairOutcome,
         InitialShareRepairPreparation, OlmRecoveryCounters, OlmRecoverySignalOutcome,
-        RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyIngressKind, RoomKeyMergeDecision,
+        RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyIngressKind,
+        RoomKeyMemberReloadContext, RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision,
         RoomKeyReceiveCounters, RoomKeyReceiveDiagnosticKind, RoomKeyRotationReason,
     },
     session_manager::{
@@ -1359,6 +1360,29 @@ impl OlmMachine {
             self.inner.room_key_diagnostics.note_discard(room_id, reason);
         }
         Ok(discarded)
+    }
+
+    /// Discard the active room key after a full member-list reload and emit a
+    /// typed, privacy-safe reload boundary for correlation with the next
+    /// outbound-session creation.
+    #[doc(hidden)]
+    pub async fn discard_room_key_after_member_reload(
+        &self,
+        room_id: &RoomId,
+        reason: RoomKeyRotationReason,
+        context: RoomKeyMemberReloadContext,
+    ) -> StoreResult<bool> {
+        let result = self.inner.group_session_manager.invalidate_group_session(room_id).await;
+        let outcome = match &result {
+            Ok(true) => RoomKeyMemberReloadDiscardOutcome::Discarded,
+            Ok(false) => RoomKeyMemberReloadDiscardOutcome::NoActiveSession,
+            Err(_) => RoomKeyMemberReloadDiscardOutcome::SdkError,
+        };
+        self.inner.room_key_diagnostics.emit_member_reload(room_id, reason, context, outcome);
+        if matches!(&result, Ok(true)) {
+            self.inner.room_key_diagnostics.note_discard(room_id, reason);
+        }
+        result
     }
 
     /// Rooms whose active outbound session was previously shared with `device`

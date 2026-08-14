@@ -129,9 +129,10 @@ pub use matrix_sdk_base::crypto::{
     OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome,
     RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
     RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
-    RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters,
-    RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
-    RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMemberReloadContext,
+    RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision,
+    RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
+    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
     RoomKeyRotationDiagnostic, RoomKeyRotationReason, RoomKeyWithheldContent, RoomKeyWithheldEvent,
     SessionCreationError, SignatureError, VERSION,
     olm::{
