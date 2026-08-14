@@ -802,27 +802,15 @@ impl RoomListService {
         // mismatched generation/checkpoint view.
         let result = {
             let mut state = self.room_subscription_state.lock().unwrap();
-            let current = state.active_rooms.clone();
+            // The authoritative diff is against the ACTUAL Sliding Sync map,
+            // so a session expiry (UnknownPos) that cleared it without
+            // touching the logical active set is detected as a change.
+            let current = self.sliding_sync.subscribed_rooms();
             let added: Vec<OwnedRoomId> = desired.difference(&current).cloned().collect();
             let removed: Vec<OwnedRoomId> = current.difference(&desired).cloned().collect();
             let retained = current.intersection(&desired).count();
 
             if added.is_empty() && removed.is_empty() {
-                // A session expiry (UnknownPos) clears the actual Sliding Sync
-                // subscription map without touching the logical active set;
-                // treat that as a change so coverage is restored.
-                let actual = self.sliding_sync.subscribed_rooms();
-                if actual != desired {
-                    return self.apply_reconcile_change(
-                        state,
-                        settings,
-                        cancel_in_flight_request,
-                        desired,
-                        added,
-                        removed,
-                        retained,
-                    );
-                }
                 let checkpoints_retained = !self.room_subscription_checkpoints.get().is_empty();
                 return RoomSubscriptionReconcile {
                     generation: RoomSubscriptionGeneration(state.generation),
@@ -846,6 +834,13 @@ impl RoomListService {
         };
 
         result
+    }
+
+    /// The actual Sliding Sync subscribed-room set (the authoritative request
+    /// state, which a session expiry can clear independently of the logical
+    /// active set).
+    pub fn actual_subscribed_rooms(&self) -> BTreeSet<OwnedRoomId> {
+        self.sliding_sync.subscribed_rooms()
     }
 
     /// Apply a differential subscription change under the state lock and the
@@ -1006,6 +1001,12 @@ impl RoomListService {
 
     #[cfg(test)]
     pub fn sliding_sync(&self) -> &SlidingSync {
+        &self.sliding_sync
+    }
+
+    /// The underlying Sliding Sync, exposed for session-lifecycle testing.
+    #[doc(hidden)]
+    pub fn sliding_sync_for_testing(&self) -> &SlidingSync {
         &self.sliding_sync
     }
 }

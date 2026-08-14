@@ -3560,6 +3560,47 @@ async fn test_reconcile_readd_marks_the_room_missing_again() -> Result<(), Error
 }
 
 #[async_test]
+async fn test_reconcile_recovers_after_session_expiry_and_reports_readd() -> Result<(), Error> {
+    let (client, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_a = room_id!("!a:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 1 } },
+            "rooms": { room_a: { "initial": true } },
+        },
+    };
+
+    let generation_before =
+        room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await.generation;
+    assert_eq!(room_list.actual_subscribed_rooms(), BTreeSet::from([room_a.to_owned()]));
+
+    // A session expiry (UnknownPos) clears the actual Sliding Sync map without
+    // touching the logical active set.
+    room_list.sliding_sync_for_testing().expire_session().await;
+
+    // Reconcile with the same desired set must detect the cleared actual map
+    // and restore the subscription (not a no-op).
+    let result = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await;
+    assert!(!result.noop, "a cleared actual map must not be a no-op");
+    assert_eq!(result.added, 1, "the room must be re-added after expiry");
+    assert_eq!(result.removed, 0);
+    assert_ne!(result.generation, generation_before, "generation must advance");
+    assert_eq!(
+        room_list.actual_subscribed_rooms(),
+        BTreeSet::from([room_a.to_owned()]),
+        "subscription must be restored"
+    );
+
+    Ok(())
+}
+
+#[async_test]
 async fn test_reconcile_publishes_coherent_active_set_and_never_an_intermediate_empty_state()
 -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
