@@ -175,6 +175,11 @@ impl SlidingSync {
         }
     }
 
+    /// The currently subscribed room set (the authoritative request state).
+    pub fn subscribed_rooms(&self) -> BTreeSet<OwnedRoomId> {
+        self.inner.room_subscriptions.read().unwrap().keys().cloned().collect()
+    }
+
     /// Atomically reconcile the room-subscription map from the current set to
     /// the desired set, holding the subscription write lock across both
     /// additions and removals so no request construction can observe an
