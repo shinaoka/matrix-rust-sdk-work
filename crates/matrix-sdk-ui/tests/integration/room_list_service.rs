@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
@@ -3370,4 +3370,236 @@ async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_i
             },
         },
     };
+}
+
+#[async_test]
+async fn test_reconcile_identical_set_is_a_true_noop() -> Result<(), Error> {
+    let (client, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_a = room_id!("!a:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 1 } },
+            "rooms": { room_a: { "initial": true } },
+        },
+    };
+
+    let generation = room_list.subscribe_to_rooms_with_generation(&[room_a]).await;
+    let checkpoints_before = room_list.room_subscription_checkpoints().get().clone();
+    let members_synced_before = client.get_room(room_a).unwrap().are_members_synced();
+
+    // Re-subscribing the identical set must be a true no-op.
+    let result = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await;
+
+    assert!(result.noop, "identical set must be a no-op");
+    assert_eq!(result.generation, generation, "generation must be unchanged");
+    assert_eq!(result.added, 0);
+    assert_eq!(result.removed, 0);
+    assert_eq!(result.retained, 1);
+    assert_eq!(room_list.active_room_subscriptions(), BTreeSet::from([room_a.to_owned()]));
+    assert_eq!(
+        room_list.room_subscription_checkpoints().get().clone(),
+        checkpoints_before,
+        "checkpoints must be unchanged on a no-op"
+    );
+    assert_eq!(
+        client.get_room(room_a).unwrap().are_members_synced(),
+        members_synced_before,
+        "no member invalidation on a no-op"
+    );
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_reconcile_adds_only_new_rooms_and_retains_intersection() -> Result<(), Error> {
+    let (client, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_a = room_id!("!a:bar.org");
+    let room_b = room_id!("!b:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 2 } },
+            "rooms": {
+                room_a: { "initial": true },
+                room_b: { "initial": true },
+            },
+        },
+    };
+
+    let generation_a = room_list.subscribe_to_rooms_with_generation(&[room_a]).await;
+    let members_synced_a = client.get_room(room_a).unwrap().are_members_synced();
+    #[cfg(feature = "testing")]
+    client.get_room(room_a).unwrap().mark_members_synced();
+    #[cfg(feature = "testing")]
+    client.get_room(room_b).unwrap().mark_members_synced();
+    let members_synced_a_after_fetch = client.get_room(room_a).unwrap().are_members_synced();
+    let members_synced_b_before = client.get_room(room_b).unwrap().are_members_synced();
+
+    let result = room_list.reconcile_room_subscriptions_with_generation(&[room_a, room_b]).await;
+
+    assert!(!result.noop);
+    assert_eq!(result.added, 1);
+    assert_eq!(result.removed, 0);
+    assert_eq!(result.retained, 1);
+    assert_eq!(
+        result.generation.get(),
+        generation_a.get() + 1,
+        "generation bumps exactly once for one change"
+    );
+    assert_eq!(
+        room_list.active_room_subscriptions(),
+        BTreeSet::from([room_a.to_owned(), room_b.to_owned()])
+    );
+
+    // A is retained unchanged; only B was invalidated.
+    assert_eq!(
+        client.get_room(room_a).unwrap().are_members_synced(),
+        members_synced_a_after_fetch,
+        "retained room A must not be invalidated"
+    );
+    assert_eq!(
+        client.get_room(room_b).unwrap().are_members_synced(),
+        members_synced_b_before,
+        "room B was already marked missing by the subscribe"
+    );
+    assert_eq!(
+        client.get_room(room_a).unwrap().members_missing_reason(),
+        matrix_sdk_base::RoomMembersMissingReason::RoomSubscription
+    );
+    let _ = members_synced_a;
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_reconcile_removes_only_removed_rooms_and_keeps_retained_checkpoints()
+-> Result<(), Error> {
+    let (client, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_a = room_id!("!a:bar.org");
+    let room_b = room_id!("!b:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 2 } },
+            "rooms": {
+                room_a: { "initial": true },
+                room_b: { "initial": true },
+            },
+        },
+    };
+
+    let _ = room_list.reconcile_room_subscriptions_with_generation(&[room_a, room_b]).await;
+    let members_synced_b = client.get_room(room_b).unwrap().are_members_synced();
+
+    let result = room_list.reconcile_room_subscriptions_with_generation(&[room_b]).await;
+
+    assert!(!result.noop);
+    assert_eq!(result.added, 0);
+    assert_eq!(result.removed, 1);
+    assert_eq!(result.retained, 1);
+    assert_eq!(room_list.active_room_subscriptions(), BTreeSet::from([room_b.to_owned()]));
+    assert_eq!(
+        client.get_room(room_b).unwrap().are_members_synced(),
+        members_synced_b,
+        "retained room B must be unchanged"
+    );
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_reconcile_readd_marks_the_room_missing_again() -> Result<(), Error> {
+    let (client, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_a = room_id!("!a:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 1 } },
+            "rooms": { room_a: { "initial": true } },
+        },
+    };
+
+    let _ = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await;
+    #[cfg(feature = "testing")]
+    client.get_room(room_a).unwrap().mark_members_synced();
+    let _ = room_list.reconcile_room_subscriptions_with_generation(&[]).await;
+    assert!(room_list.active_room_subscriptions().is_empty());
+
+    // Removing then re-adding must mark the room missing again (the security
+    // precaution for genuinely lost coverage).
+    let readd = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await;
+    assert_eq!(readd.added, 1);
+    assert_eq!(readd.removed, 0);
+    assert!(!client.get_room(room_a).unwrap().are_members_synced());
+    assert_eq!(
+        client.get_room(room_a).unwrap().members_missing_reason(),
+        matrix_sdk_base::RoomMembersMissingReason::RoomSubscription
+    );
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_reconcile_publishes_coherent_active_set_and_never_an_intermediate_empty_state()
+-> Result<(), Error> {
+    let (_, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_a = room_id!("!a:bar.org");
+    let room_b = room_id!("!b:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 2 } },
+            "rooms": {
+                room_a: { "initial": true },
+                room_b: { "initial": true },
+            },
+        },
+    };
+
+    // A -> {A,B} -> {B}: the active set is exactly the desired set after every
+    // step, and the generation is monotonic (never the transient empty set).
+    let first = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await;
+    assert_eq!(room_list.active_room_subscriptions(), BTreeSet::from([room_a.to_owned()]));
+    let second = room_list.reconcile_room_subscriptions_with_generation(&[room_a, room_b]).await;
+    assert_eq!(
+        room_list.active_room_subscriptions(),
+        BTreeSet::from([room_a.to_owned(), room_b.to_owned()])
+    );
+    let third = room_list.reconcile_room_subscriptions_with_generation(&[room_b]).await;
+    assert_eq!(room_list.active_room_subscriptions(), BTreeSet::from([room_b.to_owned()]));
+
+    assert!(second.generation.get() > first.generation.get());
+    assert!(third.generation.get() > second.generation.get());
+
+    // The reconcile result itself is identifier-free.
+    let debug = format!("{first:?} {second:?} {third:?}");
+    assert!(!debug.contains("!a") && !debug.contains("!b") && !debug.contains("bar.org"));
+
+    Ok(())
 }

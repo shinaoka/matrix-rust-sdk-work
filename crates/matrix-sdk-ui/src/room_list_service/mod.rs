@@ -157,6 +157,27 @@ impl RoomSubscriptionGeneration {
     }
 }
 
+/// Closed result of one atomic room-subscription reconciliation.
+///
+/// Contains only counts, flags, and the process-local generation — never
+/// room identifiers or positions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoomSubscriptionReconcile {
+    /// The process-local generation of the resulting subscription set.
+    pub generation: RoomSubscriptionGeneration,
+    /// Whether the desired set exactly equals the current set (a true no-op:
+    /// no generation bump, no checkpoint mutation, no member invalidation).
+    pub noop: bool,
+    /// Rooms added by this reconciliation (newly subscribed).
+    pub added: usize,
+    /// Rooms removed by this reconciliation (unsubscribed).
+    pub removed: usize,
+    /// Rooms retained across the reconciliation.
+    pub retained: usize,
+    /// Whether any retained-room checkpoint was kept.
+    pub checkpoints_retained: bool,
+}
+
 /// Provenance checkpoint for a room present in a subscription response.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RoomSubscriptionCheckpoint {
@@ -722,6 +743,122 @@ impl RoomListService {
         };
 
         generation
+    }
+
+    /// Atomically reconcile the room-subscription set from the current set to
+    /// the desired set, diffing by room ID.
+    ///
+    /// An identical desired set is a true no-op: the generation and retained
+    /// checkpoints are unchanged and no member invalidation occurs. Retained
+    /// rooms keep their subscriptions and member completeness; only newly
+    /// added rooms are marked as missing members; only removed rooms are
+    /// unsubscribed. The resulting generation and active set are published
+    /// coherently under one lock — no observer can pair an intermediate set
+    /// with the published generation.
+    pub async fn reconcile_room_subscriptions_with_generation(
+        &self,
+        room_ids: &[&RoomId],
+    ) -> RoomSubscriptionReconcile {
+        // Calculate the settings for the room subscriptions.
+        let settings = assign!(http::request::RoomSubscription::default(), {
+            required_state: required_state_for_user(DEFAULT_REQUIRED_STATE, self.client.user_id())
+            .into_iter()
+            .chain(
+                DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
+                    (state_event.clone(), (*value).to_owned())
+                })
+            )
+            .collect(),
+            timeline_limit: UInt::from(DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT),
+        });
+
+        // Decide whether the in-flight request (if any) should be cancelled if needed.
+        let cancel_in_flight_request = match self.state_machine.get() {
+            State::Init | State::Recovering | State::Error { .. } | State::Terminated { .. } => {
+                false
+            }
+            State::SettingUp | State::Running => true,
+        };
+
+        // Before subscribing, let's listen these rooms to calculate their latest
+        // events.
+        if self.client.event_cache().has_subscribed() {
+            let latest_events = self.client.latest_events().await;
+
+            for room_id in room_ids {
+                if let Err(error) = latest_events.listen_to_room(room_id).await {
+                    // Let's not fail the room subscription. Instead, emit a log because it's very
+                    // unlikely to happen.
+                    error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+                }
+            }
+        }
+
+        let desired: BTreeSet<OwnedRoomId> =
+            room_ids.iter().map(|room_id| (*room_id).to_owned()).collect();
+
+        // Reconcile under the same lock used by iteration capture and
+        // publication commit: no observer can observe an intermediate set or a
+        // mismatched generation/checkpoint view.
+        let result = {
+            let mut state = self.room_subscription_state.lock().unwrap();
+            let current = state.active_rooms.clone();
+            let added: Vec<&RoomId> =
+                desired.difference(&current).map(|room_id| room_id.as_ref()).collect();
+            let removed: Vec<&RoomId> =
+                current.difference(&desired).map(|room_id| room_id.as_ref()).collect();
+            let retained = current.intersection(&desired).count();
+
+            if added.is_empty() && removed.is_empty() {
+                let checkpoints_retained = !self.room_subscription_checkpoints.get().is_empty();
+                return RoomSubscriptionReconcile {
+                    generation: RoomSubscriptionGeneration(state.generation),
+                    noop: true,
+                    added: 0,
+                    removed: 0,
+                    retained,
+                    checkpoints_retained,
+                };
+            }
+
+            self.sliding_sync.subscribe_to_rooms(&added, Some(settings), cancel_in_flight_request);
+            self.sliding_sync.unsubscribe_to_rooms(&removed, cancel_in_flight_request);
+
+            state.generation = state.generation.wrapping_add(1).max(1);
+            state.active_rooms = desired.clone();
+
+            // Drop checkpoints of removed rooms; keep retained-room checkpoints.
+            let checkpoints = self.room_subscription_checkpoints.get();
+            let checkpoints_retained = !checkpoints.is_empty();
+            if !removed.is_empty() {
+                let mut retained_checkpoints = (*checkpoints).clone();
+                for room_id in &removed {
+                    retained_checkpoints.remove(*room_id);
+                }
+                self.room_subscription_checkpoints.set(Arc::new(retained_checkpoints));
+            }
+
+            RoomSubscriptionReconcile {
+                generation: RoomSubscriptionGeneration(state.generation),
+                noop: false,
+                added: added.len(),
+                removed: removed.len(),
+                retained,
+                checkpoints_retained,
+            }
+        };
+
+        result
+    }
+
+    /// The currently active room-subscription set.
+    pub fn active_room_subscriptions(&self) -> BTreeSet<OwnedRoomId> {
+        self.room_subscription_state.lock().unwrap().active_rooms.clone()
+    }
+
+    /// The process-local generation of the current room-subscription set.
+    pub fn subscription_generation(&self) -> RoomSubscriptionGeneration {
+        RoomSubscriptionGeneration(self.room_subscription_state.lock().unwrap().generation)
     }
 
     /// Subscribe to the retained latest checkpoint per room.
