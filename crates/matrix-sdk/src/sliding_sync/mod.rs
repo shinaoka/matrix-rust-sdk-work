@@ -22,7 +22,7 @@ mod error;
 mod list;
 
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::Debug,
     future::Future,
     sync::{Arc, RwLock as StdRwLock, RwLockWriteGuard as StdRwLockWriteGuard},
@@ -173,6 +173,55 @@ impl SlidingSync {
                 SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
             );
         }
+    }
+
+    /// Atomically reconcile the room-subscription map from the current set to
+    /// the desired set, holding the subscription write lock across both
+    /// additions and removals so no request construction can observe an
+    /// intermediate set.
+    ///
+    /// Additions install the subscription and mark only genuinely new rooms as
+    /// members missing; removals are explicit; an identical set changes
+    /// nothing. Returns whether the set changed.
+    pub fn reconcile_subscriptions(
+        &self,
+        room_ids: &[&RoomId],
+        settings: Option<http::request::RoomSubscription>,
+        cancel_in_flight_request: bool,
+    ) -> bool {
+        let mut room_subscriptions = self.inner.room_subscriptions.write().unwrap();
+        let settings = settings.unwrap_or_default();
+        let desired: BTreeSet<OwnedRoomId> =
+            room_ids.iter().map(|room_id| (*room_id).to_owned()).collect();
+        let mut changed = false;
+
+        // Additions: only genuinely new rooms are marked members missing.
+        for room_id in room_ids {
+            if let Entry::Vacant(entry) = room_subscriptions.entry((*room_id).to_owned()) {
+                if let Some(room) = self.inner.client.get_room(room_id) {
+                    room.mark_members_missing_with_reason(
+                        RoomMembersMissingReason::RoomSubscription,
+                    );
+                }
+                entry.insert(settings.clone());
+                changed = true;
+            }
+        }
+
+        // Removals: drop every currently subscribed room not in the desired set.
+        let retained: BTreeSet<OwnedRoomId> = room_subscriptions.keys().cloned().collect();
+        for room_id in retained.difference(&desired) {
+            if room_subscriptions.remove(room_id).is_some() {
+                changed = true;
+            }
+        }
+
+        if cancel_in_flight_request && changed {
+            self.inner.internal_channel_send_if_possible(
+                SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
+            );
+        }
+        changed
     }
 
     /// Replace all subscriptions to rooms by other ones.

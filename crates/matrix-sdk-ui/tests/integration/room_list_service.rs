@@ -3438,13 +3438,15 @@ async fn test_reconcile_adds_only_new_rooms_and_retains_intersection() -> Result
     };
 
     let generation_a = room_list.subscribe_to_rooms_with_generation(&[room_a]).await;
-    let members_synced_a = client.get_room(room_a).unwrap().are_members_synced();
-    #[cfg(feature = "testing")]
+    // Simulate both rooms completing a member fetch so the reconciliation's
+    // invalidation is observable (member completeness is otherwise false for
+    // both, making the assertions vacuous).
     client.get_room(room_a).unwrap().mark_members_synced();
-    #[cfg(feature = "testing")]
     client.get_room(room_b).unwrap().mark_members_synced();
-    let members_synced_a_after_fetch = client.get_room(room_a).unwrap().are_members_synced();
+    let members_synced_a_before = client.get_room(room_a).unwrap().are_members_synced();
     let members_synced_b_before = client.get_room(room_b).unwrap().are_members_synced();
+    assert!(members_synced_a_before);
+    assert!(members_synced_b_before);
 
     let result = room_list.reconcile_room_subscriptions_with_generation(&[room_a, room_b]).await;
 
@@ -3462,22 +3464,19 @@ async fn test_reconcile_adds_only_new_rooms_and_retains_intersection() -> Result
         BTreeSet::from([room_a.to_owned(), room_b.to_owned()])
     );
 
-    // A is retained unchanged; only B was invalidated.
-    assert_eq!(
+    // Retained A keeps its member completeness; only added B is invalidated.
+    assert!(
         client.get_room(room_a).unwrap().are_members_synced(),
-        members_synced_a_after_fetch,
         "retained room A must not be invalidated"
     );
-    assert_eq!(
-        client.get_room(room_b).unwrap().are_members_synced(),
-        members_synced_b_before,
-        "room B was already marked missing by the subscribe"
+    assert!(
+        !client.get_room(room_b).unwrap().are_members_synced(),
+        "added room B must be invalidated"
     );
     assert_eq!(
-        client.get_room(room_a).unwrap().members_missing_reason(),
+        client.get_room(room_b).unwrap().members_missing_reason(),
         matrix_sdk_base::RoomMembersMissingReason::RoomSubscription
     );
-    let _ = members_synced_a;
 
     Ok(())
 }

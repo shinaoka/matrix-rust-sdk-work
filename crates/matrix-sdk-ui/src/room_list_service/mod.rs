@@ -821,8 +821,15 @@ impl RoomListService {
                 };
             }
 
-            self.sliding_sync.subscribe_to_rooms(&added, Some(settings), cancel_in_flight_request);
-            self.sliding_sync.unsubscribe_to_rooms(&removed, cancel_in_flight_request);
+            // One atomic primitive under the subscription write lock: no
+            // request construction can observe an intermediate set.
+            let desired_refs: Vec<&RoomId> =
+                desired.iter().map(|room_id| room_id.as_ref()).collect();
+            self.sliding_sync.reconcile_subscriptions(
+                &desired_refs,
+                Some(settings),
+                cancel_in_flight_request,
+            );
 
             state.generation = state.generation.wrapping_add(1).max(1);
             state.active_rooms = desired.clone();
