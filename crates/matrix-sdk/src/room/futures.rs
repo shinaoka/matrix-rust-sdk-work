@@ -599,9 +599,10 @@ pub(crate) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
     room.client
         .locks()
         .initial_share_repair_deduplicated_handler
-        .run((room.room_id().to_owned(), expected_session.clone()), async {
-            run_initial_share_repair(room, &expected_session).await
-        })
+        .run(
+            (room.room_id().to_owned(), expected_session.clone()),
+            Box::pin(run_initial_share_repair(room, &expected_session)),
+        )
         .await?;
 
     room.ensure_room_joined()?;

@@ -499,7 +499,16 @@ async fn test_issue_523_unusable_claim_key_is_classified_invalid() {
             .send(RoomMessageEventContent::text_plain("first"))
             .await
     });
-    while claims.load(Ordering::SeqCst) < 2 {
+    while claims.load(Ordering::SeqCst) < 2
+        || !events.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                RoomKeyDiagnosticEvent::InitialShareRepair(record)
+                    if record.claim
+                        == matrix_sdk::encryption::InitialShareRepairClaimOutcome::Invalid
+            )
+        })
+    {
         tokio::task::yield_now().await;
     }
     tokio::time::advance(Duration::from_millis(1500)).await;
