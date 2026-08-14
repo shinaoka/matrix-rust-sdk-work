@@ -3621,13 +3621,32 @@ async fn test_expiry_then_empty_reconcile_clears_logical_set_and_checkpoints() -
     let _ = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await;
     assert_eq!(room_list.active_room_subscriptions(), BTreeSet::from([room_a.to_owned()]));
 
-    // Session expiry clears the actual map; the logical set must follow even
-    // when the desired set is empty (the reconcile is then a no-op on the map).
+    // A subscribed-room sync publishes a checkpoint for A.
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "1",
+            "lists": { ALL_ROOMS: { "count": 1 } },
+            "rooms": { room_a: { "initial": false } },
+        },
+    };
+    assert!(
+        room_list.room_subscription_checkpoints().get().contains_key(room_a),
+        "the subscribed room must have a published checkpoint"
+    );
+
+    // Session expiry clears the actual map; the logical set and checkpoints
+    // must follow even when the desired set is empty (the reconcile is then a
+    // no-op on the map).
     room_list.sliding_sync_for_testing().expire_session().await;
     let result = room_list.reconcile_room_subscriptions_with_generation(&[]).await;
     assert!(result.noop);
     assert!(room_list.active_room_subscriptions().is_empty(), "logical set must follow the expiry");
-    assert!(room_list.room_subscription_checkpoints().get().is_empty());
+    assert!(
+        room_list.room_subscription_checkpoints().get().is_empty(),
+        "checkpoints must be cleared"
+    );
 
     Ok(())
 }

@@ -1046,7 +1046,7 @@ impl PollTimeout {
 #[allow(clippy::dbg_macro)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         future::ready,
         ops::Not,
         sync::{Arc, Mutex},
@@ -1106,6 +1106,22 @@ mod tests {
         let sliding_sync = sliding_sync_builder.build().await?;
 
         Ok((server, sliding_sync))
+    }
+
+    #[test]
+    fn subscription_delta_debug_is_identifier_free() {
+        let delta = super::SlidingSyncSubscriptionDelta {
+            changed: true,
+            added: BTreeSet::from([ruma::room_id!("!private-added:bar.org").to_owned()]),
+            removed: BTreeSet::from([ruma::room_id!("!private-removed:bar.org").to_owned()]),
+            retained: BTreeSet::from([ruma::room_id!("!private-retained:bar.org").to_owned()]),
+        };
+        let debug = format!("{delta:?}");
+        assert!(!debug.contains("private-added"));
+        assert!(!debug.contains("private-removed"));
+        assert!(!debug.contains("private-retained"));
+        assert!(!debug.contains("bar.org"));
+        assert!(debug.contains("changed: true"));
     }
 
     #[async_test]

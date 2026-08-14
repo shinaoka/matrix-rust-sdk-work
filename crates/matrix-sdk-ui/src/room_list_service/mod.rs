@@ -799,7 +799,10 @@ impl RoomListService {
                     .map(|(room_id, checkpoint)| (room_id.clone(), checkpoint.clone()))
                     .collect();
                 let checkpoints_retained = !retained_checkpoints.is_empty();
-                self.room_subscription_checkpoints.set(Arc::new(retained_checkpoints));
+                // set_if_not_eq: an ordinary identical-set reconcile must not
+                // emit checkpoint-channel churn; an expiry repair that actually
+                // changes the map still notifies.
+                self.room_subscription_checkpoints.set_if_not_eq(Arc::new(retained_checkpoints));
                 return RoomSubscriptionReconcile {
                     generation: RoomSubscriptionGeneration(state.generation),
                     noop: true,
@@ -824,7 +827,7 @@ impl RoomListService {
                 .map(|(room_id, checkpoint)| (room_id.clone(), checkpoint.clone()))
                 .collect();
             let checkpoints_retained = !retained_checkpoints.is_empty();
-            self.room_subscription_checkpoints.set(Arc::new(retained_checkpoints));
+            self.room_subscription_checkpoints.set_if_not_eq(Arc::new(retained_checkpoints));
 
             RoomSubscriptionReconcile {
                 generation: RoomSubscriptionGeneration(state.generation),
