@@ -106,10 +106,12 @@ pub use room_key_diagnostics::{
     InitialShareSessionDiagnostic, InitialShareStage, OlmRecoveryCounters, OlmRecoveryDiagnostic,
     OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome, RequestedRoomKeySession,
     RoomKeyCreationOutcome, RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent,
-    RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome, RoomKeyIngressKind, RoomKeyMergeDecision,
-    RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
-    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
-    RoomKeyRotationDiagnostic, RoomKeyRotationReason,
+    RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome, RoomKeyIngressKind,
+    RoomKeyMemberReloadContext, RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome,
+    RoomKeyMergeDecision, RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic,
+    RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason, RoomKeyRequestAction,
+    RoomKeyRequesterDeviceState, RoomKeyRequesterScope, RoomKeyRotationDiagnostic,
+    RoomKeyRotationReason,
 };
 use serde::{Deserialize, Serialize};
 pub use session_manager::{

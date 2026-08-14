@@ -26,7 +26,11 @@ mod state;
 mod tags;
 mod tombstone;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 pub use call::CallIntentConsensus;
 pub use create::*;
@@ -102,6 +106,67 @@ pub struct Room {
 
     /// A sender that will notify receivers when room member updates happen.
     pub room_member_updates_sender: broadcast::Sender<RoomMembersUpdate>,
+
+    /// Process-local provenance for the next full member reload. It is kept
+    /// outside persisted `RoomInfo` and contains no Matrix identifiers.
+    member_reload_diagnostics: Arc<Mutex<RoomMemberReloadDiagnosticState>>,
+}
+
+#[derive(Debug, Default)]
+struct RoomMemberReloadDiagnosticState {
+    first_invalidated_at: Option<Instant>,
+    invalidation_count: u32,
+    members_were_synced_before_invalidation: Option<bool>,
+}
+
+impl RoomMemberReloadDiagnosticState {
+    fn note_invalidation(&mut self, members_were_synced: bool) {
+        if self.first_invalidated_at.is_none() || members_were_synced {
+            self.first_invalidated_at = Some(Instant::now());
+            self.invalidation_count = 1;
+            self.members_were_synced_before_invalidation = Some(members_were_synced);
+        } else {
+            self.invalidation_count = self.invalidation_count.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self) -> RoomMemberReloadDiagnosticSnapshot {
+        RoomMemberReloadDiagnosticSnapshot {
+            members_were_synced_before_invalidation: self.members_were_synced_before_invalidation,
+            invalidation_count: self.invalidation_count,
+            invalidation_age_ms: self
+                .first_invalidated_at
+                .map(|started| started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RoomMemberReloadDiagnosticSnapshot {
+    pub(crate) members_were_synced_before_invalidation: Option<bool>,
+    pub(crate) invalidation_count: u32,
+    pub(crate) invalidation_age_ms: Option<u64>,
+}
+
+#[cfg(test)]
+mod member_reload_diagnostic_tests {
+    use super::RoomMemberReloadDiagnosticState;
+
+    #[test]
+    fn invalidation_provenance_counts_repeated_marks_and_resets_on_new_complete_state() {
+        let mut state = RoomMemberReloadDiagnosticState::default();
+        state.note_invalidation(true);
+        state.note_invalidation(false);
+        let repeated = state.snapshot();
+        assert_eq!(repeated.members_were_synced_before_invalidation, Some(true));
+        assert_eq!(repeated.invalidation_count, 2);
+        assert!(repeated.invalidation_age_ms.is_some());
+
+        state.note_invalidation(true);
+        let restarted = state.snapshot();
+        assert_eq!(restarted.members_were_synced_before_invalidation, Some(true));
+        assert_eq!(restarted.invalidation_count, 1);
+    }
 }
 
 impl Room {
@@ -131,6 +196,7 @@ impl Room {
             room_info_notable_update_sender,
             seen_knock_request_ids_map: SharedObservable::new_async(None),
             room_member_updates_sender,
+            member_reload_diagnostics: Arc::new(Mutex::new(Default::default())),
         }
     }
 

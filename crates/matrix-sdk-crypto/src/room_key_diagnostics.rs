@@ -258,8 +258,64 @@ pub struct RoomKeyRotationDiagnostic {
     pub first_share_outcome: RoomKeyFirstShareOutcome,
     /// Whether a safe first-send correlation was available.
     pub first_send_correlation_present: bool,
+    /// Time between the authoritative discard and this replacement-session
+    /// boundary, when the rotation followed an explicit discard.
+    pub discard_elapsed_ms: Option<u64>,
     /// Creation elapsed time.
     pub elapsed_ms: u64,
+}
+
+/// Closed outcome of discarding an outbound Megolm session after a full
+/// member-list reload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomKeyMemberReloadDiscardOutcome {
+    /// An active outbound session was invalidated.
+    Discarded,
+    /// No active outbound session existed.
+    NoActiveSession,
+    /// The crypto store operation failed.
+    SdkError,
+}
+
+/// Privacy-safe context captured around a full member-list reload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RoomKeyMemberReloadContext {
+    /// Whether the member list was complete immediately before the first
+    /// process-local invalidation, if that provenance is available.
+    pub members_were_synced_before_invalidation: Option<bool>,
+    /// Number of invalidation marks observed before this reload.
+    pub invalidation_count: u32,
+    /// Time from the first observed invalidation to this reload boundary.
+    pub invalidation_age_ms: Option<u64>,
+    /// Homeserver `/members` request duration, when measured by the caller.
+    pub request_elapsed_ms: Option<u64>,
+    /// Number of member events returned. The observer receives only a bucket.
+    pub response_member_count: usize,
+    /// Local response-processing duration before the discard operation.
+    pub processing_elapsed_ms: u64,
+}
+
+/// A typed, privacy-safe full-member-reload and Megolm-discard boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoomKeyMemberReloadDiagnostic {
+    /// Anonymous room correlation shared with the later rotation boundary.
+    pub room: RoomKeyDiagnosticAlias,
+    /// Closed reason retained from the member invalidation.
+    pub reason: RoomKeyRotationReason,
+    /// Whether members were complete before the first invalidation, when known.
+    pub members_were_synced_before_invalidation: Option<bool>,
+    /// Invalidation count bucket: 0, 1, 2-5, 6-20, or 21+.
+    pub invalidation_count_bucket: u8,
+    /// Time from first invalidation to reload, when process-local provenance exists.
+    pub invalidation_age_ms: Option<u64>,
+    /// Homeserver `/members` request duration, when available.
+    pub request_elapsed_ms: Option<u64>,
+    /// Response member-count bucket: 0, 1, 2-5, 6-20, or 21+.
+    pub response_member_count_bucket: u8,
+    /// Local processing duration before the discard boundary.
+    pub processing_elapsed_ms: u64,
+    /// Closed discard result.
+    pub discard_outcome: RoomKeyMemberReloadDiscardOutcome,
 }
 
 /// Room-key diagnostic event emitted by the crypto machine.
@@ -269,6 +325,8 @@ pub enum RoomKeyDiagnosticEvent {
     IncomingRequest(IncomingRoomKeyRequestDiagnostic),
     /// Outbound Megolm creation/rotation boundary.
     Rotation(RoomKeyRotationDiagnostic),
+    /// Full member-list reload and the resulting outbound-session discard.
+    MemberReload(RoomKeyMemberReloadDiagnostic),
     /// Receive-side room-key lifecycle outcome.
     Receive(RoomKeyReceiveDiagnostic),
     /// Post-unwedge recovery re-share outcome (issue #477).
@@ -720,7 +778,7 @@ struct RoomKeyDiagnosticState {
     peers: BTreeMap<String, RoomKeyDiagnosticAlias>,
     devices: BTreeMap<(String, String), RoomKeyDiagnosticAlias>,
     active_sessions: BTreeMap<String, String>,
-    pending_discard_reasons: BTreeMap<String, RoomKeyRotationReason>,
+    pending_discards: BTreeMap<String, PendingRoomKeyDiscard>,
     next_room: u64,
     next_session: u64,
     next_request: u64,
@@ -735,6 +793,16 @@ struct RoomKeyDiagnosticState {
     /// Per-(room, session) one-shot flag for the bounded index-0 duplicate
     /// share (issue #510).
     index0_reshare_attempted: BTreeSet<(String, String)>,
+}
+
+struct PendingRoomKeyDiscard {
+    reason: RoomKeyRotationReason,
+    noted_at: Instant,
+}
+
+pub(crate) struct RoomKeyRotationClassification {
+    pub(crate) reason: RoomKeyRotationReason,
+    pub(crate) discard_elapsed_ms: Option<u64>,
 }
 
 /// Per-session initial-share tally (issue #509).
@@ -1064,8 +1132,42 @@ impl RoomKeyDiagnosticHub {
         lock(&self.0).olm_recovery_counters
     }
 
+    pub(crate) fn emit_member_reload(
+        &self,
+        room_id: &RoomId,
+        reason: RoomKeyRotationReason,
+        context: RoomKeyMemberReloadContext,
+        discard_outcome: RoomKeyMemberReloadDiscardOutcome,
+    ) {
+        let (observer, event) = {
+            let mut state = lock(&self.0);
+            let room = room_alias(&mut state, room_id);
+            let event = RoomKeyMemberReloadDiagnostic {
+                room,
+                reason,
+                members_were_synced_before_invalidation: context
+                    .members_were_synced_before_invalidation,
+                invalidation_count_bucket: matching_bucket_token(
+                    context.invalidation_count as usize,
+                ),
+                invalidation_age_ms: context.invalidation_age_ms,
+                request_elapsed_ms: context.request_elapsed_ms,
+                response_member_count_bucket: matching_bucket_token(context.response_member_count),
+                processing_elapsed_ms: context.processing_elapsed_ms,
+                discard_outcome,
+            };
+            (state.observer.clone(), event)
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::MemberReload(event));
+        }
+    }
+
     pub(crate) fn note_discard(&self, room_id: &RoomId, reason: RoomKeyRotationReason) {
-        lock(&self.0).pending_discard_reasons.insert(room_id.as_str().to_owned(), reason);
+        lock(&self.0).pending_discards.insert(
+            room_id.as_str().to_owned(),
+            PendingRoomKeyDiscard { reason, noted_at: Instant::now() },
+        );
     }
 
     pub(crate) fn classify_rotation_reason(
@@ -1075,12 +1177,17 @@ impl RoomKeyDiagnosticHub {
         expired_messages: bool,
         invalidated: bool,
         had_session: bool,
-    ) -> RoomKeyRotationReason {
+    ) -> RoomKeyRotationClassification {
         let mut state = lock(&self.0);
-        if let Some(reason) = state.pending_discard_reasons.remove(room_id.as_str()) {
-            return reason;
+        if let Some(discard) = state.pending_discards.remove(room_id.as_str()) {
+            return RoomKeyRotationClassification {
+                reason: discard.reason,
+                discard_elapsed_ms: Some(
+                    discard.noted_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                ),
+            };
         }
-        if expired_messages {
+        let reason = if expired_messages {
             RoomKeyRotationReason::ExpiredMessageCount
         } else if expired_time {
             RoomKeyRotationReason::ExpiredTime
@@ -1090,7 +1197,8 @@ impl RoomKeyDiagnosticHub {
             RoomKeyRotationReason::StoreMissing
         } else {
             RoomKeyRotationReason::Initial
-        }
+        };
+        RoomKeyRotationClassification { reason, discard_elapsed_ms: None }
     }
 
     pub(crate) fn emit_rotation(
@@ -1100,6 +1208,7 @@ impl RoomKeyDiagnosticHub {
         new_session_id: Option<&str>,
         reason: RoomKeyRotationReason,
         creation_outcome: RoomKeyCreationOutcome,
+        discard_elapsed_ms: Option<u64>,
         elapsed_ms: u64,
     ) {
         let (observer, event) = {
@@ -1119,6 +1228,7 @@ impl RoomKeyDiagnosticHub {
                 creation_outcome,
                 first_share_outcome: RoomKeyFirstShareOutcome::Pending,
                 first_send_correlation_present: false,
+                discard_elapsed_ms,
                 elapsed_ms,
             };
             (state.observer.clone(), event)
@@ -1378,6 +1488,7 @@ mod tests {
             Some("PRIVATE-SESSION"),
             RoomKeyRotationReason::Initial,
             RoomKeyCreationOutcome::Created,
+            None,
             2,
         );
         let request_id = OwnedTransactionId::from("PRIVATE-REQUEST");
@@ -1410,21 +1521,70 @@ mod tests {
         let room = room_id!("!private:example.invalid");
         hub.note_discard(room, RoomKeyRotationReason::MembershipOrDeviceChange);
         assert_eq!(
-            hub.classify_rotation_reason(room, true, true, true, true),
+            hub.classify_rotation_reason(room, true, true, true, true).reason,
             RoomKeyRotationReason::MembershipOrDeviceChange
         );
         assert_eq!(
-            hub.classify_rotation_reason(room, false, true, false, true),
+            hub.classify_rotation_reason(room, false, true, false, true).reason,
             RoomKeyRotationReason::ExpiredMessageCount
         );
         assert_eq!(
-            hub.classify_rotation_reason(room, true, false, false, true),
+            hub.classify_rotation_reason(room, true, false, false, true).reason,
             RoomKeyRotationReason::ExpiredTime
         );
         assert_eq!(
-            hub.classify_rotation_reason(room, false, false, true, true),
+            hub.classify_rotation_reason(room, false, false, true, true).reason,
             RoomKeyRotationReason::Invalidated
         );
+    }
+
+    #[test]
+    fn member_reload_and_following_rotation_share_anonymous_room_correlation() {
+        let hub = RoomKeyDiagnosticHub::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        hub.set_observer(Some(Arc::new(move |event| lock(&captured).push(event))));
+        let room = room_id!("!private-member-reload:example.invalid");
+
+        hub.emit_member_reload(
+            room,
+            RoomKeyRotationReason::RoomSubscription,
+            RoomKeyMemberReloadContext {
+                members_were_synced_before_invalidation: Some(true),
+                invalidation_count: 2,
+                invalidation_age_ms: Some(42),
+                request_elapsed_ms: Some(17),
+                response_member_count: 26,
+                processing_elapsed_ms: 3,
+            },
+            RoomKeyMemberReloadDiscardOutcome::Discarded,
+        );
+        hub.note_discard(room, RoomKeyRotationReason::RoomSubscription);
+        let classification = hub.classify_rotation_reason(room, false, false, true, true);
+        hub.emit_rotation(
+            room,
+            Some("PRIVATE-OLD-SESSION"),
+            Some("PRIVATE-NEW-SESSION"),
+            classification.reason,
+            RoomKeyCreationOutcome::Created,
+            classification.discard_elapsed_ms,
+            2,
+        );
+
+        let events = lock(&events);
+        let RoomKeyDiagnosticEvent::MemberReload(reload) = &events[0] else { panic!() };
+        let RoomKeyDiagnosticEvent::Rotation(rotation) = &events[1] else { panic!() };
+        assert_eq!(reload.room, rotation.room);
+        assert_eq!(reload.reason, RoomKeyRotationReason::RoomSubscription);
+        assert_eq!(reload.invalidation_count_bucket, 2);
+        assert_eq!(reload.response_member_count_bucket, 4);
+        assert_eq!(reload.discard_outcome, RoomKeyMemberReloadDiscardOutcome::Discarded);
+        assert!(rotation.discard_elapsed_ms.is_some());
+
+        let debug = format!("{events:?}");
+        for private in ["private-member-reload", "PRIVATE-OLD-SESSION", "PRIVATE-NEW-SESSION"] {
+            assert!(!debug.contains(private), "privacy leak: {debug}");
+        }
     }
 
     #[test]

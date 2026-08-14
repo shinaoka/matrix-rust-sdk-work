@@ -1108,6 +1108,7 @@ impl Room {
             .members_request_deduplicated_handler
             .run(self.room_id().to_owned(), async move {
                 let request = get_member_events::v3::Request::new(self.inner.room_id().to_owned());
+                let request_started = Instant::now();
                 let response = self
                     .client
                     .send(request.clone())
@@ -1117,12 +1118,15 @@ impl Room {
                         RequestConfig::new().timeout(Duration::from_secs(60)).retry_limit(3),
                     )
                     .await?;
+                let request_elapsed_ms =
+                    request_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
                 // That's a large `Future`. Let's `Box::pin` to reduce its size on the stack.
-                Box::pin(self.client.base_client().receive_all_members(
+                Box::pin(self.client.base_client().receive_all_members_with_request_elapsed(
                     self.room_id(),
                     &request,
                     &response,
+                    Some(request_elapsed_ms),
                 ))
                 .await?;
 
