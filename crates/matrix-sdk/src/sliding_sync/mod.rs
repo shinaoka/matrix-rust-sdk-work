@@ -187,18 +187,23 @@ impl SlidingSync {
     ///
     /// Additions install the subscription and mark only genuinely new rooms as
     /// members missing; removals are explicit; an identical set changes
-    /// nothing. Returns whether the set changed.
+    /// nothing. The returned delta is computed under the same write lock, so
+    /// callers can derive no-op/generation/checkpoint decisions from it
+    /// without a separate, racy read.
     pub fn reconcile_subscriptions(
         &self,
         room_ids: &[&RoomId],
         settings: Option<http::request::RoomSubscription>,
         cancel_in_flight_request: bool,
-    ) -> bool {
+    ) -> SlidingSyncSubscriptionDelta {
         let mut room_subscriptions = self.inner.room_subscriptions.write().unwrap();
         let settings = settings.unwrap_or_default();
         let desired: BTreeSet<OwnedRoomId> =
             room_ids.iter().map(|room_id| (*room_id).to_owned()).collect();
-        let mut changed = false;
+
+        let before: BTreeSet<OwnedRoomId> = room_subscriptions.keys().cloned().collect();
+        let mut added = BTreeSet::new();
+        let mut removed = BTreeSet::new();
 
         // Additions: only genuinely new rooms are marked members missing.
         for room_id in room_ids {
@@ -209,24 +214,26 @@ impl SlidingSync {
                     );
                 }
                 entry.insert(settings.clone());
-                changed = true;
+                added.insert((*room_id).to_owned());
             }
         }
 
         // Removals: drop every currently subscribed room not in the desired set.
-        let retained: BTreeSet<OwnedRoomId> = room_subscriptions.keys().cloned().collect();
-        for room_id in retained.difference(&desired) {
+        for room_id in before.difference(&desired) {
             if room_subscriptions.remove(room_id).is_some() {
-                changed = true;
+                removed.insert(room_id.clone());
             }
         }
 
+        let changed = !added.is_empty() || !removed.is_empty();
         if cancel_in_flight_request && changed {
             self.inner.internal_channel_send_if_possible(
                 SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
             );
         }
-        changed
+        // Retained: rooms subscribed before this reconciliation that remain.
+        let retained: BTreeSet<OwnedRoomId> = before.intersection(&desired).cloned().collect();
+        SlidingSyncSubscriptionDelta { changed, added, removed, retained }
     }
 
     /// Replace all subscriptions to rooms by other ones.
@@ -872,6 +879,20 @@ impl SlidingSync {
             self.inner.room_subscriptions.write().unwrap().clear();
         }
     }
+}
+
+/// The authoritative room-subscription delta computed by one atomic
+/// reconciliation, under the subscription write lock.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SlidingSyncSubscriptionDelta {
+    /// Whether the set changed at all.
+    pub changed: bool,
+    /// Rooms newly subscribed by this reconciliation.
+    pub added: BTreeSet<OwnedRoomId>,
+    /// Rooms unsubscribed by this reconciliation.
+    pub removed: BTreeSet<OwnedRoomId>,
+    /// Rooms that were already subscribed and remain subscribed.
+    pub retained: BTreeSet<OwnedRoomId>,
 }
 
 /// Private implementation for [`SlidingSync::subscribe_to_rooms`] and

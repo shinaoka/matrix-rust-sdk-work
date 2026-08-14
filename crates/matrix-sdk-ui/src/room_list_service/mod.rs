@@ -161,7 +161,7 @@ impl RoomSubscriptionGeneration {
 ///
 /// Contains only counts, flags, and the process-local generation — never
 /// room identifiers or positions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RoomSubscriptionReconcile {
     /// The process-local generation of the resulting subscription set.
     pub generation: RoomSubscriptionGeneration,
@@ -176,6 +176,26 @@ pub struct RoomSubscriptionReconcile {
     pub retained: usize,
     /// Whether any retained-room checkpoint was kept.
     pub checkpoints_retained: bool,
+    /// Rooms newly subscribed by this reconciliation (callers only; never
+    /// serialized to diagnostics).
+    pub added_rooms: BTreeSet<OwnedRoomId>,
+    /// Rooms retained across this reconciliation (callers only).
+    pub retained_rooms: BTreeSet<OwnedRoomId>,
+}
+
+impl std::fmt::Debug for RoomSubscriptionReconcile {
+    /// Identifier-free: the caller-facing room sets are never serialized.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RoomSubscriptionReconcile")
+            .field("generation", &self.generation)
+            .field("noop", &self.noop)
+            .field("added", &self.added)
+            .field("removed", &self.removed)
+            .field("retained", &self.retained)
+            .field("checkpoints_retained", &self.checkpoints_retained)
+            .finish()
+    }
 }
 
 /// Provenance checkpoint for a room present in a subscription response.
@@ -802,35 +822,57 @@ impl RoomListService {
         // mismatched generation/checkpoint view.
         let result = {
             let mut state = self.room_subscription_state.lock().unwrap();
-            // The authoritative diff is against the ACTUAL Sliding Sync map,
-            // so a session expiry (UnknownPos) that cleared it without
-            // touching the logical active set is detected as a change.
-            let current = self.sliding_sync.subscribed_rooms();
-            let added: Vec<OwnedRoomId> = desired.difference(&current).cloned().collect();
-            let removed: Vec<OwnedRoomId> = current.difference(&desired).cloned().collect();
-            let retained = current.intersection(&desired).count();
+            // The authoritative delta is computed by the Sliding Sync
+            // primitive under its subscription write lock, so a session
+            // expiry (UnknownPos) that cleared the map without touching the
+            // logical active set is detected as a change with no read/write
+            // race.
+            let desired_refs: Vec<&RoomId> =
+                desired.iter().map(|room_id| room_id.as_ref()).collect();
+            let delta = self.sliding_sync.reconcile_subscriptions(
+                &desired_refs,
+                Some(settings),
+                cancel_in_flight_request,
+            );
 
-            if added.is_empty() && removed.is_empty() {
+            if !delta.changed {
                 let checkpoints_retained = !self.room_subscription_checkpoints.get().is_empty();
                 return RoomSubscriptionReconcile {
                     generation: RoomSubscriptionGeneration(state.generation),
                     noop: true,
                     added: 0,
                     removed: 0,
-                    retained,
+                    retained: delta.retained.len(),
                     checkpoints_retained,
+                    added_rooms: BTreeSet::new(),
+                    retained_rooms: delta.retained.clone(),
                 };
             }
 
-            self.apply_reconcile_change(
-                state,
-                settings,
-                cancel_in_flight_request,
-                desired,
-                added,
-                removed,
-                retained,
-            )
+            state.generation = state.generation.wrapping_add(1).max(1);
+            state.active_rooms = desired;
+
+            // Retain checkpoints only for rooms still subscribed after this
+            // reconciliation; added and removed rooms lose theirs.
+            let checkpoints = self.room_subscription_checkpoints.get();
+            let retained_checkpoints: BTreeMap<_, _> = (*checkpoints)
+                .iter()
+                .filter(|(room_id, _)| delta.retained.contains(*room_id))
+                .map(|(room_id, checkpoint)| (room_id.clone(), checkpoint.clone()))
+                .collect();
+            let checkpoints_retained = !retained_checkpoints.is_empty();
+            self.room_subscription_checkpoints.set(Arc::new(retained_checkpoints));
+
+            RoomSubscriptionReconcile {
+                generation: RoomSubscriptionGeneration(state.generation),
+                noop: false,
+                added: delta.added.len(),
+                removed: delta.removed.len(),
+                retained: delta.retained.len(),
+                checkpoints_retained,
+                added_rooms: delta.added,
+                retained_rooms: delta.retained,
+            }
         };
 
         result
@@ -841,52 +883,6 @@ impl RoomListService {
     /// active set).
     pub fn actual_subscribed_rooms(&self) -> BTreeSet<OwnedRoomId> {
         self.sliding_sync.subscribed_rooms()
-    }
-
-    /// Apply a differential subscription change under the state lock and the
-    /// Sliding Sync subscription write lock, publish the coherent
-    /// generation/active-set/checkpoint view, and return the closed result.
-    fn apply_reconcile_change(
-        &self,
-        mut state: std::sync::MutexGuard<'_, RoomSubscriptionState>,
-        settings: http::request::RoomSubscription,
-        cancel_in_flight_request: bool,
-        desired: BTreeSet<OwnedRoomId>,
-        added: Vec<OwnedRoomId>,
-        removed: Vec<OwnedRoomId>,
-        retained: usize,
-    ) -> RoomSubscriptionReconcile {
-        // One atomic primitive under the subscription write lock: no request
-        // construction can observe an intermediate set.
-        let desired_refs: Vec<&RoomId> = desired.iter().map(|room_id| room_id.as_ref()).collect();
-        self.sliding_sync.reconcile_subscriptions(
-            &desired_refs,
-            Some(settings),
-            cancel_in_flight_request,
-        );
-
-        state.generation = state.generation.wrapping_add(1).max(1);
-        state.active_rooms = desired;
-
-        // Drop checkpoints of removed rooms; keep retained-room checkpoints.
-        let checkpoints = self.room_subscription_checkpoints.get();
-        let mut retained_checkpoints = (*checkpoints).clone();
-        for room_id in &removed {
-            retained_checkpoints.remove(room_id);
-        }
-        let checkpoints_retained = !retained_checkpoints.is_empty();
-        if !removed.is_empty() {
-            self.room_subscription_checkpoints.set(Arc::new(retained_checkpoints));
-        }
-
-        RoomSubscriptionReconcile {
-            generation: RoomSubscriptionGeneration(state.generation),
-            noop: false,
-            added: added.len(),
-            removed: removed.len(),
-            retained,
-            checkpoints_retained,
-        }
     }
 
     /// The currently active room-subscription set.
