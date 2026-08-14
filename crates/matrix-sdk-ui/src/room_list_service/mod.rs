@@ -706,63 +706,15 @@ impl RoomListService {
     }
 
     /// Replace room subscriptions and return their process-local generation.
+    ///
+    /// Implemented as a thin wrapper over the atomic differential
+    /// reconciliation, so an identical desired set is a true no-op (issue
+    /// #518).
     pub async fn subscribe_to_rooms_with_generation(
         &self,
         room_ids: &[&RoomId],
     ) -> RoomSubscriptionGeneration {
-        // Calculate the settings for the room subscriptions.
-        let settings = assign!(http::request::RoomSubscription::default(), {
-            required_state: required_state_for_user(DEFAULT_REQUIRED_STATE, self.client.user_id())
-            .into_iter()
-            .chain(
-                DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
-                    (state_event.clone(), (*value).to_owned())
-                })
-            )
-            .collect(),
-            timeline_limit: UInt::from(DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT),
-        });
-
-        // Decide whether the in-flight request (if any) should be cancelled if needed.
-        let cancel_in_flight_request = match self.state_machine.get() {
-            State::Init | State::Recovering | State::Error { .. } | State::Terminated { .. } => {
-                false
-            }
-            State::SettingUp | State::Running => true,
-        };
-
-        // Before subscribing, let's listen these rooms to calculate their latest
-        // events.
-        if self.client.event_cache().has_subscribed() {
-            let latest_events = self.client.latest_events().await;
-
-            for room_id in room_ids {
-                if let Err(error) = latest_events.listen_to_room(room_id).await {
-                    // Let's not fail the room subscription. Instead, emit a log because it's very
-                    // unlikely to happen.
-                    error!(?error, ?room_id, "Failed to listen to the latest event for this room");
-                }
-            }
-        }
-
-        // Reconfigure, publish the generation, and clear retained checkpoints
-        // under the same lock used by iteration capture and publication
-        // commit. No observer can pair the new request configuration with the
-        // old generation or restore an inactive generation after the clear.
-        let generation = {
-            let mut state = self.room_subscription_state.lock().unwrap();
-            self.sliding_sync.clear_and_subscribe_to_rooms(
-                room_ids,
-                Some(settings),
-                cancel_in_flight_request,
-            );
-            state.generation = state.generation.wrapping_add(1).max(1);
-            state.active_rooms = room_ids.iter().map(|room_id| (*room_id).to_owned()).collect();
-            self.room_subscription_checkpoints.set(Arc::new(BTreeMap::new()));
-            RoomSubscriptionGeneration(state.generation)
-        };
-
-        generation
+        self.reconcile_room_subscriptions_with_generation(room_ids).await.generation
     }
 
     /// Atomically reconcile the room-subscription set from the current set to
@@ -836,7 +788,18 @@ impl RoomListService {
             );
 
             if !delta.changed {
-                let checkpoints_retained = !self.room_subscription_checkpoints.get().is_empty();
+                // A session expiry can clear the actual map while the logical
+                // set and checkpoints still describe the pre-expiry rooms;
+                // bring them in line even on the no-op path.
+                state.active_rooms = desired.clone();
+                let checkpoints = self.room_subscription_checkpoints.get();
+                let retained_checkpoints: BTreeMap<_, _> = (*checkpoints)
+                    .iter()
+                    .filter(|(room_id, _)| delta.retained.contains(*room_id))
+                    .map(|(room_id, checkpoint)| (room_id.clone(), checkpoint.clone()))
+                    .collect();
+                let checkpoints_retained = !retained_checkpoints.is_empty();
+                self.room_subscription_checkpoints.set(Arc::new(retained_checkpoints));
                 return RoomSubscriptionReconcile {
                     generation: RoomSubscriptionGeneration(state.generation),
                     noop: true,

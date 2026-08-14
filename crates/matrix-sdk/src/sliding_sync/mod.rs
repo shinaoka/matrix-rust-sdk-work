@@ -883,7 +883,7 @@ impl SlidingSync {
 
 /// The authoritative room-subscription delta computed by one atomic
 /// reconciliation, under the subscription write lock.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct SlidingSyncSubscriptionDelta {
     /// Whether the set changed at all.
     pub changed: bool,
@@ -893,6 +893,19 @@ pub struct SlidingSyncSubscriptionDelta {
     pub removed: BTreeSet<OwnedRoomId>,
     /// Rooms that were already subscribed and remain subscribed.
     pub retained: BTreeSet<OwnedRoomId>,
+}
+
+impl std::fmt::Debug for SlidingSyncSubscriptionDelta {
+    /// Identifier-free: the room sets are caller-facing only.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SlidingSyncSubscriptionDelta")
+            .field("changed", &self.changed)
+            .field("added", &self.added.len())
+            .field("removed", &self.removed.len())
+            .field("retained", &self.retained.len())
+            .finish()
+    }
 }
 
 /// Private implementation for [`SlidingSync::subscribe_to_rooms`] and

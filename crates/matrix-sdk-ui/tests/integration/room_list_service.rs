@@ -3601,6 +3601,67 @@ async fn test_reconcile_recovers_after_session_expiry_and_reports_readd() -> Res
 }
 
 #[async_test]
+async fn test_expiry_then_empty_reconcile_clears_logical_set_and_checkpoints() -> Result<(), Error>
+{
+    let (_, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_a = room_id!("!a:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 1 } },
+            "rooms": { room_a: { "initial": true } },
+        },
+    };
+
+    let _ = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await;
+    assert_eq!(room_list.active_room_subscriptions(), BTreeSet::from([room_a.to_owned()]));
+
+    // Session expiry clears the actual map; the logical set must follow even
+    // when the desired set is empty (the reconcile is then a no-op on the map).
+    room_list.sliding_sync_for_testing().expire_session().await;
+    let result = room_list.reconcile_room_subscriptions_with_generation(&[]).await;
+    assert!(result.noop);
+    assert!(room_list.active_room_subscriptions().is_empty(), "logical set must follow the expiry");
+    assert!(room_list.room_subscription_checkpoints().get().is_empty());
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_delta_debug_is_identifier_free() -> Result<(), Error> {
+    let (_, server, room_list) = new_room_list_service().await?;
+    let sync = room_list.sync();
+    pin_mut!(sync);
+    let room_a = room_id!("!a:bar.org");
+    let room_b = room_id!("!b:bar.org");
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": { ALL_ROOMS: { "count": 2 } },
+            "rooms": {
+                room_a: { "initial": true },
+                room_b: { "initial": true },
+            },
+        },
+    };
+
+    let _ = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await;
+    let result = room_list.reconcile_room_subscriptions_with_generation(&[room_a, room_b]).await;
+    let debug = format!("{result:?}");
+    assert!(!debug.contains("!a") && !debug.contains("!b") && !debug.contains("bar.org"));
+
+    Ok(())
+}
+
+#[async_test]
 async fn test_reconcile_publishes_coherent_active_set_and_never_an_intermediate_empty_state()
 -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
