@@ -851,6 +851,12 @@ impl RoomListService {
         self.sliding_sync.subscribed_rooms()
     }
 
+    /// Whether detailed room subscriptions were restored together with the
+    /// shared Sliding Sync position at startup.
+    pub fn has_restored_room_subscriptions(&self) -> bool {
+        self.sliding_sync.has_restored_room_subscriptions()
+    }
+
     /// The currently active room-subscription set.
     pub fn active_room_subscriptions(&self) -> BTreeSet<OwnedRoomId> {
         self.room_subscription_state.lock().unwrap().active_rooms.clone()

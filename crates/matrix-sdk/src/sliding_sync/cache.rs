@@ -4,9 +4,11 @@
 //! same cache. It helps to define what it sometimes called a “cold start”, or a
 //!  “fast start”.
 
+use std::collections::BTreeMap;
+
 use matrix_sdk_base::{StateStore, StoreError};
 use matrix_sdk_common::timer;
-use ruma::UserId;
+use ruma::{OwnedRoomId, UserId, api::client::sync::sync_events::v5 as http};
 use tracing::{info, trace, warn};
 
 use super::{FrozenSlidingSyncList, SlidingSync, SlidingSyncPositionMarkers};
@@ -63,7 +65,20 @@ pub(super) async fn store_sliding_sync_state(
         // go in the crypto process store at the moment, but should be fixed
         // later on.
         if let Some(olm_machine) = &*sliding_sync.inner.client.olm_machine().await {
-            let pos_blob = serde_json::to_vec(&FrozenSlidingSyncPos { pos: position.pos.clone() })?;
+            // Room subscriptions are server-side state scoped to this `pos`.
+            // Persist both in one record so a resumed session does not treat
+            // previously covered rooms as fresh subscriptions and invalidate
+            // their member snapshots. A record without a position never
+            // carries a coverage claim.
+            let room_subscriptions = position
+                .pos
+                .as_ref()
+                .map(|_| sliding_sync.inner.room_subscriptions.read().unwrap().clone())
+                .unwrap_or_default();
+            let pos_blob = serde_json::to_vec(&FrozenSlidingSyncPos {
+                pos: position.pos.clone(),
+                room_subscriptions,
+            })?;
             olm_machine.store().set_custom_value(&instance_storage_key, pos_blob).await?;
         }
     }
@@ -147,6 +162,7 @@ pub(super) async fn restore_sliding_sync_list(
 pub(super) struct RestoredFields {
     pub to_device_token: Option<String>,
     pub pos: Option<String>,
+    pub room_subscriptions: BTreeMap<OwnedRoomId, http::request::RoomSubscription>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +189,10 @@ fn classify_to_device_token(token: Option<String>) -> (Option<String>, ToDeviceT
 struct FrozenSlidingSyncPos {
     #[serde(skip_serializing_if = "Option::is_none")]
     pos: Option<String>,
+    /// Added after the original pos-only format. Old records deserialize to an
+    /// empty map and therefore retain the conservative startup behaviour.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    room_subscriptions: BTreeMap<OwnedRoomId, http::request::RoomSubscription>,
 }
 
 /// Restore the `SlidingSync`'s state from what is stored in the storage.
@@ -219,6 +239,9 @@ pub(super) async fn restore_sliding_sync_state(
             {
                 trace!("Successfully read the `Sliding Sync` pos from the crypto store cache");
                 restored_fields.pos = frozen_pos.pos;
+                if restored_fields.pos.is_some() {
+                    restored_fields.room_subscriptions = frozen_pos.room_subscriptions;
+                }
             }
         }
 
@@ -231,6 +254,8 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use matrix_sdk_test::async_test;
+    #[cfg(feature = "e2e-encryption")]
+    use ruma::room_id;
 
     #[cfg(feature = "e2e-encryption")]
     use super::format_storage_key_for_sliding_sync;
@@ -256,6 +281,15 @@ mod tests {
                 (None, ToDeviceTokenFormat::Legacy)
             );
         }
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[test]
+    fn legacy_pos_only_record_has_no_subscription_coverage() {
+        let frozen: super::FrozenSlidingSyncPos =
+            serde_json::from_str(r#"{"pos":"legacy"}"#).expect("legacy record must decode");
+        assert_eq!(frozen.pos.as_deref(), Some("legacy"));
+        assert!(frozen.room_subscriptions.is_empty());
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -387,6 +421,7 @@ mod tests {
         let storage_key_prefix = format_storage_key_prefix(sync_id, client.user_id().unwrap());
         let full_storage_key = format_storage_key_for_sliding_sync(&storage_key_prefix);
         let sliding_sync = client.sliding_sync(sync_id)?.build().await?;
+        let restored_room_id = room_id!("!restored:example.org");
 
         // At first, there's nothing in both stores.
         if let Some(olm_machine) = &*client.base_client().olm_machine().await {
@@ -402,6 +437,7 @@ mod tests {
         {
             let mut position_guard = sliding_sync.inner.position.lock().await;
             position_guard.pos = Some(pos.clone());
+            sliding_sync.subscribe_to_rooms(&[restored_room_id], None, false);
 
             // Then, we can correctly cache the sliding sync instance.
             store_sliding_sync_state(&sliding_sync, &position_guard).await?;
@@ -416,6 +452,33 @@ mod tests {
 
         // After restoring, to-device token could be read.
         assert_eq!(restored_fields.pos.unwrap(), pos);
+        assert_eq!(restored_fields.room_subscriptions.len(), 1);
+        assert!(restored_fields.room_subscriptions.contains_key(restored_room_id));
+
+        let restored_sync = client.sliding_sync(sync_id)?.share_pos().build().await?;
+        assert!(restored_sync.has_restored_room_subscriptions());
+        assert!(restored_sync.subscribed_rooms().contains(restored_room_id));
+
+        let retained = restored_sync.reconcile_subscriptions(&[restored_room_id], None, false);
+        assert!(!retained.changed);
+        assert!(retained.added.is_empty());
+        assert!(retained.retained.contains(restored_room_id));
+
+        let added_room_id = room_id!("!added:example.org");
+        let expanded =
+            restored_sync.reconcile_subscriptions(&[restored_room_id, added_room_id], None, false);
+        assert!(expanded.changed);
+        assert!(expanded.retained.contains(restored_room_id));
+        assert!(expanded.added.contains(added_room_id));
+
+        // Expiration invalidates the position and its coverage claim together.
+        restored_sync.expire_session().await;
+        assert!(!restored_sync.has_restored_room_subscriptions());
+        assert!(restored_sync.subscribed_rooms().is_empty());
+        let after_expiry = client.sliding_sync(sync_id)?.share_pos().build().await?;
+        assert!(after_expiry.inner.position.lock().await.pos.is_none());
+        assert!(!after_expiry.has_restored_room_subscriptions());
+        assert!(after_expiry.subscribed_rooms().is_empty());
 
         // Test the "migration" path: assume a missing to-device token in crypto store,
         // but present in a former state store.

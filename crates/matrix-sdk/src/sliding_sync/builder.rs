@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt::Debug,
-    sync::{Arc, RwLock as StdRwLock},
+    sync::{Arc, RwLock as StdRwLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -259,21 +259,32 @@ impl SlidingSyncBuilder {
             lists.insert(list.name().to_owned(), list);
         }
 
-        let (share_pos, pos) = {
+        let (share_pos, pos, room_subscriptions) = {
             cfg_if! {
                 if #[cfg(feature = "e2e-encryption")] {
                     if self.share_pos {
                         // If the sliding sync instance is configured to share its current sync
-                        // position, we will restore it from the cache.
-                        (true, super::cache::restore_sliding_sync_state(&client, &self.storage_key).await?.and_then(|fields| fields.pos))
+                        // position, restore the room subscriptions associated with that exact
+                        // position as well. They are server-side session state; restoring one
+                        // without the other creates a false coverage gap.
+                        let restored = super::cache::restore_sliding_sync_state(
+                            &client,
+                            &self.storage_key,
+                        )
+                        .await?;
+                        let (pos, room_subscriptions) = restored
+                            .map(|fields| (fields.pos, fields.room_subscriptions))
+                            .unwrap_or_default();
+                        (true, pos, room_subscriptions)
                     } else {
-                        (false, None)
+                        (false, None, self.room_subscriptions)
                     }
                 } else {
-                    (false, None)
+                    (false, None, self.room_subscriptions)
                 }
             }
         };
+        let restored_room_subscriptions = pos.is_some() && !room_subscriptions.is_empty();
 
         let lists = AsyncRwLock::new(lists);
 
@@ -288,7 +299,8 @@ impl SlidingSyncBuilder {
 
             position: Arc::new(AsyncMutex::new(SlidingSyncPositionMarkers { pos })),
 
-            room_subscriptions: StdRwLock::new(self.room_subscriptions),
+            room_subscriptions: StdRwLock::new(room_subscriptions),
+            restored_room_subscriptions: AtomicBool::new(restored_room_subscriptions),
             extensions: self.extensions.unwrap_or_default(),
 
             internal_channel: internal_channel_sender,

@@ -25,7 +25,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::Debug,
     future::Future,
-    sync::{Arc, RwLock as StdRwLock, RwLockWriteGuard as StdRwLockWriteGuard},
+    sync::{
+        Arc, RwLock as StdRwLock, RwLockWriteGuard as StdRwLockWriteGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -109,6 +112,10 @@ pub(super) struct SlidingSyncInner {
     /// but one wants to receive updates.
     room_subscriptions: StdRwLock<BTreeMap<OwnedRoomId, http::request::RoomSubscription>>,
 
+    /// Whether the initial room-subscription map was restored together with a
+    /// non-empty shared position from the same persisted session record.
+    restored_room_subscriptions: AtomicBool,
+
     /// The intended state of the extensions being supplied to sliding /sync
     /// calls.
     extensions: http::request::Extensions,
@@ -178,6 +185,12 @@ impl SlidingSync {
     /// The currently subscribed room set (the authoritative request state).
     pub fn subscribed_rooms(&self) -> BTreeSet<OwnedRoomId> {
         self.inner.room_subscriptions.read().unwrap().keys().cloned().collect()
+    }
+
+    /// Whether this instance started with room subscriptions restored from the
+    /// same persisted record as its shared position.
+    pub fn has_restored_room_subscriptions(&self) -> bool {
+        self.inner.restored_room_subscriptions.load(Ordering::Relaxed)
     }
 
     /// Atomically reconcile the room-subscription map from the current set to
@@ -877,6 +890,7 @@ impl SlidingSync {
             // Clear all room subscriptions: we don't want to resend all room subscriptions
             // when the session will restart.
             self.inner.room_subscriptions.write().unwrap().clear();
+            self.inner.restored_room_subscriptions.store(false, Ordering::Relaxed);
         }
     }
 }
