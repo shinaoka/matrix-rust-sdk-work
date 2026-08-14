@@ -194,6 +194,50 @@ pub struct OutboundGroupSessionEncryptionResult {
     pub session_id: Arc<str>,
 }
 
+/// Runtime-only candidates and attempt budget for initial-share repair.
+#[derive(Default)]
+pub(crate) struct InitialShareRepairState {
+    candidates: BTreeMap<(OwnedUserId, OwnedDeviceId), DeviceData>,
+    targets: Option<BTreeSet<(OwnedUserId, OwnedDeviceId)>>,
+    immediate_attempted: bool,
+    wake_attempted: bool,
+}
+
+impl InitialShareRepairState {
+    pub(crate) fn record_missing(&mut self, devices: impl IntoIterator<Item = DeviceData>) {
+        for device in devices {
+            self.candidates
+                .entry((device.user_id().to_owned(), device.device_id().to_owned()))
+                .or_insert(device);
+        }
+    }
+
+    pub(crate) fn candidates(&self) -> impl Iterator<Item = &DeviceData> {
+        self.candidates.values()
+    }
+
+    pub(crate) fn policy_matches(&self, targets: &BTreeSet<(OwnedUserId, OwnedDeviceId)>) -> bool {
+        self.targets.as_ref().is_none_or(|expected| expected == targets)
+    }
+
+    pub(crate) fn begin(
+        &mut self,
+        wake: bool,
+        targets: BTreeSet<(OwnedUserId, OwnedDeviceId)>,
+    ) -> bool {
+        if wake && !self.immediate_attempted {
+            return false;
+        }
+        let attempted = if wake { &mut self.wake_attempted } else { &mut self.immediate_attempted };
+        if *attempted {
+            return false;
+        }
+        self.targets.get_or_insert(targets);
+        *attempted = true;
+        true
+    }
+}
+
 /// Outbound group session.
 ///
 /// Outbound group sessions are used to exchange room messages between a group
@@ -213,6 +257,7 @@ pub struct OutboundGroupSession {
     settings: Arc<EncryptionSettings>,
     shared_with_set: Arc<StdRwLock<ShareInfoSet>>,
     to_share_with_set: Arc<StdRwLock<ToShareMap>>,
+    initial_share_repair: Arc<StdRwLock<InitialShareRepairState>>,
 }
 
 /// A a map of userid/device it to a `ShareInfo`.
@@ -403,6 +448,7 @@ impl OutboundGroupSession {
             settings: Arc::new(settings),
             shared_with_set: Default::default(),
             to_share_with_set: Default::default(),
+            initial_share_repair: Default::default(),
         })
     }
 
@@ -422,6 +468,32 @@ impl OutboundGroupSession {
         share_infos: ShareInfoSet,
     ) {
         self.to_share_with_set.write().insert(request_id, (request, share_infos));
+    }
+
+    pub(crate) fn record_initial_share_missing(
+        &self,
+        devices: impl IntoIterator<Item = DeviceData>,
+    ) {
+        self.initial_share_repair.write().record_missing(devices);
+    }
+
+    pub(crate) fn initial_share_repair_candidates(&self) -> Vec<DeviceData> {
+        self.initial_share_repair.read().candidates().cloned().collect()
+    }
+
+    pub(crate) fn initial_share_repair_policy_matches(
+        &self,
+        targets: &BTreeSet<(OwnedUserId, OwnedDeviceId)>,
+    ) -> bool {
+        self.initial_share_repair.read().policy_matches(targets)
+    }
+
+    pub(crate) fn begin_initial_share_repair(
+        &self,
+        wake: bool,
+        targets: BTreeSet<(OwnedUserId, OwnedDeviceId)>,
+    ) -> bool {
+        self.initial_share_repair.write().begin(wake, targets)
     }
 
     /// Create a new `m.room_key.withheld` event content with the given code for
@@ -883,6 +955,7 @@ impl OutboundGroupSession {
             settings: pickle.settings,
             shared_with_set: Arc::new(StdRwLock::new(pickle.shared_with_set)),
             to_share_with_set: Arc::new(StdRwLock::new(pickle.requests)),
+            initial_share_repair: Default::default(),
         })
     }
 

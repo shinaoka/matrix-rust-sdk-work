@@ -49,7 +49,7 @@ use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, ttl::TtlValu
 use ruma::events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent};
 use ruma::{
     DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName,
-    RoomAliasId, RoomId, RoomOrAliasId, ServerName, UInt, UserId,
+    OwnedUserId, RoomAliasId, RoomId, RoomOrAliasId, ServerName, UInt, UserId,
     api::{
         FeatureFlag, MatrixVersion, Metadata, OutgoingRequest, SupportedVersions,
         client::{
@@ -271,6 +271,12 @@ pub(crate) struct ClientLocks {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) group_session_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
 
+    /// Handler making every concurrent index-0 sender await the same bounded
+    /// initial-share repair fence for a room session.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) initial_share_repair_deduplicated_handler:
+        DeduplicatingHandler<(OwnedRoomId, String)>,
+
     /// Lock making sure we're only doing one key claim request at a time.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) key_claim_lock: Mutex<()>,
@@ -310,6 +316,13 @@ pub(crate) struct ClientLocks {
     /// outside the `OlmMachine`.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) crypto_store_generation: Arc<Mutex<Option<u64>>>,
+}
+
+/// Candidate users whose device-key/Olm availability changed in a sync.
+#[cfg(feature = "e2e-encryption")]
+#[derive(Clone)]
+pub(crate) struct InitialShareRepairWake {
+    pub(crate) users: BTreeSet<OwnedUserId>,
 }
 
 pub(crate) struct ClientInner {
@@ -390,6 +403,16 @@ pub(crate) struct ClientInner {
     /// wait for the sync to get the data to fetch a room object from the state
     /// store.
     pub(crate) sync_beat: event_listener::Event,
+
+    /// E2EE-only wake source for bounded initial-share repair. The payload is
+    /// the changed user set, so unrelated sync traffic cannot consume the one
+    /// repair wake.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) initial_share_repair_wakes: broadcast::Sender<InitialShareRepairWake>,
+
+    /// Explicit cancellation for in-flight initial-share repair on logout.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) initial_share_repair_cancellation: broadcast::Sender<()>,
 
     /// A central cache for events, inactive first.
     ///
@@ -503,6 +526,10 @@ impl ClientInner {
             room_updates_publication_sequence: RoomUpdatesPublicationSequence::default(),
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
+            #[cfg(feature = "e2e-encryption")]
+            initial_share_repair_wakes: broadcast::Sender::new(8),
+            #[cfg(feature = "e2e-encryption")]
+            initial_share_repair_cancellation: broadcast::Sender::new(1),
             event_cache,
             send_queue_data: send_queue,
             latest_events,
@@ -551,6 +578,13 @@ impl Debug for Client {
 }
 
 impl Client {
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) fn notify_initial_share_repair_wake(&self, users: BTreeSet<OwnedUserId>) {
+        if !users.is_empty() {
+            let _ = self.inner.initial_share_repair_wakes.send(InitialShareRepairWake { users });
+        }
+    }
+
     /// Create a new [`Client`] that will use the given homeserver.
     ///
     /// # Arguments
@@ -1568,10 +1602,12 @@ impl Client {
         match auth_api {
             AuthApi::Matrix(matrix_auth) => {
                 matrix_auth.logout().await?;
-                Ok(())
             }
-            AuthApi::OAuth(oauth) => Ok(oauth.logout().await?),
+            AuthApi::OAuth(oauth) => oauth.logout().await?,
         }
+        #[cfg(feature = "e2e-encryption")]
+        let _ = self.inner.initial_share_repair_cancellation.send(());
+        Ok(())
     }
 
     /// Get or upload a sync filter.
@@ -2071,6 +2107,8 @@ impl Client {
             .auth_ctx
             .session_change_sender
             .send(SessionChange::UnknownToken(unknown_token_data.clone()));
+        #[cfg(feature = "e2e-encryption")]
+        let _ = self.inner.initial_share_repair_cancellation.send(());
     }
 
     /// Fetches server versions from network; no caching.
@@ -2916,6 +2954,18 @@ impl Client {
         }
 
         let response = self.send(request).with_request_config(request_config).await?;
+        #[cfg(feature = "e2e-encryption")]
+        let repair_wake_users = {
+            let mut users = response.device_lists.changed.iter().cloned().collect::<BTreeSet<_>>();
+            if !response.device_one_time_keys_count.is_empty()
+                || response.device_unused_fallback_key_types.is_some()
+            {
+                if let Some(user_id) = self.user_id() {
+                    users.insert(user_id.to_owned());
+                }
+            }
+            users
+        };
         let next_batch = response.next_batch.clone();
         let response = if sync_settings.save_sync_token {
             self.process_sync(response).await?
@@ -2928,6 +2978,8 @@ impl Client {
             error!(error = ?e, "Error while sending outgoing E2EE requests");
         }
 
+        #[cfg(feature = "e2e-encryption")]
+        self.notify_initial_share_repair_wake(repair_wake_users);
         self.inner.sync_beat.notify(usize::MAX);
 
         Ok(SyncResponse::new(next_batch, response))

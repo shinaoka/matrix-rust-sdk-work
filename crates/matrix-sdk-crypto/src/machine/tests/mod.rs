@@ -92,6 +92,7 @@ mod decryption_verification_state;
 mod index0_reshare;
 mod initial_share_diagnostics;
 mod interactive_verification;
+mod issue_523;
 mod megolm_sender_data;
 mod olm_encryption;
 mod olm_recovery_reshare;

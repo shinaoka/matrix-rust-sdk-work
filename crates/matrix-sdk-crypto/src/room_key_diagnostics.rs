@@ -280,6 +280,8 @@ pub enum RoomKeyDiagnosticEvent {
     InitialShareSession(InitialShareSessionDiagnostic),
     /// Bounded index-0 duplicate-share record (issue #510).
     Index0Reshare(Index0ReshareDiagnostic),
+    /// Targeted initial-share Olm repair record (issue #523).
+    InitialShareRepair(InitialShareRepairDiagnostic),
 }
 
 /// The kind of incoming encrypted room-key event, once the decrypted payload
@@ -504,6 +506,95 @@ pub struct InitialShareSessionDiagnostic {
     /// when no committed share contradicts it).
     pub created_at_index0: bool,
     /// Time since this session's initial share was first observed.
+    pub elapsed_ms: u64,
+}
+
+/// Initial Olm state of an exact initial-share repair candidate (issue #523).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialShareRepairOlmState {
+    /// No Olm session existed after the normal pre-share.
+    Missing,
+    /// A usable Olm session existed before repair.
+    Present,
+    /// The session state could not be established safely.
+    Unknown,
+}
+
+/// Result of selecting an initial-share repair attempt (issue #523).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialShareRepairPreparation {
+    /// There is no current repair work to perform.
+    NotNeeded,
+    /// A wake was received for a different recipient user.
+    NotMatchingWake,
+    /// The active session or recipient policy invalidated the repair.
+    Cancelled,
+    /// The current recipient policy has no repair target.
+    NoRecipients,
+    /// The bounded attempt was admitted.
+    Attempted,
+}
+
+/// Closed result of the targeted `/keys/claim` attempt (issue #523).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialShareRepairClaimOutcome {
+    /// No claim was needed because a candidate already had an Olm session.
+    NotNeeded,
+    /// A claim request was queued for the exact candidate set.
+    Requested,
+    /// The claim response created at least one usable Olm session.
+    Accepted,
+    /// The response contained no usable key for a candidate.
+    Empty,
+    /// The response was unusable or failed verification.
+    Invalid,
+    /// The claim request failed at the homeserver transport boundary.
+    NetworkFailed,
+    /// The SDK or crypto store could not complete claim processing.
+    SdkFailed,
+}
+
+/// Closed result of the bounded initial-share repair (issue #523).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialShareRepairOutcome {
+    /// The repaired room-key request was accepted by the homeserver.
+    Settled,
+    /// A matching event-driven wake remains before the fence.
+    WaitingWake,
+    /// The first-event fence expired.
+    Deadline,
+    /// The session or recipient policy was invalidated.
+    Cancelled,
+    /// Recipient policy selected no repair target.
+    NoRecipients,
+    /// The repair operation failed without changing the encrypted event path.
+    Failed,
+}
+
+/// A typed, privacy-safe bounded initial-share repair record (issue #523).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialShareRepairDiagnostic {
+    /// Anonymous session correlation.
+    pub session: RoomKeyDiagnosticAlias,
+    /// Initial Olm state.
+    pub initial_olm: InitialShareRepairOlmState,
+    /// Claim result.
+    pub claim: InitialShareRepairClaimOutcome,
+    /// Repair result.
+    pub repair: InitialShareRepairOutcome,
+    /// Own-device coverage bucket.
+    pub own_coverage_bucket: u8,
+    /// Peer users with at least one covered eligible device.
+    pub peer_users_covered_bucket: u8,
+    /// Peer users with zero covered eligible devices.
+    pub peer_users_zero_coverage_bucket: u8,
+    /// Devices still missing Olm.
+    pub missing_devices_bucket: u8,
+    /// First encrypted room-event index when known.
+    pub first_event_message_index: Option<u32>,
+    /// Whether the active session still matches the repaired session.
+    pub same_session: bool,
+    /// Time since the initial share was first observed.
     pub elapsed_ms: u64,
 }
 
@@ -732,6 +823,9 @@ struct RoomKeyDiagnosticState {
     device_classes: BTreeMap<RoomKeyDiagnosticAlias, InitialShareDeviceClass>,
     /// Per-session initial-share tallies (issue #509).
     initial_shares: BTreeMap<(String, String), InitialShareState>,
+    /// Latest initial-share repair snapshot, finalized with the actual first
+    /// room-event index when encryption consumes index 0 (issue #523).
+    initial_share_repairs: BTreeMap<(String, String), InitialShareRepairSnapshot>,
     /// Per-(room, session) one-shot flag for the bounded index-0 duplicate
     /// share (issue #510).
     index0_reshare_attempted: BTreeSet<(String, String)>,
@@ -750,6 +844,18 @@ struct InitialShareState {
     min_committed_index: Option<u32>,
     accepted_devices: BTreeSet<RoomKeyDiagnosticAlias>,
     first_event_reported: bool,
+}
+
+#[derive(Clone, Copy)]
+struct InitialShareRepairSnapshot {
+    initial_olm: InitialShareRepairOlmState,
+    claim: InitialShareRepairClaimOutcome,
+    repair: InitialShareRepairOutcome,
+    own_coverage: usize,
+    peer_users_covered: usize,
+    peer_users_zero_coverage: usize,
+    missing_devices: usize,
+    same_session: bool,
 }
 
 struct RequestDiagnosticState {
@@ -990,6 +1096,112 @@ impl RoomKeyDiagnosticHub {
         };
         if let Some(observer) = observer {
             observer(RoomKeyDiagnosticEvent::InitialShareSession(event));
+        }
+        self.emit_initial_share_repair_event_index(room_id, session_id, first_event_message_index);
+    }
+
+    fn emit_initial_share_repair_event_index(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        first_event_message_index: u32,
+    ) {
+        let Some((observer, event)) = ({
+            let mut state = lock(&self.0);
+            let key = (room_id.as_str().to_owned(), session_id.to_owned());
+            let snapshot = state.initial_share_repairs.get(&key).copied();
+            snapshot.map(|snapshot| {
+                let session = session_alias(&mut state, room_id, session_id);
+                let elapsed_ms = state
+                    .initial_shares
+                    .get(&key)
+                    .and_then(|tally| tally.first_seen)
+                    .map(|first| first.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                    .unwrap_or(0);
+                (
+                    state.observer.clone(),
+                    InitialShareRepairDiagnostic {
+                        session,
+                        initial_olm: snapshot.initial_olm,
+                        claim: snapshot.claim,
+                        repair: snapshot.repair,
+                        own_coverage_bucket: matching_bucket_token(snapshot.own_coverage),
+                        peer_users_covered_bucket: matching_bucket_token(
+                            snapshot.peer_users_covered,
+                        ),
+                        peer_users_zero_coverage_bucket: matching_bucket_token(
+                            snapshot.peer_users_zero_coverage,
+                        ),
+                        missing_devices_bucket: matching_bucket_token(snapshot.missing_devices),
+                        first_event_message_index: Some(first_event_message_index),
+                        same_session: snapshot.same_session,
+                        elapsed_ms,
+                    },
+                )
+            })
+        }) else {
+            return;
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::InitialShareRepair(event));
+        }
+    }
+
+    /// Record a bounded initial-share repair result (issue #523).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn note_initial_share_repair(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        initial_olm: InitialShareRepairOlmState,
+        claim: InitialShareRepairClaimOutcome,
+        repair: InitialShareRepairOutcome,
+        own_coverage: usize,
+        peer_users_covered: usize,
+        peer_users_zero_coverage: usize,
+        missing_devices: usize,
+        first_event_message_index: Option<u32>,
+        same_session: bool,
+    ) {
+        let (observer, event) = {
+            let mut state = lock(&self.0);
+            let session = session_alias(&mut state, room_id, session_id);
+            state.initial_share_repairs.insert(
+                (room_id.as_str().to_owned(), session_id.to_owned()),
+                InitialShareRepairSnapshot {
+                    initial_olm,
+                    claim,
+                    repair,
+                    own_coverage,
+                    peer_users_covered,
+                    peer_users_zero_coverage,
+                    missing_devices,
+                    same_session,
+                },
+            );
+            let elapsed_ms = state
+                .initial_shares
+                .get(&(room_id.as_str().to_owned(), session_id.to_owned()))
+                .and_then(|tally| tally.first_seen)
+                .map(|first| first.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+            let event = InitialShareRepairDiagnostic {
+                session,
+                initial_olm,
+                claim,
+                repair,
+                own_coverage_bucket: matching_bucket_token(own_coverage),
+                peer_users_covered_bucket: matching_bucket_token(peer_users_covered),
+                peer_users_zero_coverage_bucket: matching_bucket_token(peer_users_zero_coverage),
+                missing_devices_bucket: matching_bucket_token(missing_devices),
+                first_event_message_index,
+                same_session,
+                elapsed_ms,
+            };
+            (state.observer.clone(), event)
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::InitialShareRepair(event));
         }
     }
 

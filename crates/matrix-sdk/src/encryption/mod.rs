@@ -19,7 +19,7 @@
 #[cfg(feature = "experimental-send-custom-to-device")]
 use std::ops::Deref;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     io::{Cursor, Read, Write},
     iter,
@@ -122,14 +122,16 @@ pub use matrix_sdk_base::crypto::{
     CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, ForwardedRoomKeyAuthOutcome,
     IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
     Index0InitialShareState, Index0ReshareDiagnostic, Index0ReshareOutcome,
-    InitialShareDeviceClass, InitialShareDeviceDiagnostic, InitialShareSessionDiagnostic,
-    InitialShareStage, KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError,
-    OlmRecoveryCounters, OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome,
-    OlmRecoverySignalOutcome, RequestedRoomKeySession, RoomKeyCreationOutcome,
-    RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver,
-    RoomKeyFirstShareOutcome, RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMergeDecision,
-    RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
-    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    InitialShareDeviceClass, InitialShareDeviceDiagnostic, InitialShareRepairClaimOutcome,
+    InitialShareRepairDiagnostic, InitialShareRepairOlmState, InitialShareRepairOutcome,
+    InitialShareRepairPreparation, InitialShareSessionDiagnostic, InitialShareStage,
+    KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError, OlmRecoveryCounters,
+    OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome,
+    RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
+    RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
+    RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMergeDecision, RoomKeyReceiveCounters,
+    RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
+    RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
     RoomKeyRotationDiagnostic, RoomKeyRotationReason, RoomKeyWithheldContent, RoomKeyWithheldEvent,
     SessionCreationError, SignatureError, VERSION,
     olm::{
@@ -533,12 +535,32 @@ impl FromStr for DuplicateOneTimeKeyErrorMessage {
     }
 }
 
+/// Result of one bounded targeted initial-share repair attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitialShareRepairAttempt {
+    /// No repair was needed for this invocation.
+    NotNeeded,
+    /// A wake was for a different recipient user.
+    NotMatchingWake,
+    /// The session or recipient policy invalidated the repair.
+    Cancelled,
+    /// The current recipient policy has no repair target.
+    NoRecipients,
+    /// The repair remains eligible for the one matching wake.
+    WaitingWake,
+    /// The repaired room-key request was queued and accepted.
+    Settled,
+    /// A closed failure diagnostic was emitted for this attempt.
+    Failed,
+}
+
 impl Client {
     pub(crate) async fn olm_machine(&self) -> RwLockReadGuard<'_, Option<OlmMachine>> {
         self.base_client().olm_machine().await
     }
 
-    /// Whether the bounded index-0 duplicate share is enabled (issue #510).
+    /// Whether the retired bounded index-0 duplicate share is enabled (issue #510).
+    #[allow(dead_code)]
     pub(crate) fn index0_duplicate_share_enabled(&self) -> bool {
         self.inner.index0_duplicate_share
     }
@@ -689,6 +711,188 @@ impl Client {
         Ok(())
     }
 
+    /// Run one bounded targeted initial-share repair attempt.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) async fn repair_initial_share(
+        &self,
+        room: &Room,
+        expected_session: Option<&str>,
+        wake_users: Option<&BTreeSet<OwnedUserId>>,
+    ) -> Result<InitialShareRepairAttempt> {
+        use matrix_sdk_base::crypto::{
+            InitialShareRepairClaimOutcome as Claim, InitialShareRepairOutcome as Repair,
+            InitialShareRepairPreparation,
+        };
+
+        if room.state() != matrix_sdk_base::RoomState::Joined {
+            let _ = self
+                .base_client()
+                .note_initial_share_repair(
+                    room.room_id(),
+                    expected_session,
+                    Claim::NotNeeded,
+                    Repair::Cancelled,
+                )
+                .await;
+            return Ok(InitialShareRepairAttempt::Cancelled);
+        }
+
+        let _lock = self.locks().key_claim_lock.lock().await;
+        let (preparation, claim) = match self
+            .base_client()
+            .prepare_initial_share_repair(room.room_id(), wake_users.is_some(), wake_users)
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self
+                    .base_client()
+                    .note_initial_share_repair(
+                        room.room_id(),
+                        expected_session,
+                        Claim::SdkFailed,
+                        Repair::Failed,
+                    )
+                    .await;
+                return Ok(InitialShareRepairAttempt::Failed);
+            }
+        };
+        match preparation {
+            InitialShareRepairPreparation::NotNeeded => {
+                return Ok(InitialShareRepairAttempt::NotNeeded);
+            }
+            InitialShareRepairPreparation::NotMatchingWake => {
+                return Ok(InitialShareRepairAttempt::NotMatchingWake);
+            }
+            InitialShareRepairPreparation::Cancelled => {
+                let _ = self
+                    .base_client()
+                    .note_initial_share_repair(
+                        room.room_id(),
+                        expected_session,
+                        Claim::NotNeeded,
+                        Repair::Cancelled,
+                    )
+                    .await;
+                return Ok(InitialShareRepairAttempt::Cancelled);
+            }
+            InitialShareRepairPreparation::NoRecipients => {
+                let _ = self
+                    .base_client()
+                    .note_initial_share_repair(
+                        room.room_id(),
+                        expected_session,
+                        Claim::NotNeeded,
+                        Repair::NoRecipients,
+                    )
+                    .await;
+                return Ok(InitialShareRepairAttempt::NoRecipients);
+            }
+            InitialShareRepairPreparation::Attempted => {}
+        }
+
+        let claimed = claim.is_some();
+        let mut claim_response_empty = false;
+        if let Some((request_id, request)) = claim {
+            let response = match self.send(request).await {
+                Ok(response) => response,
+                Err(_) => {
+                    let _ = self
+                        .base_client()
+                        .note_initial_share_repair(
+                            room.room_id(),
+                            expected_session,
+                            Claim::NetworkFailed,
+                            Repair::Failed,
+                        )
+                        .await;
+                    return Ok(InitialShareRepairAttempt::Failed);
+                }
+            };
+            claim_response_empty = response.one_time_keys.is_empty();
+            if self.mark_request_as_sent(&request_id, &response).await.is_err() {
+                let _ = self
+                    .base_client()
+                    .note_initial_share_repair(
+                        room.room_id(),
+                        expected_session,
+                        Claim::SdkFailed,
+                        Repair::Failed,
+                    )
+                    .await;
+                return Ok(InitialShareRepairAttempt::Failed);
+            }
+        }
+
+        let requests = match self.base_client().reshare_initial_share(room.room_id()).await {
+            Ok(requests) => requests,
+            Err(_) => {
+                let _ = self
+                    .base_client()
+                    .note_initial_share_repair(
+                        room.room_id(),
+                        expected_session,
+                        Claim::SdkFailed,
+                        Repair::Failed,
+                    )
+                    .await;
+                return Ok(InitialShareRepairAttempt::Failed);
+            }
+        };
+        let claim_outcome = if !claimed {
+            Claim::NotNeeded
+        } else if !requests.is_empty() {
+            Claim::Accepted
+        } else if claim_response_empty {
+            Claim::Empty
+        } else {
+            Claim::Invalid
+        };
+        for request in &requests {
+            let response = match self.send_to_device(request).await {
+                Ok(response) => response,
+                Err(_) => {
+                    let _ = self
+                        .base_client()
+                        .note_initial_share_repair(
+                            room.room_id(),
+                            expected_session,
+                            Claim::NetworkFailed,
+                            Repair::Failed,
+                        )
+                        .await;
+                    return Ok(InitialShareRepairAttempt::Failed);
+                }
+            };
+            if self.mark_request_as_sent(&request.txn_id, &response).await.is_err() {
+                let _ = self
+                    .base_client()
+                    .note_initial_share_repair(
+                        room.room_id(),
+                        expected_session,
+                        Claim::SdkFailed,
+                        Repair::Failed,
+                    )
+                    .await;
+                return Ok(InitialShareRepairAttempt::Failed);
+            }
+        }
+        let (repair_outcome, attempt) = if requests.is_empty() {
+            (Repair::WaitingWake, InitialShareRepairAttempt::WaitingWake)
+        } else {
+            (Repair::Settled, InitialShareRepairAttempt::Settled)
+        };
+        self.base_client()
+            .note_initial_share_repair(
+                room.room_id(),
+                expected_session,
+                claim_outcome,
+                repair_outcome,
+            )
+            .await?;
+        Ok(attempt)
+    }
+
     /// Upload the E2E encryption keys.
     ///
     /// This uploads the long lived device keys as well as the required amount
@@ -760,7 +964,8 @@ impl Client {
     }
 
     /// Report the send outcome of a queued index-0 duplicate share (issue
-    /// #510). Observation only.
+    /// #510). Observation only; retained for SDK compatibility.
+    #[allow(dead_code)]
     pub(crate) async fn note_index0_reshare(
         &self,
         room_id: &RoomId,

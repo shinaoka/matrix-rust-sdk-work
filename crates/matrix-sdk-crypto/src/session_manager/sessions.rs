@@ -313,6 +313,57 @@ impl SessionManager {
         Ok(result)
     }
 
+    /// Build a claim request for exactly the supplied device set.
+    ///
+    /// Unlike [`Self::get_missing_sessions`], this deliberately does not widen
+    /// the request to every device of a user or consult the retry cache. It is
+    /// used by the bounded initial-share repair after recipient policy has
+    /// selected the candidates.
+    pub async fn get_missing_sessions_for_devices(
+        &self,
+        devices: BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>,
+    ) -> StoreResult<Option<(OwnedTransactionId, KeysClaimRequest)>> {
+        let mut missing = BTreeMap::new();
+
+        for (user_id, device_ids) in devices {
+            for device_id in device_ids {
+                let Some(device) = self.store.get_device_data(&user_id, &device_id).await? else {
+                    continue;
+                };
+                if !device.supports_olm() || device.curve25519_key().is_none() {
+                    continue;
+                }
+
+                let has_session = if let Some(sessions) =
+                    self.store.get_sessions(&device.curve25519_key().unwrap().to_base64()).await?
+                {
+                    !sessions.lock().await.is_empty()
+                } else {
+                    false
+                };
+                if !has_session {
+                    missing
+                        .entry(user_id.clone())
+                        .or_insert_with(BTreeMap::new)
+                        .insert(device_id, OneTimeKeyAlgorithm::SignedCurve25519);
+                }
+            }
+        }
+
+        let result = if missing.is_empty() {
+            None
+        } else {
+            Some((
+                TransactionId::new(),
+                assign!(KeysClaimRequest::new(missing), {
+                    timeout: Some(Self::KEY_CLAIM_TIMEOUT),
+                }),
+            ))
+        };
+        *(self.current_key_claim_request.write()) = result.clone();
+        Ok(result)
+    }
+
     fn is_user_timed_out(&self, user_id: &UserId, device_id: &DeviceId) -> bool {
         self.failed_devices.read().get(user_id).is_some_and(|d| d.contains(device_id))
     }

@@ -70,7 +70,7 @@ async fn test_index0_reshare_queues_one_duplicate_while_message_index_is_zero() 
         .reshare_index0_once(room_id, iter::once(bob.user_id()), EncryptionSettings::default())
         .await
         .unwrap();
-    assert_let!(Index0ReshareDecision::Queued { requests, session_id } = decision);
+    assert_let!(Index0ReshareDecision::Queued { requests, session_id, .. } = decision);
     assert!(!requests.is_empty());
     assert_eq!(session_id, outbound.session_id());
     for request in &requests {

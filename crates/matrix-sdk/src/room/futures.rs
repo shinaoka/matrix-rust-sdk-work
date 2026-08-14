@@ -257,11 +257,9 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                         None
                     };
 
-                    // Issue #510: before the first room event consumes index
-                    // 0, run the bounded index-0 duplicate share. Never blocks
-                    // the send beyond the short deadline and never changes the
-                    // encrypted content.
-                    ensure_index0_duplicate_share(room).await?;
+                    // Issue #523 supersedes the blind #510 duplicate here:
+                    // the preshare fence above repairs only exact missing-Olm
+                    // recipients, so healthy committed devices are not resent.
 
                     let olm = room.client.olm_machine().await;
                     let olm = olm.as_ref().expect("Olm machine wasn't started");
@@ -589,13 +587,176 @@ pub(crate) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
     }
 
     // Query keys in case we don't have them for newly synced members.
-    //
-    // Note we do it all the time, because we might have sync'd members before
-    // sending a message (so didn't enter the above branch), but
-    // could have not query their keys ever.
     room.query_keys_for_untracked_or_dirty_users().await?;
-
     room.preshare_room_key().await?;
+
+    let expected_session =
+        room.client.base_client().current_outbound_group_session_id(room.room_id()).await?;
+    let Some(expected_session) = expected_session else {
+        room.ensure_room_joined()?;
+        return Ok(());
+    };
+    room.client
+        .locks()
+        .initial_share_repair_deduplicated_handler
+        .run((room.room_id().to_owned(), expected_session.clone()), async {
+            run_initial_share_repair(room, &expected_session).await
+        })
+        .await?;
+
+    room.ensure_room_joined()?;
+    Ok(())
+}
+
+#[cfg(feature = "e2e-encryption")]
+async fn run_initial_share_repair(room: &Room, expected_session: &str) -> Result<()> {
+    // Issue #523: repair only exact missing-Olm recipients before index 0.
+    const INITIAL_SHARE_REPAIR_DEADLINE: Duration = Duration::from_millis(1500);
+    use crate::encryption::InitialShareRepairAttempt;
+    use matrix_sdk_base::crypto::{
+        InitialShareRepairClaimOutcome as Claim, InitialShareRepairOutcome as Repair,
+    };
+
+    let deadline = tokio::time::Instant::now() + INITIAL_SHARE_REPAIR_DEADLINE;
+    let mut wake_receiver = room.client.inner.initial_share_repair_wakes.subscribe();
+    let mut cancellation_receiver = room.client.inner.initial_share_repair_cancellation.subscribe();
+    let mut needs_wake = false;
+
+    match tokio::time::timeout_at(
+        deadline,
+        room.client.repair_initial_share(room, Some(expected_session), None),
+    )
+    .await
+    {
+        Ok(Ok(InitialShareRepairAttempt::WaitingWake)) => needs_wake = true,
+        Ok(Ok(InitialShareRepairAttempt::Cancelled)) => room.preshare_room_key().await?,
+        Ok(Ok(InitialShareRepairAttempt::NotMatchingWake)) => unreachable!(),
+        Ok(Ok(InitialShareRepairAttempt::Failed)) => needs_wake = true,
+        Ok(Ok(
+            InitialShareRepairAttempt::NotNeeded
+            | InitialShareRepairAttempt::NoRecipients
+            | InitialShareRepairAttempt::Settled,
+        )) => {}
+        Ok(Err(_)) => {
+            let _ = room
+                .client
+                .base_client()
+                .note_initial_share_repair(
+                    room.room_id(),
+                    Some(expected_session),
+                    Claim::SdkFailed,
+                    Repair::Failed,
+                )
+                .await;
+        }
+        Err(_) => {
+            let _ = room
+                .client
+                .base_client()
+                .note_initial_share_repair(
+                    room.room_id(),
+                    Some(expected_session),
+                    Claim::SdkFailed,
+                    Repair::Deadline,
+                )
+                .await;
+        }
+    }
+
+    while needs_wake {
+        let sync_beat = room.client.inner.sync_beat.listen();
+        tokio::pin!(sync_beat);
+        tokio::select! {
+            wake = wake_receiver.recv() => match wake {
+                Ok(wake) => match tokio::time::timeout_at(
+                    deadline,
+                    room.client.repair_initial_share(
+                        room,
+                        Some(expected_session),
+                        Some(&wake.users),
+                    ),
+                ).await {
+                    Ok(Ok(InitialShareRepairAttempt::NotMatchingWake)) => continue,
+                    Ok(Ok(InitialShareRepairAttempt::WaitingWake)) => {
+                        tokio::time::sleep_until(deadline).await;
+                        let _ = room.client.base_client().note_initial_share_repair(
+                            room.room_id(), Some(expected_session), Claim::Empty, Repair::Deadline,
+                        ).await;
+                        break;
+                    }
+                    Ok(Ok(InitialShareRepairAttempt::Cancelled)) => {
+                        room.preshare_room_key().await?;
+                        break;
+                    }
+                    Ok(Ok(
+                        InitialShareRepairAttempt::Failed,
+                    )) => {
+                        tokio::time::sleep_until(deadline).await;
+                        let _ = room.client.base_client().note_initial_share_repair(
+                            room.room_id(), Some(expected_session), Claim::SdkFailed, Repair::Deadline,
+                        ).await;
+                        break;
+                    }
+                    Ok(Ok(
+                        InitialShareRepairAttempt::NotNeeded
+                            | InitialShareRepairAttempt::NoRecipients
+                            | InitialShareRepairAttempt::Settled,
+                    )) => break,
+                    Ok(Err(_)) => {
+                        let _ = room.client.base_client().note_initial_share_repair(
+                            room.room_id(), Some(expected_session), Claim::SdkFailed, Repair::Failed,
+                        ).await;
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = room.client.base_client().note_initial_share_repair(
+                            room.room_id(), Some(expected_session), Claim::SdkFailed, Repair::Deadline,
+                        ).await;
+                        break;
+                    }
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = room.client.base_client().note_initial_share_repair(
+                        room.room_id(), Some(expected_session), Claim::NotNeeded, Repair::Cancelled,
+                    ).await;
+                    break;
+                }
+            },
+            _ = cancellation_receiver.recv() => {
+                let _ = room.client.base_client().note_initial_share_repair(
+                    room.room_id(), Some(expected_session), Claim::NotNeeded, Repair::Cancelled,
+                ).await;
+                break;
+            },
+            _ = &mut sync_beat => {
+                let joined = room.state() == matrix_sdk_base::RoomState::Joined;
+                let current = room.client.base_client().current_outbound_group_session_id(room.room_id()).await?;
+                let same_session = current.as_deref() == Some(expected_session);
+                let policy_current = joined
+                    && same_session
+                    && matches!(
+                        room.client.base_client().validate_initial_share_repair(room.room_id()).await,
+                        Ok(true)
+                    );
+                if !policy_current {
+                    let _ = room.client.base_client().note_initial_share_repair(
+                        room.room_id(), Some(expected_session), Claim::NotNeeded, Repair::Cancelled,
+                    ).await;
+                    if joined {
+                        room.preshare_room_key().await?;
+                    }
+                    break;
+                }
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                let _ = room.client.base_client().note_initial_share_repair(
+                    room.room_id(), Some(expected_session), Claim::Empty, Repair::Deadline,
+                ).await;
+                break;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -608,6 +769,7 @@ pub(crate) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
 /// timed-out duplicate never blocks the message and never downgrades its
 /// encryption. A homeserver acceptance is not a recipient decryption proof.
 #[cfg(feature = "e2e-encryption")]
+#[allow(dead_code)]
 pub(crate) async fn ensure_index0_duplicate_share(room: &Room) -> Result<()> {
     use matrix_sdk_base::crypto::{Index0ReshareDecision, Index0ReshareOutcome};
 
@@ -630,7 +792,7 @@ pub(crate) async fn ensure_index0_duplicate_share(room: &Room) -> Result<()> {
             return Ok(());
         }
     };
-    let Index0ReshareDecision::Queued { session_id, requests } = decision else {
+    let Index0ReshareDecision::Queued { session_id, requests, .. } = decision else {
         return Ok(());
     };
     if requests.is_empty() {

@@ -28,9 +28,10 @@ use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, DeviceData, EncryptionSettings, Index0ReshareDecision,
-    OlmError, OlmMachine, RoomKeyReshareResult, RoomKeyReshareTarget, RoomKeyRotationReason,
-    TrustRequirement, UnwedgeReshareOutcome, store::DynCryptoStore,
-    store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
+    InitialShareRepairPreparation, OlmError, OlmMachine, RoomKeyReshareResult,
+    RoomKeyReshareTarget, RoomKeyRotationReason, TrustRequirement, UnwedgeReshareOutcome,
+    store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
+    types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
 use ruma::DeviceId;
@@ -1118,6 +1119,86 @@ impl BaseClient {
         Ok((members, settings))
     }
 
+    /// Prepare a targeted initial-share Olm claim, after re-evaluating the
+    /// current room recipient policy.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn prepare_initial_share_repair(
+        &self,
+        room_id: &RoomId,
+        wake: bool,
+        wake_users: Option<&BTreeSet<OwnedUserId>>,
+    ) -> Result<(
+        InitialShareRepairPreparation,
+        Option<(ruma::OwnedTransactionId, ruma::api::client::keys::claim_keys::v3::Request)>,
+    )> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .prepare_initial_share_repair(
+                    room_id,
+                    members.iter().map(Deref::deref),
+                    settings,
+                    wake,
+                    wake_users,
+                )
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Re-evaluate the recipient policy captured by the active initial-share
+    /// repair without consuming its retry budget.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn validate_initial_share_repair(&self, room_id: &RoomId) -> Result<bool> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .validate_initial_share_repair(room_id, members.iter().map(Deref::deref), settings)
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Queue encrypted initial-share repair requests after a targeted claim.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn reshare_initial_share(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Arc<ToDeviceRequest>>> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .reshare_initial_share(room_id, members.iter().map(Deref::deref), settings)
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Record a closed initial-share repair outcome.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn note_initial_share_repair(
+        &self,
+        room_id: &RoomId,
+        expected_session_id: Option<&str>,
+        claim: matrix_sdk_crypto::InitialShareRepairClaimOutcome,
+        repair: matrix_sdk_crypto::InitialShareRepairOutcome,
+    ) -> Result<()> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .note_initial_share_repair(
+                    room_id,
+                    expected_session_id,
+                    members.iter().map(Deref::deref),
+                    settings,
+                    claim,
+                    repair,
+                )
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
     /// Return the current outbound group-session identifier, if one exists.
     #[cfg(feature = "e2e-encryption")]
     pub async fn current_outbound_group_session_id(
@@ -1130,6 +1211,30 @@ impl BaseClient {
         }
     }
 
+    /// Prepare a targeted claim for a forced room-key re-share.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn prepare_force_reshare_claim(
+        &self,
+        room_id: &RoomId,
+        expected_session_id: Option<&str>,
+        target: RoomKeyReshareTarget,
+    ) -> Result<Option<(ruma::OwnedTransactionId, ruma::api::client::keys::claim_keys::v3::Request)>>
+    {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .prepare_force_reshare_claim(
+                    room_id,
+                    expected_session_id,
+                    target,
+                    members.iter().map(Deref::deref),
+                    settings,
+                )
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
     /// Force-share the current outbound room key with eligible target devices.
     #[cfg(feature = "e2e-encryption")]
     pub async fn force_reshare_room_key(
@@ -1137,6 +1242,7 @@ impl BaseClient {
         room_id: &RoomId,
         expected_session_id: Option<&str>,
         target: RoomKeyReshareTarget,
+        only_devices: Option<&BTreeMap<OwnedUserId, BTreeSet<ruma::OwnedDeviceId>>>,
     ) -> Result<RoomKeyReshareResult> {
         let (members, settings) = self.room_key_share_context(room_id).await?;
         match self.olm_machine().await.as_ref() {
@@ -1145,6 +1251,7 @@ impl BaseClient {
                     room_id,
                     expected_session_id,
                     target,
+                    only_devices,
                     members.iter().map(Deref::deref),
                     settings,
                 )

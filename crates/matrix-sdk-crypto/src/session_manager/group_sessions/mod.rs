@@ -56,8 +56,9 @@ use crate::{
         SenderData, SenderDataFinder, Session, ShareInfo, ShareState, StaticAccountData,
     },
     room_key_diagnostics::{
-        Index0ReshareOutcome, InitialShareDeviceClass, InitialShareStage, RoomKeyCreationOutcome,
-        RoomKeyDiagnosticHub,
+        Index0ReshareOutcome, InitialShareDeviceClass, InitialShareRepairClaimOutcome,
+        InitialShareRepairOlmState, InitialShareRepairOutcome, InitialShareRepairPreparation,
+        InitialShareStage, RoomKeyCreationOutcome, RoomKeyDiagnosticHub,
     },
     store::{CryptoStoreWrapper, Result as StoreResult, Store, types::Changes},
     types::{
@@ -124,6 +125,13 @@ pub enum RoomKeyReshareResult {
         requests: Vec<Arc<ToDeviceRequest>>,
         /// Number of device recipients across the requests.
         recipient_count: usize,
+        /// Eligible devices that still could not be Olm-encrypted.
+        failed_recipient_count: usize,
+    },
+    /// Eligible target devices existed but none could be Olm-encrypted.
+    UnableToEncrypt {
+        /// Number of devices with an explicit encryption failure.
+        recipient_count: usize,
     },
     /// No current outbound session exists.
     NoSession,
@@ -145,6 +153,11 @@ pub enum Index0ReshareDecision {
     /// The attempt was cancelled by a fenced identity change (the active
     /// session changed while the decision was being made).
     Cancelled,
+    /// Eligible targets existed but none could be Olm-encrypted.
+    UnableToEncrypt {
+        /// Number of devices with an explicit encryption failure.
+        recipient_count: usize,
+    },
     /// A duplicate was queued; the requests still need to be sent and marked
     /// as sent by the caller within the bounded deadline.
     Queued {
@@ -152,6 +165,8 @@ pub enum Index0ReshareDecision {
         session_id: String,
         /// New `m.room.encrypted` to-device requests carrying the room key.
         requests: Vec<Arc<ToDeviceRequest>>,
+        /// Eligible devices that still could not be Olm-encrypted.
+        failed_recipient_count: usize,
     },
 }
 
@@ -1034,6 +1049,7 @@ impl GroupSessionManager {
                 SenderData::unknown(),
             )
             .await?;
+        let created_session = inbound.is_some();
         tracing::Span::current().record("session_id", outbound.session_id());
 
         // Having an inbound group session here means that we created a new
@@ -1075,6 +1091,7 @@ impl GroupSessionManager {
                 device,
             )
             .await?;
+        let created_session = created_session || should_rotate;
 
         // Filter out the devices that already received this room key or have a
         // to-device message already queued up.
@@ -1133,14 +1150,23 @@ impl GroupSessionManager {
 
         // Issue #509: report devices that had no Olm session (the SDK claims a
         // one-time key and queues an `m.no_olm` withheld notice).
-        for (device, _code) in &unable_to_encrypt_devices {
+        for (device, code) in &unable_to_encrypt_devices {
             self.room_key_diagnostics.emit_initial_share_device(
                 room_id,
                 outbound.session_id(),
                 device.user_id(),
                 device.device_id(),
                 initial_share_device_class(&account, device),
-                InitialShareStage::OlmMissing,
+                if code == &WithheldCode::NoOlm {
+                    InitialShareStage::OlmMissing
+                } else {
+                    InitialShareStage::Withheld
+                },
+            );
+        }
+        if created_session && outbound.message_index().await == 0 {
+            outbound.record_initial_share_missing(
+                unable_to_encrypt_devices.iter().map(|(device, _)| device.clone()),
             );
         }
 
@@ -1214,12 +1240,335 @@ impl GroupSessionManager {
         Ok(requests)
     }
 
+    /// Re-evaluate the exact devices that failed the initial Olm share and
+    /// return only those devices as a targeted claim set.
+    pub(crate) async fn initial_share_repair_targets(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+        wake: bool,
+        wake_users: Option<&BTreeSet<OwnedUserId>>,
+        validate_only: bool,
+    ) -> OlmResult<(
+        InitialShareRepairPreparation,
+        Option<BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>>,
+    )> {
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok((InitialShareRepairPreparation::NotNeeded, None));
+        };
+        if outbound.message_index().await != 0 {
+            return Ok((InitialShareRepairPreparation::NotNeeded, None));
+        }
+        if outbound.invalidated() {
+            return Ok((InitialShareRepairPreparation::Cancelled, None));
+        }
+
+        let candidates = outbound.initial_share_repair_candidates();
+        if candidates.is_empty() {
+            return Ok((InitialShareRepairPreparation::NotNeeded, None));
+        }
+        if wake
+            && wake_users.is_some_and(|users| {
+                !candidates.iter().any(|device| users.contains(device.user_id()))
+            })
+        {
+            return Ok((InitialShareRepairPreparation::NotMatchingWake, None));
+        }
+
+        let settings = encryption_settings.into();
+        let CollectRecipientsResult { should_rotate, devices, .. } =
+            self.collect_session_recipients(users, &settings, &outbound).await?;
+        if should_rotate {
+            return Ok((InitialShareRepairPreparation::Cancelled, None));
+        }
+
+        let current = self.sessions.get_or_load(room_id).await;
+        if current.is_none_or(|current| current.session_id() != outbound.session_id()) {
+            return Ok((InitialShareRepairPreparation::Cancelled, None));
+        }
+
+        let candidate_ids: BTreeSet<_> = candidates
+            .iter()
+            .map(|device| (device.user_id().to_owned(), device.device_id().to_owned()))
+            .collect();
+        let sharing = outbound.sharing_view();
+        let mut targets = BTreeMap::new();
+        for device in devices.into_values().flatten() {
+            let key = (device.user_id().to_owned(), device.device_id().to_owned());
+            if candidate_ids.contains(&key)
+                && !sharing.has_pending_share(&device)
+                && matches!(sharing.get_share_state(&device), ShareState::NotShared)
+            {
+                targets.entry(key.0).or_insert_with(BTreeSet::new).insert(key.1);
+            }
+        }
+        let target_ids = targets
+            .iter()
+            .flat_map(|(user_id, devices)| {
+                devices.iter().map(|device_id| (user_id.clone(), device_id.clone()))
+            })
+            .collect::<BTreeSet<_>>();
+        if !outbound.initial_share_repair_policy_matches(&target_ids) {
+            return Ok((InitialShareRepairPreparation::Cancelled, None));
+        }
+        if validate_only {
+            return Ok((InitialShareRepairPreparation::NotNeeded, None));
+        }
+        if targets.is_empty() {
+            let all_candidates_are_shared = candidates
+                .iter()
+                .all(|device| matches!(sharing.get_share_state(device), ShareState::Shared { .. }));
+            return Ok((
+                if all_candidates_are_shared {
+                    InitialShareRepairPreparation::NotNeeded
+                } else {
+                    InitialShareRepairPreparation::NoRecipients
+                },
+                None,
+            ));
+        }
+        if !outbound.begin_initial_share_repair(wake, target_ids) {
+            return Ok((InitialShareRepairPreparation::NotNeeded, None));
+        }
+
+        Ok((InitialShareRepairPreparation::Attempted, Some(targets)))
+    }
+
+    /// Encrypt the current room key for the still-eligible initial-share
+    /// repair candidates after a targeted claim response.
+    pub(crate) async fn reshare_initial_share(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<Vec<Arc<ToDeviceRequest>>> {
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok(Vec::new());
+        };
+        if outbound.message_index().await != 0 || outbound.invalidated() {
+            return Ok(Vec::new());
+        }
+
+        let settings = encryption_settings.into();
+        let CollectRecipientsResult { should_rotate, devices, .. } =
+            self.collect_session_recipients(users, &settings, &outbound).await?;
+        if should_rotate {
+            return Ok(Vec::new());
+        }
+
+        let candidate_ids: BTreeSet<_> = outbound
+            .initial_share_repair_candidates()
+            .into_iter()
+            .map(|device| (device.user_id().to_owned(), device.device_id().to_owned()))
+            .collect();
+        let devices = {
+            let sharing = outbound.sharing_view();
+            devices
+                .into_values()
+                .flatten()
+                .filter(|device| {
+                    candidate_ids
+                        .contains(&(device.user_id().to_owned(), device.device_id().to_owned()))
+                        && !sharing.has_pending_share(device)
+                        && matches!(sharing.get_share_state(device), ShareState::NotShared)
+                })
+                .collect::<Vec<_>>()
+        };
+        if devices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let previous_request_ids =
+            outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
+        let mut changes = Changes::default();
+        let unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        let account = self.store.static_account();
+        for (device, code) in &unable_to_encrypt {
+            self.room_key_diagnostics.emit_initial_share_device(
+                room_id,
+                outbound.session_id(),
+                device.user_id(),
+                device.device_id(),
+                initial_share_device_class(&account, device),
+                if code == &WithheldCode::NoOlm {
+                    InitialShareStage::OlmMissing
+                } else {
+                    InitialShareStage::Withheld
+                },
+            );
+        }
+
+        let requests = outbound
+            .pending_requests()
+            .into_iter()
+            .filter(|request| {
+                !previous_request_ids.contains(&request.txn_id)
+                    && request.event_type.to_string() == "m.room.encrypted"
+            })
+            .collect::<Vec<_>>();
+        for request in &requests {
+            for (user_id, devices) in &request.messages {
+                for device_id in devices.keys() {
+                    let DeviceIdOrAllDevices::DeviceId(device_id) = device_id else {
+                        continue;
+                    };
+                    self.room_key_diagnostics.emit_initial_share_device(
+                        room_id,
+                        outbound.session_id(),
+                        user_id,
+                        device_id,
+                        InitialShareDeviceClass::Unknown,
+                        InitialShareStage::OlmEncrypted,
+                    );
+                    self.room_key_diagnostics.emit_initial_share_device(
+                        room_id,
+                        outbound.session_id(),
+                        user_id,
+                        device_id,
+                        InitialShareDeviceClass::Unknown,
+                        InitialShareStage::RequestQueued,
+                    );
+                }
+            }
+        }
+        if !changes.is_empty() {
+            self.store.save_changes(changes).await?;
+        }
+        Ok(requests)
+    }
+
+    /// Record the closed repair outcome using the current authoritative share
+    /// state and eligible recipient set.
+    pub(crate) async fn note_initial_share_repair(
+        &self,
+        room_id: &RoomId,
+        expected_session_id: Option<&str>,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+        claim: InitialShareRepairClaimOutcome,
+        repair: InitialShareRepairOutcome,
+    ) -> OlmResult<()> {
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok(());
+        };
+        let session_id = expected_session_id.unwrap_or_else(|| outbound.session_id());
+        let same_session = session_id == outbound.session_id() && !outbound.invalidated();
+        if !same_session {
+            self.room_key_diagnostics.note_initial_share_repair(
+                room_id,
+                session_id,
+                InitialShareRepairOlmState::Unknown,
+                claim,
+                InitialShareRepairOutcome::Cancelled,
+                0,
+                0,
+                0,
+                0,
+                None,
+                false,
+            );
+            return Ok(());
+        }
+
+        let settings = encryption_settings.into();
+        let CollectRecipientsResult { devices, .. } =
+            self.collect_session_recipients(users, &settings, &outbound).await?;
+        let account = self.store.static_account();
+        let candidates: BTreeSet<_> = outbound
+            .initial_share_repair_candidates()
+            .into_iter()
+            .map(|device| (device.user_id().to_owned(), device.device_id().to_owned()))
+            .collect();
+        let mut own_coverage = 0;
+        let mut eligible_peer_users = BTreeSet::new();
+        let mut covered_peer_users = BTreeSet::new();
+        let mut missing_devices = 0;
+        let sharing = outbound.sharing_view();
+        for device in devices.into_values().flatten() {
+            let covered = matches!(sharing.get_share_state(&device), ShareState::Shared { .. });
+            if device.user_id() == account.user_id {
+                if covered {
+                    own_coverage += 1;
+                }
+            } else {
+                eligible_peer_users.insert(device.user_id().to_owned());
+                if covered {
+                    covered_peer_users.insert(device.user_id().to_owned());
+                }
+            }
+            if candidates.contains(&(device.user_id().to_owned(), device.device_id().to_owned()))
+                && !covered
+            {
+                missing_devices += 1;
+            }
+        }
+        drop(sharing);
+        self.room_key_diagnostics.note_initial_share_repair(
+            room_id,
+            session_id,
+            if candidates.is_empty() {
+                InitialShareRepairOlmState::Present
+            } else {
+                InitialShareRepairOlmState::Missing
+            },
+            claim,
+            repair,
+            own_coverage,
+            covered_peer_users.len(),
+            eligible_peer_users.difference(&covered_peer_users).count(),
+            missing_devices,
+            None,
+            true,
+        );
+        Ok(())
+    }
+
+    /// Select the exact eligible target devices for a forced re-share.
+    pub(crate) async fn force_reshare_targets(
+        &self,
+        room_id: &RoomId,
+        expected_session_id: Option<&str>,
+        target: RoomKeyReshareTarget,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<Option<BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>>> {
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok(None);
+        };
+        if expected_session_id.is_some_and(|expected| expected != outbound.session_id()) {
+            return Ok(None);
+        }
+        let settings = encryption_settings.into();
+        let CollectRecipientsResult { devices, .. } =
+            self.collect_session_recipients(users, &settings, &outbound).await?;
+        let account = self.store.static_account();
+        let sharing = outbound.sharing_view();
+        let mut targets = BTreeMap::new();
+        for device in devices.into_values().flatten() {
+            if target.matches(
+                account.user_id(),
+                account.device_id(),
+                device.user_id(),
+                device.device_id(),
+            ) && !sharing.has_pending_share(&device)
+            {
+                targets
+                    .entry(device.user_id().to_owned())
+                    .or_insert_with(BTreeSet::new)
+                    .insert(device.device_id().to_owned());
+            }
+        }
+        if targets.is_empty() { Ok(None) } else { Ok(Some(targets)) }
+    }
+
     /// Force-share the current outbound session without creating or rotating it.
     pub async fn force_reshare_room_key(
         &self,
         room_id: &RoomId,
         expected_session_id: Option<&str>,
         target: RoomKeyReshareTarget,
+        only_devices: Option<&BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>>,
         users: impl Iterator<Item = &UserId>,
         encryption_settings: impl Into<EncryptionSettings>,
     ) -> OlmResult<RoomKeyReshareResult> {
@@ -1246,7 +1595,12 @@ impl GroupSessionManager {
                         device.user_id(),
                         device.device_id(),
                     );
-                    target_matches && !sharing.has_pending_share(device)
+                    let exact_target_matches = only_devices.is_none_or(|targets| {
+                        targets
+                            .get(device.user_id())
+                            .is_some_and(|devices| devices.contains(device.device_id()))
+                    });
+                    target_matches && exact_target_matches && !sharing.has_pending_share(device)
                 })
                 .collect::<Vec<_>>()
         };
@@ -1257,19 +1611,38 @@ impl GroupSessionManager {
         let previous_request_ids =
             outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
         let mut changes = Changes::default();
-        let _unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        let unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        for (device, code) in &unable_to_encrypt {
+            self.room_key_diagnostics.emit_initial_share_device(
+                room_id,
+                outbound.session_id(),
+                device.user_id(),
+                device.device_id(),
+                initial_share_device_class(&account, device),
+                if code == &WithheldCode::NoOlm {
+                    InitialShareStage::OlmMissing
+                } else {
+                    InitialShareStage::Withheld
+                },
+            );
+        }
         let requests = outbound
             .pending_requests()
             .into_iter()
             .filter(|request| !previous_request_ids.contains(&request.txn_id))
             .collect::<Vec<_>>();
+        let failed_recipient_count = unable_to_encrypt.len();
         if requests.is_empty() {
-            return Ok(RoomKeyReshareResult::NoRecipients);
+            return Ok(if failed_recipient_count == 0 {
+                RoomKeyReshareResult::NoRecipients
+            } else {
+                RoomKeyReshareResult::UnableToEncrypt { recipient_count: failed_recipient_count }
+            });
         }
         let recipient_count = requests.iter().map(|request| request.message_count()).sum();
         self.store.save_changes(changes).await?;
         Self::log_room_key_sharing_result(&requests);
-        Ok(RoomKeyReshareResult::Sent { requests, recipient_count })
+        Ok(RoomKeyReshareResult::Sent { requests, recipient_count, failed_recipient_count })
     }
 
     /// Decide and queue the bounded index-0 duplicate share (issue #510).
@@ -1362,7 +1735,21 @@ impl GroupSessionManager {
         let previous_request_ids =
             outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
         let mut changes = Changes::default();
-        let _unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        let unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        for (device, code) in &unable_to_encrypt {
+            self.room_key_diagnostics.emit_initial_share_device(
+                room_id,
+                outbound.session_id(),
+                device.user_id(),
+                device.device_id(),
+                initial_share_device_class(&account, device),
+                if code == &WithheldCode::NoOlm {
+                    InitialShareStage::OlmMissing
+                } else {
+                    InitialShareStage::Withheld
+                },
+            );
+        }
         let requests = outbound
             .pending_requests()
             .into_iter()
@@ -1371,11 +1758,16 @@ impl GroupSessionManager {
                     && request.event_type.to_string() == "m.room.encrypted"
             })
             .collect::<Vec<_>>();
+        let failed_recipient_count = unable_to_encrypt.len();
         if requests.is_empty() {
-            return Ok(Index0ReshareDecision::NotNeeded);
+            return Ok(if failed_recipient_count == 0 {
+                Index0ReshareDecision::NotNeeded
+            } else {
+                Index0ReshareDecision::UnableToEncrypt { recipient_count: failed_recipient_count }
+            });
         }
         self.store.save_changes(changes).await?;
-        Ok(Index0ReshareDecision::Queued { session_id, requests })
+        Ok(Index0ReshareDecision::Queued { session_id, requests, failed_recipient_count })
     }
 
     /// Collect the devices belonging to the given user, and send the details of
@@ -1896,12 +2288,13 @@ mod tests {
                 room_id,
                 Some(&session_id),
                 RoomKeyReshareTarget::AllEligible,
+                None,
                 users(),
                 EncryptionSettings::default(),
             )
             .await
             .unwrap();
-        let RoomKeyReshareResult::Sent { requests, recipient_count } = first else {
+        let RoomKeyReshareResult::Sent { requests, recipient_count, .. } = first else {
             panic!("expected forced requests");
         };
         assert!(!requests.is_empty());
@@ -1914,6 +2307,7 @@ mod tests {
                     room_id,
                     Some(&session_id),
                     RoomKeyReshareTarget::AllEligible,
+                    None,
                     users(),
                     EncryptionSettings::default(),
                 )
@@ -1936,6 +2330,7 @@ mod tests {
                     room_id,
                     None,
                     RoomKeyReshareTarget::AllEligible,
+                    None,
                     users(),
                     EncryptionSettings::default(),
                 )
@@ -1953,6 +2348,7 @@ mod tests {
                     current_room,
                     Some("stale"),
                     RoomKeyReshareTarget::AllEligible,
+                    None,
                     users(),
                     EncryptionSettings::default(),
                 )

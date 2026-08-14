@@ -193,6 +193,18 @@ impl SlidingSyncResponseProcessor {
         // `handle_room_response` before this function), so panic is fine.
         assert!(self.response.is_none());
 
+        #[cfg(feature = "e2e-encryption")]
+        let mut repair_wake_users =
+            extensions.e2ee.device_lists.changed.iter().cloned().collect::<BTreeSet<_>>();
+        #[cfg(feature = "e2e-encryption")]
+        if !extensions.e2ee.device_one_time_keys_count.is_empty()
+            || extensions.e2ee.device_unused_fallback_key_types.is_some()
+        {
+            if let Some(user_id) = self.client.user_id() {
+                repair_wake_users.insert(user_id.to_owned());
+            }
+        }
+
         if let Some((to_device_events, olm_recovery_signals)) = self
             .client
             .base_client()
@@ -211,6 +223,9 @@ impl SlidingSyncResponseProcessor {
         } else {
             self.to_device_events = Vec::new();
         };
+
+        #[cfg(feature = "e2e-encryption")]
+        self.client.notify_initial_share_repair_wake(repair_wake_users);
 
         Ok(())
     }
@@ -276,6 +291,10 @@ impl SlidingSyncResponseProcessor {
         // post-unwedge re-share for any standard Olm recovery signals observed
         // in this sync (current membership is authoritative).
         if !self.olm_recovery_signals.is_empty() {
+            #[cfg(feature = "e2e-encryption")]
+            self.client.notify_initial_share_repair_wake(
+                self.olm_recovery_signals.iter().map(|signal| signal.user_id.clone()).collect(),
+            );
             self.client.encryption().on_olm_unwedged(self.olm_recovery_signals).await;
         }
 

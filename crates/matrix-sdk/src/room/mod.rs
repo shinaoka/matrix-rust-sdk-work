@@ -16,7 +16,7 @@
 
 use std::{
     borrow::Borrow,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     ops::Deref,
     sync::Arc,
@@ -195,6 +195,13 @@ pub enum RoomKeyReshareResult {
         /// Number of to-device requests sent.
         request_count: usize,
         /// Number of recipient devices across those requests.
+        recipient_count: usize,
+        /// Eligible devices that still could not be Olm-encrypted.
+        failed_recipient_count: usize,
+    },
+    /// Eligible target devices existed but none could be Olm-encrypted.
+    UnableToEncrypt {
+        /// Number of devices with an explicit encryption failure.
         recipient_count: usize,
     },
     /// No current outbound session exists.
@@ -2585,6 +2592,30 @@ impl Room {
         target: RoomKeyReshareTarget,
     ) -> Result<RoomKeyReshareResult> {
         self.ensure_room_joined()?;
+        let _claim_lock = self.client.locks().key_claim_lock.lock().await;
+        let mut only_devices = None;
+        if let Some((request_id, request)) = self
+            .client
+            .base_client()
+            .prepare_force_reshare_claim(
+                self.room_id(),
+                expected.map(|token| token.0.as_str()),
+                target.into(),
+            )
+            .await?
+        {
+            only_devices = Some(
+                request
+                    .one_time_keys
+                    .iter()
+                    .map(|(user_id, devices)| {
+                        (user_id.to_owned(), devices.keys().cloned().collect::<BTreeSet<_>>())
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            );
+            let response = self.client.send(request).await?;
+            self.client.mark_request_as_sent(&request_id, &response).await?;
+        }
         let result = self
             .client
             .base_client()
@@ -2592,16 +2623,28 @@ impl Room {
                 self.room_id(),
                 expected.map(|token| token.0.as_str()),
                 target.into(),
+                only_devices.as_ref(),
             )
             .await?;
         Ok(match result {
-            CryptoRoomKeyReshareResult::Sent { requests, recipient_count } => {
+            CryptoRoomKeyReshareResult::Sent {
+                requests,
+                recipient_count,
+                failed_recipient_count,
+            } => {
                 let request_count = requests.len();
                 for request in requests {
                     let response = self.client.send_to_device(&request).await?;
                     self.client.mark_request_as_sent(&request.txn_id, &response).await?;
                 }
-                RoomKeyReshareResult::Sent { request_count, recipient_count }
+                RoomKeyReshareResult::Sent {
+                    request_count,
+                    recipient_count,
+                    failed_recipient_count,
+                }
+            }
+            CryptoRoomKeyReshareResult::UnableToEncrypt { recipient_count } => {
+                RoomKeyReshareResult::UnableToEncrypt { recipient_count }
             }
             CryptoRoomKeyReshareResult::NoSession => RoomKeyReshareResult::NoSession,
             CryptoRoomKeyReshareResult::NoRecipients => RoomKeyReshareResult::NoRecipients,

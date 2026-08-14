@@ -1,6 +1,6 @@
 mod backups;
 mod cross_signing;
-mod index0_reshare;
+mod issue_523;
 mod recovery;
 mod secret_storage;
 mod shared_history;

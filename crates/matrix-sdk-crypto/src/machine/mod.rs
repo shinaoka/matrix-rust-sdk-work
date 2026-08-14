@@ -15,7 +15,7 @@
 #[cfg(feature = "experimental-encrypted-state-events")]
 use std::borrow::Borrow;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -85,8 +85,9 @@ use crate::{
         SenderDataFinder, SessionType, StaticAccountData,
     },
     room_key_diagnostics::{
-        Index0ReshareOutcome, OlmRecoveryCounters, OlmRecoverySignalOutcome, RoomKeyDiagnosticHub,
-        RoomKeyDiagnosticObserver, RoomKeyIngressKind, RoomKeyMergeDecision,
+        Index0ReshareOutcome, InitialShareRepairClaimOutcome, InitialShareRepairOutcome,
+        InitialShareRepairPreparation, OlmRecoveryCounters, OlmRecoverySignalOutcome,
+        RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyIngressKind, RoomKeyMergeDecision,
         RoomKeyReceiveCounters, RoomKeyReceiveDiagnosticKind, RoomKeyRotationReason,
     },
     session_manager::{
@@ -1433,6 +1434,90 @@ impl OlmMachine {
         self.inner.group_session_manager.note_to_device_request_failed(request_id);
     }
 
+    /// Select and prepare a bounded targeted claim for initial-share repair.
+    ///
+    /// The preparation result is closed and does not expose recipient
+    /// identifiers; the optional request is present only when one or more
+    /// selected devices still lack an Olm session.
+    #[doc(hidden)]
+    pub async fn prepare_initial_share_repair(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+        wake: bool,
+        wake_users: Option<&BTreeSet<OwnedUserId>>,
+    ) -> OlmResult<(InitialShareRepairPreparation, Option<(OwnedTransactionId, KeysClaimRequest)>)>
+    {
+        let settings = encryption_settings.into();
+        let (preparation, targets) = self
+            .inner
+            .group_session_manager
+            .initial_share_repair_targets(room_id, users, settings, wake, wake_users, false)
+            .await?;
+        let Some(targets) = targets else {
+            return Ok((preparation, None));
+        };
+
+        let request = self.inner.session_manager.get_missing_sessions_for_devices(targets).await?;
+        Ok((preparation, request))
+    }
+
+    /// Re-evaluate the recipient policy captured by the active initial-share
+    /// repair without consuming its one-wake budget.
+    #[doc(hidden)]
+    pub async fn validate_initial_share_repair(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<bool> {
+        let (preparation, _) = self
+            .inner
+            .group_session_manager
+            .initial_share_repair_targets(room_id, users, encryption_settings, false, None, true)
+            .await?;
+        Ok(!matches!(preparation, InitialShareRepairPreparation::Cancelled))
+    }
+
+    /// Queue the encrypted index-0 room-key repair after a targeted claim.
+    #[doc(hidden)]
+    pub async fn reshare_initial_share(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<Vec<Arc<ToDeviceRequest>>> {
+        self.inner
+            .group_session_manager
+            .reshare_initial_share(room_id, users, encryption_settings)
+            .await
+    }
+
+    /// Record a closed initial-share repair outcome.
+    #[doc(hidden)]
+    pub async fn note_initial_share_repair(
+        &self,
+        room_id: &RoomId,
+        expected_session_id: Option<&str>,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+        claim: InitialShareRepairClaimOutcome,
+        repair: InitialShareRepairOutcome,
+    ) -> OlmResult<()> {
+        self.inner
+            .group_session_manager
+            .note_initial_share_repair(
+                room_id,
+                expected_session_id,
+                users,
+                encryption_settings,
+                claim,
+                repair,
+            )
+            .await
+    }
+
     /// Decide and queue the bounded index-0 duplicate share (issue #510). See
     /// [`GroupSessionManager::reshare_index0_once`].
     pub async fn reshare_index0_once(
@@ -1497,6 +1582,7 @@ impl OlmMachine {
         room_id: &RoomId,
         expected_session_id: Option<&str>,
         target: crate::RoomKeyReshareTarget,
+        only_devices: Option<&BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>>,
         users: impl Iterator<Item = &UserId>,
         encryption_settings: impl Into<EncryptionSettings>,
     ) -> OlmResult<crate::RoomKeyReshareResult> {
@@ -1506,10 +1592,35 @@ impl OlmMachine {
                 room_id,
                 expected_session_id,
                 target,
+                only_devices,
                 users,
                 encryption_settings,
             )
             .await
+    }
+
+    /// Prepare a targeted claim for devices selected by a forced room-key
+    /// re-share. The request contains only devices in the selected target set
+    /// that currently lack an Olm session.
+    #[doc(hidden)]
+    pub async fn prepare_force_reshare_claim(
+        &self,
+        room_id: &RoomId,
+        expected_session_id: Option<&str>,
+        target: crate::RoomKeyReshareTarget,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<Option<(OwnedTransactionId, KeysClaimRequest)>> {
+        let settings = encryption_settings.into();
+        let Some(targets) = self
+            .inner
+            .group_session_manager
+            .force_reshare_targets(room_id, expected_session_id, target, users, settings.clone())
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(self.inner.session_manager.get_missing_sessions_for_devices(targets).await?)
     }
 
     /// Encrypts the given content using Olm for each of the given devices.
