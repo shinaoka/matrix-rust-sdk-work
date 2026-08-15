@@ -131,6 +131,10 @@ pub struct ClientBuilder {
     /// off so SDK behavior stays upstream-compatible.
     #[cfg(feature = "e2e-encryption")]
     index0_duplicate_share: bool,
+    /// Whether to run targeted initial-share Olm repair before the first room
+    /// event of a fresh outbound Megolm session (issue #523). Defaults to off.
+    #[cfg(feature = "e2e-encryption")]
+    initial_share_repair: bool,
     cross_process_lock_config: CrossProcessLockConfig,
     threading_support: ThreadingSupport,
     #[cfg(feature = "experimental-search")]
@@ -168,6 +172,8 @@ impl ClientBuilder {
             enable_share_history_on_invite: true,
             #[cfg(feature = "e2e-encryption")]
             index0_duplicate_share: false,
+            #[cfg(feature = "e2e-encryption")]
+            initial_share_repair: false,
             cross_process_lock_config: CrossProcessLockConfig::MultiProcess {
                 holder_name: Self::DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME.to_owned(),
             },
@@ -530,6 +536,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable targeted initial-share Olm repair (issue #523): after standard
+    /// pre-share, retry exact missing-Olm recipients before the first event.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn with_initial_share_repair(mut self, enabled: bool) -> Self {
+        self.initial_share_repair = enabled;
+        self
+    }
+
     /// Set the cross-process store locks holder name.
     ///
     /// The SDK provides cross-process store locks (see
@@ -679,6 +693,8 @@ impl ClientBuilder {
             self.enable_share_history_on_invite,
             #[cfg(feature = "e2e-encryption")]
             self.index0_duplicate_share,
+            #[cfg(feature = "e2e-encryption")]
+            self.initial_share_repair,
             self.cross_process_lock_config,
             #[cfg(feature = "experimental-search")]
             search_index,

@@ -439,6 +439,11 @@ pub(crate) struct ClientInner {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) index0_duplicate_share: bool,
 
+    /// Whether to run targeted initial-share Olm repair before the first room
+    /// event of a fresh outbound Megolm session (issue #523).
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) initial_share_repair: bool,
+
     /// Data related to the [`SendQueue`].
     ///
     /// [`SendQueue`]: crate::send_queue::SendQueue
@@ -494,6 +499,7 @@ impl ClientInner {
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
         #[cfg(feature = "e2e-encryption")] enable_share_history_on_invite: bool,
         #[cfg(feature = "e2e-encryption")] index0_duplicate_share: bool,
+        #[cfg(feature = "e2e-encryption")] initial_share_repair: bool,
         cross_process_lock_config: CrossProcessLockConfig,
         #[cfg(feature = "experimental-search")] search_index_handler: SearchIndex,
         thread_subscription_catchup: OnceCell<Arc<ThreadSubscriptionCatchup>>,
@@ -541,6 +547,8 @@ impl ClientInner {
             enable_share_history_on_invite,
             #[cfg(feature = "e2e-encryption")]
             index0_duplicate_share,
+            #[cfg(feature = "e2e-encryption")]
+            initial_share_repair,
             server_max_upload_size: Mutex::new(OnceCell::new()),
             #[cfg(feature = "experimental-search")]
             search_index: search_index_handler,
@@ -3364,6 +3372,8 @@ impl Client {
                 self.inner.enable_share_history_on_invite,
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.index0_duplicate_share,
+                #[cfg(feature = "e2e-encryption")]
+                self.inner.initial_share_repair,
                 cross_process_lock_config,
                 #[cfg(feature = "experimental-search")]
                 self.inner.search_index.clone(),

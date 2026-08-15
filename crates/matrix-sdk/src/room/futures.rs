@@ -590,6 +590,11 @@ pub(crate) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
     room.query_keys_for_untracked_or_dirty_users().await?;
     room.preshare_room_key().await?;
 
+    if !room.client.initial_share_repair_enabled() {
+        room.ensure_room_joined()?;
+        return Ok(());
+    }
+
     let expected_session =
         room.client.base_client().current_outbound_group_session_id(room.room_id()).await?;
     let Some(expected_session) = expected_session else {
@@ -607,6 +612,18 @@ pub(crate) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
 
     room.ensure_room_joined()?;
     Ok(())
+}
+
+/// Reproduce the former standard pre-share to #510 boundary for SDK tests.
+///
+/// This helper is unavailable in normal builds, returns no cryptographic data,
+/// and must not be called by production send paths.
+#[cfg(all(feature = "e2e-encryption", feature = "testing"))]
+pub async fn ensure_room_encryption_ready_with_index0_duplicate_share_for_testing(
+    room: &Room,
+) -> Result<()> {
+    ensure_room_encryption_ready(room).await?;
+    ensure_index0_duplicate_share(room).await
 }
 
 #[cfg(feature = "e2e-encryption")]
@@ -778,8 +795,8 @@ pub(crate) async fn ensure_index0_duplicate_share(room: &Room) -> Result<()> {
     // duplicate is best-effort delivery hardening, not a send gate.
     const INDEX0_RESHARE_DEADLINE: Duration = Duration::from_millis(1500);
 
-    // Opt-in (default off) so the SDK stays upstream-compatible; Koushi
-    // enables it through `ClientBuilder::with_index0_duplicate_share`.
+    // Opt-in (default off) so the SDK stays upstream-compatible; callers
+    // enable it through `ClientBuilder::with_index0_duplicate_share`.
     if !room.client.index0_duplicate_share_enabled() {
         return Ok(());
     }

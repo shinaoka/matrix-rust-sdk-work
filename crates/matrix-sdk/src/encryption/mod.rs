@@ -566,6 +566,10 @@ impl Client {
         self.inner.index0_duplicate_share
     }
 
+    pub(crate) fn initial_share_repair_enabled(&self) -> bool {
+        self.inner.initial_share_repair
+    }
+
     pub(crate) async fn mark_request_as_sent(
         &self,
         request_id: &TransactionId,

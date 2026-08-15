@@ -114,6 +114,11 @@ async fn test_first_room_event_queues_exactly_one_index0_duplicate() {
         .await;
 
     let room = alice.get_room(&room_id).unwrap();
+    matrix_sdk::room::futures::ensure_room_encryption_ready_with_index0_duplicate_share_for_testing(
+        &room,
+    )
+    .await
+    .unwrap();
     let content = RoomMessageEventContent::text_plain("first");
     let _ = room.send(content).await.unwrap().response;
 
@@ -154,17 +159,17 @@ async fn test_first_room_event_queues_exactly_one_index0_duplicate() {
 async fn test_duplicate_send_failure_never_downgrades_the_first_event() {
     let (server, alice, room_id, events) = setup_encrypted_room().await;
 
-    // A stateful responder: the preshare succeeds, every later duplicate
-    // attempt fails.
+    // A stateful responder: the preshare succeeds, the duplicate fails, and
+    // the follow-up preshare after that test-only boundary also succeeds.
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts_clone = Arc::clone(&attempts);
     Mock::given(method("PUT"))
         .and(path_regex(TO_DEVICE_PATH))
         .respond_with(move |_request: &Request| {
-            if attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY)
-            } else {
+            if attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
                 ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY)
             }
         })
         .mount(server.server())
@@ -179,6 +184,11 @@ async fn test_duplicate_send_failure_never_downgrades_the_first_event() {
         .await;
 
     let room = alice.get_room(&room_id).unwrap();
+    matrix_sdk::room::futures::ensure_room_encryption_ready_with_index0_duplicate_share_for_testing(
+        &room,
+    )
+    .await
+    .unwrap();
     let content = RoomMessageEventContent::text_plain("first");
     let _ = room.send(content).await.unwrap().response;
 
@@ -213,21 +223,22 @@ async fn test_duplicate_deadline_is_bounded_with_controlled_time() {
 
     // The preshare's to-device request settles immediately; the duplicate's
     // response is delayed far beyond its 1.5s deadline so the deadline always
-    // fires first, deterministically, without any wall-clock sleep.
+    // fires first, deterministically, without any wall-clock sleep. The
+    // follow-up preshare after that test-only boundary settles immediately.
     let duplicate_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let duplicate_attempts_clone = Arc::clone(&duplicate_attempts);
     Mock::given(method("PUT"))
         .and(path_regex(TO_DEVICE_PATH))
         .respond_with(move |_request: &Request| {
-            if duplicate_attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY)
-            } else {
-                ResponseTemplate::new(200)
+            match duplicate_attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY),
+                1 => ResponseTemplate::new(200)
                     .set_body_json(&*test_json::EMPTY)
-                    .set_delay(Duration::from_secs(3600))
+                    .set_delay(Duration::from_secs(3600)),
+                _ => ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY),
             }
         })
-        .expect(2)
+        .expect(3)
         .named("send_to_device")
         .mount(server.server())
         .await;
@@ -244,6 +255,10 @@ async fn test_duplicate_deadline_is_bounded_with_controlled_time() {
     tokio::time::pause();
     let room = alice.get_room(&room_id).unwrap();
     let send = tokio::spawn(async move {
+        matrix_sdk::room::futures::ensure_room_encryption_ready_with_index0_duplicate_share_for_testing(
+            &room,
+        )
+        .await?;
         let content = RoomMessageEventContent::text_plain("first");
         room.send(content).await.map(|result| result.response)
     });

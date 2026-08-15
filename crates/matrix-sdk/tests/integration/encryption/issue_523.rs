@@ -34,6 +34,7 @@ const ROOM_SEND_PATH: &str = r"^/_matrix/client/.*/rooms/.*/send/m.room.encrypte
 
 async fn setup_room(
     exhaust_one_time_keys: bool,
+    enable_initial_share_repair: bool,
 ) -> (MatrixMockServer, Client, ruma::OwnedRoomId, Arc<Mutex<Vec<RoomKeyDiagnosticEvent>>>) {
     let server = MatrixMockServer::new().await;
     server.mock_crypto_endpoints_preset().await;
@@ -41,8 +42,17 @@ async fn setup_room(
     let bob_user_id = user_id!("@bob:example.org");
     let alice_device_id = device_id!("ALICEDEVICE");
     let bob_device_id = device_id!("BOBDEVICE");
-    let alice =
-        server.client_builder_for_crypto_end_to_end(alice_user_id, alice_device_id).build().await;
+    let alice = server
+        .client_builder_for_crypto_end_to_end(alice_user_id, alice_device_id)
+        .on_builder(|builder| {
+            if enable_initial_share_repair {
+                builder.with_initial_share_repair(true)
+            } else {
+                builder
+            }
+        })
+        .build()
+        .await;
     let bob = server.client_builder_for_crypto_end_to_end(bob_user_id, bob_device_id).build().await;
     server.exchange_e2ee_identities(&alice, &bob).await;
 
@@ -81,8 +91,99 @@ async fn setup_room(
 }
 
 #[async_test]
+async fn test_issue_523_default_builder_skips_repair_fence() {
+    let (server, alice, room_id, events) = setup_room(true, false).await;
+    let claim_count = Arc::new(AtomicUsize::new(0));
+    let repair_claim_seen = Arc::new(Notify::new());
+    let claim_count_for_mock = Arc::clone(&claim_count);
+    let repair_claim_seen_for_mock = Arc::clone(&repair_claim_seen);
+    Mock::given(method("POST"))
+        .and(path_regex(CLAIM_PATH))
+        .respond_with(move |_request: &Request| {
+            if claim_count_for_mock.fetch_add(1, Ordering::SeqCst) > 0 {
+                repair_claim_seen_for_mock.notify_one();
+            }
+            ResponseTemplate::new(200).set_body_json(json!({ "one_time_keys": {} }))
+        })
+        .mount(server.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(TO_DEVICE_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY))
+        .mount(server.server())
+        .await;
+    let room_send_seen = Arc::new(Notify::new());
+    let room_send_seen_for_mock = Arc::clone(&room_send_seen);
+    Mock::given(method("PUT"))
+        .and(path_regex(ROOM_SEND_PATH))
+        .respond_with(move |_request: &Request| {
+            room_send_seen_for_mock.notify_one();
+            ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID)
+        })
+        .mount(server.server())
+        .await;
+
+    let send_client = alice.clone();
+    let send_room_id = room_id.clone();
+    let send = tokio::spawn(async move {
+        send_client
+            .get_room(&send_room_id)
+            .unwrap()
+            .send(RoomMessageEventContent::text_plain("first"))
+            .await
+    });
+    let room_send_preceded_repair = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            _ = room_send_seen.notified() => true,
+            _ = repair_claim_seen.notified() => false,
+        }
+    })
+    .await
+    .expect("default send produced neither a room event nor a repair claim");
+    if !room_send_preceded_repair {
+        send.abort();
+    }
+    assert!(
+        room_send_preceded_repair,
+        "default client must send the room event without a targeted repair claim"
+    );
+    send.await.expect("room send task panicked").expect("room send failed");
+
+    let requests = server.server().received_requests().await.unwrap();
+    let paths: Vec<_> = requests.iter().map(|request| request.url.path()).collect();
+    assert_eq!(
+        paths.iter().filter(|path| path.ends_with("/keys/claim")).count(),
+        1,
+        "default initial sharing must make one claim and no targeted repair claim"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.contains("/rooms/") && path.contains("/send/m.room.encrypted/")),
+        "normal encrypted send must still occur"
+    );
+    assert!(
+        events.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                RoomKeyDiagnosticEvent::InitialShareSession(record)
+                    if record.first_event_message_index == 0
+            )
+        }),
+        "normal initial-share diagnostics must remain"
+    );
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| { matches!(event, RoomKeyDiagnosticEvent::InitialShareRepair(_)) })
+    );
+}
+
+#[async_test]
 async fn test_issue_523_matching_device_key_wake_runs_one_targeted_repair() {
-    let (server, alice, room_id, events) = setup_room(false).await;
+    let (server, alice, room_id, events) = setup_room(false, true).await;
     let claims = Arc::new(Mutex::new(Vec::<Value>::new()));
     let claim_wake = Arc::new(Notify::new());
     let claims_for_mock = Arc::clone(&claims);
@@ -153,7 +254,7 @@ async fn test_issue_523_matching_device_key_wake_runs_one_targeted_repair() {
 
 #[async_test]
 async fn test_issue_523_empty_claim_is_retried_before_the_first_event() {
-    let (server, alice, room_id, events) = setup_room(true).await;
+    let (server, alice, room_id, events) = setup_room(true, true).await;
     let claims = Arc::new(Mutex::new(Vec::<Value>::new()));
     let claims_for_mock = Arc::clone(&claims);
     Mock::given(method("POST"))
@@ -213,7 +314,7 @@ async fn test_issue_523_empty_claim_is_retried_before_the_first_event() {
 
 #[async_test]
 async fn test_issue_523_unmatched_repair_wake_respects_the_deadline() {
-    let (server, alice, room_id, events) = setup_room(true).await;
+    let (server, alice, room_id, events) = setup_room(true, true).await;
     let claims = Arc::new(Mutex::new(Vec::<Value>::new()));
     let claim_wake = Arc::new(Notify::new());
     let claims_for_mock = Arc::clone(&claims);
@@ -294,7 +395,7 @@ async fn test_issue_523_unmatched_repair_wake_respects_the_deadline() {
 
 #[async_test]
 async fn test_issue_523_concurrent_first_events_share_one_repair_fence() {
-    let (server, alice, room_id, _events) = setup_room(true).await;
+    let (server, alice, room_id, _events) = setup_room(true, true).await;
     let claims = Arc::new(AtomicUsize::new(0));
     let claims_for_mock = Arc::clone(&claims);
     Mock::given(method("POST"))
@@ -351,7 +452,7 @@ async fn test_issue_523_concurrent_first_events_share_one_repair_fence() {
 
 #[async_test]
 async fn test_issue_523_room_leave_cancels_waiting_repair() {
-    let (server, alice, room_id, events) = setup_room(true).await;
+    let (server, alice, room_id, events) = setup_room(true, true).await;
     let claim_wake = Arc::new(Notify::new());
     let claim_wake_for_mock = Arc::clone(&claim_wake);
     Mock::given(method("POST"))
@@ -400,7 +501,7 @@ async fn test_issue_523_room_leave_cancels_waiting_repair() {
 
 #[async_test]
 async fn test_issue_523_logout_cancels_waiting_repair() {
-    let (server, alice, room_id, events) = setup_room(true).await;
+    let (server, alice, room_id, events) = setup_room(true, true).await;
     let claims = Arc::new(AtomicUsize::new(0));
     let claims_for_mock = Arc::clone(&claims);
     Mock::given(method("POST"))
@@ -453,7 +554,7 @@ async fn test_issue_523_logout_cancels_waiting_repair() {
 
 #[async_test]
 async fn test_issue_523_unusable_claim_key_is_classified_invalid() {
-    let (server, alice, room_id, events) = setup_room(true).await;
+    let (server, alice, room_id, events) = setup_room(true, true).await;
     let claims = Arc::new(AtomicUsize::new(0));
     let claims_for_mock = Arc::clone(&claims);
     Mock::given(method("POST"))
@@ -525,7 +626,7 @@ async fn test_issue_523_unusable_claim_key_is_classified_invalid() {
 
 #[async_test]
 async fn test_issue_523_repair_claim_network_failure_is_closed_and_send_stays_encrypted() {
-    let (server, alice, room_id, events) = setup_room(true).await;
+    let (server, alice, room_id, events) = setup_room(true, true).await;
     let claims = Arc::new(AtomicUsize::new(0));
     let claims_for_mock = Arc::clone(&claims);
     Mock::given(method("POST"))
@@ -568,7 +669,7 @@ async fn test_issue_523_repair_claim_network_failure_is_closed_and_send_stays_en
 
 #[async_test]
 async fn test_issue_523_available_otk_repairs_the_room_key_before_index_zero() {
-    let (server, alice, room_id, events) = setup_room(false).await;
+    let (server, alice, room_id, events) = setup_room(false, true).await;
     Mock::given(method("POST"))
         .and(path_regex(CLAIM_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "one_time_keys": {} })))
