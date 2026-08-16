@@ -1647,7 +1647,7 @@ impl OlmMachine {
                 outcome: ManualIndex0ShareOutcome::Completed,
                 room_id: room_id.to_owned(),
                 session_id: Some(session_id),
-                index0_content: Some(std::sync::Arc::new(index0_content)),
+                index0_content: Some(Arc::new(index0_content)),
                 own_devices,
                 peer_devices,
                 claim_occurred,

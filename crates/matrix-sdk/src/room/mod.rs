@@ -2667,10 +2667,10 @@ impl Room {
             Ok(guard) => guard,
             Err(_) => return Ok(cancelled(true)),
         };
-        let mut owned_ids: Vec<ruma::OwnedTransactionId> = Vec::new();
-        let mut marked_ids: std::collections::HashSet<ruma::OwnedTransactionId> =
+        let mut owned_ids: Vec<OwnedTransactionId> = Vec::new();
+        let mut marked_ids: std::collections::HashSet<OwnedTransactionId> =
             std::collections::HashSet::new();
-        let mut claim_expectation: Option<ruma::OwnedTransactionId> = None;
+        let mut claim_expectation: Option<OwnedTransactionId> = None;
 
         let result = async {
             let (mut preparation, mut claim) = self

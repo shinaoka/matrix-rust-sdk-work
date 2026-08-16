@@ -31,6 +31,7 @@ use std::{
     },
     time::Duration,
 };
+use std::fmt;
 
 use async_stream::stream;
 pub use client::{Version, VersionBuilder};
@@ -909,7 +910,7 @@ pub struct SlidingSyncSubscriptionDelta {
     pub retained: BTreeSet<OwnedRoomId>,
 }
 
-impl std::fmt::Debug for SlidingSyncSubscriptionDelta {
+impl fmt::Debug for SlidingSyncSubscriptionDelta {
     /// Identifier-free: the room sets are caller-facing only.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
