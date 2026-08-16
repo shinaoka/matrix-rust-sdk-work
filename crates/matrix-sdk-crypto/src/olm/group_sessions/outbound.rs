@@ -834,6 +834,36 @@ impl OutboundGroupSession {
         )
     }
 
+    /// Atomically capture the index-0 room-key material when the session is
+    /// still at message index 0.
+    ///
+    /// Reads the message index and the session key under a single read guard
+    /// of the underlying session, so a concurrent `encrypt` (which takes the
+    /// write guard) cannot advance the index between the index check and the
+    /// key capture. Returns `None` when the session index is not 0.
+    pub(crate) async fn index0_key_material(&self) -> Option<(u32, RoomKeyContent)> {
+        let session = self.inner.read().await;
+        let index = session.message_index();
+        if index != 0 {
+            return None;
+        }
+        let session_key = session.session_key();
+        let shared_history =
+            shared_history_from_history_visibility(&self.settings.history_visibility);
+        Some((
+            index,
+            RoomKeyContent::MegolmV1AesSha2(
+                MegolmV1AesSha2RoomKeyContent::new(
+                    self.room_id().to_owned(),
+                    self.session_id().to_owned(),
+                    session_key,
+                    shared_history,
+                )
+                .into(),
+            ),
+        ))
+    }
+
     /// Create a read-only view into the device sharing state of this session.
     /// This view includes pending requests, so it is not guaranteed that the
     /// represented state has been fully propagated yet.
@@ -887,6 +917,34 @@ impl OutboundGroupSession {
     /// Get the list of request ids this session is waiting for to be sent out.
     pub(crate) fn pending_request_ids(&self) -> Vec<OwnedTransactionId> {
         self.to_share_with_set.read().keys().cloned().collect()
+    }
+
+    /// Remove an un-sent to-device request from this session's pending set
+    /// (manual index-0 share cleanup, issue #538). The caller persists the
+    /// session afterwards; no share info is merged and `mark_as_shared` is
+    /// not called.
+    pub(crate) fn remove_request(&self, request_id: &TransactionId) {
+        self.to_share_with_set.write().remove(request_id);
+    }
+
+    /// Remove an un-sent to-device request and return the removed entry so
+    /// the caller can restore it on persistence failure (transactional
+    /// manual mark, issue #538).
+    pub(crate) fn remove_request_captured(
+        &self,
+        request_id: &TransactionId,
+    ) -> Option<(Arc<ToDeviceRequest>, ShareInfoSet)> {
+        self.to_share_with_set.write().remove(request_id)
+    }
+
+    /// Restore a previously removed un-sent request (rollback of a failed
+    /// transactional manual mark, issue #538).
+    pub(crate) fn restore_request(
+        &self,
+        request_id: &TransactionId,
+        request: (Arc<ToDeviceRequest>, ShareInfoSet),
+    ) {
+        self.to_share_with_set.write().insert(request_id.to_owned(), request);
     }
 
     /// Read the per-device share infos of a still-pending request (issue

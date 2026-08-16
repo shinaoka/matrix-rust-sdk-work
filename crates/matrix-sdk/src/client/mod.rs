@@ -281,6 +281,13 @@ pub(crate) struct ClientLocks {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) key_claim_lock: Mutex<()>,
 
+    /// True per-room serialization locks shared by the normal preshare path
+    /// and the manual encryption-debug executors (issue #538). The
+    /// deduplicating handler is coalescing, not a mutex.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) room_key_transport_locks:
+        std::sync::Mutex<BTreeMap<OwnedRoomId, Arc<tokio::sync::Mutex<()>>>>,
+
     /// Handler to ensure that only one members request is running at a time,
     /// given a room.
     pub(crate) members_request_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
@@ -624,6 +631,20 @@ impl Client {
 
     pub(crate) fn locks(&self) -> &ClientLocks {
         &self.inner.locks
+    }
+
+    /// The true per-room serialization lock shared by the normal preshare
+    /// path and the manual encryption-debug executors (issue #538). The
+    /// `group_session_deduplicated_handler` is coalescing (a waiting caller
+    /// adopts the leader's outcome), not a mutex, so a real per-room lock is
+    /// required to serialize manual index-0 share / force-new against
+    /// normal preshare.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) fn room_key_transport_lock(&self, room_id: &RoomId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.inner.locks.room_key_transport_locks.lock().unwrap();
+        map.entry(room_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub(crate) fn auth_ctx(&self) -> &AuthCtx {

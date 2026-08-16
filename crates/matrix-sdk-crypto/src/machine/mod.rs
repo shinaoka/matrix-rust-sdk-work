@@ -21,7 +21,6 @@ use std::{
 };
 
 use itertools::Itertools;
-#[cfg(feature = "experimental-send-custom-to-device")]
 use matrix_sdk_common::deserialized_responses::WithheldCode;
 use matrix_sdk_common::{
     BoxFuture,
@@ -92,7 +91,9 @@ use crate::{
         RoomKeyReceiveCounters, RoomKeyReceiveDiagnosticKind, RoomKeyRotationReason,
     },
     session_manager::{
-        GroupSessionManager, Index0ReshareDecision, SessionManager, UnwedgeReshareOutcome,
+        GroupSessionManager, Index0ReshareDecision, ManualClaimOutcome, ManualFinalizeStep,
+        ManualIndex0Preparation, ManualIndex0ShareOutcome, ManualIndex0ShareSummary,
+        SessionManager, UnwedgeReshareOutcome,
     },
     store::{
         CryptoStoreWrapper, IntoCryptoStore, MemoryStore, Result as StoreResult, SecretImportError,
@@ -1567,6 +1568,270 @@ impl OlmMachine {
         self.inner.room_key_diagnostics.note_index0_reshare(room_id, session_id, outcome);
     }
 
+    /// Prepare a manual index-0 room-key share (issue #538 diagnostic
+    /// control).
+    ///
+    /// Atomically captures the current outbound session's index-0 room-key
+    /// content (under the same lock scope event encryption uses), collects
+    /// the complete eligible recipient set, classifies own-other vs peer
+    /// devices, and returns an optional keys-claim request for eligible
+    /// devices that lack an Olm session. The returned
+    /// [`ManualIndex0Preparation`] owns the captured content so a concurrent
+    /// normal send cannot invalidate it.
+    pub async fn prepare_manual_index0_share(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<(ManualIndex0Preparation, Option<(OwnedTransactionId, KeysClaimRequest)>)> {
+        let settings = encryption_settings.into();
+        let Some(outbound) =
+            self.inner.group_session_manager.current_outbound_session(room_id).await
+        else {
+            return Ok((
+                ManualIndex0Preparation::refused(room_id, ManualIndex0ShareOutcome::NoSession),
+                None,
+            ));
+        };
+        let Some((_, index0_content)) = outbound.index0_key_material().await else {
+            return Ok((
+                ManualIndex0Preparation::refused(
+                    room_id,
+                    ManualIndex0ShareOutcome::RefusedIndexAdvanced,
+                ),
+                None,
+            ));
+        };
+        let session_id = outbound.session_id().to_owned();
+        let Some(recipients) = self
+            .inner
+            .group_session_manager
+            .collect_recipients_for_current_outbound(room_id, users, &settings)
+            .await?
+        else {
+            return Ok((
+                ManualIndex0Preparation::refused(room_id, ManualIndex0ShareOutcome::NoSession),
+                None,
+            ));
+        };
+        let account = self.inner.store.static_account();
+        let (own_devices, peer_devices): (Vec<DeviceData>, Vec<DeviceData>) = recipients
+            .devices
+            .into_values()
+            .flatten()
+            .filter(|device| {
+                device.user_id() != account.user_id() || device.device_id() != account.device_id()
+            })
+            .partition(|device| device.user_id() == account.user_id());
+
+        let claim_targets = own_devices.iter().chain(peer_devices.iter()).fold(
+            BTreeMap::<OwnedUserId, BTreeSet<OwnedDeviceId>>::new(),
+            |mut acc, device| {
+                acc.entry(device.user_id().to_owned())
+                    .or_default()
+                    .insert(device.device_id().to_owned());
+                acc
+            },
+        );
+        let claim = if claim_targets.is_empty() {
+            None
+        } else {
+            self.inner.session_manager.get_missing_sessions_for_devices(claim_targets).await?
+        };
+        // A claim returned by the preparation step counts as an occurred
+        // claim for the final summary (issue #538).
+        let claim_occurred = claim.is_some();
+
+        Ok((
+            ManualIndex0Preparation {
+                outcome: ManualIndex0ShareOutcome::Completed,
+                room_id: room_id.to_owned(),
+                session_id: Some(session_id),
+                index0_content: Some(std::sync::Arc::new(index0_content)),
+                own_devices,
+                peer_devices,
+                claim_occurred,
+            },
+            claim,
+        ))
+    }
+
+    /// Continue a manual index-0 share (issue #538 diagnostic control).
+    ///
+    /// Re-evaluates the recipient policy (membership, history visibility,
+    /// trust, blacklist, current-device exclusion) at this point, claims
+    /// one-time/fallback keys for any newly eligible devices that lack an
+    /// Olm session (`NeedsClaim` — the caller sends and marks the claim,
+    /// then calls this again under the same monotonic deadline), and once no
+    /// claim is needed queues the standard Olm-encrypted index-0
+    /// `m.room_key` to the complete eligible set. Never sends a room event
+    /// and never consumes index 0.
+    pub async fn finalize_manual_index0_share(
+        &self,
+        mut preparation: ManualIndex0Preparation,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<ManualFinalizeStep> {
+        let settings = encryption_settings.into();
+        let room_id = preparation.room_id.clone();
+
+        // A refusal captured during preparation is terminal.
+        let Some(index0_content) = preparation.index0_content.take() else {
+            let mut summary = ManualIndex0ShareSummary::failed();
+            summary.outcome = preparation.outcome;
+            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
+        };
+        let Some(expected_session_id) = preparation.session_id.clone() else {
+            return Ok(ManualFinalizeStep::Ready {
+                requests: Vec::new(),
+                summary: ManualIndex0ShareSummary::failed(),
+            });
+        };
+
+        let Some(outbound) =
+            self.inner.group_session_manager.current_outbound_session(&room_id).await
+        else {
+            let mut summary = ManualIndex0ShareSummary::failed();
+            summary.outcome = ManualIndex0ShareOutcome::NoSession;
+            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
+        };
+        if outbound.session_id() != expected_session_id {
+            let mut summary = ManualIndex0ShareSummary::failed();
+            summary.outcome = ManualIndex0ShareOutcome::CancelledStale;
+            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
+        }
+
+        // Late re-evaluation: a join during the claim stage is included.
+        let Some(recipients) = self
+            .inner
+            .group_session_manager
+            .collect_recipients_for_current_outbound(&room_id, users, &settings)
+            .await?
+        else {
+            let mut summary = ManualIndex0ShareSummary::failed();
+            summary.outcome = ManualIndex0ShareOutcome::NoSession;
+            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
+        };
+        let account = self.inner.store.static_account();
+        let (own_devices, peer_devices): (Vec<DeviceData>, Vec<DeviceData>) = recipients
+            .devices
+            .into_values()
+            .flatten()
+            .filter(|device| {
+                device.user_id() != account.user_id() || device.device_id() != account.device_id()
+            })
+            .partition(|device| device.user_id() == account.user_id());
+
+        // Any newly eligible device lacking an Olm session needs a claim
+        // first; the caller transports it and resumes.
+        let claim_targets = own_devices.iter().chain(&peer_devices).fold(
+            BTreeMap::<OwnedUserId, BTreeSet<OwnedDeviceId>>::new(),
+            |mut acc, device| {
+                acc.entry(device.user_id().to_owned())
+                    .or_default()
+                    .insert(device.device_id().to_owned());
+                acc
+            },
+        );
+        let claim = if claim_targets.is_empty() {
+            None
+        } else {
+            self.inner.session_manager.get_missing_sessions_for_devices(claim_targets).await?
+        };
+        if let Some((request_id, request)) = claim {
+            preparation.claim_occurred = true;
+            return Ok(ManualFinalizeStep::NeedsClaim {
+                request_id,
+                request,
+                continuation: preparation,
+            });
+        }
+        let claim_outcome = if preparation.claim_occurred {
+            ManualClaimOutcome::Succeeded
+        } else {
+            ManualClaimOutcome::NotNeeded
+        };
+
+        // An empty eligible set is a refusal, not a success: crypto excludes
+        // the current device, so a creator-only room must not report
+        // Completed with zero recipients (issue #538).
+        if own_devices.is_empty() && peer_devices.is_empty() {
+            let mut summary = ManualIndex0ShareSummary::failed();
+            summary.outcome = ManualIndex0ShareOutcome::NoRecipients;
+            summary.claim = claim_outcome;
+            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
+        }
+
+        // Queue the index-0 share to the complete eligible set.
+        let all_devices = own_devices.iter().chain(&peer_devices).cloned().collect::<Vec<_>>();
+        let mut changes = Changes::default();
+        let withheld = self
+            .inner
+            .group_session_manager
+            .encrypt_for_devices_content(
+                all_devices.clone(),
+                &outbound,
+                index0_content,
+                &mut changes,
+            )
+            .await?;
+        if !changes.is_empty() {
+            self.inner.store.save_changes(changes).await?;
+        }
+        let requests = outbound.pending_requests();
+
+        // Closed summary buckets (no identifiers).
+        let own_missing = withheld
+            .iter()
+            .filter(|(device, code)| {
+                *code == WithheldCode::NoOlm && device.user_id() == account.user_id()
+            })
+            .count();
+        let peer_missing = withheld
+            .iter()
+            .filter(|(device, code)| {
+                *code == WithheldCode::NoOlm && device.user_id() != account.user_id()
+            })
+            .count();
+        let own_accepted = own_devices.len().saturating_sub(own_missing);
+        let peer_accepted = peer_devices.len().saturating_sub(peer_missing);
+
+        let peer_users_total: BTreeSet<OwnedUserId> =
+            peer_devices.iter().map(|device| device.user_id().to_owned()).collect();
+        let peer_users_with_acceptance: BTreeSet<OwnedUserId> = peer_devices
+            .iter()
+            .filter(|device| {
+                !withheld.iter().any(|(withheld_device, code)| {
+                    *code == WithheldCode::NoOlm
+                        && withheld_device.user_id() == device.user_id()
+                        && withheld_device.device_id() == device.device_id()
+                })
+            })
+            .map(|device| device.user_id().to_owned())
+            .collect();
+        let peer_users_with_zero_accepted =
+            peer_users_total.difference(&peer_users_with_acceptance).count();
+
+        let summary = ManualIndex0ShareSummary {
+            outcome: ManualIndex0ShareOutcome::Completed,
+            message_index_before: Some(0),
+            message_index_after: Some(0),
+            own_eligible: own_devices.len(),
+            own_accepted,
+            own_missing,
+            peer_eligible: peer_devices.len(),
+            peer_accepted,
+            peer_missing,
+            peer_users_with_zero_accepted,
+            claim: claim_outcome,
+            elapsed_ms: 0,
+            room_event_sent: false,
+            index0_consumed: false,
+        };
+
+        Ok(ManualFinalizeStep::Ready { requests, summary })
+    }
+
     /// Get to-device requests to share a room key with users in a room.
     ///
     /// # Arguments
@@ -1598,6 +1863,41 @@ impl OlmMachine {
     /// Return the current outbound group-session identifier, if one exists.
     pub async fn current_outbound_group_session_id(&self, room_id: &RoomId) -> Option<String> {
         self.inner.group_session_manager.current_outbound_group_session_id(room_id).await
+    }
+
+    /// Return the current outbound group-session message index (the index of
+    /// the next message), if a session exists (issue #538).
+    pub async fn current_outbound_group_session_message_index(
+        &self,
+        room_id: &RoomId,
+    ) -> Option<u32> {
+        let outbound = self.inner.group_session_manager.current_outbound_session(room_id).await?;
+        Some(outbound.message_index().await)
+    }
+
+    /// Remove owned un-sent manual share requests and clear the matching
+    /// keys-claim expectation (issue #538 cleanup). Called on every
+    /// non-completed/partial exit of a manual index-0 share.
+    pub async fn cleanup_manual_pending_requests(
+        &self,
+        room_id: &RoomId,
+        owned_ids: &[OwnedTransactionId],
+        claim_expectation: Option<&TransactionId>,
+    ) -> StoreResult<()> {
+        self.inner
+            .group_session_manager
+            .cleanup_manual_pending_requests(room_id, owned_ids)
+            .await?;
+        if let Some(claim_id) = claim_expectation {
+            self.inner.session_manager.cancel_keys_claim_expectation(claim_id);
+        }
+        Ok(())
+    }
+
+    /// Mark a manual index-0 share request as sent with a transactional
+    /// persist-first order (issue #538).
+    pub async fn mark_manual_request_as_sent(&self, request_id: &TransactionId) -> StoreResult<()> {
+        self.inner.group_session_manager.mark_manual_request_as_sent(request_id).await
     }
 
     /// Force-share the current outbound session without creating or rotating it.

@@ -32,6 +32,7 @@ use ruma::events::AnyStateEventContent;
 use ruma::{
     DeviceId, OwnedDeviceId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId,
     UserId,
+    api::client::keys::claim_keys::v3::Request as KeysClaimRequest,
     events::{AnyMessageLikeEventContent, AnyToDeviceEventContent, ToDeviceEventType},
     serde::Raw,
     to_device::DeviceIdOrAllDevices,
@@ -47,6 +48,7 @@ use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 
 #[cfg(feature = "experimental-encrypted-state-events")]
 use crate::types::events::room::encrypted::RoomEncryptedEventContent;
+use crate::types::events::room_key::RoomKeyContent;
 use crate::{
     Device, DeviceData, EncryptionSettings, LocalTrust, OlmError,
     error::{EventError, MegolmResult, OlmResult},
@@ -89,6 +91,173 @@ pub enum UnwedgeReshareOutcome {
     Failed,
 }
 
+/// Outcome of a manual index-0 room-key share (issue #538 diagnostic
+/// control). Closed and privacy-safe: no identifiers, session ids, device
+/// ids, or key material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualIndex0ShareOutcome {
+    /// The index-0 key was shared to the eligible set and all requests were
+    /// accepted and marked (or the missing bucket is reported).
+    Completed,
+    /// The room is not encrypted.
+    RefusedNotEncrypted,
+    /// The current outbound session is no longer at message index 0.
+    RefusedIndexAdvanced,
+    /// No outbound session exists for the room.
+    NoSession,
+    /// No recipients are eligible after policy re-evaluation.
+    NoRecipients,
+    /// Recipient policy blocked the share.
+    PolicyBlocked,
+    /// The operation was cancelled because the session/room/account changed.
+    CancelledStale,
+    /// The monotonic deadline expired before completion.
+    Deadline,
+    /// The operation failed.
+    Failed,
+}
+
+/// Closed outcome of the one-time/fallback keys-claim step of a manual
+/// index-0 share.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualClaimOutcome {
+    NotNeeded,
+    Succeeded,
+    Failed,
+    Deadline,
+}
+
+/// Closed aggregate summary of a manual index-0 share. Counts are buckets
+/// only; no identifiers, session ids, device ids, or key material cross the
+/// boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ManualIndex0ShareSummary {
+    pub outcome: ManualIndex0ShareOutcome,
+    pub message_index_before: Option<u32>,
+    pub message_index_after: Option<u32>,
+    pub own_eligible: usize,
+    pub own_accepted: usize,
+    pub own_missing: usize,
+    pub peer_eligible: usize,
+    pub peer_accepted: usize,
+    pub peer_missing: usize,
+    pub peer_users_with_zero_accepted: usize,
+    pub claim: ManualClaimOutcome,
+    pub elapsed_ms: u64,
+    pub room_event_sent: bool,
+    pub index0_consumed: bool,
+}
+
+impl ManualIndex0ShareSummary {
+    pub(crate) fn failed() -> Self {
+        Self {
+            outcome: ManualIndex0ShareOutcome::Failed,
+            message_index_before: None,
+            message_index_after: None,
+            own_eligible: 0,
+            own_accepted: 0,
+            own_missing: 0,
+            peer_eligible: 0,
+            peer_accepted: 0,
+            peer_missing: 0,
+            peer_users_with_zero_accepted: 0,
+            claim: ManualClaimOutcome::NotNeeded,
+            elapsed_ms: 0,
+            room_event_sent: false,
+            index0_consumed: false,
+        }
+    }
+}
+
+/// Captured state for a manual index-0 room-key share (issue #538
+/// diagnostic control). Carries the atomically captured index-0 room-key
+/// content and the complete eligible recipient classification so the final
+/// share step can Olm-encrypt the original index-0 key even if a concurrent
+/// normal send advances the session afterwards.
+#[derive(Debug)]
+pub struct ManualIndex0Preparation {
+    /// `Completed` when the preparation captured a usable index-0 session;
+    /// otherwise a refusal outcome (`NoSession`, `RefusedIndexAdvanced`).
+    pub(crate) outcome: ManualIndex0ShareOutcome,
+    /// The room the preparation belongs to (needed for late re-evaluation).
+    pub(crate) room_id: OwnedRoomId,
+    /// The captured outbound session identity.
+    pub(crate) session_id: Option<String>,
+    /// The atomically captured index-0 room-key content. Shared by `Arc`
+    /// because `RoomKeyContent` (and the underlying vodozemac `SessionKey`)
+    /// is not `Clone`; the content is immutable once captured.
+    pub(crate) index0_content: Option<Arc<RoomKeyContent>>,
+    /// Eligible own-other devices (excluding the current device).
+    pub(crate) own_devices: Vec<DeviceData>,
+    /// Eligible peer devices.
+    pub(crate) peer_devices: Vec<DeviceData>,
+    /// Whether a keys-claim was returned to the caller during this
+    /// operation; the final summary reports `claim=Succeeded` when true.
+    pub(crate) claim_occurred: bool,
+}
+
+impl ManualIndex0Preparation {
+    /// The room the preparation belongs to (for late re-evaluation).
+    pub fn room_id(&self) -> &RoomId {
+        &self.room_id
+    }
+
+    pub(crate) fn refused(room_id: &RoomId, outcome: ManualIndex0ShareOutcome) -> Self {
+        Self {
+            outcome,
+            room_id: room_id.to_owned(),
+            session_id: None,
+            index0_content: None,
+            own_devices: Vec::new(),
+            peer_devices: Vec::new(),
+            claim_occurred: false,
+        }
+    }
+}
+
+/// Next step of a manual index-0 share finalization (issue #538 diagnostic
+/// control). The caller transports each returned request, marks it, and then
+/// resumes; `NeedsClaim` loops until `Ready` or a terminal refusal.
+#[derive(Debug)]
+pub enum ManualFinalizeStep {
+    /// More Olm sessions are missing; the caller must send this standard
+    /// keys-claim request (one-time/fallback keys), mark it as sent, and then
+    /// call the finalize step again under the same monotonic deadline. The
+    /// continuation carries the captured index-0 material and the
+    /// claim-occurred flag.
+    NeedsClaim {
+        request_id: OwnedTransactionId,
+        request: KeysClaimRequest,
+        continuation: ManualIndex0Preparation,
+    },
+    /// The index-0 room-key to-device requests are ready to send. The closed
+    /// summary accompanies them; `requests` may be empty.
+    Ready { requests: Vec<Arc<ToDeviceRequest>>, summary: ManualIndex0ShareSummary },
+}
+
+/// Outcome of a manual force-new-outbound-session (issue #538).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualForceNewOutcome {
+    Completed,
+    RefusedNotEncrypted,
+    CancelledStale,
+    Failed,
+    Deadline,
+}
+
+/// Closed summary of a manual force-new-outbound-session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ManualForceNewSummary {
+    pub outcome: ManualForceNewOutcome,
+    pub previous_session_exists: bool,
+    pub fresh_session_created: bool,
+    pub message_index: Option<u32>,
+    pub elapsed_ms: u64,
+}
+
 /// Eligible device class for a forced re-share of the current room key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoomKeyReshareTarget {
@@ -99,7 +268,6 @@ pub enum RoomKeyReshareTarget {
     /// Every eligible device except this device.
     AllEligible,
 }
-
 impl RoomKeyReshareTarget {
     fn matches(
         self,
@@ -280,6 +448,63 @@ impl GroupSessionManager {
         self.sessions.get_or_load(room_id).await.map(|session| session.session_id().to_owned())
     }
 
+    /// Load the current outbound group session for a room, if one exists
+    /// (manual index-0 share, issue #538).
+    pub(crate) async fn current_outbound_session(
+        &self,
+        room_id: &RoomId,
+    ) -> Option<OutboundGroupSession> {
+        self.sessions.get_or_load(room_id).await
+    }
+
+    /// Remove owned un-sent manual share requests (issue #538 cleanup) from
+    /// the outbound session's pending set and the being-shared map, and
+    /// durably persist the session. Called on every non-completed/partial
+    /// exit so no manual request survives to be drained by a later normal
+    /// preshare.
+    pub(crate) async fn cleanup_manual_pending_requests(
+        &self,
+        room_id: &RoomId,
+        owned_ids: &[OwnedTransactionId],
+    ) -> StoreResult<()> {
+        if owned_ids.is_empty() {
+            return Ok(());
+        }
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok(());
+        };
+        let mut removed = false;
+        for id in owned_ids {
+            outbound.remove_request(id);
+            if self.sessions.remove_from_being_shared(id).is_some() {
+                removed = true;
+            }
+        }
+        if removed {
+            let mut changes = Changes::default();
+            changes.outbound_group_sessions.push(outbound);
+            self.store.save_changes(changes).await?;
+        }
+        Ok(())
+    }
+
+    /// Collect the complete eligible recipient devices for the current
+    /// outbound session of a room (manual index-0 share, issue #538). The
+    /// caller owns the policy re-evaluation and the per-device
+    /// classification; this is the same recipient collection the normal
+    /// share path uses.
+    pub(crate) async fn collect_recipients_for_current_outbound(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: &EncryptionSettings,
+    ) -> OlmResult<Option<CollectRecipientsResult>> {
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok(None);
+        };
+        Ok(Some(self.collect_session_recipients(users, encryption_settings, &outbound).await?))
+    }
+
     const MAX_TO_DEVICE_MESSAGES: usize = 250;
 
     pub fn new(store: Store, room_key_diagnostics: RoomKeyDiagnosticHub) -> Self {
@@ -355,6 +580,41 @@ impl GroupSessionManager {
 
         changes.outbound_group_sessions.push(session.clone());
         self.store.save_changes(changes).await
+    }
+
+    /// Mark a manual index-0 share request as sent with a transactional
+    /// persist-first order (issue #538): the outbound session is persisted
+    /// with the request removed BEFORE the in-memory pending/being-shared
+    /// maps are committed, so a persistence failure rolls back the in-memory
+    /// state and no manual request survives a reload. The `m.no_olm`
+    /// withheld handling of the normal mark path is intentionally not
+    /// performed here: devices that could not be Olm-encrypted are reported
+    /// in the closed summary as missing and their queued requests are
+    /// removed by the cleanup path.
+    pub(crate) async fn mark_manual_request_as_sent(
+        &self,
+        request_id: &TransactionId,
+    ) -> StoreResult<()> {
+        let Some(session) = self.sessions.find_request_owner(request_id) else {
+            return Ok(());
+        };
+        let Some(removed) = session.remove_request_captured(request_id) else {
+            // Nothing pending for this request id; nothing to do.
+            return Ok(());
+        };
+
+        let mut changes = Changes::default();
+        changes.outbound_group_sessions.push(session.clone());
+        match self.store.save_changes(changes).await {
+            Ok(()) => {
+                self.sessions.remove_from_being_shared(request_id);
+                Ok(())
+            }
+            Err(error) => {
+                session.restore_request(request_id, removed);
+                Err(error)
+            }
+        }
     }
 
     /// Report a failed to-device send attempt for a still-pending room-key
@@ -866,6 +1126,144 @@ impl GroupSessionManager {
         // was used to encrypt the room key to be persisted again. This is
         // needed because each encryption step will mutate the Olm session,
         // ratcheting its state forward.
+        for result in join_all(tasks).await {
+            let result = result.expect("Encryption task panicked");
+
+            let (used_sessions, failed_no_olm) = result?;
+
+            changes.sessions.extend(used_sessions);
+            withheld_devices.extend(failed_no_olm);
+        }
+
+        Ok(withheld_devices)
+    }
+
+    /// Encrypt a caller-supplied room-key content (the atomically captured
+    /// index-0 key, issue #538) for the given devices and create to-device
+    /// requests that send the encrypted content to them.
+    #[allow(clippy::too_many_arguments)]
+    async fn encrypt_session_for_content(
+        store: Arc<CryptoStoreWrapper>,
+        group_session: OutboundGroupSession,
+        index0_content: Arc<RoomKeyContent>,
+        devices: Vec<DeviceData>,
+        room_key_diagnostics: RoomKeyDiagnosticHub,
+    ) -> OlmResult<(
+        EncryptForDevicesResult,
+        BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, ShareInfo>>,
+    )> {
+        let mut result_builder = EncryptForDevicesResultBuilder::default();
+        let mut share_infos = BTreeMap::new();
+
+        let encrypt = |store: Arc<CryptoStoreWrapper>,
+                       device: DeviceData,
+                       content: Arc<RoomKeyContent>| async move {
+            let encryption_result =
+                device.maybe_encrypt_room_key_content(store.as_ref(), &content).await;
+
+            (device, encryption_result)
+        };
+
+        let tasks: Vec<_> = devices
+            .iter()
+            .map(|d| spawn(encrypt(store.clone(), d.clone(), index0_content.clone())))
+            .collect();
+
+        let results = join_all(tasks).await;
+
+        for result in results {
+            let (device, encryption_result) = result.expect("Encryption task panicked");
+
+            match encryption_result {
+                Ok(MaybeEncryptedRoomKey::Encrypted { used_session, share_info, message }) => {
+                    result_builder.on_successful_encryption(&device, *used_session, message);
+
+                    let user_id = device.user_id().to_owned();
+                    let device_id = device.device_id().to_owned();
+                    share_infos
+                        .entry(user_id)
+                        .or_insert_with(BTreeMap::new)
+                        .insert(device_id, *share_info);
+                }
+                Ok(MaybeEncryptedRoomKey::MissingSession) => {
+                    result_builder.on_missing_session(device);
+                }
+                Err(error) => {
+                    room_key_diagnostics.emit_initial_share_device(
+                        group_session.room_id(),
+                        group_session.session_id(),
+                        device.user_id(),
+                        device.device_id(),
+                        InitialShareDeviceClass::Unknown,
+                        InitialShareStage::OlmEncryptionFailed,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok((result_builder.into_result(), share_infos))
+    }
+
+    /// Queue to-device requests carrying a caller-supplied room-key content
+    /// (manual index-0 share, issue #538).
+    async fn encrypt_request_content(
+        store: Arc<CryptoStoreWrapper>,
+        chunk: Vec<DeviceData>,
+        outbound: OutboundGroupSession,
+        index0_content: Arc<RoomKeyContent>,
+        sessions: GroupSessionCache,
+        room_key_diagnostics: RoomKeyDiagnosticHub,
+    ) -> OlmResult<(Vec<Session>, Vec<(DeviceData, WithheldCode)>)> {
+        let (result, share_infos) = Self::encrypt_session_for_content(
+            store,
+            outbound.clone(),
+            index0_content,
+            chunk,
+            room_key_diagnostics,
+        )
+        .await?;
+
+        if let Some(request) = result.to_device_request {
+            let id = request.txn_id.clone();
+            outbound.add_request(id.clone(), request.into(), share_infos);
+            sessions.mark_as_being_shared(id, outbound.clone());
+        }
+
+        Ok((result.updated_olm_sessions, result.no_olm_devices))
+    }
+
+    /// Encrypt the caller-supplied index-0 room-key content for the given
+    /// recipient devices and queue the to-device requests on the outbound
+    /// session (manual index-0 share, issue #538).
+    pub(crate) async fn encrypt_for_devices_content(
+        &self,
+        recipient_devices: Vec<DeviceData>,
+        group_session: &OutboundGroupSession,
+        index0_content: Arc<RoomKeyContent>,
+        changes: &mut Changes,
+    ) -> OlmResult<Vec<(DeviceData, WithheldCode)>> {
+        if !recipient_devices.is_empty() {
+            // The to-device requests are persisted with the session.
+            changes.outbound_group_sessions = vec![group_session.clone()];
+        }
+
+        let tasks: Vec<_> = recipient_devices
+            .chunks(Self::MAX_TO_DEVICE_MESSAGES)
+            .map(|chunk| {
+                spawn(Self::encrypt_request_content(
+                    self.store.crypto_store(),
+                    chunk.to_vec(),
+                    group_session.clone(),
+                    index0_content.clone(),
+                    self.sessions.clone(),
+                    self.room_key_diagnostics.clone(),
+                ))
+            })
+            .collect();
+
+        let mut withheld_devices = Vec::new();
+
         for result in join_all(tasks).await {
             let result = result.expect("Encryption task panicked");
 

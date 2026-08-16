@@ -28,10 +28,10 @@ use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, DeviceData, EncryptionSettings, Index0ReshareDecision,
-    InitialShareRepairPreparation, OlmError, OlmMachine, RoomKeyMemberReloadContext,
-    RoomKeyReshareResult, RoomKeyReshareTarget, RoomKeyRotationReason, TrustRequirement,
-    UnwedgeReshareOutcome, store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
-    types::requests::ToDeviceRequest,
+    InitialShareRepairPreparation, ManualFinalizeStep, ManualIndex0Preparation, OlmError,
+    OlmMachine, RoomKeyMemberReloadContext, RoomKeyReshareResult, RoomKeyReshareTarget,
+    RoomKeyRotationReason, TrustRequirement, UnwedgeReshareOutcome, store::DynCryptoStore,
+    store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
 use ruma::DeviceId;
@@ -1243,6 +1243,20 @@ impl BaseClient {
         }
     }
 
+    /// Return the current outbound group-session message index (issue #538).
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn current_outbound_group_session_message_index(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<u32>> {
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => {
+                Ok(machine.current_outbound_group_session_message_index(room_id).await)
+            }
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
     /// Prepare a targeted claim for a forced room-key re-share.
     #[cfg(feature = "e2e-encryption")]
     pub async fn prepare_force_reshare_claim(
@@ -1288,6 +1302,79 @@ impl BaseClient {
                     settings,
                 )
                 .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Prepare a manual index-0 room-key share (issue #538 diagnostic
+    /// control). Atomically captures the current outbound session's index-0
+    /// room-key content, collects the complete eligible recipient set, and
+    /// returns an optional keys-claim request for eligible devices lacking
+    /// an Olm session.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn prepare_manual_index0_share(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(
+        ManualIndex0Preparation,
+        Option<(ruma::OwnedTransactionId, ruma::api::client::keys::claim_keys::v3::Request)>,
+    )> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .prepare_manual_index0_share(room_id, members.iter().map(Deref::deref), settings)
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Continue a manual index-0 share (issue #538 diagnostic control):
+    /// re-evaluate recipients, claim newly eligible missing-Olm devices
+    /// (`NeedsClaim`), or queue the index-0 room-key share (`Ready`).
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn finalize_manual_index0_share(
+        &self,
+        preparation: ManualIndex0Preparation,
+    ) -> Result<ManualFinalizeStep> {
+        let (members, settings) = self.room_key_share_context(preparation.room_id()).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .finalize_manual_index0_share(
+                    preparation,
+                    members.iter().map(Deref::deref),
+                    settings,
+                )
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Remove owned un-sent manual share requests and clear the matching
+    /// keys-claim expectation (issue #538 cleanup).
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn cleanup_manual_pending_requests(
+        &self,
+        room_id: &RoomId,
+        owned_ids: &[ruma::OwnedTransactionId],
+        claim_expectation: Option<&ruma::TransactionId>,
+    ) -> Result<()> {
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .cleanup_manual_pending_requests(room_id, owned_ids, claim_expectation)
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Mark a manual index-0 share request as sent (transactional,
+    /// issue #538).
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn mark_manual_request_as_sent(
+        &self,
+        request_id: &ruma::TransactionId,
+    ) -> Result<()> {
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine.mark_manual_request_as_sent(request_id).await?),
             None => panic!("Olm machine wasn't started"),
         }
     }

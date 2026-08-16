@@ -364,6 +364,17 @@ impl SessionManager {
         Ok(result)
     }
 
+    /// Clear the stored keys-claim expectation if it matches the given
+    /// request id (manual index-0 share cleanup, issue #538). Normally the
+    /// expectation is cleared by a matching `/keys/claim` response; this is
+    /// the cancellation path when the claim was never sent or failed.
+    pub(crate) fn cancel_keys_claim_expectation(&self, request_id: &TransactionId) {
+        let mut guard = self.current_key_claim_request.write();
+        if guard.as_ref().is_some_and(|(id, _)| id == request_id) {
+            guard.take();
+        }
+    }
+
     fn is_user_timed_out(&self, user_id: &UserId, device_id: &DeviceId) -> bool {
         self.failed_devices.read().get(user_id).is_some_and(|d| d.contains(device_id))
     }

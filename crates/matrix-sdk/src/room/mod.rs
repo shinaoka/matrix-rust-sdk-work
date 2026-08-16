@@ -36,7 +36,13 @@ pub use identity_status_changes::IdentityStatusChanges;
 use matrix_sdk_base::crypto::types::events::room::encrypted::EncryptedEvent;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{
-    DeviceData, RoomKeyReshareResult as CryptoRoomKeyReshareResult,
+    DeviceData, ManualClaimOutcome as CryptoManualClaimOutcome,
+    ManualFinalizeStep as CryptoManualFinalizeStep,
+    ManualForceNewOutcome as CryptoManualForceNewOutcome,
+    ManualForceNewSummary as CryptoManualForceNewSummary,
+    ManualIndex0ShareOutcome as CryptoManualIndex0ShareOutcome,
+    ManualIndex0ShareSummary as CryptoManualIndex0ShareSummary,
+    RoomKeyReshareResult as CryptoRoomKeyReshareResult,
     RoomKeyReshareTarget as CryptoRoomKeyReshareTarget, UnwedgeReshareOutcome,
 };
 #[cfg(feature = "e2e-encryption")]
@@ -291,6 +297,11 @@ impl Deref for Room {
 
 const TYPING_NOTICE_TIMEOUT: Duration = Duration::from_secs(4);
 const TYPING_NOTICE_RESEND_TIMEOUT: Duration = Duration::from_secs(3);
+/// Monotonic absolute deadline for the manual index-0 share and force-new
+/// executors (issue #538), covering lock acquisition, claims, all sends, and
+/// marking.
+#[cfg(feature = "e2e-encryption")]
+const MANUAL_ENCRYPTION_DEBUG_DEADLINE: Duration = Duration::from_secs(10);
 
 /// A thread subscription, according to the semantics of MSC4306.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2459,12 +2470,21 @@ impl Room {
     /// This will create Olm sessions with all the users/device pairs in the
     /// room if necessary and share a room key that can be shared with them.
     ///
-    /// Does nothing if no room key needs to be shared.
-    // TODO: expose this publicly so people can pre-share a group session if
-    // e.g. a user starts to type a message for a room.
+    /// Does nothing if no room key needs to be shared. Serialized with the
+    /// manual encryption-debug executors (issue #538) via the per-room
+    /// transport lock.
     #[cfg(feature = "e2e-encryption")]
-    #[instrument(skip_all, fields(room_id = ?self.room_id()))]
-    async fn preshare_room_key(&self) -> Result<()> {
+    pub async fn preshare_room_key(&self) -> Result<()> {
+        let transport_lock = self.client.room_key_transport_lock(self.room_id());
+        let _lock = transport_lock.lock().await;
+        self.preshare_room_key_locked().await
+    }
+
+    /// The preshare body, run with the per-room transport lock already held
+    /// (issue #538: the manual force-new executor holds the guard across
+    /// discard + staged preshare + post-check without reacquiring it).
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) async fn preshare_room_key_locked(&self) -> Result<()> {
         self.ensure_room_joined()?;
 
         // Take and release the lock on the store, if needs be.
@@ -2586,6 +2606,307 @@ impl Room {
             .current_outbound_group_session_id(self.room_id())
             .await?
             .map(OutboundGroupSessionToken))
+    }
+
+    /// Return the current outbound group-session message index, if a session
+    /// exists (issue #538).
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn current_outbound_group_session_message_index(&self) -> Result<Option<u32>> {
+        self.ensure_room_joined()?;
+        Ok(self
+            .client
+            .base_client()
+            .current_outbound_group_session_message_index(self.room_id())
+            .await?)
+    }
+
+    /// Manually share the current outbound session's index-0 room key to
+    /// every eligible recipient device (issue #538 diagnostic control).
+    ///
+    /// Refuses when the current outbound session is not at message index 0.
+    /// Claims one-time/fallback keys for eligible devices lacking an Olm
+    /// session, re-evaluates recipient policy at finalization (late
+    /// re-evaluation), and reports a closed aggregate summary. Never sends a
+    /// room event and never consumes index 0. `cancellation` and `validate`
+    /// are checked before every HTTP effect; a signal or a `false` validator
+    /// yields `CancelledStale` (deadline expiry yields `Deadline`).
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn share_index0_room_key(
+        &self,
+        cancellation: &mut broadcast::Receiver<()>,
+        validate: impl Fn() -> bool + Send + Sync,
+    ) -> Result<CryptoManualIndex0ShareSummary> {
+        self.ensure_room_joined()?;
+        // The monotonic absolute deadline starts before lock acquisition and
+        // covers lock, claims, sends, and transactional marking (issue #538).
+        let deadline = tokio::time::Instant::now() + MANUAL_ENCRYPTION_DEBUG_DEADLINE;
+        let cancelled = |expired: bool| -> CryptoManualIndex0ShareSummary {
+            CryptoManualIndex0ShareSummary {
+                outcome: if expired {
+                    CryptoManualIndex0ShareOutcome::Deadline
+                } else {
+                    CryptoManualIndex0ShareOutcome::CancelledStale
+                },
+                message_index_before: None,
+                message_index_after: None,
+                own_eligible: 0,
+                own_accepted: 0,
+                own_missing: 0,
+                peer_eligible: 0,
+                peer_accepted: 0,
+                peer_missing: 0,
+                peer_users_with_zero_accepted: 0,
+                claim: CryptoManualClaimOutcome::NotNeeded,
+                elapsed_ms: 0,
+                room_event_sent: false,
+                index0_consumed: false,
+            }
+        };
+        let transport_lock = self.client.room_key_transport_lock(self.room_id());
+        let _lock = match tokio::time::timeout_at(deadline, transport_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => return Ok(cancelled(true)),
+        };
+        let mut owned_ids: Vec<ruma::OwnedTransactionId> = Vec::new();
+        let mut marked_ids: std::collections::HashSet<ruma::OwnedTransactionId> =
+            std::collections::HashSet::new();
+        let mut claim_expectation: Option<ruma::OwnedTransactionId> = None;
+
+        let result = async {
+            let (mut preparation, mut claim) = self
+                .client
+                .base_client()
+                .prepare_manual_index0_share(self.room_id())
+                .await?;
+            let mut claim_occurred = false;
+
+            loop {
+                if let Some((request_id, request)) = claim.take() {
+                    claim_expectation = Some(request_id.clone());
+                    owned_ids.push(request_id.clone());
+                    if !validate() || tokio::time::Instant::now() >= deadline {
+                        return Ok(cancelled(tokio::time::Instant::now() >= deadline));
+                    }
+                    let response = tokio::select! {
+                        _ = cancellation.recv() => return Ok(cancelled(false)),
+                        _ = tokio::time::sleep_until(deadline) => return Ok(cancelled(true)),
+                        res = self.client.send(request) => res?,
+                    };
+                    let mark = tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => return Ok(cancelled(true)),
+                        res = self.client.mark_request_as_sent(&request_id, &response) => res,
+                    };
+                    mark?;
+                    marked_ids.insert(request_id.clone());
+                    claim_occurred = true;
+                }
+
+                match self
+                    .client
+                    .base_client()
+                    .finalize_manual_index0_share(preparation)
+                    .await?
+                {
+                    CryptoManualFinalizeStep::NeedsClaim {
+                        request_id,
+                        request,
+                        continuation,
+                    } => {
+                        claim = Some((request_id, request));
+                        preparation = continuation;
+                    }
+                    CryptoManualFinalizeStep::Ready { requests, mut summary } => {
+                        for request in &requests {
+                            owned_ids.push(request.txn_id.clone());
+                            if !validate() || tokio::time::Instant::now() >= deadline {
+                                return Ok(cancelled(tokio::time::Instant::now() >= deadline));
+                            }
+                            let response = tokio::select! {
+                                _ = cancellation.recv() => return Ok(cancelled(false)),
+                                _ = tokio::time::sleep_until(deadline) => return Ok(cancelled(true)),
+                                res = self.client.send_to_device(request) => res?,
+                            };
+                            // Transactional persist-first mark (issue #538):
+                            // a persistence failure rolls back the in-memory
+                            // pending entry and the request is removed by
+                            // cleanup below.
+                            let mark = tokio::select! {
+                                _ = tokio::time::sleep_until(deadline) => return Ok(cancelled(true)),
+                                res = self.client.base_client().mark_manual_request_as_sent(
+                                    &request.txn_id,
+                                ) => res,
+                            };
+                            mark?;
+                            marked_ids.insert(request.txn_id.clone());
+                        }
+                        if claim_occurred {
+                            summary.claim = CryptoManualClaimOutcome::Succeeded;
+                        }
+                        return Ok(summary);
+                    }
+                }
+            }
+        }
+        .await;
+
+        // Cleanup on every non-completed/partial exit (issue #538): remove
+        // every owned un-marked request from the outbound session's pending
+        // set (durably) and cancel the claim expectation, so no manual
+        // request survives to be drained by a later normal preshare.
+        let pending =
+            owned_ids.iter().filter(|id| !marked_ids.contains(*id)).cloned().collect::<Vec<_>>();
+        if !pending.is_empty() || claim_expectation.is_some() {
+            self.client
+                .base_client()
+                .cleanup_manual_pending_requests(
+                    self.room_id(),
+                    &pending,
+                    claim_expectation.as_ref().map(|id| id.as_ref()),
+                )
+                .await?;
+        }
+        result
+    }
+
+    /// Manually rotate the outbound Megolm session for this room and confirm
+    /// the fresh session is at message index 0 (issue #538 diagnostic
+    /// control).
+    ///
+    /// Holds the per-room transport lock across discard, staged preshare,
+    /// and the post-check (no reacquire). Never sends a room event. A
+    /// session that fails to become fresh at index 0 yields `Failed`;
+    /// cancellation/validator failure yields `CancelledStale`.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn force_new_outbound_session(
+        &self,
+        cancellation: &mut broadcast::Receiver<()>,
+        validate: impl Fn() -> bool + Send + Sync,
+    ) -> Result<CryptoManualForceNewSummary> {
+        self.ensure_room_joined()?;
+        // The monotonic absolute deadline starts before lock acquisition and
+        // covers lock, discard, staged preshare, and the post-check (issue
+        // #538).
+        let deadline = tokio::time::Instant::now() + MANUAL_ENCRYPTION_DEBUG_DEADLINE;
+        let started = std::time::Instant::now();
+        let failed = |outcome: CryptoManualForceNewOutcome| -> CryptoManualForceNewSummary {
+            CryptoManualForceNewSummary {
+                outcome,
+                previous_session_exists: false,
+                fresh_session_created: false,
+                message_index: None,
+                elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            }
+        };
+        let transport_lock = self.client.room_key_transport_lock(self.room_id());
+        let _lock = match tokio::time::timeout_at(deadline, transport_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => return Ok(failed(CryptoManualForceNewOutcome::Deadline)),
+        };
+
+        let pre_token = tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return Ok(failed(CryptoManualForceNewOutcome::Deadline)),
+            res = self.client.base_client().current_outbound_group_session_id(self.room_id()) => res?,
+        };
+        let previous_session_exists = pre_token.is_some();
+
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(failed(CryptoManualForceNewOutcome::Deadline));
+        }
+        if !validate() {
+            return Ok(failed(CryptoManualForceNewOutcome::CancelledStale));
+        }
+        tokio::select! {
+            _ = cancellation.recv() => return Ok(failed(CryptoManualForceNewOutcome::CancelledStale)),
+            _ = tokio::time::sleep_until(deadline) => return Ok(failed(CryptoManualForceNewOutcome::Deadline)),
+            res = self.discard_room_key() => res?,
+        };
+
+        // Staged preshare (issue #538): the claim and the share run as
+        // separate fenced stages so logout/leave/validator stops wire
+        // effects between them. The per-room transport lock is already held,
+        // so the deduplicating handler is not needed for mutual exclusion.
+        // Bound the cross-process store lock by the same monotonic deadline
+        // (issue #538): its backoff can otherwise exceed the actor's
+        // shutdown join timeout.
+        let encryption = self.client.encryption();
+        let store_lock = encryption.spin_lock_store(Some(60000));
+        let store_guard = tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return Ok(failed(CryptoManualForceNewOutcome::Deadline)),
+            guard = store_lock => guard?,
+        };
+        let _store_guard = store_guard;
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(failed(CryptoManualForceNewOutcome::Deadline));
+        }
+        if !validate() {
+            return Ok(failed(CryptoManualForceNewOutcome::CancelledStale));
+        }
+        let claim = tokio::select! {
+            _ = cancellation.recv() => return Ok(failed(CryptoManualForceNewOutcome::CancelledStale)),
+            _ = tokio::time::sleep_until(deadline) => return Ok(failed(CryptoManualForceNewOutcome::Deadline)),
+            res = async {
+                let members = self
+                    .client
+                    .state_store()
+                    .get_user_ids(self.room_id(), RoomMemberships::ACTIVE)
+                    .await?;
+                self.client.claim_one_time_keys(members.iter().map(Deref::deref)).await
+            } => res,
+        };
+        claim?;
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(failed(CryptoManualForceNewOutcome::Deadline));
+        }
+        if !validate() {
+            return Ok(failed(CryptoManualForceNewOutcome::CancelledStale));
+        }
+        let share = tokio::select! {
+            _ = cancellation.recv() => return Ok(failed(CryptoManualForceNewOutcome::CancelledStale)),
+            _ = tokio::time::sleep_until(deadline) => return Ok(failed(CryptoManualForceNewOutcome::Deadline)),
+            res = self.share_room_key() => res,
+        };
+        if let Err(error) = share {
+            let machine = self.client.olm_machine().await;
+            if let Some(machine) = machine.as_ref() {
+                let _ = machine
+                    .discard_room_key_with_reason(
+                        self.room_id(),
+                        matrix_sdk_base::crypto::RoomKeyRotationReason::KeyShareFailure,
+                    )
+                    .await;
+            }
+            return Err(error);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(failed(CryptoManualForceNewOutcome::Deadline));
+        }
+        if !validate() {
+            return Ok(failed(CryptoManualForceNewOutcome::CancelledStale));
+        }
+        // Bound the post-check token reads by the same absolute deadline.
+        let post_token = tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return Ok(failed(CryptoManualForceNewOutcome::Deadline)),
+            res = self.client.base_client().current_outbound_group_session_id(self.room_id()) => res?,
+        };
+        let post_index = tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return Ok(failed(CryptoManualForceNewOutcome::Deadline)),
+            res = self.client.base_client().current_outbound_group_session_message_index(self.room_id()) => res?,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(failed(CryptoManualForceNewOutcome::Deadline));
+        }
+        if post_token.is_none() || post_token == pre_token || post_index != Some(0) {
+            return Ok(failed(CryptoManualForceNewOutcome::Failed));
+        }
+
+        Ok(CryptoManualForceNewSummary {
+            outcome: CryptoManualForceNewOutcome::Completed,
+            previous_session_exists,
+            fresh_session_created: true,
+            message_index: post_index,
+            elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        })
     }
 
     /// Force-share the current outbound room key without creating a session.

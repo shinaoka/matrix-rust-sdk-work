@@ -52,7 +52,7 @@ use crate::{
         DeviceKey, DeviceKeys, EventEncryptionAlgorithm, Signatures, SignedKey,
         events::{
             EventType, forwarded_room_key::ForwardedRoomKeyContent,
-            room::encrypted::ToDeviceEncryptedEventContent,
+            room::encrypted::ToDeviceEncryptedEventContent, room_key::RoomKeyContent,
         },
         requests::{OutgoingVerificationRequest, ToDeviceRequest},
     },
@@ -861,6 +861,36 @@ impl DeviceData {
     ) -> OlmResult<MaybeEncryptedRoomKey> {
         let content = session.as_content().await;
         let message_index = session.message_index().await;
+        let event_type = content.event_type().to_owned();
+
+        match self.encrypt(store, &event_type, content).await {
+            Ok((session, encrypted, _)) => Ok(MaybeEncryptedRoomKey::Encrypted {
+                share_info: Box::new(ShareInfo::new_shared(
+                    session.sender_key().to_owned(),
+                    message_index,
+                    self.olm_wedging_index,
+                )),
+                used_session: Box::new(session),
+                message: encrypted.cast(),
+            }),
+
+            Err(OlmError::MissingSession) => Ok(MaybeEncryptedRoomKey::MissingSession),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Encrypt a caller-supplied room-key content to this device (manual
+    /// index-0 share, issue #538). The content was captured atomically at
+    /// message index 0, so the recorded share index is 0. Takes a reference
+    /// because `RoomKeyContent` is not `Clone` (the underlying vodozemac
+    /// `SessionKey` is not cloneable); the content is immutable once
+    /// captured.
+    pub(crate) async fn maybe_encrypt_room_key_content(
+        &self,
+        store: &CryptoStoreWrapper,
+        content: &RoomKeyContent,
+    ) -> OlmResult<MaybeEncryptedRoomKey> {
+        let message_index = 0;
         let event_type = content.event_type().to_owned();
 
         match self.encrypt(store, &event_type, content).await {
