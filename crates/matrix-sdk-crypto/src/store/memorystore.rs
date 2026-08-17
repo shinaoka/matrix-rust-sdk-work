@@ -46,13 +46,14 @@ use super::{
 };
 #[cfg(test)]
 use crate::CryptoStoreError;
+#[cfg(test)]
+use crate::olm::PickledOutboundGroupSession;
 use crate::{
     gossiping::{GossipRequest, SecretInfo},
     identities::{DeviceData, UserIdentityData},
     olm::{
-        OutboundGroupSession, PickledAccount, PickledInboundGroupSession,
-        PickledOutboundGroupSession, PickledSession, PrivateCrossSigningIdentity, SenderDataType,
-        StaticAccountData,
+        OutboundGroupSession, PickledAccount, PickledInboundGroupSession, PickledSession,
+        PrivateCrossSigningIdentity, SenderDataType, StaticAccountData,
     },
     store::types::{RoomKeyWithheldEntry, RoomPendingKeyBundleDetails},
 };
