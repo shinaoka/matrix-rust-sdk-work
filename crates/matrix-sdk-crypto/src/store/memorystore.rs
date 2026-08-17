@@ -139,6 +139,11 @@ impl MemoryStore {
     }
 
     #[cfg(test)]
+    pub(crate) async fn hold_save_changes_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.save_changes_lock).lock_owned().await
+    }
+
+    #[cfg(test)]
     pub(crate) fn remove_sessions_for_test(&self, sender_key: &str) -> bool {
         self.sessions.write().remove(sender_key).is_some()
     }

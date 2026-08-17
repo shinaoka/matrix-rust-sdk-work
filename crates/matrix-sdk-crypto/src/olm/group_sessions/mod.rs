@@ -23,11 +23,11 @@ pub(crate) mod sender_data_finder;
 
 pub use forwarder_data::ForwarderData;
 pub use inbound::{InboundGroupSession, PickledInboundGroupSession};
-pub(crate) use outbound::ShareState;
 pub use outbound::{
     EncryptionSettings, OutboundGroupSession, OutboundGroupSessionEncryptionResult,
     PickledOutboundGroupSession, ShareInfo, ShareRequestKind,
 };
+pub(crate) use outbound::{OutboundStateSnapshot, ShareState};
 pub use sender_data::{KnownSenderData, SenderData, SenderDataType};
 use thiserror::Error;
 pub use vodozemac::megolm::{ExportedSessionKey, SessionKey};
