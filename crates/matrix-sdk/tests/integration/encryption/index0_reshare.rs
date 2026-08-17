@@ -42,10 +42,14 @@ fn index0_reshare_outcomes(events: &[RoomKeyDiagnosticEvent]) -> Vec<Index0Resha
 }
 
 /// Alice and Bob know each other's devices; Alice joins an encrypted room with
-/// Bob as a member. Returns the server, Alice, the room id, and the observer.
-async fn setup_encrypted_room()
--> (MatrixMockServer, Client, ruma::OwnedRoomId, Arc<std::sync::Mutex<Vec<RoomKeyDiagnosticEvent>>>)
-{
+/// Bob as a member. Returns the server, Alice, Bob, the room id, and the observer.
+async fn setup_encrypted_room() -> (
+    MatrixMockServer,
+    Client,
+    Client,
+    ruma::OwnedRoomId,
+    Arc<std::sync::Mutex<Vec<RoomKeyDiagnosticEvent>>>,
+) {
     let server = MatrixMockServer::new().await;
     server.mock_crypto_endpoints_preset().await;
 
@@ -91,12 +95,12 @@ async fn setup_encrypted_room()
         .mount()
         .await;
 
-    (server, alice, room_id.to_owned(), events)
+    (server, alice, bob, room_id.to_owned(), events)
 }
 
 #[async_test]
 async fn test_manual_index0_room_resend_preserves_index_and_sends_to_device_key() {
-    let (server, alice, room_id, _events) = setup_encrypted_room().await;
+    let (server, alice, _bob, room_id, _events) = setup_encrypted_room().await;
 
     Mock::given(method("PUT"))
         .and(path_regex(TO_DEVICE_PATH))
@@ -134,7 +138,7 @@ async fn test_manual_index0_room_resend_preserves_index_and_sends_to_device_key(
 
 #[async_test]
 async fn test_manual_index0_room_resend_failure_cleans_pending_requests() {
-    let (server, alice, room_id, _events) = setup_encrypted_room().await;
+    let (server, alice, _bob, room_id, _events) = setup_encrypted_room().await;
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts_clone = Arc::clone(&attempts);
     Mock::given(method("PUT"))
@@ -182,7 +186,7 @@ async fn test_manual_index0_room_resend_failure_cleans_pending_requests() {
 
 #[async_test]
 async fn test_manual_index0_room_resend_deadline_cleans_pending_requests() {
-    let (server, alice, room_id, _events) = setup_encrypted_room().await;
+    let (server, alice, _bob, room_id, _events) = setup_encrypted_room().await;
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts_clone = Arc::clone(&attempts);
     let manual_request_seen = Arc::new(tokio::sync::Notify::new());
@@ -238,7 +242,7 @@ async fn test_manual_index0_room_resend_deadline_cleans_pending_requests() {
 
 #[async_test]
 async fn test_manual_index0_room_resend_claim_failure_is_closed_and_retryable() {
-    let (server, alice, room_id, _events) = setup_encrypted_room().await;
+    let (server, alice, _bob, room_id, _events) = setup_encrypted_room().await;
 
     Mock::given(method("PUT"))
         .and(path_regex(TO_DEVICE_PATH))
@@ -292,8 +296,64 @@ async fn test_manual_index0_room_resend_claim_failure_is_closed_and_retryable() 
 }
 
 #[async_test]
+async fn test_manual_index0_room_resend_partial_send_cleans_and_retries() {
+    let (server, alice, bob, room_id, _events) = setup_encrypted_room().await;
+    let _bob2 = server
+        .set_up_new_device_for_encryption(&bob, &device_id!("BOBDEVICE2"), vec![&alice])
+        .await;
+
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_clone = Arc::clone(&attempts);
+    Mock::given(method("PUT"))
+        .and(path_regex(TO_DEVICE_PATH))
+        .respond_with(move |_request: &Request| {
+            let attempt = attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 3 {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY)
+            }
+        })
+        .expect(6)
+        .named("partial_then_retried_manual_resend")
+        .mount(server.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(ROOM_SEND_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
+        .expect(1)
+        .mount(server.server())
+        .await;
+
+    let room = alice.get_room(&room_id).unwrap();
+    matrix_sdk::room::futures::ensure_room_encryption_ready_with_index0_duplicate_share_for_testing(
+        &room,
+    )
+    .await
+    .unwrap();
+    let _ = room.send(RoomMessageEventContent::text_plain("advance")).await.unwrap();
+    let before = room.current_outbound_group_session_message_index().await.unwrap();
+
+    let (_sender, mut cancellation) = broadcast::channel(1);
+    let partial = room.resend_index0_room_key(&mut cancellation, || true).await.unwrap();
+    assert_eq!(partial.outcome, matrix_sdk_base::crypto::ManualIndex0ResendOutcome::Failed);
+    assert_eq!(partial.peer_accepted, 1);
+    assert_eq!(partial.peer_missing, 1);
+    assert_eq!(partial.message_index_before, before);
+    assert_eq!(partial.message_index_after, before);
+
+    let (_sender, mut cancellation) = broadcast::channel(1);
+    let retried = room.resend_index0_room_key(&mut cancellation, || true).await.unwrap();
+    assert_eq!(retried.outcome, matrix_sdk_base::crypto::ManualIndex0ResendOutcome::Completed);
+    assert_eq!(retried.peer_accepted, 2);
+    assert_eq!(retried.peer_missing, 0);
+    assert_eq!(retried.message_index_before, before);
+    assert_eq!(retried.message_index_after, before);
+}
+
+#[async_test]
 async fn test_first_room_event_queues_exactly_one_index0_duplicate() {
-    let (server, alice, room_id, events) = setup_encrypted_room().await;
+    let (server, alice, _bob, room_id, events) = setup_encrypted_room().await;
 
     // The preshare produces one to-device room-key request and the bounded
     // duplicate produces exactly one more; the second message produces none.
@@ -357,7 +417,7 @@ async fn test_first_room_event_queues_exactly_one_index0_duplicate() {
 
 #[async_test]
 async fn test_duplicate_send_failure_never_downgrades_the_first_event() {
-    let (server, alice, room_id, events) = setup_encrypted_room().await;
+    let (server, alice, _bob, room_id, events) = setup_encrypted_room().await;
 
     // A stateful responder: the preshare succeeds, the duplicate fails, and
     // the follow-up preshare after that test-only boundary also succeeds.
@@ -419,7 +479,7 @@ async fn test_duplicate_send_failure_never_downgrades_the_first_event() {
 
 #[async_test]
 async fn test_duplicate_deadline_is_bounded_with_controlled_time() {
-    let (server, alice, room_id, events) = setup_encrypted_room().await;
+    let (server, alice, _bob, room_id, events) = setup_encrypted_room().await;
 
     // The preshare's to-device request settles immediately; the duplicate's
     // response is delayed far beyond its 1.5s deadline so the deadline always
