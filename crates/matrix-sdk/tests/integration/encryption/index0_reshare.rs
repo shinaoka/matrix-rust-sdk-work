@@ -21,6 +21,7 @@ use wiremock::{
 };
 
 const TO_DEVICE_PATH: &str = r"^/_matrix/client/.*/sendToDevice/m.room.encrypted/.*";
+const CLAIM_PATH: &str = r"^/_matrix/client/.*/keys/claim$";
 const ROOM_SEND_PATH: &str = r"^/_matrix/client/.*/rooms/.*/send/m.room.encrypted/.*";
 
 fn capture_observer(
@@ -233,6 +234,61 @@ async fn test_manual_index0_room_resend_deadline_cleans_pending_requests() {
     assert_eq!(expired.outcome, matrix_sdk_base::crypto::ManualIndex0ResendOutcome::Deadline);
     assert_eq!(expired.message_index_before, before);
     assert_eq!(expired.message_index_after, before);
+}
+
+#[async_test]
+async fn test_manual_index0_room_resend_claim_failure_is_closed_and_retryable() {
+    let (server, alice, room_id, _events) = setup_encrypted_room().await;
+
+    Mock::given(method("PUT"))
+        .and(path_regex(TO_DEVICE_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY))
+        .expect(2)
+        .named("initial_share")
+        .mount(server.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(ROOM_SEND_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
+        .expect(1)
+        .named("advance_room_message")
+        .mount(server.server())
+        .await;
+
+    let room = alice.get_room(&room_id).unwrap();
+    matrix_sdk::room::futures::ensure_room_encryption_ready_with_index0_duplicate_share_for_testing(
+        &room,
+    )
+    .await
+    .unwrap();
+    let _ = room.send(RoomMessageEventContent::text_plain("advance")).await.unwrap();
+    let before = room.current_outbound_group_session_message_index().await.unwrap();
+
+    let machine = alice.olm_machine_for_testing().await;
+    machine.as_ref().unwrap().clear_olm_sessions_for_testing().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(CLAIM_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .expect(2)
+        .named("manual_claim_failure")
+        .mount(server.server())
+        .await;
+
+    let (_sender, mut cancellation) = broadcast::channel(1);
+    let failed = room.resend_index0_room_key(&mut cancellation, || true).await.unwrap();
+    assert_eq!(failed.outcome, matrix_sdk_base::crypto::ManualIndex0ResendOutcome::Failed);
+    assert_eq!(failed.claim, matrix_sdk_base::crypto::ManualClaimOutcome::Failed);
+    assert_eq!(failed.message_index_before, before);
+    assert_eq!(failed.message_index_after, before);
+
+    let (_sender, mut cancellation) = broadcast::channel(1);
+    let retried = room.resend_index0_room_key(&mut cancellation, || true).await.unwrap();
+    assert_eq!(retried.outcome, matrix_sdk_base::crypto::ManualIndex0ResendOutcome::Failed);
+    assert_eq!(retried.claim, matrix_sdk_base::crypto::ManualClaimOutcome::Failed);
+    assert_eq!(retried.message_index_before, before);
+    assert_eq!(retried.message_index_after, before);
 }
 
 #[async_test]

@@ -56,6 +56,15 @@ impl SessionStore {
         self.entries.write().await.clear()
     }
 
+    #[cfg(any(test, feature = "testing"))]
+    /// Clear cached sessions without reloading durable test data.
+    pub async fn clear_for_testing(&self) {
+        let entries = self.entries.read().await.values().cloned().collect::<Vec<_>>();
+        for sessions in entries {
+            sessions.lock().await.clear();
+        }
+    }
+
     /// Add a session to the store.
     ///
     /// Returns true if the session was added, false if the session was
