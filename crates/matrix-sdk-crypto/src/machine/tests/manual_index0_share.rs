@@ -18,13 +18,19 @@ use std::{iter, sync::Arc};
 
 use assert_matches2::assert_let;
 use matrix_sdk_test::async_test;
-use ruma::{events::room::history_visibility::HistoryVisibility, room_id, user_id};
+use ruma::{
+    TransactionId, device_id, events::room::history_visibility::HistoryVisibility, room_id, user_id,
+};
 
 use crate::{
     EncryptionSettings, ManualFinalizeStep, ManualIndex0ResendOutcome, ManualIndex0ResendStep,
     ManualIndex0ShareOutcome,
-    machine::test_helpers::get_machine_pair_with_setup_sessions_test_helper,
-    olm::OutboundGroupSession,
+    machine::test_helpers::{
+        build_session_for_pair, get_machine_pair_with_setup_sessions_test_helper,
+        get_prepared_machine_test_helper,
+    },
+    olm::{OutboundGroupSession, ShareRequestKind},
+    store::{CryptoStore, MemoryStore, types::Changes},
 };
 
 async fn settle_preshare(
@@ -40,6 +46,27 @@ async fn settle_preshare(
     for request in &requests {
         sender.inner.group_session_manager.mark_request_as_sent(&request.txn_id).await.unwrap();
     }
+}
+
+async fn get_machine_pair_with_removable_alice_store()
+-> (crate::OlmMachine, crate::OlmMachine, Arc<MemoryStore>) {
+    let (bob, one_time_keys) =
+        get_prepared_machine_test_helper(user_id!("@b:example.org"), false).await;
+    let alice_store = Arc::new(MemoryStore::new());
+    let alice = crate::OlmMachine::with_store(
+        user_id!("@a:example.org"),
+        device_id!("ALICE2"),
+        Arc::clone(&alice_store),
+        None,
+    )
+    .await
+    .unwrap();
+    let alice_device = crate::DeviceData::from_machine_test_helper(&alice).await.unwrap();
+    let bob_device = crate::DeviceData::from_machine_test_helper(&bob).await.unwrap();
+    alice.store().save_device_data(&[bob_device]).await.unwrap();
+    bob.store().save_device_data(&[alice_device]).await.unwrap();
+    let (alice, bob) = build_session_for_pair(alice, bob, one_time_keys).await;
+    (alice, bob, alice_store)
 }
 
 /// The manual index-0 share queues the index-0 `m.room_key` to the complete
@@ -155,6 +182,293 @@ async fn test_manual_index0_resend_uses_original_ledger_after_index_advanced() {
     assert_eq!(outbound.message_index().await, 1);
 }
 
+/// Pickle ownership metadata is fail-closed: legacy requests are quarantined
+/// from manual recovery and mismatched modern maps discard pending requests.
+#[async_test]
+async fn test_manual_index0_pickle_ownership_quarantines_legacy_and_mismatch() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-pickle-ownership:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    let _ = outbound.encrypt_helper("advance".to_owned()).await;
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    let step = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    let requests = match step {
+        ManualIndex0ResendStep::Ready { requests, .. } => requests,
+        other => panic!("expected queued manual requests, got {other:?}"),
+    };
+    let request = requests.first().cloned().expect("resend must queue a request");
+    outbound.add_request_with_kind(
+        TransactionId::new(),
+        request.clone(),
+        std::collections::BTreeMap::new(),
+        ShareRequestKind::Normal,
+    );
+    outbound.add_request_with_kind(
+        TransactionId::new(),
+        request,
+        std::collections::BTreeMap::new(),
+        ShareRequestKind::Manual,
+    );
+
+    let mut legacy = outbound.pickle().await;
+    legacy.request_kinds = None;
+    let restored_legacy = OutboundGroupSession::from_pickle(
+        alice.device_id().to_owned(),
+        Arc::new(alice.identity_keys()),
+        legacy,
+    )
+    .unwrap();
+    assert!(!restored_legacy.initial_share_tracking_enabled());
+    assert!(restored_legacy.pending_manual_requests().is_empty());
+    assert!(!restored_legacy.pending_requests().is_empty());
+
+    let mut mismatched = outbound.pickle().await;
+    mismatched.request_kinds = Some(std::collections::BTreeMap::new());
+    let restored_mismatched = OutboundGroupSession::from_pickle(
+        alice.device_id().to_owned(),
+        Arc::new(alice.identity_keys()),
+        mismatched,
+    )
+    .unwrap();
+    assert!(!restored_mismatched.initial_share_tracking_enabled());
+    assert!(restored_mismatched.pending_requests().is_empty());
+    assert!(restored_mismatched.pending_manual_requests().is_empty());
+}
+
+/// Cleanup removes only the owned manual requests and leaves no request that
+/// a later automatic preshare could drain.
+#[async_test]
+async fn test_manual_index0_resend_cleanup_removes_owned_requests() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-cleanup:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    let _ = outbound.encrypt_helper("advance".to_owned()).await;
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    let step = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert_let!(ManualIndex0ResendStep::Ready { requests, summary } = step);
+    assert_eq!(summary.outcome, ManualIndex0ResendOutcome::Completed);
+    let ids = requests.iter().map(|request| request.txn_id.clone()).collect::<Vec<_>>();
+    assert_eq!(outbound.pending_manual_requests().len(), ids.len());
+
+    alice.cleanup_manual_pending_requests(&room_id, &ids, None).await.unwrap();
+    assert!(outbound.pending_manual_requests().is_empty());
+    assert!(outbound.pending_request_ids().is_empty());
+    assert_eq!(alice.current_outbound_group_session_message_index(&room_id).await, Some(1));
+}
+
+/// Marking or cleaning a manual request is transactional: a persistence
+/// failure restores the in-memory request and leaves the durable request for a
+/// later explicit retry.
+#[async_test]
+async fn test_manual_index0_resend_mark_and_cleanup_roll_back_on_failure() {
+    let (alice, bob, alice_store) = get_machine_pair_with_removable_alice_store().await;
+    let room_id = room_id!("!resend-mark-cleanup-failure:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    let _ = outbound.encrypt_helper("advance".to_owned()).await;
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    let step = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    let requests = match step {
+        ManualIndex0ResendStep::Ready { requests, .. } => requests,
+        other => panic!("expected queued manual requests, got {other:?}"),
+    };
+    let request_id = requests.first().expect("resend request").txn_id.clone();
+    assert_eq!(outbound.pending_manual_requests().len(), 1);
+
+    alice_store.fail_next_save_changes_for_test();
+    assert!(alice.mark_manual_request_as_sent(&request_id).await.is_err());
+    assert_eq!(outbound.pending_manual_requests().len(), 1);
+    let persisted = alice_store
+        .get_outbound_group_session(&room_id)
+        .await
+        .unwrap()
+        .expect("manual request must remain durable after mark failure");
+    assert_eq!(persisted.pending_manual_requests().len(), 1);
+
+    alice_store.fail_next_save_changes_for_test();
+    assert!(
+        alice.cleanup_manual_pending_requests(&room_id, &[request_id.clone()], None).await.is_err()
+    );
+    assert_eq!(outbound.pending_manual_requests().len(), 1);
+    let persisted = alice_store
+        .get_outbound_group_session(&room_id)
+        .await
+        .unwrap()
+        .expect("manual request must remain durable after cleanup failure");
+    assert_eq!(persisted.pending_manual_requests().len(), 1);
+
+    alice.cleanup_manual_pending_requests(&room_id, &[request_id], None).await.unwrap();
+    assert!(outbound.pending_manual_requests().is_empty());
+}
+
+/// A failed/aborted claim clears its expectation so a later explicit retry can
+/// build a fresh claim, without leaving manual room-key requests pending.
+#[async_test]
+async fn test_manual_index0_resend_claim_cleanup_is_retryable() {
+    let (alice_before_reload, bob, alice_store) =
+        get_machine_pair_with_removable_alice_store().await;
+    let room_id = room_id!("!resend-claim-cleanup:example.org");
+    settle_preshare(&alice_before_reload, &bob, &room_id).await;
+    let sender_key = bob.identity_keys().curve25519.to_base64();
+    assert!(alice_store.get_outbound_group_session(&room_id).await.unwrap().is_some());
+    assert!(alice_store.remove_sessions_for_test(&sender_key));
+    let alice = crate::OlmMachine::with_store(
+        user_id!("@a:example.org"),
+        device_id!("ALICE2"),
+        Arc::clone(&alice_store),
+        None,
+    )
+    .await
+    .unwrap();
+    let outbound =
+        alice.inner.group_session_manager.current_outbound_session(&room_id).await.unwrap();
+    let _ = outbound.encrypt_helper("advance".to_owned()).await;
+
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preparation.outcome, ManualIndex0ResendOutcome::Completed);
+    let (claim_id, claim_request) = claim.expect("the missing Olm session must require a claim");
+    assert_eq!(claim_request.one_time_keys[bob.user_id()].len(), 1);
+    alice.cleanup_manual_pending_requests(&room_id, &[], Some(&claim_id)).await.unwrap();
+    assert!(outbound.pending_manual_requests().is_empty());
+
+    let retry = alice.get_missing_sessions(iter::once(bob.user_id())).await.unwrap();
+    let (retry_id, retry_request) = retry.expect("cleanup must permit an explicit retry");
+    assert_ne!(retry_id, claim_id);
+    assert_eq!(retry_request.one_time_keys[bob.user_id()].len(), 1);
+}
+
+/// A persistence failure after staging forwarded keys restores the outbound
+/// queue and does not leave a manual request pending for a later reload.
+#[async_test]
+async fn test_manual_index0_resend_rolls_back_on_persistence_failure() {
+    let (alice, bob, alice_store) = get_machine_pair_with_removable_alice_store().await;
+    let room_id = room_id!("!resend-persistence-failure:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    let _ = outbound.encrypt_helper("advance".to_owned()).await;
+    alice
+        .store()
+        .save_changes(Changes {
+            outbound_group_sessions: vec![outbound.clone()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    alice_store.fail_next_save_changes_for_test();
+
+    let error = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .expect_err("injected persistence failure must abort the resend");
+    let _ = error;
+    assert!(outbound.pending_manual_requests().is_empty());
+    assert!(outbound.pending_request_ids().is_empty());
+    assert_eq!(outbound.message_index().await, 1);
+    let restored = OutboundGroupSession::from_pickle(
+        alice.device_id().to_owned(),
+        Arc::new(alice.identity_keys()),
+        outbound.pickle().await,
+    )
+    .unwrap();
+    assert!(restored.pending_manual_requests().is_empty());
+    assert!(restored.pending_request_ids().is_empty());
+
+    let reloaded = crate::OlmMachine::with_store(
+        user_id!("@a:example.org"),
+        device_id!("ALICE2"),
+        Arc::clone(&alice_store),
+        None,
+    )
+    .await
+    .unwrap();
+    let persisted = reloaded
+        .inner
+        .group_session_manager
+        .current_outbound_session(&room_id)
+        .await
+        .expect("the pre-failure session must remain persisted");
+    assert_eq!(persisted.message_index().await, 1);
+    assert!(persisted.pending_manual_requests().is_empty());
+    assert!(persisted.pending_request_ids().is_empty());
+}
+
 /// A current-member input that is absent from the immutable ledger cannot
 /// widen the resend target set.
 #[async_test]
@@ -237,6 +551,164 @@ async fn test_manual_index0_resend_refuses_rotation_required_policy() {
         .unwrap();
     assert!(claim.is_none());
     assert_eq!(preparation.outcome, ManualIndex0ResendOutcome::PolicyBlocked);
+}
+
+/// A missing inbound counterpart fails closed even when the outbound session
+/// and immutable initial-share ledger are present.
+#[async_test]
+async fn test_manual_index0_resend_refuses_missing_inbound_counterpart() {
+    let (alice, bob, alice_store) = get_machine_pair_with_removable_alice_store().await;
+    let room_id = room_id!("!resend-inbound-missing:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    assert!(alice_store.remove_inbound_group_session_for_test(&room_id, outbound.session_id()));
+
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    assert_eq!(preparation.outcome, ManualIndex0ResendOutcome::InboundSessionMissing);
+    assert_eq!(preparation.inbound_first_known_index, None);
+    assert!(outbound.pending_manual_requests().is_empty());
+}
+
+/// A matching inbound counterpart whose first known index is non-zero is not
+/// sufficient proof for historical recovery.
+#[async_test]
+async fn test_manual_index0_resend_refuses_advanced_inbound_counterpart() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-inbound-advanced:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    let inbound = alice
+        .store()
+        .get_inbound_group_session(&room_id, outbound.session_id())
+        .await
+        .unwrap()
+        .expect("preshare must persist the matching inbound counterpart");
+    let advanced =
+        crate::olm::InboundGroupSession::from_export(&inbound.export_at_index(1).await).unwrap();
+    alice.store().save_inbound_group_sessions(&[advanced]).await.unwrap();
+
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    assert_eq!(preparation.outcome, ManualIndex0ResendOutcome::InboundIndexAdvanced);
+    assert_eq!(preparation.inbound_first_known_index, Some(1));
+
+    let step = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert_let!(ManualIndex0ResendStep::Ready { requests, summary } = step);
+    assert!(requests.is_empty());
+    assert_eq!(summary.outcome, ManualIndex0ResendOutcome::InboundIndexAdvanced);
+    assert_eq!(summary.inbound_first_known_index, Some(1));
+}
+
+/// A changed Curve25519 identity for a ledger device fails closed before any
+/// forwarded key request is staged.
+#[async_test]
+async fn test_manual_index0_resend_refuses_changed_sender_identity() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-identity-changed:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let replacement = crate::OlmMachine::new(bob.user_id(), bob.device_id()).await;
+    let replacement_device =
+        crate::DeviceData::from_machine_test_helper(&replacement).await.unwrap();
+    alice.store().save_device_data(&[replacement_device]).await.unwrap();
+
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    assert_eq!(preparation.outcome, ManualIndex0ResendOutcome::StaleIdentityRefused);
+    assert_eq!(preparation.peer_sender_key_changed, 1);
+
+    let step = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert_let!(ManualIndex0ResendStep::Ready { requests, summary } = step);
+    assert!(requests.is_empty());
+    assert_eq!(summary.outcome, ManualIndex0ResendOutcome::StaleIdentityRefused);
+    assert_eq!(summary.peer_sender_key_changed, 1);
+}
+
+/// A sender identity change after preparation is fenced before forwarded
+/// encryption, covering the prepare/finalize TOCTOU boundary.
+#[async_test]
+async fn test_manual_index0_resend_refuses_identity_changed_after_prepare() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-identity-toctou:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    assert_eq!(preparation.outcome, ManualIndex0ResendOutcome::Completed);
+
+    let replacement = crate::OlmMachine::new(bob.user_id(), bob.device_id()).await;
+    let replacement_device =
+        crate::DeviceData::from_machine_test_helper(&replacement).await.unwrap();
+    alice.store().save_device_data(&[replacement_device]).await.unwrap();
+
+    let step = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert_let!(ManualIndex0ResendStep::Ready { requests, summary } = step);
+    assert!(requests.is_empty());
+    assert_eq!(summary.outcome, ManualIndex0ResendOutcome::StaleIdentityRefused);
+    assert_eq!(summary.peer_sender_key_changed, 1);
 }
 
 /// A session whose initial sharing proof has not committed fails closed.
