@@ -50,8 +50,9 @@ use crate::{
     gossiping::{GossipRequest, SecretInfo},
     identities::{DeviceData, UserIdentityData},
     olm::{
-        OutboundGroupSession, PickledAccount, PickledInboundGroupSession, PickledSession,
-        PrivateCrossSigningIdentity, SenderDataType, StaticAccountData,
+        OutboundGroupSession, PickledAccount, PickledInboundGroupSession,
+        PickledOutboundGroupSession, PickledSession, PrivateCrossSigningIdentity, SenderDataType,
+        StaticAccountData,
     },
     store::types::{RoomKeyWithheldEntry, RoomPendingKeyBundleDetails},
 };
@@ -120,6 +121,8 @@ pub struct MemoryStore {
 
     #[cfg(test)]
     fail_next_save_changes: AtomicBool,
+    #[cfg(test)]
+    durable_outbound_pickles: StdRwLock<BTreeMap<OwnedRoomId, String>>,
     save_changes_lock: Arc<Mutex<()>>,
 }
 
@@ -137,6 +140,15 @@ impl MemoryStore {
     #[cfg(test)]
     pub(crate) fn remove_sessions_for_test(&self, sender_key: &str) -> bool {
         self.sessions.write().remove(sender_key).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_outbound_group_session_for_test(
+        &self,
+        room_id: &RoomId,
+    ) -> Option<PickledOutboundGroupSession> {
+        let serialized = self.durable_outbound_pickles.read().get(room_id)?.clone();
+        serde_json::from_str(&serialized).ok()
     }
 
     #[cfg(test)]
@@ -309,6 +321,14 @@ impl CryptoStore for MemoryStore {
         self.save_sessions(pickled_session);
 
         self.save_inbound_group_sessions(changes.inbound_group_sessions, None).await?;
+        #[cfg(test)]
+        for session in &changes.outbound_group_sessions {
+            let pickle = session.pickle().await;
+            self.durable_outbound_pickles.write().insert(
+                session.room_id().to_owned(),
+                serde_json::to_string(&pickle).expect("outbound pickle should serialize"),
+            );
+        }
         self.save_outbound_group_sessions(changes.outbound_group_sessions);
         self.save_private_identity(changes.private_identity);
 
