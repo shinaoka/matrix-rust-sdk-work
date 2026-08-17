@@ -118,8 +118,9 @@ use serde::{Deserialize, Serialize};
 pub use session_manager::{
     CollectStrategy, Index0ReshareDecision, ManualClaimOutcome, ManualFinalizeStep,
     ManualForceNewOutcome, ManualForceNewSummary, ManualIndex0Preparation,
-    ManualIndex0ShareOutcome, ManualIndex0ShareSummary, RoomKeyReshareResult, RoomKeyReshareTarget,
-    UnwedgeReshareOutcome,
+    ManualIndex0ResendOutcome, ManualIndex0ResendPreparation, ManualIndex0ResendStep,
+    ManualIndex0ResendSummary, ManualIndex0ShareOutcome, ManualIndex0ShareSummary,
+    RoomKeyReshareResult, RoomKeyReshareTarget, UnwedgeReshareOutcome,
 };
 pub use types::events::room_key_withheld::{RoomKeyWithheldContent, RoomKeyWithheldEvent};
 

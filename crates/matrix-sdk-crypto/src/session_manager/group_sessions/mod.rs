@@ -55,14 +55,15 @@ use crate::{
     identities::device::MaybeEncryptedRoomKey,
     olm::{
         InboundGroupSession, OutboundGroupSession, OutboundGroupSessionEncryptionResult,
-        SenderData, SenderDataFinder, Session, ShareInfo, ShareState, StaticAccountData,
+        SenderData, SenderDataFinder, Session, ShareInfo, ShareRequestKind, ShareState,
+        StaticAccountData,
     },
     room_key_diagnostics::{
         Index0ReshareOutcome, InitialShareDeviceClass, InitialShareRepairClaimOutcome,
         InitialShareRepairOlmState, InitialShareRepairOutcome, InitialShareRepairPreparation,
         InitialShareStage, RoomKeyCreationOutcome, RoomKeyDiagnosticHub,
     },
-    store::{CryptoStoreWrapper, Result as StoreResult, Store, types::Changes},
+    store::{CryptoStoreError, CryptoStoreWrapper, Result as StoreResult, Store, types::Changes},
     types::{
         events::{
             EventType, room::encrypted::ToDeviceEncryptedEventContent,
@@ -235,6 +236,124 @@ pub enum ManualFinalizeStep {
     /// The index-0 room-key to-device requests are ready to send. The closed
     /// summary accompanies them; `requests` may be empty.
     Ready { requests: Vec<Arc<ToDeviceRequest>>, summary: ManualIndex0ShareSummary },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualIndex0ResendOutcome {
+    Completed,
+    RefusedNotEncrypted,
+    NoSession,
+    InboundSessionMissing,
+    InboundIndexAdvanced,
+    OriginalLedgerMissing,
+    NoRecipients,
+    PolicyBlocked,
+    StaleIdentityRefused,
+    CancelledStale,
+    Deadline,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ManualIndex0ResendSummary {
+    pub outcome: ManualIndex0ResendOutcome,
+    pub message_index_before: Option<u32>,
+    pub message_index_after: Option<u32>,
+    pub peer_ledger: usize,
+    pub peer_sender_key_changed: usize,
+    pub peer_eligible: usize,
+    pub peer_accepted: usize,
+    pub peer_missing: usize,
+    pub policy_blocked: usize,
+    pub inbound_first_known_index: Option<u32>,
+    pub claim: ManualClaimOutcome,
+    pub elapsed_ms: u64,
+    pub room_event_sent: bool,
+    pub index0_consumed: bool,
+}
+
+impl ManualIndex0ResendSummary {
+    pub fn failed() -> Self {
+        Self {
+            outcome: ManualIndex0ResendOutcome::Failed,
+            message_index_before: None,
+            message_index_after: None,
+            peer_ledger: 0,
+            peer_sender_key_changed: 0,
+            peer_eligible: 0,
+            peer_accepted: 0,
+            peer_missing: 0,
+            policy_blocked: 0,
+            inbound_first_known_index: None,
+            claim: ManualClaimOutcome::NotNeeded,
+            elapsed_ms: 0,
+            room_event_sent: false,
+            index0_consumed: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ManualIndex0ResendPreparation {
+    pub(crate) outcome: ManualIndex0ResendOutcome,
+    pub(crate) room_id: OwnedRoomId,
+    pub(crate) session_id: Option<String>,
+    pub(crate) targets: Vec<DeviceData>,
+    pub(crate) claim_occurred: bool,
+    pub(crate) claim_checked: bool,
+    pub(crate) message_index_before: Option<u32>,
+    pub(crate) peer_ledger: usize,
+    pub(crate) peer_eligible: usize,
+    pub(crate) peer_sender_key_changed: usize,
+    pub(crate) policy_blocked: usize,
+    pub(crate) inbound_first_known_index: Option<u32>,
+}
+
+impl ManualIndex0ResendPreparation {
+    pub fn room_id(&self) -> &RoomId {
+        &self.room_id
+    }
+
+    pub fn summary(&self) -> ManualIndex0ResendSummary {
+        ManualIndex0ResendSummary {
+            outcome: self.outcome,
+            message_index_before: self.message_index_before,
+            message_index_after: self.message_index_before,
+            peer_ledger: self.peer_ledger,
+            peer_sender_key_changed: self.peer_sender_key_changed,
+            peer_eligible: self.peer_eligible,
+            peer_accepted: 0,
+            peer_missing: self.peer_eligible,
+            policy_blocked: self.policy_blocked,
+            inbound_first_known_index: self.inbound_first_known_index,
+            claim: if self.claim_occurred {
+                ManualClaimOutcome::Succeeded
+            } else {
+                ManualClaimOutcome::NotNeeded
+            },
+            elapsed_ms: 0,
+            room_event_sent: false,
+            index0_consumed: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ManualIndex0ResendStep {
+    NeedsClaimTargets {
+        targets: BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>,
+        continuation: ManualIndex0ResendPreparation,
+    },
+    NeedsClaim {
+        request_id: OwnedTransactionId,
+        request: KeysClaimRequest,
+        continuation: ManualIndex0ResendPreparation,
+    },
+    Ready {
+        requests: Vec<Arc<ToDeviceRequest>>,
+        summary: ManualIndex0ResendSummary,
+    },
 }
 
 /// Outcome of a manual force-new-outbound-session (issue #538).
@@ -473,19 +592,34 @@ impl GroupSessionManager {
         let Some(outbound) = self.sessions.get_or_load(room_id).await else {
             return Ok(());
         };
-        let mut removed = false;
+        let snapshot = outbound.snapshot_state();
+        let mut owned = Vec::new();
         for id in owned_ids {
-            outbound.remove_request(id);
-            if self.sessions.remove_from_being_shared(id).is_some() {
-                removed = true;
+            if self.sessions.find_request_owner(id).is_some() {
+                if let Err(error) = outbound.remove_request(id) {
+                    outbound.restore_state(snapshot);
+                    return Err(error);
+                }
+                owned.push(id.clone());
             }
         }
-        if removed {
-            let mut changes = Changes::default();
-            changes.outbound_group_sessions.push(outbound);
-            self.store.save_changes(changes).await?;
+        if owned.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let mut changes = Changes::default();
+        changes.outbound_group_sessions.push(outbound.clone());
+        match self.store.save_changes(changes).await {
+            Ok(()) => {
+                for id in owned {
+                    self.sessions.remove_from_being_shared(&id);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                outbound.restore_state(snapshot);
+                Err(error)
+            }
+        }
     }
 
     /// Collect the complete eligible recipient devices for the current
@@ -526,9 +660,10 @@ impl GroupSessionManager {
     }
 
     pub async fn mark_request_as_sent(&self, request_id: &TransactionId) -> StoreResult<()> {
-        let Some(session) = self.sessions.remove_from_being_shared(request_id) else {
+        let Some(session) = self.sessions.find_request_owner(request_id) else {
             return Ok(());
         };
+        let pre_mark = session.snapshot_state();
 
         // Issue #509: report the homeserver acceptance and the per-device
         // share-state commit for every device whose key share this request
@@ -557,7 +692,13 @@ impl GroupSessionManager {
             }
         }
 
-        let no_olm = session.mark_request_as_sent(request_id);
+        let no_olm = match session.mark_request_as_sent(request_id) {
+            Ok(no_olm) => no_olm,
+            Err(error) => {
+                session.restore_state(pre_mark);
+                return Err(error);
+            }
+        };
 
         let mut changes = Changes::default();
 
@@ -579,7 +720,16 @@ impl GroupSessionManager {
         }
 
         changes.outbound_group_sessions.push(session.clone());
-        self.store.save_changes(changes).await
+        match self.store.save_changes(changes).await {
+            Ok(()) => {
+                self.sessions.remove_from_being_shared(request_id);
+                Ok(())
+            }
+            Err(error) => {
+                session.restore_state(pre_mark);
+                Err(error)
+            }
+        }
     }
 
     /// Mark a manual index-0 share request as sent with a transactional
@@ -599,6 +749,12 @@ impl GroupSessionManager {
             return Ok(());
         };
         let Some(removed) = session.remove_request_captured(request_id) else {
+            if session.pending_request_ids().iter().any(|id| id == request_id) {
+                return Err(CryptoStoreError::backend(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing manual request kind",
+                )));
+            }
             // Nothing pending for this request id; nothing to do.
             return Ok(());
         };
@@ -725,9 +881,15 @@ impl GroupSessionManager {
         }
 
         let mut changes = Changes::default();
-        let withheld =
-            self.encrypt_for_devices(vec![device.clone()], &outbound, &mut changes).await?;
-        self.handle_withheld_devices(&outbound, withheld)?;
+        let withheld = self
+            .encrypt_for_devices(
+                vec![device.clone()],
+                &outbound,
+                &mut changes,
+                ShareRequestKind::Normal,
+            )
+            .await?;
+        self.handle_withheld_devices(&outbound, withheld, ShareRequestKind::Normal)?;
         if !changes.is_empty() {
             self.store.save_changes(changes).await?;
         }
@@ -1012,13 +1174,14 @@ impl GroupSessionManager {
         outbound: OutboundGroupSession,
         sessions: GroupSessionCache,
         room_key_diagnostics: RoomKeyDiagnosticHub,
+        request_kind: ShareRequestKind,
     ) -> OlmResult<(Vec<Session>, Vec<(DeviceData, WithheldCode)>)> {
         let (result, share_infos) =
             Self::encrypt_session_for(store, outbound.clone(), chunk, room_key_diagnostics).await?;
 
         if let Some(request) = result.to_device_request {
             let id = request.txn_id.clone();
-            outbound.add_request(id.clone(), request.into(), share_infos);
+            outbound.add_request_with_kind(id.clone(), request.into(), share_infos, request_kind);
             sessions.mark_as_being_shared(id, outbound.clone());
         }
 
@@ -1083,6 +1246,7 @@ impl GroupSessionManager {
         recipient_devices: Vec<DeviceData>,
         group_session: &OutboundGroupSession,
         changes: &mut Changes,
+        request_kind: ShareRequestKind,
     ) -> OlmResult<Vec<(DeviceData, WithheldCode)>> {
         // If we have some recipients, log them here.
         if !recipient_devices.is_empty() {
@@ -1116,6 +1280,7 @@ impl GroupSessionManager {
                     group_session.clone(),
                     self.sessions.clone(),
                     self.room_key_diagnostics.clone(),
+                    request_kind,
                 ))
             })
             .collect();
@@ -1226,7 +1391,12 @@ impl GroupSessionManager {
 
         if let Some(request) = result.to_device_request {
             let id = request.txn_id.clone();
-            outbound.add_request(id.clone(), request.into(), share_infos);
+            outbound.add_request_with_kind(
+                id.clone(),
+                request.into(),
+                share_infos,
+                ShareRequestKind::Manual,
+            );
             sessions.mark_as_being_shared(id, outbound.clone());
         }
 
@@ -1310,6 +1480,7 @@ impl GroupSessionManager {
         &self,
         group_session: &OutboundGroupSession,
         withheld_devices: Vec<(DeviceData, WithheldCode)>,
+        request_kind: ShareRequestKind,
     ) -> OlmResult<()> {
         // Convert a withheld code for the group session into a to-device event content.
         let to_content = |code| {
@@ -1366,7 +1537,12 @@ impl GroupSessionManager {
         for (request, share_info) in result {
             if !request.messages.is_empty() {
                 let txn_id = request.txn_id.to_owned();
-                group_session.add_request(txn_id.to_owned(), request.into(), share_info);
+                group_session.add_request_with_kind(
+                    txn_id.to_owned(),
+                    request.into(),
+                    share_info,
+                    request_kind,
+                );
 
                 self.sessions.mark_as_being_shared(txn_id, group_session.clone());
             }
@@ -1422,6 +1598,595 @@ impl GroupSessionManager {
     ///
     /// # Arguments
     ///
+    fn resend_preparation(
+        room_id: &RoomId,
+        outcome: ManualIndex0ResendOutcome,
+        message_index_before: Option<u32>,
+        inbound_first_known_index: Option<u32>,
+    ) -> ManualIndex0ResendPreparation {
+        ManualIndex0ResendPreparation {
+            outcome,
+            room_id: room_id.to_owned(),
+            session_id: None,
+            targets: Vec::new(),
+            claim_occurred: false,
+            claim_checked: false,
+            message_index_before,
+            peer_ledger: 0,
+            peer_eligible: 0,
+            peer_sender_key_changed: 0,
+            policy_blocked: 0,
+            inbound_first_known_index,
+        }
+    }
+
+    async fn collect_resend_targets(
+        &self,
+        outbound: &OutboundGroupSession,
+        users: impl Iterator<Item = &UserId>,
+        settings: &EncryptionSettings,
+    ) -> OlmResult<(Vec<DeviceData>, usize, usize, usize, bool, bool)> {
+        let Some(ledger) = outbound.initial_share_ledger() else {
+            return Ok((Vec::new(), 0, 0, 0, false, false));
+        };
+        let account = self.store.static_account();
+        let mut invalid_identity_ids = BTreeSet::new();
+        for (user_id, devices) in &ledger {
+            for (device_id, info) in devices {
+                let ShareInfo::Shared(shared) = info else { continue };
+                if user_id == account.user_id() && device_id == account.device_id() {
+                    continue;
+                }
+                let current = self.store.get_device(user_id, device_id).await?;
+                if current
+                    .as_ref()
+                    .is_none_or(|device| device.curve25519_key() != Some(shared.sender_key))
+                {
+                    invalid_identity_ids.insert((user_id.clone(), device_id.clone()));
+                }
+            }
+        }
+        let CollectRecipientsResult { should_rotate, devices, .. } =
+            self.collect_session_recipients(users, settings, outbound).await?;
+        let eligible = devices
+            .into_values()
+            .flatten()
+            .map(|device| ((device.user_id().to_owned(), device.device_id().to_owned()), device))
+            .collect::<BTreeMap<_, _>>();
+        let mut targets = Vec::new();
+        let mut peer_ledger = 0;
+        let mut sender_key_changed = 0;
+        let mut policy_blocked = 0;
+        for (user_id, devices) in ledger {
+            for (device_id, info) in devices {
+                let ShareInfo::Shared(shared) = info else { continue };
+                if user_id != account.user_id() || device_id != account.device_id() {
+                    if user_id != account.user_id() {
+                        peer_ledger += 1;
+                    }
+                } else {
+                    continue;
+                }
+                let key = (user_id.clone(), device_id.clone());
+                if invalid_identity_ids.contains(&key) {
+                    if user_id != account.user_id() {
+                        sender_key_changed += 1;
+                    }
+                    continue;
+                }
+                let Some(device) = eligible.get(&key) else {
+                    policy_blocked += 1;
+                    continue;
+                };
+                if device.curve25519_key() != Some(shared.sender_key) {
+                    if user_id != account.user_id() {
+                        sender_key_changed += 1;
+                    }
+                    continue;
+                }
+                targets.push(device.clone());
+            }
+        }
+        Ok((
+            targets,
+            peer_ledger,
+            sender_key_changed,
+            policy_blocked,
+            should_rotate,
+            !invalid_identity_ids.is_empty(),
+        ))
+    }
+
+    /// Prepare the manual index-0 recovery resend (issue #541). This reads
+    /// only the immutable initial-share ledger, never the live share/pending
+    /// view, and accepts an outbound session at any message index.
+    pub async fn prepare_manual_index0_resend(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<(ManualIndex0ResendPreparation, Option<(OwnedTransactionId, KeysClaimRequest)>)>
+    {
+        let settings = encryption_settings.into();
+        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
+            return Ok((
+                Self::resend_preparation(room_id, ManualIndex0ResendOutcome::NoSession, None, None),
+                None,
+            ));
+        };
+        let message_index_before = outbound.message_index().await;
+        if outbound.expired() || outbound.invalidated() {
+            return Ok((
+                Self::resend_preparation(
+                    room_id,
+                    ManualIndex0ResendOutcome::PolicyBlocked,
+                    Some(message_index_before),
+                    None,
+                ),
+                None,
+            ));
+        }
+        let session_id = outbound.session_id().to_owned();
+        let Some(inbound) = self.store.get_inbound_group_session(room_id, &session_id).await?
+        else {
+            return Ok((
+                Self::resend_preparation(
+                    room_id,
+                    ManualIndex0ResendOutcome::InboundSessionMissing,
+                    Some(message_index_before),
+                    None,
+                ),
+                None,
+            ));
+        };
+        let first_known_index = inbound.first_known_index();
+        if inbound.room_id() != room_id || inbound.session_id() != session_id {
+            return Ok((
+                Self::resend_preparation(
+                    room_id,
+                    ManualIndex0ResendOutcome::InboundSessionMissing,
+                    Some(message_index_before),
+                    Some(first_known_index),
+                ),
+                None,
+            ));
+        }
+        if first_known_index != 0 {
+            return Ok((
+                Self::resend_preparation(
+                    room_id,
+                    ManualIndex0ResendOutcome::InboundIndexAdvanced,
+                    Some(message_index_before),
+                    Some(first_known_index),
+                ),
+                None,
+            ));
+        }
+        if !outbound.initial_share_tracking_enabled() || outbound.initial_share_ledger().is_none() {
+            return Ok((
+                Self::resend_preparation(
+                    room_id,
+                    ManualIndex0ResendOutcome::OriginalLedgerMissing,
+                    Some(message_index_before),
+                    Some(first_known_index),
+                ),
+                None,
+            ));
+        }
+        let has_shared_proof = outbound.initial_share_ledger().is_some_and(|ledger| {
+            ledger.iter().any(|(user_id, devices)| {
+                devices.iter().any(|(device_id, info)| {
+                    matches!(info, ShareInfo::Shared(_))
+                        && !(user_id == self.store.user_id() && device_id == self.store.device_id())
+                })
+            })
+        });
+        if !has_shared_proof {
+            return Ok((
+                Self::resend_preparation(
+                    room_id,
+                    ManualIndex0ResendOutcome::OriginalLedgerMissing,
+                    Some(message_index_before),
+                    Some(first_known_index),
+                ),
+                None,
+            ));
+        }
+        let (
+            targets,
+            peer_ledger,
+            sender_key_changed,
+            policy_blocked,
+            should_rotate,
+            identity_invalid,
+        ) = self.collect_resend_targets(&outbound, users, &settings).await?;
+        if identity_invalid {
+            let mut preparation = Self::resend_preparation(
+                room_id,
+                ManualIndex0ResendOutcome::StaleIdentityRefused,
+                Some(message_index_before),
+                Some(first_known_index),
+            );
+            preparation.peer_ledger = peer_ledger;
+            preparation.peer_sender_key_changed = sender_key_changed;
+            preparation.policy_blocked = policy_blocked;
+            return Ok((preparation, None));
+        }
+        if should_rotate {
+            let mut preparation = Self::resend_preparation(
+                room_id,
+                ManualIndex0ResendOutcome::PolicyBlocked,
+                Some(message_index_before),
+                Some(first_known_index),
+            );
+            preparation.peer_ledger = peer_ledger;
+            preparation.policy_blocked = policy_blocked;
+            return Ok((preparation, None));
+        }
+        if sender_key_changed > 0 {
+            let mut preparation = Self::resend_preparation(
+                room_id,
+                ManualIndex0ResendOutcome::StaleIdentityRefused,
+                Some(message_index_before),
+                Some(first_known_index),
+            );
+            preparation.peer_ledger = peer_ledger;
+            preparation.peer_sender_key_changed = sender_key_changed;
+            preparation.policy_blocked = policy_blocked;
+            return Ok((preparation, None));
+        }
+        if targets.is_empty() {
+            let outcome = if sender_key_changed > 0 {
+                ManualIndex0ResendOutcome::StaleIdentityRefused
+            } else if policy_blocked > 0 {
+                ManualIndex0ResendOutcome::PolicyBlocked
+            } else {
+                ManualIndex0ResendOutcome::NoRecipients
+            };
+            let mut preparation = Self::resend_preparation(
+                room_id,
+                outcome,
+                Some(message_index_before),
+                Some(first_known_index),
+            );
+            preparation.peer_ledger = peer_ledger;
+            preparation.peer_sender_key_changed = sender_key_changed;
+            preparation.policy_blocked = policy_blocked;
+            return Ok((preparation, None));
+        }
+        let peer_eligible =
+            targets.iter().filter(|device| device.user_id() != self.store.user_id()).count();
+        let preparation = ManualIndex0ResendPreparation {
+            outcome: ManualIndex0ResendOutcome::Completed,
+            room_id: room_id.to_owned(),
+            session_id: Some(session_id),
+            targets,
+            claim_occurred: false,
+            claim_checked: false,
+            message_index_before: Some(message_index_before),
+            peer_ledger,
+            peer_eligible,
+            peer_sender_key_changed: sender_key_changed,
+            policy_blocked,
+            inbound_first_known_index: Some(first_known_index),
+        };
+        Ok((preparation, None))
+    }
+
+    fn summary_for_preparation(
+        preparation: &ManualIndex0ResendPreparation,
+        outcome: ManualIndex0ResendOutcome,
+    ) -> ManualIndex0ResendSummary {
+        let mut summary = preparation.summary();
+        summary.outcome = outcome;
+        summary
+    }
+
+    /// Finalize the manual recovery resend after each claim response.
+    pub async fn finalize_manual_index0_resend(
+        &self,
+        mut preparation: ManualIndex0ResendPreparation,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<ManualIndex0ResendStep> {
+        if preparation.outcome != ManualIndex0ResendOutcome::Completed {
+            return Ok(ManualIndex0ResendStep::Ready {
+                requests: Vec::new(),
+                summary: ManualIndex0ResendSummary {
+                    outcome: preparation.outcome,
+                    message_index_before: preparation.message_index_before,
+                    message_index_after: preparation.message_index_before,
+                    peer_ledger: preparation.peer_ledger,
+                    peer_sender_key_changed: preparation.peer_sender_key_changed,
+                    peer_eligible: preparation.peer_eligible,
+                    peer_accepted: 0,
+                    peer_missing: 0,
+                    policy_blocked: preparation.policy_blocked,
+                    inbound_first_known_index: preparation.inbound_first_known_index,
+                    claim: ManualClaimOutcome::NotNeeded,
+                    elapsed_ms: 0,
+                    room_event_sent: false,
+                    index0_consumed: false,
+                },
+            });
+        }
+        let settings = encryption_settings.into();
+        let Some(outbound) = self.sessions.get_or_load(&preparation.room_id).await else {
+            let summary =
+                Self::summary_for_preparation(&preparation, ManualIndex0ResendOutcome::NoSession);
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        };
+        if outbound.expired() || outbound.invalidated() {
+            let summary = Self::summary_for_preparation(
+                &preparation,
+                ManualIndex0ResendOutcome::PolicyBlocked,
+            );
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        }
+        if preparation.session_id.as_deref() != Some(outbound.session_id()) {
+            let summary = Self::summary_for_preparation(
+                &preparation,
+                ManualIndex0ResendOutcome::CancelledStale,
+            );
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        }
+        let Some(inbound) = self
+            .store
+            .get_inbound_group_session(&preparation.room_id, outbound.session_id())
+            .await?
+        else {
+            let summary = Self::summary_for_preparation(
+                &preparation,
+                ManualIndex0ResendOutcome::InboundSessionMissing,
+            );
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        };
+        if inbound.room_id() != preparation.room_id || inbound.session_id() != outbound.session_id()
+        {
+            let summary = Self::summary_for_preparation(
+                &preparation,
+                ManualIndex0ResendOutcome::InboundSessionMissing,
+            );
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        }
+        if inbound.first_known_index() != 0 {
+            let mut summary = Self::summary_for_preparation(
+                &preparation,
+                ManualIndex0ResendOutcome::InboundIndexAdvanced,
+            );
+            summary.inbound_first_known_index = Some(inbound.first_known_index());
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        }
+        let (
+            current_targets,
+            peer_ledger,
+            sender_key_changed,
+            policy_blocked,
+            should_rotate,
+            identity_invalid,
+        ) = self.collect_resend_targets(&outbound, users, &settings).await?;
+        if identity_invalid {
+            let mut summary = ManualIndex0ResendSummary::failed();
+            summary.outcome = ManualIndex0ResendOutcome::StaleIdentityRefused;
+            summary.message_index_before = preparation.message_index_before;
+            summary.message_index_after = preparation.message_index_before;
+            summary.peer_ledger = peer_ledger;
+            summary.peer_eligible = preparation.peer_eligible;
+            summary.peer_sender_key_changed = sender_key_changed;
+            summary.policy_blocked = policy_blocked;
+            summary.peer_missing = summary.peer_eligible;
+            summary.inbound_first_known_index = Some(0);
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        }
+        if should_rotate {
+            let mut summary = ManualIndex0ResendSummary::failed();
+            summary.outcome = ManualIndex0ResendOutcome::PolicyBlocked;
+            summary.message_index_before = preparation.message_index_before;
+            summary.message_index_after = preparation.message_index_before;
+            summary.peer_ledger = peer_ledger;
+            summary.policy_blocked = policy_blocked;
+            summary.inbound_first_known_index = Some(0);
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        }
+        let prepared_ids = preparation
+            .targets
+            .iter()
+            .map(|device| (device.user_id().to_owned(), device.device_id().to_owned()))
+            .collect::<BTreeSet<_>>();
+        if sender_key_changed > 0 {
+            let mut summary = ManualIndex0ResendSummary::failed();
+            summary.outcome = ManualIndex0ResendOutcome::StaleIdentityRefused;
+            summary.message_index_before = preparation.message_index_before;
+            summary.message_index_after = preparation.message_index_before;
+            summary.peer_ledger = preparation.peer_ledger;
+            summary.peer_sender_key_changed = sender_key_changed;
+            summary.policy_blocked = preparation.policy_blocked;
+            summary.peer_missing = summary.peer_eligible;
+            summary.inbound_first_known_index = Some(0);
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        }
+        preparation.targets = current_targets
+            .into_iter()
+            .filter(|device| {
+                prepared_ids.contains(&(device.user_id().to_owned(), device.device_id().to_owned()))
+            })
+            .collect();
+        preparation.peer_eligible = preparation
+            .targets
+            .iter()
+            .filter(|device| device.user_id() != self.store.user_id())
+            .count();
+        preparation.peer_sender_key_changed = sender_key_changed;
+        preparation.policy_blocked = policy_blocked;
+        if preparation.targets.is_empty() {
+            let outcome = if sender_key_changed > 0 {
+                ManualIndex0ResendOutcome::StaleIdentityRefused
+            } else if policy_blocked > 0 {
+                ManualIndex0ResendOutcome::PolicyBlocked
+            } else {
+                ManualIndex0ResendOutcome::NoRecipients
+            };
+            let claim = if preparation.claim_occurred {
+                ManualClaimOutcome::Succeeded
+            } else {
+                ManualClaimOutcome::NotNeeded
+            };
+            return Ok(ManualIndex0ResendStep::Ready {
+                requests: Vec::new(),
+                summary: ManualIndex0ResendSummary {
+                    outcome,
+                    message_index_before: preparation.message_index_before,
+                    message_index_after: preparation.message_index_before,
+                    peer_ledger,
+                    peer_sender_key_changed: sender_key_changed,
+                    peer_eligible: 0,
+                    peer_accepted: 0,
+                    peer_missing: preparation.peer_eligible,
+                    policy_blocked,
+                    inbound_first_known_index: Some(0),
+                    claim,
+                    elapsed_ms: 0,
+                    room_event_sent: false,
+                    index0_consumed: false,
+                },
+            });
+        }
+        let claim_targets = preparation.targets.iter().fold(
+            BTreeMap::<OwnedUserId, BTreeSet<OwnedDeviceId>>::new(),
+            |mut result, device| {
+                result
+                    .entry(device.user_id().to_owned())
+                    .or_default()
+                    .insert(device.device_id().to_owned());
+                result
+            },
+        );
+        if !preparation.claim_checked {
+            return Ok(ManualIndex0ResendStep::NeedsClaimTargets {
+                targets: claim_targets,
+                continuation: preparation,
+            });
+        }
+        let Some(ledger) = outbound.initial_share_ledger() else {
+            let summary = Self::summary_for_preparation(
+                &preparation,
+                ManualIndex0ResendOutcome::OriginalLedgerMissing,
+            );
+            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+        };
+        let mut validated_devices = Vec::new();
+        for target in &preparation.targets {
+            let expected_key = ledger
+                .get(target.user_id())
+                .and_then(|devices| devices.get(target.device_id()))
+                .and_then(|info| match info {
+                    ShareInfo::Shared(shared) => Some(shared.sender_key),
+                    ShareInfo::Withheld(_) => None,
+                });
+            let Some(expected_key) = expected_key else {
+                let mut summary = Self::summary_for_preparation(
+                    &preparation,
+                    ManualIndex0ResendOutcome::StaleIdentityRefused,
+                );
+                summary.peer_sender_key_changed = summary.peer_sender_key_changed.saturating_add(1);
+                return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+            };
+            let Some(device) = self.store.get_device(target.user_id(), target.device_id()).await?
+            else {
+                let mut summary = Self::summary_for_preparation(
+                    &preparation,
+                    ManualIndex0ResendOutcome::StaleIdentityRefused,
+                );
+                summary.peer_sender_key_changed = summary.peer_sender_key_changed.saturating_add(1);
+                return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+            };
+            if device.curve25519_key() != Some(expected_key)
+                || target.curve25519_key() != Some(expected_key)
+            {
+                let mut summary = Self::summary_for_preparation(
+                    &preparation,
+                    ManualIndex0ResendOutcome::StaleIdentityRefused,
+                );
+                summary.peer_sender_key_changed = summary.peer_sender_key_changed.saturating_add(1);
+                return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
+            }
+            validated_devices.push((target, device, expected_key));
+        }
+        let mut changes = Changes::default();
+        let mut staged = Vec::new();
+        for (target, device, expected_key) in validated_devices {
+            let (used_session, content) =
+                device.encrypt_room_key_for_forwarding(inbound.clone(), Some(0)).await?;
+            changes.sessions.push(used_session);
+            let event_type = content.event_type().to_owned();
+            let request = Arc::new(ToDeviceRequest::new(
+                target.user_id(),
+                target.device_id().to_owned(),
+                &event_type,
+                content.cast(),
+            ));
+            let mut share_infos = BTreeMap::new();
+            share_infos.entry(target.user_id().to_owned()).or_insert_with(BTreeMap::new).insert(
+                target.device_id().to_owned(),
+                ShareInfo::new_shared(expected_key, 0, Default::default()),
+            );
+            staged.push((request, share_infos));
+        }
+        let pre_queue = outbound.snapshot_state();
+        let mut requests = Vec::new();
+        let mut request_ids = Vec::new();
+        for (request, share_infos) in staged {
+            let txn_id = request.txn_id.clone();
+            outbound.add_request_with_kind(
+                txn_id.clone(),
+                request.clone(),
+                share_infos,
+                ShareRequestKind::Manual,
+            );
+            self.sessions.mark_as_being_shared(txn_id.clone(), outbound.clone());
+            request_ids.push(txn_id);
+            requests.push(request);
+        }
+        changes.outbound_group_sessions.push(outbound.clone());
+        if let Err(error) = self.store.save_changes(changes).await {
+            for request_id in &request_ids {
+                self.sessions.remove_from_being_shared(request_id);
+            }
+            outbound.restore_state(pre_queue);
+            return Err(error.into());
+        }
+        let peer_accepted = preparation
+            .targets
+            .iter()
+            .filter(|device| device.user_id() != self.store.user_id())
+            .count();
+        let peer_missing = 0;
+        let claim = if preparation.claim_occurred {
+            ManualClaimOutcome::Succeeded
+        } else {
+            ManualClaimOutcome::NotNeeded
+        };
+        Ok(ManualIndex0ResendStep::Ready {
+            requests,
+            summary: ManualIndex0ResendSummary {
+                outcome: ManualIndex0ResendOutcome::Completed,
+                message_index_before: preparation.message_index_before,
+                message_index_after: preparation.message_index_before,
+                peer_ledger: preparation.peer_ledger,
+                peer_sender_key_changed: preparation.peer_sender_key_changed,
+                peer_eligible: preparation.peer_eligible,
+                peer_accepted,
+                peer_missing,
+                policy_blocked: preparation.policy_blocked,
+                inbound_first_known_index: Some(0),
+                claim,
+                elapsed_ms: 0,
+                room_event_sent: false,
+                index0_consumed: false,
+            },
+        })
+    }
+
     /// `room_id` - The room id of the room where the room key will be used.
     ///
     /// `users` - The list of users that should receive the room key.
@@ -1547,8 +2312,14 @@ impl GroupSessionManager {
         // for the m.room_key_withheld events since we might have more of those
         // coming from the `collect_session_recipients()` method. Instead they get
         // returned by the method.
-        let unable_to_encrypt_devices =
-            self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        let unable_to_encrypt_devices = self
+            .encrypt_for_devices(
+                devices,
+                &outbound,
+                &mut changes,
+                if created_session { ShareRequestKind::Initial } else { ShareRequestKind::Normal },
+            )
+            .await?;
 
         // Issue #509: report devices that had no Olm session (the SDK claims a
         // one-time key and queues an `m.no_olm` withheld notice).
@@ -1577,7 +2348,11 @@ impl GroupSessionManager {
 
         // Now handle and add the withheld recipients to the resulting requests to the
         // `OutboundGroupSession`.
-        self.handle_withheld_devices(&outbound, withheld_devices)?;
+        self.handle_withheld_devices(
+            &outbound,
+            withheld_devices,
+            if created_session { ShareRequestKind::Initial } else { ShareRequestKind::Normal },
+        )?;
 
         // The to-device requests get added to the outbound group session, this
         // way we're making sure that they are persisted and scoped to the
@@ -1620,7 +2395,7 @@ impl GroupSessionManager {
             if !outbound.shared() {
                 debug!("The room key doesn't need to be shared with anyone. Marking as shared.");
 
-                outbound.mark_as_shared();
+                outbound.commit_empty_initial_share();
                 changes.outbound_group_sessions.push(outbound.clone());
             }
         } else {
@@ -1784,7 +2559,9 @@ impl GroupSessionManager {
         let previous_request_ids =
             outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
         let mut changes = Changes::default();
-        let unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        let unable_to_encrypt = self
+            .encrypt_for_devices(devices, &outbound, &mut changes, ShareRequestKind::Normal)
+            .await?;
         let account = self.store.static_account();
         for (device, code) in &unable_to_encrypt {
             self.room_key_diagnostics.emit_initial_share_device(
@@ -2002,7 +2779,11 @@ impl GroupSessionManager {
                             .get(device.user_id())
                             .is_some_and(|devices| devices.contains(device.device_id()))
                     });
-                    target_matches && exact_target_matches && !sharing.has_pending_share(device)
+                    let pending = sharing.has_pending_share(device);
+                    target_matches
+                        && exact_target_matches
+                        && !pending
+                        && !outbound.has_failed_manual_reshare(device)
                 })
                 .collect::<Vec<_>>()
         };
@@ -2013,7 +2794,9 @@ impl GroupSessionManager {
         let previous_request_ids =
             outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
         let mut changes = Changes::default();
-        let unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        let unable_to_encrypt = self
+            .encrypt_for_devices(devices, &outbound, &mut changes, ShareRequestKind::Normal)
+            .await?;
         for (device, code) in &unable_to_encrypt {
             self.room_key_diagnostics.emit_initial_share_device(
                 room_id,
@@ -2033,6 +2816,9 @@ impl GroupSessionManager {
             .into_iter()
             .filter(|request| !previous_request_ids.contains(&request.txn_id))
             .collect::<Vec<_>>();
+        for (device, _) in &unable_to_encrypt {
+            outbound.record_failed_manual_reshare(device);
+        }
         let failed_recipient_count = unable_to_encrypt.len();
         if requests.is_empty() {
             return Ok(if failed_recipient_count == 0 {
@@ -2137,7 +2923,9 @@ impl GroupSessionManager {
         let previous_request_ids =
             outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
         let mut changes = Changes::default();
-        let unable_to_encrypt = self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
+        let unable_to_encrypt = self
+            .encrypt_for_devices(devices, &outbound, &mut changes, ShareRequestKind::Normal)
+            .await?;
         for (device, code) in &unable_to_encrypt {
             self.room_key_diagnostics.emit_initial_share_device(
                 room_id,

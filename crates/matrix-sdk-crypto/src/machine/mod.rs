@@ -92,8 +92,8 @@ use crate::{
     },
     session_manager::{
         GroupSessionManager, Index0ReshareDecision, ManualClaimOutcome, ManualFinalizeStep,
-        ManualIndex0Preparation, ManualIndex0ShareOutcome, ManualIndex0ShareSummary,
-        SessionManager, UnwedgeReshareOutcome,
+        ManualIndex0Preparation, ManualIndex0ResendPreparation, ManualIndex0ResendStep,
+        ManualIndex0ShareOutcome, ManualIndex0ShareSummary, SessionManager, UnwedgeReshareOutcome,
     },
     store::{
         CryptoStoreWrapper, IntoCryptoStore, MemoryStore, Result as StoreResult, SecretImportError,
@@ -1778,7 +1778,7 @@ impl OlmMachine {
         if !changes.is_empty() {
             self.inner.store.save_changes(changes).await?;
         }
-        let requests = outbound.pending_requests();
+        let requests = outbound.pending_manual_requests();
 
         // Closed summary buckets (no identifiers).
         let own_missing = withheld
@@ -1830,6 +1830,79 @@ impl OlmMachine {
         };
 
         Ok(ManualFinalizeStep::Ready { requests, summary })
+    }
+
+    /// Prepare the one-shot index-0 recovery resend (issue #541).
+    pub async fn prepare_manual_index0_resend(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<(ManualIndex0ResendPreparation, Option<(OwnedTransactionId, KeysClaimRequest)>)>
+    {
+        let (preparation, _) = self
+            .inner
+            .group_session_manager
+            .prepare_manual_index0_resend(room_id, users, encryption_settings)
+            .await?;
+        let claim_targets = preparation.targets.iter().fold(
+            BTreeMap::<OwnedUserId, BTreeSet<OwnedDeviceId>>::new(),
+            |mut result, device| {
+                result
+                    .entry(device.user_id().to_owned())
+                    .or_default()
+                    .insert(device.device_id().to_owned());
+                result
+            },
+        );
+        let claim = if claim_targets.is_empty() {
+            None
+        } else {
+            self.inner.session_manager.get_missing_sessions_for_devices(claim_targets).await?
+        };
+        let mut preparation = preparation;
+        if claim.is_some() {
+            preparation.claim_occurred = true;
+        }
+        Ok((preparation, claim))
+    }
+
+    /// Continue the one-shot index-0 recovery resend after claims.
+    pub async fn finalize_manual_index0_resend(
+        &self,
+        preparation: ManualIndex0ResendPreparation,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<ManualIndex0ResendStep> {
+        let users = users.map(ToOwned::to_owned).collect::<Vec<_>>();
+        let settings = encryption_settings.into();
+        let step = self
+            .inner
+            .group_session_manager
+            .finalize_manual_index0_resend(
+                preparation,
+                users.iter().map(|user| user.as_ref()),
+                settings.clone(),
+            )
+            .await?;
+        let ManualIndex0ResendStep::NeedsClaimTargets { targets, mut continuation } = step else {
+            return Ok(step);
+        };
+        if let Some((request_id, request)) =
+            self.inner.session_manager.get_missing_sessions_for_devices(targets).await?
+        {
+            continuation.claim_occurred = true;
+            return Ok(ManualIndex0ResendStep::NeedsClaim { request_id, request, continuation });
+        }
+        continuation.claim_checked = true;
+        self.inner
+            .group_session_manager
+            .finalize_manual_index0_resend(
+                continuation,
+                users.iter().map(|user| user.as_ref()),
+                settings,
+            )
+            .await
     }
 
     /// Get to-device requests to share a room key with users in a room.
@@ -1884,14 +1957,10 @@ impl OlmMachine {
         owned_ids: &[OwnedTransactionId],
         claim_expectation: Option<&TransactionId>,
     ) -> StoreResult<()> {
-        self.inner
-            .group_session_manager
-            .cleanup_manual_pending_requests(room_id, owned_ids)
-            .await?;
         if let Some(claim_id) = claim_expectation {
             self.inner.session_manager.cancel_keys_claim_expectation(claim_id);
         }
-        Ok(())
+        self.inner.group_session_manager.cleanup_manual_pending_requests(room_id, owned_ids).await
     }
 
     /// Mark a manual index-0 share request as sent with a transactional

@@ -14,15 +14,17 @@
 
 //! Tests for the manual index-0 room-key share (issue #538).
 
-use std::iter;
+use std::{iter, sync::Arc};
 
 use assert_matches2::assert_let;
 use matrix_sdk_test::async_test;
-use ruma::{room_id, user_id};
+use ruma::{events::room::history_visibility::HistoryVisibility, room_id, user_id};
 
 use crate::{
-    EncryptionSettings, ManualFinalizeStep, ManualIndex0ShareOutcome,
+    EncryptionSettings, ManualFinalizeStep, ManualIndex0ResendOutcome, ManualIndex0ResendStep,
+    ManualIndex0ShareOutcome,
     machine::test_helpers::get_machine_pair_with_setup_sessions_test_helper,
+    olm::OutboundGroupSession,
 };
 
 async fn settle_preshare(
@@ -87,11 +89,181 @@ async fn test_manual_index0_share_queues_index0_requests_without_advancing_index
 
     for request in &requests {
         assert_eq!(request.event_type.to_string(), "m.room.encrypted");
-        alice.inner.group_session_manager.mark_request_as_sent(&request.txn_id).await.unwrap();
+        alice
+            .inner
+            .group_session_manager
+            .mark_manual_request_as_sent(&request.txn_id)
+            .await
+            .unwrap();
     }
 
     let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
     assert_eq!(outbound.message_index().await, 0, "share must not consume index 0");
+}
+
+/// The issue-541 resend works after the current outbound index advances and
+/// emits an encrypted to-device request without consuming another index.
+#[async_test]
+async fn test_manual_index0_resend_uses_original_ledger_after_index_advanced() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    let _ = outbound.encrypt_helper("advance".to_owned()).await;
+    assert_eq!(outbound.message_index().await, 1);
+
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    let step = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert_let!(ManualIndex0ResendStep::Ready { requests, summary } = step);
+    assert!(!requests.is_empty());
+    assert_eq!(summary.outcome, ManualIndex0ResendOutcome::Completed);
+    assert_eq!(summary.message_index_before, Some(1));
+    assert_eq!(summary.message_index_after, Some(1));
+    assert_eq!(summary.claim, crate::ManualClaimOutcome::NotNeeded);
+    assert!(!summary.index0_consumed);
+    assert!(requests.iter().all(|request| request.event_type.to_string() == "m.room.encrypted"));
+    assert!(outbound.pending_requests().is_empty());
+    assert_eq!(outbound.pending_manual_requests().len(), requests.len());
+    let restored = OutboundGroupSession::from_pickle(
+        alice.device_id().to_owned(),
+        Arc::new(alice.identity_keys()),
+        outbound.pickle().await,
+    )
+    .unwrap();
+    assert!(restored.pending_requests().is_empty());
+    assert!(restored.pending_manual_requests().is_empty());
+    assert_eq!(outbound.message_index().await, 1);
+}
+
+/// A current-member input that is absent from the immutable ledger cannot
+/// widen the resend target set.
+#[async_test]
+async fn test_manual_index0_resend_does_not_widen_to_unshared_user() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-no-widen:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    let _ = outbound.encrypt_helper("advance".to_owned()).await;
+    let users = [bob.user_id(), user_id!("@new:example.org")];
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            users.iter().copied(),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    let step = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            users.iter().copied(),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert_let!(ManualIndex0ResendStep::Ready { requests, summary } = step);
+    assert_eq!(summary.outcome, ManualIndex0ResendOutcome::Completed);
+    assert_eq!(summary.peer_eligible, 1);
+    assert_eq!(requests.len(), 1);
+}
+
+/// An invalidated current session cannot be used for historical recovery.
+#[async_test]
+async fn test_manual_index0_resend_refuses_invalidated_session() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-invalidated:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    outbound.invalidate_session();
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    assert_eq!(preparation.outcome, ManualIndex0ResendOutcome::PolicyBlocked);
+}
+
+/// A history-visibility change requires rotation and blocks historical resend.
+#[async_test]
+async fn test_manual_index0_resend_refuses_rotation_required_policy() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-policy:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let mut settings = EncryptionSettings::default();
+    settings.history_visibility = HistoryVisibility::WorldReadable;
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(&room_id, iter::once(bob.user_id()), settings)
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    assert_eq!(preparation.outcome, ManualIndex0ResendOutcome::PolicyBlocked);
+}
+
+/// A session whose initial sharing proof has not committed fails closed.
+#[async_test]
+async fn test_manual_index0_resend_requires_committed_initial_ledger() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-no-proof:example.org");
+    let requests = alice
+        .share_room_key(&room_id, iter::once(bob.user_id()), EncryptionSettings::default())
+        .await
+        .unwrap();
+    assert!(!requests.is_empty());
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    assert_eq!(preparation.outcome, ManualIndex0ResendOutcome::OriginalLedgerMissing);
 }
 
 /// A manual index-0 share is refused once the session has advanced past

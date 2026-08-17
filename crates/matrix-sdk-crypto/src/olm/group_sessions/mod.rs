@@ -26,7 +26,7 @@ pub use inbound::{InboundGroupSession, PickledInboundGroupSession};
 pub(crate) use outbound::ShareState;
 pub use outbound::{
     EncryptionSettings, OutboundGroupSession, OutboundGroupSessionEncryptionResult,
-    PickledOutboundGroupSession, ShareInfo,
+    PickledOutboundGroupSession, ShareInfo, ShareRequestKind,
 };
 pub use sender_data::{KnownSenderData, SenderData, SenderDataType};
 use thiserror::Error;

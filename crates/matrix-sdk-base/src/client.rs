@@ -28,9 +28,10 @@ use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, DeviceData, EncryptionSettings, Index0ReshareDecision,
-    InitialShareRepairPreparation, ManualFinalizeStep, ManualIndex0Preparation, OlmError,
-    OlmMachine, RoomKeyMemberReloadContext, RoomKeyReshareResult, RoomKeyReshareTarget,
-    RoomKeyRotationReason, TrustRequirement, UnwedgeReshareOutcome, store::DynCryptoStore,
+    InitialShareRepairPreparation, ManualFinalizeStep, ManualIndex0Preparation,
+    ManualIndex0ResendPreparation, ManualIndex0ResendStep, OlmError, OlmMachine,
+    RoomKeyMemberReloadContext, RoomKeyReshareResult, RoomKeyReshareTarget, RoomKeyRotationReason,
+    TrustRequirement, UnwedgeReshareOutcome, store::DynCryptoStore,
     store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
@@ -1340,6 +1341,43 @@ impl BaseClient {
         match self.olm_machine().await.as_ref() {
             Some(machine) => Ok(machine
                 .finalize_manual_index0_share(
+                    preparation,
+                    members.iter().map(Deref::deref),
+                    settings,
+                )
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Prepare the one-shot current-session index-0 recovery resend (issue #541).
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn prepare_manual_index0_resend(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(
+        ManualIndex0ResendPreparation,
+        Option<(ruma::OwnedTransactionId, ruma::api::client::keys::claim_keys::v3::Request)>,
+    )> {
+        let (members, settings) = self.room_key_share_context(room_id).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .prepare_manual_index0_resend(room_id, members.iter().map(Deref::deref), settings)
+                .await?),
+            None => panic!("Olm machine wasn't started"),
+        }
+    }
+
+    /// Continue the one-shot current-session index-0 recovery resend (issue #541).
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn finalize_manual_index0_resend(
+        &self,
+        preparation: ManualIndex0ResendPreparation,
+    ) -> Result<ManualIndex0ResendStep> {
+        let (members, settings) = self.room_key_share_context(preparation.room_id()).await?;
+        match self.olm_machine().await.as_ref() {
+            Some(machine) => Ok(machine
+                .finalize_manual_index0_resend(
                     preparation,
                     members.iter().map(Deref::deref),
                     settings,
