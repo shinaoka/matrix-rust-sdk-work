@@ -5565,6 +5565,8 @@ pub struct RoomMemberWithSenderInfo {
 mod tests {
     use std::collections::BTreeMap;
 
+    #[cfg(feature = "e2e-encryption")]
+    use super::CryptoManualIndex0ResendOutcome;
     use matrix_sdk_base::{ComposerDraft, DraftAttachment, store::ComposerDraftType};
     use matrix_sdk_test::{
         JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
@@ -5574,6 +5576,7 @@ mod tests {
         events::{relation::RelationType, room::member::MembershipState},
         owned_event_id, room_id, user_id,
     };
+    use tokio::sync::broadcast;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path_regex},
@@ -5595,6 +5598,22 @@ mod tests {
     fn test_room_key_reshare_token_debug_is_redacted() {
         let token = super::OutboundGroupSessionToken("secret-session-id".to_owned());
         assert_eq!(format!("{token:?}"), "OutboundGroupSessionToken(<redacted>)");
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_resend_index0_room_key_fences_before_crypto_when_validator_is_stale() {
+        use matrix_sdk_test::DEFAULT_TEST_ROOM_ID;
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room = server.sync_joined_room(&client, DEFAULT_TEST_ROOM_ID.as_ref()).await;
+        let (_sender, mut cancellation) = broadcast::channel(1);
+
+        let summary = room.resend_index0_room_key(&mut cancellation, || false).await.unwrap();
+        assert_eq!(summary.outcome, CryptoManualIndex0ResendOutcome::CancelledStale);
+        assert!(summary.message_index_before.is_none());
+        assert_eq!(summary.peer_accepted, 0);
     }
 
     #[cfg(all(feature = "sqlite", feature = "e2e-encryption"))]

@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    convert::Infallible,
-    sync::Arc,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(not(test))]
+use std::convert::Infallible;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use matrix_sdk_common::{
@@ -43,6 +44,8 @@ use super::{
         StoredRoomKeyBundleData, TrackedUser,
     },
 };
+#[cfg(test)]
+use crate::CryptoStoreError;
 use crate::{
     gossiping::{GossipRequest, SecretInfo},
     identities::{DeviceData, UserIdentityData},
@@ -115,6 +118,8 @@ pub struct MemoryStore {
     room_key_backups_fully_downloaded: StdRwLock<HashSet<OwnedRoomId>>,
     rooms_pending_key_bundle: StdRwLock<HashMap<OwnedRoomId, RoomPendingKeyBundleDetails>>,
 
+    #[cfg(test)]
+    fail_next_save_changes: AtomicBool,
     save_changes_lock: Arc<Mutex<()>>,
 }
 
@@ -122,6 +127,37 @@ impl MemoryStore {
     /// Create a new empty `MemoryStore`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_save_changes_for_test(&self) {
+        self.fail_next_save_changes.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_sessions_for_test(&self, sender_key: &str) -> bool {
+        self.sessions.write().remove(sender_key).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_inbound_group_session_for_test(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> bool {
+        let removed = self
+            .inbound_group_sessions
+            .write()
+            .get_mut(room_id)
+            .and_then(|sessions| sessions.remove(session_id))
+            .is_some();
+        if removed {
+            self.inbound_group_sessions_backed_up_to
+                .write()
+                .get_mut(room_id)
+                .map(|sessions| sessions.remove(session_id));
+        }
+        removed
     }
 
     fn get_static_account(&self) -> Option<StaticAccountData> {
@@ -190,12 +226,18 @@ impl MemoryStore {
     }
 }
 
+#[cfg(not(test))]
 type Result<T> = std::result::Result<T, Infallible>;
+#[cfg(test)]
+type Result<T> = std::result::Result<T, CryptoStoreError>;
 
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl CryptoStore for MemoryStore {
+    #[cfg(not(test))]
     type Error = Infallible;
+    #[cfg(test)]
+    type Error = CryptoStoreError;
 
     async fn close(&self) -> Result<()> {
         Ok(())
@@ -251,6 +293,12 @@ impl CryptoStore for MemoryStore {
 
     async fn save_changes(&self, changes: Changes) -> Result<()> {
         let _guard = self.save_changes_lock.lock().await;
+        #[cfg(test)]
+        if self.fail_next_save_changes.swap(false, Ordering::SeqCst) {
+            return Err(CryptoStoreError::backend(std::io::Error::other(
+                "injected save_changes failure",
+            )));
+        }
 
         let mut pickled_session: Vec<(String, PickledSession)> = Vec::new();
         for session in changes.sessions {
