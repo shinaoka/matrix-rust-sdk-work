@@ -21,6 +21,7 @@ mod client;
 mod error;
 mod list;
 
+use std::fmt;
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::Debug,
@@ -31,7 +32,6 @@ use std::{
     },
     time::Duration,
 };
-use std::fmt;
 
 use async_stream::stream;
 pub use client::{Version, VersionBuilder};
