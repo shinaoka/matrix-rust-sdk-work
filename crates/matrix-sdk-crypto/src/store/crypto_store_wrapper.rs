@@ -259,6 +259,12 @@ impl CryptoStoreWrapper {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "testing"))]
+    /// Clear cached Olm sessions without mutating durable test data.
+    pub async fn clear_sessions_for_testing(&self) {
+        self.sessions.clear_for_testing().await;
+    }
+
     pub async fn get_sessions(
         &self,
         sender_key: &str,

@@ -1594,6 +1594,12 @@ impl Store {
         Ok(RoomKeyImportResult::new(imported_count, total_count, keys))
     }
 
+    #[cfg(any(test, feature = "testing"))]
+    /// Clear cached Olm sessions without mutating durable test data.
+    pub async fn clear_olm_sessions_for_testing(&self) {
+        self.inner.store.clear_sessions_for_testing().await;
+    }
+
     pub(crate) fn crypto_store(&self) -> Arc<CryptoStoreWrapper> {
         self.inner.store.clone()
     }

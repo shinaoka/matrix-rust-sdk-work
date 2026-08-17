@@ -487,6 +487,12 @@ impl OlmMachine {
         &self.inner.store
     }
 
+    #[cfg(any(test, feature = "testing"))]
+    /// Clear cached Olm sessions without mutating durable test data.
+    pub async fn clear_olm_sessions_for_testing(&self) {
+        self.store().clear_olm_sessions_for_testing().await;
+    }
+
     /// The unique user id that owns this `OlmMachine` instance.
     pub fn user_id(&self) -> &UserId {
         &self.inner.user_id
