@@ -1132,19 +1132,6 @@ impl OutboundGroupSession {
         Some((request, infos, kind))
     }
 
-    /// Restore a previously removed un-sent request (rollback of a failed
-    /// transactional manual mark, issue #538).
-    pub(crate) fn restore_request(
-        &self,
-        request_id: &TransactionId,
-        request: (Arc<ToDeviceRequest>, ShareInfoSet, ShareRequestKind),
-    ) {
-        let (request, infos, kind) = request;
-        let mut state = self.request_state.write();
-        state.requests.insert(request_id.to_owned(), (request, infos));
-        state.kinds.insert(request_id.to_owned(), kind);
-    }
-
     /// Read the per-device share infos of a still-pending request (issue
     /// #509). Returns `None` when the request is no longer pending.
     pub(crate) fn pending_share_infos(&self, request_id: &TransactionId) -> Option<ShareInfoSet> {

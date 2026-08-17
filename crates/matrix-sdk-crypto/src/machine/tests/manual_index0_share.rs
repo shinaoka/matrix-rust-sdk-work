@@ -14,7 +14,7 @@
 
 //! Tests for the manual index-0 room-key share (issue #538).
 
-use std::{iter, sync::Arc};
+use std::{iter, sync::Arc, time::Duration};
 
 use assert_matches2::assert_let;
 use matrix_sdk_test::async_test;
@@ -426,6 +426,154 @@ async fn test_manual_index0_resend_mark_and_cleanup_roll_back_on_failure() {
     assert!(persisted.pending_manual_requests().is_empty());
     assert!(persisted.pending_requests().is_empty());
 
+    alice.cleanup_manual_pending_requests(&room_id, &[request_id], None).await.unwrap();
+    assert!(outbound.pending_manual_requests().is_empty());
+}
+
+/// Dropping a finalize future while durable persistence is blocked restores the
+/// outbound queue and leaves an explicit retry possible.
+#[async_test]
+async fn test_manual_index0_resend_finalize_cancellation_rolls_back() {
+    let (alice, bob, alice_store) = get_machine_pair_with_removable_alice_store().await;
+    let room_id = room_id!("!resend-finalize-cancel:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    let _ = outbound.encrypt_helper("advance".to_owned()).await;
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+
+    let save_hold = alice_store.hold_save_changes_for_test().await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            alice.finalize_manual_index0_resend(
+                preparation,
+                iter::once(bob.user_id()),
+                EncryptionSettings::default(),
+            ),
+        )
+        .await
+        .is_err()
+    );
+    assert!(outbound.pending_manual_requests().is_empty());
+    assert!(outbound.pending_request_ids().is_empty());
+    drop(save_hold);
+
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    let retry = alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(retry, ManualIndex0ResendStep::Ready { .. }));
+}
+
+/// Dropping mark and cleanup futures while persistence is blocked restores the
+/// pending request and its owner-map entry for a later retry.
+#[async_test]
+async fn test_manual_index0_resend_mark_and_cleanup_cancellation_roll_back() {
+    let (alice, bob, alice_store) = get_machine_pair_with_removable_alice_store().await;
+    let room_id = room_id!("!resend-mark-cleanup-cancel:example.org");
+    settle_preshare(&alice, &bob, &room_id).await;
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    let _ = outbound.encrypt_helper("advance".to_owned()).await;
+
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    let requests = match alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap()
+    {
+        ManualIndex0ResendStep::Ready { requests, .. } => requests,
+        other => panic!("expected queued manual request, got {other:?}"),
+    };
+    let request_id = requests.first().expect("manual request").txn_id.clone();
+    assert!(alice.inner.group_session_manager.find_request_owner(&request_id).is_some());
+
+    let save_hold = alice_store.hold_save_changes_for_test().await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            alice.mark_manual_request_as_sent(&request_id),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(outbound.pending_manual_requests().len(), 1);
+    assert!(alice.inner.group_session_manager.find_request_owner(&request_id).is_some());
+    drop(save_hold);
+    alice.mark_manual_request_as_sent(&request_id).await.unwrap();
+    assert!(alice.inner.group_session_manager.find_request_owner(&request_id).is_none());
+
+    let (preparation, claim) = alice
+        .prepare_manual_index0_resend(
+            &room_id,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_none());
+    let requests = match alice
+        .finalize_manual_index0_resend(
+            preparation,
+            iter::once(bob.user_id()),
+            EncryptionSettings::default(),
+        )
+        .await
+        .unwrap()
+    {
+        ManualIndex0ResendStep::Ready { requests, .. } => requests,
+        other => panic!("expected queued manual request, got {other:?}"),
+    };
+    let request_id = requests.first().expect("manual request").txn_id.clone();
+
+    let save_hold = alice_store.hold_save_changes_for_test().await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            alice.cleanup_manual_pending_requests(
+                &room_id,
+                std::slice::from_ref(&request_id),
+                None
+            ),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(outbound.pending_manual_requests().len(), 1);
+    assert!(alice.inner.group_session_manager.find_request_owner(&request_id).is_some());
+    drop(save_hold);
     alice.cleanup_manual_pending_requests(&room_id, &[request_id], None).await.unwrap();
     assert!(outbound.pending_manual_requests().is_empty());
 }

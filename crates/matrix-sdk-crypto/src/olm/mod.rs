@@ -32,7 +32,7 @@ pub use group_sessions::{
     SessionCreationError, SessionExportError, SessionKey, ShareInfo, ShareRequestKind,
 };
 pub(crate) use group_sessions::{
-    ShareState,
+    OutboundStateSnapshot, ShareState,
     sender_data_finder::{self, SenderDataFinder},
 };
 pub use session::{PickledSession, Session};

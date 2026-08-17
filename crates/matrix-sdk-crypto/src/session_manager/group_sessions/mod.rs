@@ -55,8 +55,8 @@ use crate::{
     identities::device::MaybeEncryptedRoomKey,
     olm::{
         InboundGroupSession, OutboundGroupSession, OutboundGroupSessionEncryptionResult,
-        SenderData, SenderDataFinder, Session, ShareInfo, ShareRequestKind, ShareState,
-        StaticAccountData,
+        OutboundStateSnapshot, SenderData, SenderDataFinder, Session, ShareInfo, ShareRequestKind,
+        ShareState, StaticAccountData,
     },
     room_key_diagnostics::{
         Index0ReshareOutcome, InitialShareDeviceClass, InitialShareRepairClaimOutcome,
@@ -548,6 +548,44 @@ impl GroupSessionCache {
     }
 }
 
+struct OutboundStateRollback {
+    session: OutboundGroupSession,
+    snapshot: Option<OutboundStateSnapshot>,
+    sessions: GroupSessionCache,
+    request_ids: Vec<OwnedTransactionId>,
+    remove_owner_on_drop: bool,
+}
+
+impl OutboundStateRollback {
+    fn new(
+        session: OutboundGroupSession,
+        snapshot: OutboundStateSnapshot,
+        sessions: GroupSessionCache,
+        request_ids: Vec<OwnedTransactionId>,
+        remove_owner_on_drop: bool,
+    ) -> Self {
+        Self { session, snapshot: Some(snapshot), sessions, request_ids, remove_owner_on_drop }
+    }
+
+    fn disarm(mut self) {
+        self.snapshot.take();
+    }
+}
+
+impl Drop for OutboundStateRollback {
+    fn drop(&mut self) {
+        let Some(snapshot) = self.snapshot.take() else {
+            return;
+        };
+        self.session.restore_state(snapshot);
+        if self.remove_owner_on_drop {
+            for request_id in &self.request_ids {
+                self.sessions.remove_from_being_shared(request_id);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GroupSessionManager {
     /// Store for the encryption keys.
@@ -576,6 +614,14 @@ impl GroupSessionManager {
         self.sessions.get_or_load(room_id).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn find_request_owner(
+        &self,
+        request_id: &TransactionId,
+    ) -> Option<OutboundGroupSession> {
+        self.sessions.find_request_owner(request_id)
+    }
+
     /// Remove owned un-sent manual share requests (issue #538 cleanup) from
     /// the outbound session's pending set and the being-shared map, and
     /// durably persist the session. Called on every non-completed/partial
@@ -593,11 +639,17 @@ impl GroupSessionManager {
             return Ok(());
         };
         let snapshot = outbound.snapshot_state();
+        let rollback = OutboundStateRollback::new(
+            outbound.clone(),
+            snapshot,
+            self.sessions.clone(),
+            owned_ids.to_vec(),
+            false,
+        );
         let mut owned = Vec::new();
         for id in owned_ids {
             if self.sessions.find_request_owner(id).is_some() {
                 if let Err(error) = outbound.remove_request(id) {
-                    outbound.restore_state(snapshot);
                     return Err(error);
                 }
                 owned.push(id.clone());
@@ -613,12 +665,10 @@ impl GroupSessionManager {
                 for id in owned {
                     self.sessions.remove_from_being_shared(&id);
                 }
+                rollback.disarm();
                 Ok(())
             }
-            Err(error) => {
-                outbound.restore_state(snapshot);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -748,14 +798,23 @@ impl GroupSessionManager {
         let Some(session) = self.sessions.find_request_owner(request_id) else {
             return Ok(());
         };
-        let Some(removed) = session.remove_request_captured(request_id) else {
+        let rollback = OutboundStateRollback::new(
+            session.clone(),
+            session.snapshot_state(),
+            self.sessions.clone(),
+            vec![request_id.to_owned()],
+            false,
+        );
+        let Some(_removed) = session.remove_request_captured(request_id) else {
             if session.pending_request_ids().iter().any(|id| id == request_id) {
+                rollback.disarm();
                 return Err(CryptoStoreError::backend(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "missing manual request kind",
                 )));
             }
             // Nothing pending for this request id; nothing to do.
+            rollback.disarm();
             return Ok(());
         };
 
@@ -764,12 +823,10 @@ impl GroupSessionManager {
         match self.store.save_changes(changes).await {
             Ok(()) => {
                 self.sessions.remove_from_being_shared(request_id);
+                rollback.disarm();
                 Ok(())
             }
-            Err(error) => {
-                session.restore_request(request_id, removed);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -2135,6 +2192,14 @@ impl GroupSessionManager {
         let pre_queue = outbound.snapshot_state();
         let mut requests = Vec::new();
         let mut request_ids = Vec::new();
+        let rollback_ids = staged.iter().map(|(request, _)| request.txn_id.clone()).collect();
+        let rollback = OutboundStateRollback::new(
+            outbound.clone(),
+            pre_queue,
+            self.sessions.clone(),
+            rollback_ids,
+            true,
+        );
         for (request, share_infos) in staged {
             let txn_id = request.txn_id.clone();
             outbound.add_request_with_kind(
@@ -2149,12 +2214,9 @@ impl GroupSessionManager {
         }
         changes.outbound_group_sessions.push(outbound.clone());
         if let Err(error) = self.store.save_changes(changes).await {
-            for request_id in &request_ids {
-                self.sessions.remove_from_being_shared(request_id);
-            }
-            outbound.restore_state(pre_queue);
             return Err(error.into());
         }
+        rollback.disarm();
         let peer_accepted = preparation
             .targets
             .iter()
