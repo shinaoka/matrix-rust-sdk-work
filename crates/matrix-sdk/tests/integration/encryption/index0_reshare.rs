@@ -132,6 +132,110 @@ async fn test_manual_index0_room_resend_preserves_index_and_sends_to_device_key(
 }
 
 #[async_test]
+async fn test_manual_index0_room_resend_failure_cleans_pending_requests() {
+    let (server, alice, room_id, _events) = setup_encrypted_room().await;
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_clone = Arc::clone(&attempts);
+    Mock::given(method("PUT"))
+        .and(path_regex(TO_DEVICE_PATH))
+        .respond_with(move |_request: &Request| {
+            let attempt = attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 2 {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY)
+            }
+        })
+        .expect(4)
+        .named("failed_then_retried_manual_resend")
+        .mount(server.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(ROOM_SEND_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
+        .expect(1)
+        .mount(server.server())
+        .await;
+
+    let room = alice.get_room(&room_id).unwrap();
+    matrix_sdk::room::futures::ensure_room_encryption_ready_with_index0_duplicate_share_for_testing(
+        &room,
+    )
+    .await
+    .unwrap();
+    let _ = room.send(RoomMessageEventContent::text_plain("advance")).await.unwrap();
+    let before = room.current_outbound_group_session_message_index().await.unwrap();
+
+    let (_sender, mut cancellation) = broadcast::channel(1);
+    let failed = room.resend_index0_room_key(&mut cancellation, || true).await.unwrap();
+    assert_eq!(failed.outcome, matrix_sdk_base::crypto::ManualIndex0ResendOutcome::Failed);
+    assert_eq!(failed.message_index_before, before);
+    assert_eq!(failed.message_index_after, before);
+
+    let (_sender, mut cancellation) = broadcast::channel(1);
+    let retried = room.resend_index0_room_key(&mut cancellation, || true).await.unwrap();
+    assert_eq!(retried.outcome, matrix_sdk_base::crypto::ManualIndex0ResendOutcome::Completed);
+    assert_eq!(retried.message_index_before, before);
+    assert_eq!(retried.message_index_after, before);
+}
+
+#[async_test]
+async fn test_manual_index0_room_resend_deadline_cleans_pending_requests() {
+    let (server, alice, room_id, _events) = setup_encrypted_room().await;
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_clone = Arc::clone(&attempts);
+    let manual_request_seen = Arc::new(tokio::sync::Notify::new());
+    let manual_request_seen_clone = Arc::clone(&manual_request_seen);
+    Mock::given(method("PUT"))
+        .and(path_regex(TO_DEVICE_PATH))
+        .respond_with(move |_request: &Request| {
+            let attempt = attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 2 {
+                manual_request_seen_clone.notify_one();
+                ResponseTemplate::new(200)
+                    .set_body_json(&*test_json::EMPTY)
+                    .set_delay(Duration::from_secs(3600))
+            } else {
+                ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY)
+            }
+        })
+        .expect(3)
+        .named("deadline_manual_resend")
+        .mount(server.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(ROOM_SEND_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
+        .expect(1)
+        .mount(server.server())
+        .await;
+
+    let room = alice.get_room(&room_id).unwrap();
+    matrix_sdk::room::futures::ensure_room_encryption_ready_with_index0_duplicate_share_for_testing(
+        &room,
+    )
+    .await
+    .unwrap();
+    let _ = room.send(RoomMessageEventContent::text_plain("advance")).await.unwrap();
+    let before = room.current_outbound_group_session_message_index().await.unwrap();
+
+    tokio::time::pause();
+    let (_sender, mut cancellation) = broadcast::channel(1);
+    let resend = tokio::spawn({
+        let room = room.clone();
+        async move { room.resend_index0_room_key(&mut cancellation, || true).await.unwrap() }
+    });
+    manual_request_seen.notified().await;
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    let expired = resend.await.unwrap();
+    assert_eq!(expired.outcome, matrix_sdk_base::crypto::ManualIndex0ResendOutcome::Deadline);
+    assert_eq!(expired.message_index_before, before);
+    assert_eq!(expired.message_index_after, before);
+}
+
+#[async_test]
 async fn test_first_room_event_queues_exactly_one_index0_duplicate() {
     let (server, alice, room_id, events) = setup_encrypted_room().await;
 
