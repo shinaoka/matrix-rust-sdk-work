@@ -256,6 +256,58 @@ async fn test_manual_index0_pickle_ownership_quarantines_legacy_and_mismatch() {
     assert!(restored_mismatched.pending_manual_requests().is_empty());
 }
 
+/// Initial, Normal, and Manual ownership can coexist while the initial batch
+/// is pending; only the committed Initial request becomes the ledger.
+#[async_test]
+async fn test_manual_index0_pickle_interleaves_initial_normal_and_manual() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        user_id!("@a:example.org"),
+        user_id!("@b:example.org"),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!resend-pickle-interleaved:example.org");
+    let initial_requests = alice
+        .share_room_key(&room_id, iter::once(bob.user_id()), EncryptionSettings::default())
+        .await
+        .unwrap();
+    let initial_request = initial_requests.first().cloned().expect("initial request");
+    let outbound = alice.inner.group_session_manager.get_outbound_group_session(&room_id).unwrap();
+    outbound.add_request_with_kind(
+        TransactionId::new(),
+        initial_request.clone(),
+        std::collections::BTreeMap::new(),
+        ShareRequestKind::Normal,
+    );
+    outbound.add_request_with_kind(
+        TransactionId::new(),
+        initial_request,
+        std::collections::BTreeMap::new(),
+        ShareRequestKind::Manual,
+    );
+    alice
+        .inner
+        .group_session_manager
+        .mark_request_as_sent(&initial_requests[0].txn_id)
+        .await
+        .unwrap();
+
+    assert!(outbound.initial_share_ledger().is_some());
+    assert_eq!(outbound.pending_request_ids().len(), 2);
+    assert_eq!(outbound.pending_requests().len(), 1);
+    assert_eq!(outbound.pending_manual_requests().len(), 1);
+    let restored = OutboundGroupSession::from_pickle(
+        alice.device_id().to_owned(),
+        Arc::new(alice.identity_keys()),
+        outbound.pickle().await,
+    )
+    .unwrap();
+    assert!(restored.initial_share_tracking_enabled());
+    assert!(restored.initial_share_ledger().is_some());
+    assert_eq!(restored.pending_request_ids().len(), 1);
+    assert!(restored.pending_manual_requests().is_empty());
+}
+
 /// Cleanup removes only the owned manual requests and leaves no request that
 /// a later automatic preshare could drain.
 #[async_test]
@@ -335,24 +387,44 @@ async fn test_manual_index0_resend_mark_and_cleanup_roll_back_on_failure() {
     alice_store.fail_next_save_changes_for_test();
     assert!(alice.mark_manual_request_as_sent(&request_id).await.is_err());
     assert_eq!(outbound.pending_manual_requests().len(), 1);
-    let persisted = alice_store
-        .get_outbound_group_session(&room_id)
-        .await
-        .unwrap()
+    let durable = alice_store
+        .durable_outbound_group_session_for_test(&room_id)
         .expect("manual request must remain durable after mark failure");
-    assert_eq!(persisted.pending_manual_requests().len(), 1);
+    assert_eq!(durable.requests.len(), 1);
+    assert_eq!(
+        durable.request_kinds.as_ref().and_then(|kinds| kinds.get(&request_id)),
+        Some(&ShareRequestKind::Manual)
+    );
+    let persisted = OutboundGroupSession::from_pickle(
+        alice.device_id().to_owned(),
+        Arc::new(alice.identity_keys()),
+        durable,
+    )
+    .unwrap();
+    assert!(persisted.pending_manual_requests().is_empty());
+    assert!(persisted.pending_requests().is_empty());
 
     alice_store.fail_next_save_changes_for_test();
     assert!(
         alice.cleanup_manual_pending_requests(&room_id, &[request_id.clone()], None).await.is_err()
     );
     assert_eq!(outbound.pending_manual_requests().len(), 1);
-    let persisted = alice_store
-        .get_outbound_group_session(&room_id)
-        .await
-        .unwrap()
+    let durable = alice_store
+        .durable_outbound_group_session_for_test(&room_id)
         .expect("manual request must remain durable after cleanup failure");
-    assert_eq!(persisted.pending_manual_requests().len(), 1);
+    assert_eq!(durable.requests.len(), 1);
+    assert_eq!(
+        durable.request_kinds.as_ref().and_then(|kinds| kinds.get(&request_id)),
+        Some(&ShareRequestKind::Manual)
+    );
+    let persisted = OutboundGroupSession::from_pickle(
+        alice.device_id().to_owned(),
+        Arc::new(alice.identity_keys()),
+        durable,
+    )
+    .unwrap();
+    assert!(persisted.pending_manual_requests().is_empty());
+    assert!(persisted.pending_requests().is_empty());
 
     alice.cleanup_manual_pending_requests(&room_id, &[request_id], None).await.unwrap();
     assert!(outbound.pending_manual_requests().is_empty());
@@ -450,20 +522,14 @@ async fn test_manual_index0_resend_rolls_back_on_persistence_failure() {
     assert!(restored.pending_manual_requests().is_empty());
     assert!(restored.pending_request_ids().is_empty());
 
-    let reloaded = crate::OlmMachine::with_store(
-        user_id!("@a:example.org"),
-        device_id!("ALICE2"),
-        Arc::clone(&alice_store),
-        None,
+    let persisted = OutboundGroupSession::from_pickle(
+        alice.device_id().to_owned(),
+        Arc::new(alice.identity_keys()),
+        alice_store
+            .durable_outbound_group_session_for_test(&room_id)
+            .expect("the pre-failure session must remain persisted"),
     )
-    .await
     .unwrap();
-    let persisted = reloaded
-        .inner
-        .group_session_manager
-        .current_outbound_session(&room_id)
-        .await
-        .expect("the pre-failure session must remain persisted");
     assert_eq!(persisted.message_index().await, 1);
     assert!(persisted.pending_manual_requests().is_empty());
     assert!(persisted.pending_request_ids().is_empty());
