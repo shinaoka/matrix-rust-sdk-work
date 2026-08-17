@@ -5616,6 +5616,28 @@ mod tests {
         assert_eq!(summary.peer_accepted, 0);
     }
 
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_resend_index0_room_key_honors_cancellation_after_preparation() {
+        let room_id = room_id!("!resend-cancel-after-prepare:b.c");
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let f = EventFactory::new().room(room_id).sender(user_id!("@example:localhost"));
+        let room = server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_state_event(f.room_encryption()),
+            )
+            .await;
+        room.preshare_room_key().await.unwrap();
+        let (sender, mut cancellation) = broadcast::channel(1);
+        sender.send(()).unwrap();
+
+        let summary = room.resend_index0_room_key(&mut cancellation, || true).await.unwrap();
+        assert_eq!(summary.outcome, CryptoManualIndex0ResendOutcome::CancelledStale);
+        assert_eq!(summary.peer_accepted, 0);
+    }
+
     #[cfg(all(feature = "sqlite", feature = "e2e-encryption"))]
     #[async_test]
     async fn test_cache_invalidation_while_encrypt() {
