@@ -4,6 +4,8 @@
 
 use std::{sync::Arc, time::Duration};
 
+use tokio::sync::broadcast;
+
 use matrix_sdk::{
     Client,
     encryption::{Index0ReshareOutcome, RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver},
@@ -89,6 +91,44 @@ async fn setup_encrypted_room()
         .await;
 
     (server, alice, room_id.to_owned(), events)
+}
+
+#[async_test]
+async fn test_manual_index0_room_resend_preserves_index_and_sends_to_device_key() {
+    let (server, alice, room_id, _events) = setup_encrypted_room().await;
+
+    Mock::given(method("PUT"))
+        .and(path_regex(TO_DEVICE_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EMPTY))
+        .expect(3)
+        .named("initial_duplicate_and_manual_resend")
+        .mount(server.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(ROOM_SEND_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
+        .expect(1)
+        .named("advance_room_message")
+        .mount(server.server())
+        .await;
+
+    let room = alice.get_room(&room_id).unwrap();
+    matrix_sdk::room::futures::ensure_room_encryption_ready_with_index0_duplicate_share_for_testing(
+        &room,
+    )
+    .await
+    .unwrap();
+    let _ = room.send(RoomMessageEventContent::text_plain("advance")).await.unwrap();
+    let before = room.current_outbound_group_session_message_index().await.unwrap();
+    assert_eq!(before, Some(1));
+
+    let (_sender, mut cancellation) = broadcast::channel(1);
+    let summary = room.resend_index0_room_key(&mut cancellation, || true).await.unwrap();
+    assert_eq!(summary.outcome, matrix_sdk_base::crypto::ManualIndex0ResendOutcome::Completed);
+    assert_eq!(summary.message_index_before, before);
+    assert_eq!(summary.message_index_after, before);
+    assert!(!summary.room_event_sent);
+    assert!(!summary.index0_consumed);
 }
 
 #[async_test]
