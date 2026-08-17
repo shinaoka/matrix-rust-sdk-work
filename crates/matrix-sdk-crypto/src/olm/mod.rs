@@ -29,7 +29,7 @@ pub use group_sessions::{
     BackedUpRoomKey, EncryptionSettings, ExportedRoomKey, ForwarderData, InboundGroupSession,
     KnownSenderData, OutboundGroupSession, OutboundGroupSessionEncryptionResult,
     PickledInboundGroupSession, PickledOutboundGroupSession, SenderData, SenderDataType,
-    SessionCreationError, SessionExportError, SessionKey, ShareInfo,
+    SessionCreationError, SessionExportError, SessionKey, ShareInfo, ShareRequestKind,
 };
 pub(crate) use group_sessions::{
     ShareState,

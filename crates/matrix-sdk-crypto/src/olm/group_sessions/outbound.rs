@@ -57,7 +57,7 @@ use crate::{
     DeviceData,
     olm::account::shared_history_from_history_visibility,
     session_manager::CollectStrategy,
-    store::caches::SequenceNumber,
+    store::{CryptoStoreError, Result as StoreResult, caches::SequenceNumber},
     types::{
         EventEncryptionAlgorithm,
         events::{
@@ -256,7 +256,10 @@ pub struct OutboundGroupSession {
     invalidated: Arc<AtomicBool>,
     settings: Arc<EncryptionSettings>,
     shared_with_set: Arc<StdRwLock<ShareInfoSet>>,
-    to_share_with_set: Arc<StdRwLock<ToShareMap>>,
+    request_state: Arc<StdRwLock<OutboundRequestState>>,
+    initial_share_tracking_enabled: Arc<AtomicBool>,
+    initial_share_batch_started: Arc<AtomicBool>,
+    failed_manual_reshare_devices: Arc<StdRwLock<BTreeSet<(OwnedUserId, OwnedDeviceId)>>>,
     initial_share_repair: Arc<StdRwLock<InitialShareRepairState>>,
 }
 
@@ -267,6 +270,35 @@ pub struct OutboundGroupSession {
 pub type ShareInfoSet = BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, ShareInfo>>;
 
 type ToShareMap = BTreeMap<OwnedTransactionId, (Arc<ToDeviceRequest>, ShareInfoSet)>;
+
+#[derive(Clone)]
+struct OutboundRequestState {
+    requests: ToShareMap,
+    kinds: BTreeMap<OwnedTransactionId, ShareRequestKind>,
+    initial_share_candidates: ShareInfoSet,
+    initial_share_ledger: Option<ShareInfoSet>,
+}
+
+pub(crate) struct OutboundStateSnapshot {
+    request_state: OutboundRequestState,
+    shared_with_set: ShareInfoSet,
+    shared: bool,
+}
+
+/// Identifies which operation owns a pending outbound room-key request.
+/// Persisted separately from the request tuple for pickle compatibility.
+/// Persisted owner classification for an outbound room-key request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareRequestKind {
+    /// Request belonging to the newly-created session's initial share batch.
+    Initial,
+    /// A later normal share or a legacy request.
+    #[default]
+    Normal,
+    /// A temporary manual diagnostic request.
+    Manual,
+}
 
 /// Struct holding info about the share state of a outbound group session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -308,13 +340,13 @@ pub struct SharedWith {
 /// [`OutboundGroupSession`].
 pub(crate) struct SharingView<'a> {
     shared_with_set: RwLockReadGuard<'a, ShareInfoSet>,
-    to_share_with_set: RwLockReadGuard<'a, ToShareMap>,
+    request_state: RwLockReadGuard<'a, OutboundRequestState>,
 }
 
 impl SharingView<'_> {
     /// Whether a room-key request is currently queued for this device.
     pub(crate) fn has_pending_share(&self, device: &DeviceData) -> bool {
-        self.to_share_with_set.values().any(|(_, shares)| {
+        self.request_state.requests.values().any(|(_, shares)| {
             shares
                 .get(device.user_id())
                 .is_some_and(|devices| devices.contains_key(device.device_id()))
@@ -380,7 +412,8 @@ impl SharingView<'_> {
 
         let already_shared = iter_share_info_set(&self.shared_with_set, user_ids, device_ids);
         let pending = self
-            .to_share_with_set
+            .request_state
+            .requests
             .values()
             .flat_map(move |(_, set)| iter_share_info_set(set, user_ids, device_ids));
         already_shared.chain(pending)
@@ -447,7 +480,15 @@ impl OutboundGroupSession {
             invalidated: Arc::new(AtomicBool::new(false)),
             settings: Arc::new(settings),
             shared_with_set: Default::default(),
-            to_share_with_set: Default::default(),
+            request_state: Arc::new(StdRwLock::new(OutboundRequestState {
+                requests: BTreeMap::new(),
+                kinds: BTreeMap::new(),
+                initial_share_candidates: BTreeMap::new(),
+                initial_share_ledger: None,
+            })),
+            initial_share_tracking_enabled: Arc::new(AtomicBool::new(true)),
+            initial_share_batch_started: Arc::new(AtomicBool::new(false)),
+            failed_manual_reshare_devices: Default::default(),
             initial_share_repair: Default::default(),
         })
     }
@@ -467,7 +508,68 @@ impl OutboundGroupSession {
         request: Arc<ToDeviceRequest>,
         share_infos: ShareInfoSet,
     ) {
-        self.to_share_with_set.write().insert(request_id, (request, share_infos));
+        self.add_request_with_kind(request_id, request, share_infos, ShareRequestKind::Normal);
+    }
+
+    pub(crate) fn add_request_with_kind(
+        &self,
+        request_id: OwnedTransactionId,
+        request: Arc<ToDeviceRequest>,
+        share_infos: ShareInfoSet,
+        kind: ShareRequestKind,
+    ) {
+        if kind == ShareRequestKind::Initial {
+            self.initial_share_batch_started.store(true, Ordering::SeqCst);
+        }
+        let mut state = self.request_state.write();
+        state.requests.insert(request_id.clone(), (request, share_infos));
+        state.kinds.insert(request_id, kind);
+    }
+
+    pub(crate) fn initial_share_tracking_enabled(&self) -> bool {
+        self.initial_share_tracking_enabled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn initial_share_ledger(&self) -> Option<ShareInfoSet> {
+        self.request_state.read().initial_share_ledger.clone()
+    }
+
+    pub(crate) fn snapshot_state(&self) -> OutboundStateSnapshot {
+        OutboundStateSnapshot {
+            request_state: self.request_state.read().clone(),
+            shared_with_set: self.shared_with_set.read().clone(),
+            shared: self.shared(),
+        }
+    }
+
+    pub(crate) fn restore_state(&self, snapshot: OutboundStateSnapshot) {
+        *self.shared_with_set.write() = snapshot.shared_with_set;
+        *self.request_state.write() = snapshot.request_state;
+        self.shared.store(snapshot.shared, Ordering::SeqCst);
+    }
+
+    pub(crate) fn has_failed_manual_reshare(&self, device: &DeviceData) -> bool {
+        self.failed_manual_reshare_devices
+            .read()
+            .contains(&(device.user_id().to_owned(), device.device_id().to_owned()))
+    }
+
+    pub(crate) fn record_failed_manual_reshare(&self, device: &DeviceData) {
+        self.failed_manual_reshare_devices
+            .write()
+            .insert((device.user_id().to_owned(), device.device_id().to_owned()));
+    }
+
+    pub(crate) fn commit_empty_initial_share(&self) {
+        if self.initial_share_tracking_enabled()
+            && self.initial_share_batch_started.load(Ordering::SeqCst)
+        {
+            let mut state = self.request_state.write();
+            if state.initial_share_ledger.is_none() {
+                state.initial_share_ledger = Some(state.initial_share_candidates.clone());
+            }
+        }
+        self.mark_as_shared();
     }
 
     pub(crate) fn record_initial_share_missing(
@@ -526,11 +628,58 @@ impl OutboundGroupSession {
     pub fn mark_request_as_sent(
         &self,
         request_id: &TransactionId,
-    ) -> BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>> {
+    ) -> StoreResult<BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>> {
         let mut no_olm_devices = BTreeMap::new();
 
-        let removed = self.to_share_with_set.write().remove(request_id);
-        if let Some((to_device, request)) = removed {
+        let (to_device, request, has_pending_requests) = {
+            let mut state = self.request_state.write();
+            let Some(kind) = state.kinds.remove(request_id) else {
+                error!("corrupt outbound request ownership: missing request kind");
+                return Err(CryptoStoreError::backend(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing outbound request kind",
+                )));
+            };
+            let Some((to_device, request)) = state.requests.remove(request_id) else {
+                state.kinds.insert(request_id.to_owned(), kind);
+                error!("corrupt outbound request ownership: missing request");
+                return Err(CryptoStoreError::backend(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing outbound request",
+                )));
+            };
+            if kind == ShareRequestKind::Manual {
+                state.requests.insert(request_id.to_owned(), (to_device, request));
+                state.kinds.insert(request_id.to_owned(), kind);
+                return Err(CryptoStoreError::backend(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "normal mark attempted for manual request",
+                )));
+            }
+            let has_pending_initial =
+                state.kinds.values().any(|kind| *kind == ShareRequestKind::Initial);
+            if kind == ShareRequestKind::Initial && self.initial_share_tracking_enabled() {
+                for (user_id, info) in &request {
+                    let shared =
+                        state.initial_share_candidates.entry(user_id.to_owned()).or_default();
+                    for (device_id, share_info) in info {
+                        if matches!(share_info, ShareInfo::Shared(_)) {
+                            shared.insert(device_id.to_owned(), share_info.clone());
+                        }
+                    }
+                }
+            }
+            if self.initial_share_tracking_enabled()
+                && self.initial_share_batch_started.load(Ordering::SeqCst)
+                && !has_pending_initial
+                && state.initial_share_ledger.is_none()
+            {
+                state.initial_share_ledger = Some(state.initial_share_candidates.clone());
+            }
+            let has_pending_requests = state.requests.is_empty();
+            (to_device, request, has_pending_requests)
+        };
+        {
             let recipients: BTreeMap<&UserId, BTreeSet<&DeviceId>> = request
                 .iter()
                 .map(|(u, d)| (u.as_ref(), d.keys().map(|d| d.as_ref()).collect()))
@@ -554,7 +703,7 @@ impl OutboundGroupSession {
                 self.shared_with_set.write().entry(user_id).or_default().extend(info);
             }
 
-            if self.to_share_with_set.read().is_empty() {
+            if has_pending_requests {
                 debug!(
                     session_id = self.session_id(),
                     room_id = ?self.room_id,
@@ -564,19 +713,9 @@ impl OutboundGroupSession {
 
                 self.mark_as_shared();
             }
-        } else {
-            let request_ids: Vec<String> =
-                self.to_share_with_set.read().keys().map(|k| k.to_string()).collect();
-
-            error!(
-                all_request_ids = ?request_ids,
-                ?request_id,
-                "Marking to-device request carrying a room key as sent but no \
-                 request found with the given id"
-            );
         }
 
-        no_olm_devices
+        Ok(no_olm_devices)
     }
 
     /// Encrypt the given plaintext using this session.
@@ -870,7 +1009,7 @@ impl OutboundGroupSession {
     pub(crate) fn sharing_view(&self) -> SharingView<'_> {
         SharingView {
             shared_with_set: self.shared_with_set.read(),
-            to_share_with_set: self.to_share_with_set.read(),
+            request_state: self.request_state.read(),
         }
     }
 
@@ -908,23 +1047,67 @@ impl OutboundGroupSession {
             .insert(device_id.to_owned(), share_info);
     }
 
-    /// Get the list of requests that need to be sent out for this session to be
-    /// marked as shared.
+    /// Get normal requests that need to be sent out by the regular share path.
+    /// Manual diagnostic requests are intentionally excluded so a restart or
+    /// ordinary preshare can never drain a one-shot resend.
     pub(crate) fn pending_requests(&self) -> Vec<Arc<ToDeviceRequest>> {
-        self.to_share_with_set.read().values().map(|(req, _)| req.clone()).collect()
+        let state = self.request_state.read();
+        state
+            .requests
+            .iter()
+            .filter(|(id, _)| {
+                matches!(
+                    state.kinds.get(*id),
+                    Some(ShareRequestKind::Initial | ShareRequestKind::Normal)
+                )
+            })
+            .map(|(_, (req, _))| req.clone())
+            .collect()
+    }
+
+    /// Get pending Manual diagnostic requests for the explicit manual executor.
+    pub(crate) fn pending_manual_requests(&self) -> Vec<Arc<ToDeviceRequest>> {
+        let state = self.request_state.read();
+        state
+            .requests
+            .iter()
+            .filter(|(id, _)| state.kinds.get(*id) == Some(&ShareRequestKind::Manual))
+            .map(|(_, (req, _))| req.clone())
+            .collect()
     }
 
     /// Get the list of request ids this session is waiting for to be sent out.
     pub(crate) fn pending_request_ids(&self) -> Vec<OwnedTransactionId> {
-        self.to_share_with_set.read().keys().cloned().collect()
+        self.request_state.read().requests.keys().cloned().collect()
     }
 
     /// Remove an un-sent to-device request from this session's pending set
     /// (manual index-0 share cleanup, issue #538). The caller persists the
     /// session afterwards; no share info is merged and `mark_as_shared` is
     /// not called.
-    pub(crate) fn remove_request(&self, request_id: &TransactionId) {
-        self.to_share_with_set.write().remove(request_id);
+    pub(crate) fn remove_request(&self, request_id: &TransactionId) -> StoreResult<()> {
+        let mut state = self.request_state.write();
+        let Some(kind) = state.kinds.remove(request_id) else {
+            return Err(CryptoStoreError::backend(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing outbound request kind during cleanup",
+            )));
+        };
+        if kind != ShareRequestKind::Manual {
+            state.kinds.insert(request_id.to_owned(), kind);
+            return Err(CryptoStoreError::backend(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cleanup attempted for non-manual request",
+            )));
+        }
+        if state.requests.remove(request_id).is_none() {
+            state.kinds.insert(request_id.to_owned(), kind);
+            return Err(CryptoStoreError::backend(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing outbound request during cleanup",
+            )));
+        }
+        Ok(())
     }
 
     /// Remove an un-sent to-device request and return the removed entry so
@@ -933,8 +1116,20 @@ impl OutboundGroupSession {
     pub(crate) fn remove_request_captured(
         &self,
         request_id: &TransactionId,
-    ) -> Option<(Arc<ToDeviceRequest>, ShareInfoSet)> {
-        self.to_share_with_set.write().remove(request_id)
+    ) -> Option<(Arc<ToDeviceRequest>, ShareInfoSet, ShareRequestKind)> {
+        let mut state = self.request_state.write();
+        let Some(kind) = state.kinds.remove(request_id) else {
+            return None;
+        };
+        if kind != ShareRequestKind::Manual {
+            state.kinds.insert(request_id.to_owned(), kind);
+            return None;
+        }
+        let Some((request, infos)) = state.requests.remove(request_id) else {
+            state.kinds.insert(request_id.to_owned(), kind);
+            return None;
+        };
+        Some((request, infos, kind))
     }
 
     /// Restore a previously removed un-sent request (rollback of a failed
@@ -942,15 +1137,18 @@ impl OutboundGroupSession {
     pub(crate) fn restore_request(
         &self,
         request_id: &TransactionId,
-        request: (Arc<ToDeviceRequest>, ShareInfoSet),
+        request: (Arc<ToDeviceRequest>, ShareInfoSet, ShareRequestKind),
     ) {
-        self.to_share_with_set.write().insert(request_id.to_owned(), request);
+        let (request, infos, kind) = request;
+        let mut state = self.request_state.write();
+        state.requests.insert(request_id.to_owned(), (request, infos));
+        state.kinds.insert(request_id.to_owned(), kind);
     }
 
     /// Read the per-device share infos of a still-pending request (issue
     /// #509). Returns `None` when the request is no longer pending.
     pub(crate) fn pending_share_infos(&self, request_id: &TransactionId) -> Option<ShareInfoSet> {
-        self.to_share_with_set.read().get(request_id).map(|(_, infos)| infos.clone())
+        self.request_state.read().requests.get(request_id).map(|(_, infos)| infos.clone())
     }
 
     /// List the user/device recipients of a still-pending request (issue
@@ -959,7 +1157,7 @@ impl OutboundGroupSession {
         &self,
         request_id: &TransactionId,
     ) -> Option<Vec<(OwnedUserId, OwnedDeviceId)>> {
-        self.to_share_with_set.read().get(request_id).map(|(request, _)| {
+        self.request_state.read().requests.get(request_id).map(|(request, _)| {
             request
                 .messages
                 .iter()
@@ -999,6 +1197,30 @@ impl OutboundGroupSession {
     ) -> Result<Self, PickleError> {
         let inner: GroupSession = pickle.pickle.into();
         let session_id = inner.session_id();
+        let mut requests = pickle.requests;
+        let (mut request_kinds, tracking_enabled) = match pickle.request_kinds {
+            None => {
+                (requests.keys().cloned().map(|id| (id, ShareRequestKind::Normal)).collect(), false)
+            }
+            Some(kinds) if kinds.keys().eq(requests.keys()) => {
+                (kinds, pickle.initial_share_tracking_enabled)
+            }
+            Some(_) => {
+                // A modern pickle with mismatched ownership metadata is
+                // fail-closed: discard pending requests rather than
+                // reclassifying a possibly-manual request as Normal.
+                requests.clear();
+                (BTreeMap::new(), false)
+            }
+        };
+        let manual_ids = request_kinds
+            .iter()
+            .filter_map(|(id, kind)| (*kind == ShareRequestKind::Manual).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        for id in manual_ids {
+            requests.remove(&id);
+            request_kinds.remove(&id);
+        }
 
         Ok(Self {
             inner: Arc::new(RwLock::new(inner)),
@@ -1012,7 +1234,17 @@ impl OutboundGroupSession {
             invalidated: AtomicBool::from(pickle.invalidated).into(),
             settings: pickle.settings,
             shared_with_set: Arc::new(StdRwLock::new(pickle.shared_with_set)),
-            to_share_with_set: Arc::new(StdRwLock::new(pickle.requests)),
+            request_state: Arc::new(StdRwLock::new(OutboundRequestState {
+                requests,
+                kinds: request_kinds,
+                initial_share_candidates: pickle.initial_share_candidates,
+                initial_share_ledger: pickle.initial_share_ledger,
+            })),
+            initial_share_tracking_enabled: Arc::new(AtomicBool::new(tracking_enabled)),
+            initial_share_batch_started: Arc::new(AtomicBool::new(
+                pickle.initial_share_batch_started,
+            )),
+            failed_manual_reshare_devices: Default::default(),
             initial_share_repair: Default::default(),
         })
     }
@@ -1026,6 +1258,7 @@ impl OutboundGroupSession {
     ///   session, either an unencrypted mode or an encrypted using passphrase.
     pub async fn pickle(&self) -> PickledOutboundGroupSession {
         let pickle = self.inner.read().await.pickle();
+        let request_state = self.request_state.read().clone();
 
         PickledOutboundGroupSession {
             pickle,
@@ -1036,7 +1269,12 @@ impl OutboundGroupSession {
             shared: self.shared(),
             invalidated: self.invalidated(),
             shared_with_set: self.shared_with_set.read().clone(),
-            requests: self.to_share_with_set.read().clone(),
+            requests: request_state.requests,
+            request_kinds: Some(request_state.kinds),
+            initial_share_tracking_enabled: self.initial_share_tracking_enabled(),
+            initial_share_batch_started: self.initial_share_batch_started.load(Ordering::SeqCst),
+            initial_share_candidates: request_state.initial_share_candidates,
+            initial_share_ledger: request_state.initial_share_ledger,
         }
     }
 }
@@ -1078,6 +1316,17 @@ pub struct PickledOutboundGroupSession {
     pub shared_with_set: BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, ShareInfo>>,
     /// Requests that need to be sent out to share the session.
     pub requests: BTreeMap<OwnedTransactionId, (Arc<ToDeviceRequest>, ShareInfoSet)>,
+    /// Request ownership tags. `None` means this is a legacy pickle.
+    #[serde(default)]
+    pub request_kinds: Option<BTreeMap<OwnedTransactionId, ShareRequestKind>>,
+    #[serde(default)]
+    pub initial_share_tracking_enabled: bool,
+    #[serde(default)]
+    pub initial_share_batch_started: bool,
+    #[serde(default)]
+    pub initial_share_candidates: ShareInfoSet,
+    #[serde(default)]
+    pub initial_share_ledger: Option<ShareInfoSet>,
 }
 
 #[cfg(test)]

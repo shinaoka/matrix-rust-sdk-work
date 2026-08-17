@@ -40,6 +40,9 @@ use matrix_sdk_base::crypto::{
     ManualFinalizeStep as CryptoManualFinalizeStep,
     ManualForceNewOutcome as CryptoManualForceNewOutcome,
     ManualForceNewSummary as CryptoManualForceNewSummary,
+    ManualIndex0ResendOutcome as CryptoManualIndex0ResendOutcome,
+    ManualIndex0ResendStep as CryptoManualIndex0ResendStep,
+    ManualIndex0ResendSummary as CryptoManualIndex0ResendSummary,
     ManualIndex0ShareOutcome as CryptoManualIndex0ShareOutcome,
     ManualIndex0ShareSummary as CryptoManualIndex0ShareSummary,
     RoomKeyReshareResult as CryptoRoomKeyReshareResult,
@@ -2766,6 +2769,231 @@ impl Room {
                 .await?;
         }
         result
+    }
+
+    /// Manually resend index-0 recovery material for the current outbound
+    /// Megolm session (issue #541). This is a one-shot, bounded diagnostic
+    /// operation and never rotates or advances the room session.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn resend_index0_room_key(
+        &self,
+        cancellation: &mut broadcast::Receiver<()>,
+        validate: impl Fn() -> bool + Send + Sync,
+    ) -> Result<CryptoManualIndex0ResendSummary> {
+        self.ensure_room_joined()?;
+        let deadline = tokio::time::Instant::now() + MANUAL_ENCRYPTION_DEBUG_DEADLINE;
+        let started = std::time::Instant::now();
+        let cancelled = |expired: bool| {
+            let mut summary = CryptoManualIndex0ResendSummary::failed();
+            summary.outcome = if expired {
+                CryptoManualIndex0ResendOutcome::Deadline
+            } else {
+                CryptoManualIndex0ResendOutcome::CancelledStale
+            };
+            summary.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            summary
+        };
+        if !validate() {
+            return Ok(cancelled(false));
+        }
+        let encrypted = tokio::time::timeout_at(deadline, self.latest_encryption_state()).await;
+        match encrypted {
+            Ok(Ok(state)) if state.is_encrypted() => {}
+            Ok(Ok(_)) => {
+                let mut summary = cancelled(false);
+                summary.outcome = CryptoManualIndex0ResendOutcome::RefusedNotEncrypted;
+                return Ok(summary);
+            }
+            Ok(Err(_)) => {
+                let mut summary = cancelled(false);
+                summary.outcome = CryptoManualIndex0ResendOutcome::Failed;
+                return Ok(summary);
+            }
+            Err(_) => return Ok(cancelled(true)),
+        }
+        let transport_lock = self.client.room_key_transport_lock(self.room_id());
+        let _lock = match tokio::time::timeout_at(deadline, transport_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => return Ok(cancelled(true)),
+        };
+        let mut owned_ids = Vec::<OwnedTransactionId>::new();
+        let mut marked_ids = std::collections::HashSet::<OwnedTransactionId>::new();
+        let mut claim_expectation = None;
+        let mut claim_occurred = false;
+        let mut known_summary = CryptoManualIndex0ResendSummary::failed();
+        let result: Result<CryptoManualIndex0ResendSummary> = async {
+            let (mut preparation, mut claim) = match tokio::time::timeout_at(
+                deadline,
+                self.client.base_client().prepare_manual_index0_resend(self.room_id()),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Ok(cancelled(true)),
+            };
+            known_summary = preparation.summary();
+            loop {
+                if let Some((request_id, request)) = claim.take() {
+                    claim_expectation = Some(request_id.clone());
+                    owned_ids.push(request_id.clone());
+                    if !validate() || tokio::time::Instant::now() >= deadline {
+                        return Ok(cancelled(tokio::time::Instant::now() >= deadline));
+                    }
+                    let response = tokio::select! {
+                        _ = cancellation.recv() => return Ok(cancelled(false)),
+                        _ = tokio::time::sleep_until(deadline) => {
+                            let mut summary = cancelled(true);
+                            summary.claim = CryptoManualClaimOutcome::Deadline;
+                            return Ok(summary);
+                        },
+                        res = self.client.send(request) => match res {
+                            Ok(response) => response,
+                            Err(_) => {
+                                let mut summary = cancelled(false);
+                                summary.outcome = CryptoManualIndex0ResendOutcome::Failed;
+                                summary.claim = CryptoManualClaimOutcome::Failed;
+                                return Ok(summary);
+                            }
+                        },
+                    };
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {
+                            let mut summary = cancelled(true);
+                            summary.claim = CryptoManualClaimOutcome::Deadline;
+                            return Ok(summary);
+                        },
+                        res = self.client.mark_request_as_sent(&request_id, &response) => if res.is_err() {
+                            let mut summary = cancelled(false);
+                            summary.outcome = CryptoManualIndex0ResendOutcome::Failed;
+                            summary.claim = CryptoManualClaimOutcome::Failed;
+                            return Ok(summary);
+                        },
+                    }
+                    marked_ids.insert(request_id);
+                    claim_occurred = true;
+                }
+                let finalized = tokio::time::timeout_at(
+                    deadline,
+                    self.client.base_client().finalize_manual_index0_resend(preparation),
+                )
+                .await;
+                let step = match finalized {
+                    Ok(result) => result?,
+                    Err(_) => return Ok(cancelled(true)),
+                };
+                match step {
+                    CryptoManualIndex0ResendStep::NeedsClaimTargets { .. } => {
+                        let mut summary = known_summary;
+                        summary.outcome = CryptoManualIndex0ResendOutcome::Failed;
+                        return Ok(summary);
+                    }
+                    CryptoManualIndex0ResendStep::NeedsClaim { request_id, request, continuation } => {
+                        claim = Some((request_id, request));
+                        preparation = continuation;
+                        known_summary = preparation.summary();
+                    }
+                    CryptoManualIndex0ResendStep::Ready { requests, mut summary } => {
+                        owned_ids.extend(requests.iter().map(|request| request.txn_id.clone()));
+                        let own_user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+                        summary.peer_accepted = 0;
+                        summary.peer_missing = summary.peer_eligible;
+                        known_summary = summary;
+                        for request in &requests {
+                            let peer_count = request
+                                .messages
+                                .iter()
+                                .filter(|(user_id, _)| user_id.as_str() != own_user_id.as_str())
+                                .map(|(_, devices)| devices.len())
+                                .sum::<usize>();
+                            if !validate() || tokio::time::Instant::now() >= deadline {
+                                return Ok(cancelled(tokio::time::Instant::now() >= deadline));
+                            }
+                            let response = tokio::select! {
+                                _ = cancellation.recv() => return Ok(cancelled(false)),
+                                _ = tokio::time::sleep_until(deadline) => return Ok(cancelled(true)),
+                                res = self.client.send_to_device(request) => res?,
+                            };
+                            summary.peer_accepted =
+                                summary.peer_accepted.saturating_add(peer_count);
+                            summary.peer_missing =
+                                summary.peer_eligible.saturating_sub(summary.peer_accepted);
+                            known_summary = summary;
+                            tokio::select! {
+                                _ = tokio::time::sleep_until(deadline) => return Ok(cancelled(true)),
+                                res = self.client.base_client().mark_manual_request_as_sent(&request.txn_id) => res?,
+                            }
+                            let _ = response;
+                            marked_ids.insert(request.txn_id.clone());
+                        }
+                        if claim_occurred {
+                            summary.claim = CryptoManualClaimOutcome::Succeeded;
+                        }
+                        let index_after = tokio::select! {
+                            _ = cancellation.recv() => return Ok(cancelled(false)),
+                            _ = tokio::time::sleep_until(deadline) => return Ok(cancelled(true)),
+                            res = self.client.base_client().current_outbound_group_session_message_index(self.room_id()) => res?,
+                        };
+                        summary.message_index_after = index_after;
+                        if summary.message_index_before != summary.message_index_after {
+                            summary.outcome = CryptoManualIndex0ResendOutcome::CancelledStale;
+                        }
+                        summary.elapsed_ms =
+                            started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        return Ok(summary);
+                    }
+                }
+            }
+        }
+        .await;
+        let result = result.map(|mut summary| {
+            if summary.message_index_before.is_none() {
+                summary.message_index_before = known_summary.message_index_before;
+                summary.message_index_after = known_summary.message_index_after;
+                summary.peer_ledger = known_summary.peer_ledger;
+                summary.peer_sender_key_changed = known_summary.peer_sender_key_changed;
+                summary.peer_eligible = known_summary.peer_eligible;
+                summary.peer_accepted = known_summary.peer_accepted;
+                summary.peer_missing = known_summary.peer_missing;
+                summary.policy_blocked = known_summary.policy_blocked;
+                summary.inbound_first_known_index = known_summary.inbound_first_known_index;
+            }
+            if claim_occurred && summary.claim == CryptoManualClaimOutcome::NotNeeded {
+                summary.claim = CryptoManualClaimOutcome::Succeeded;
+            }
+            summary
+        });
+        let mut summary = match result {
+            Ok(summary) => summary,
+            Err(_) => {
+                let mut summary = known_summary;
+                summary.outcome = CryptoManualIndex0ResendOutcome::Failed;
+                if claim_occurred && summary.claim == CryptoManualClaimOutcome::NotNeeded {
+                    summary.claim = CryptoManualClaimOutcome::Succeeded;
+                }
+                summary
+            }
+        };
+        let pending =
+            owned_ids.iter().filter(|id| !marked_ids.contains(*id)).cloned().collect::<Vec<_>>();
+        if !pending.is_empty() || claim_expectation.is_some() {
+            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            match tokio::time::timeout_at(
+                cleanup_deadline,
+                self.client.base_client().cleanup_manual_pending_requests(
+                    self.room_id(),
+                    &pending,
+                    claim_expectation.as_ref().map(|id| id.as_ref()),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => summary.outcome = CryptoManualIndex0ResendOutcome::Failed,
+                Err(_) => summary.outcome = CryptoManualIndex0ResendOutcome::Deadline,
+            }
+        }
+        summary.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        Ok(summary)
     }
 
     /// Manually rotate the outbound Megolm session for this room and confirm
