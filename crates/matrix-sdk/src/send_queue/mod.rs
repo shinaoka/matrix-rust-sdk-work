@@ -491,6 +491,20 @@ impl std::fmt::Debug for RoomSendQueue {
     }
 }
 
+fn send_error_is_recoverable(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::SecureBackupRequired => true,
+        #[cfg(feature = "e2e-encryption")]
+        crate::Error::EncryptionReadiness(_) => true,
+        crate::Error::Http(http_error) => matches!(
+            http_error.retry_kind(),
+            RetryKind::Transient { .. } | RetryKind::NetworkFailure
+        ),
+        crate::Error::ConcurrentRequestFailed => true,
+        _ => false,
+    }
+}
+
 impl RoomSendQueue {
     fn new(
         globally_enabled: bool,
@@ -1060,26 +1074,7 @@ impl RoomSendQueue {
                         }
                         continue;
                     }
-                    let is_recoverable = match err {
-                        crate::Error::SecureBackupRequired => true,
-
-                        crate::Error::Http(ref http_err) => {
-                            // All transient errors are recoverable.
-                            matches!(
-                                http_err.retry_kind(),
-                                RetryKind::Transient { .. } | RetryKind::NetworkFailure
-                            )
-                        }
-
-                        // `ConcurrentRequestFailed` typically happens because of an HTTP failure;
-                        // since we don't get the underlying error, be lax and consider it
-                        // recoverable, and let observers decide to retry it or not. At some point
-                        // we'll get the actual underlying error.
-                        crate::Error::ConcurrentRequestFailed => true,
-
-                        // As of 2024-06-27, all other error types are considered unrecoverable.
-                        _ => false,
-                    };
+                    let is_recoverable = send_error_is_recoverable(&err);
 
                     // Disable the queue for this room after any kind of error happened.
                     locally_enabled.store(false, Ordering::SeqCst);
@@ -3214,8 +3209,17 @@ mod tests {
         room_id,
     };
 
-    use super::canonicalize_dependent_requests;
+    use super::{canonicalize_dependent_requests, send_error_is_recoverable};
     use crate::{client::WeakClient, test_utils::logged_in_client};
+
+    #[cfg(feature = "e2e-encryption")]
+    #[test]
+    fn test_encryption_readiness_errors_are_recoverable() {
+        let error = crate::Error::EncryptionReadiness(crate::EncryptionReadinessError::new(
+            crate::EncryptionReadinessStage::Deadline,
+        ));
+        assert!(send_error_is_recoverable(&error));
+    }
 
     #[test]
     fn test_canonicalize_dependent_events_created_at() {

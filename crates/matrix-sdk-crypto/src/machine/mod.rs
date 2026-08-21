@@ -84,6 +84,7 @@ use crate::{
         SenderDataFinder, SessionType, StaticAccountData,
     },
     room_key_diagnostics::{
+        EncryptionReadinessOutcome, EncryptionReadinessQueryState, EncryptionReadinessSyncState,
         Index0ReshareOutcome, InitialShareRepairClaimOutcome, InitialShareRepairOutcome,
         InitialShareRepairPreparation, OlmRecoveryCounters, OlmRecoverySignalOutcome,
         RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyIngressKind,
@@ -1444,6 +1445,36 @@ impl OlmMachine {
     /// Replacing or clearing this observer does not alter key-sharing behavior.
     pub fn set_room_key_diagnostic_observer(&self, observer: Option<RoomKeyDiagnosticObserver>) {
         self.inner.room_key_diagnostics.set_observer(observer);
+    }
+
+    /// Emit one privacy-safe first-event encryption readiness record.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_encryption_readiness_diagnostic(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        generation: u64,
+        sync: EncryptionReadinessSyncState,
+        query: EncryptionReadinessQueryState,
+        outcome: EncryptionReadinessOutcome,
+        active_members: usize,
+        returned_devices: usize,
+        message_index: Option<u32>,
+        registry_evictions: u64,
+    ) {
+        self.inner.room_key_diagnostics.emit_encryption_readiness(
+            room_id,
+            session_id,
+            generation,
+            sync,
+            query,
+            outcome,
+            active_members,
+            returned_devices,
+            message_index,
+            registry_evictions,
+        );
     }
 
     /// Return the retained closed creation/rotation reason for an exact

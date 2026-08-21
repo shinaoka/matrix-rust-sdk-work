@@ -451,6 +451,14 @@ pub(crate) struct ClientInner {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) initial_share_repair: bool,
 
+    /// Generation-scoped readiness for the application-owned encryption sync.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) encryption_sync_readiness: crate::encryption::EncryptionSyncReadiness,
+
+    /// Bounded exact-session registry for first-event readiness.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) outbound_session_readiness: crate::encryption::OutboundSessionReadinessRegistry,
+
     /// Data related to the [`SendQueue`].
     ///
     /// [`SendQueue`]: crate::send_queue::SendQueue
@@ -507,6 +515,7 @@ impl ClientInner {
         #[cfg(feature = "e2e-encryption")] enable_share_history_on_invite: bool,
         #[cfg(feature = "e2e-encryption")] index0_duplicate_share: bool,
         #[cfg(feature = "e2e-encryption")] initial_share_repair: bool,
+        #[cfg(feature = "e2e-encryption")] encryption_sync_readiness: bool,
         cross_process_lock_config: CrossProcessLockConfig,
         #[cfg(feature = "experimental-search")] search_index_handler: SearchIndex,
         thread_subscription_catchup: OnceCell<Arc<ThreadSubscriptionCatchup>>,
@@ -556,6 +565,14 @@ impl ClientInner {
             index0_duplicate_share,
             #[cfg(feature = "e2e-encryption")]
             initial_share_repair,
+            #[cfg(feature = "e2e-encryption")]
+            encryption_sync_readiness: crate::encryption::EncryptionSyncReadiness::new(
+                encryption_sync_readiness,
+            ),
+            #[cfg(feature = "e2e-encryption")]
+            outbound_session_readiness: crate::encryption::OutboundSessionReadinessRegistry::new(
+                encryption_sync_readiness,
+            ),
             server_max_upload_size: Mutex::new(OnceCell::new()),
             #[cfg(feature = "experimental-search")]
             search_index: search_index_handler,
@@ -3395,6 +3412,8 @@ impl Client {
                 self.inner.index0_duplicate_share,
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.initial_share_repair,
+                #[cfg(feature = "e2e-encryption")]
+                self.inner.encryption_sync_readiness.enabled(),
                 cross_process_lock_config,
                 #[cfg(feature = "experimental-search")]
                 self.inner.search_index.clone(),
