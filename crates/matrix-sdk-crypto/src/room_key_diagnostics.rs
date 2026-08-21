@@ -340,6 +340,8 @@ pub enum EncryptionReadinessSyncState {
 pub enum EncryptionReadinessQueryState {
     /// The query did not start.
     NotStarted,
+    /// The request is in flight and has not settled.
+    InProgress,
     /// The response was accepted and committed.
     Accepted,
     /// The query failed.
