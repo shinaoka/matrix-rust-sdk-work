@@ -313,6 +313,75 @@ async fn test_send_queue_keeps_readiness_failure_pending_and_recoverable() {
 }
 
 #[async_test]
+async fn test_in_flight_query_deadline_is_reported_truthfully() {
+    let (server, alice, room_id, diagnostics) = setup_room().await;
+    let query_count_before = server
+        .server()
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/keys/query"))
+        .count();
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/.*/keys/query$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(30))
+                .set_body_json(serde_json::json!({ "device_keys": {} })),
+        )
+        .with_priority(1)
+        .mount(server.server())
+        .await;
+    tokio::time::pause();
+    let mut generation = alice.begin_encryption_sync_generation().expect("enabled readiness");
+    generation.mark_received();
+    let send_client = alice.clone();
+    let send_room_id = room_id.clone();
+    let send = tokio::spawn(async move {
+        send_client
+            .get_room(&send_room_id)
+            .expect("joined room")
+            .send(RoomMessageEventContent::text_plain("first"))
+            .await
+    });
+    let mut query_started = false;
+    for _ in 0..1_000 {
+        query_started = server
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/keys/query"))
+            .count()
+            > query_count_before;
+        if query_started {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(query_started, "authoritative query entered the in-flight state");
+    tokio::time::advance(Duration::from_secs(11)).await;
+    let error = send.await.expect("send task").expect_err("fence deadline");
+    assert!(matches!(
+        error,
+        matrix_sdk::Error::EncryptionReadiness(error)
+            if error.stage() == matrix_sdk::EncryptionReadinessStage::Deadline
+    ));
+    assert!(diagnostics.lock().unwrap().iter().any(|event| {
+        matches!(
+            event,
+            RoomKeyDiagnosticEvent::EncryptionReadiness(record)
+                if record.outcome == matrix_sdk::encryption::EncryptionReadinessOutcome::Deadline
+                    && record.query
+                        == matrix_sdk::encryption::EncryptionReadinessQueryState::InProgress
+                    && record.retryable
+        )
+    }));
+}
+
+#[async_test]
 async fn test_deadline_is_typed_retryable_and_does_not_consume_index_zero() {
     let (server, alice, room_id, diagnostics) = setup_room().await;
     tokio::time::pause();
@@ -382,6 +451,8 @@ async fn test_deadline_is_typed_retryable_and_does_not_consume_index_zero() {
             event,
             RoomKeyDiagnosticEvent::EncryptionReadiness(record)
                 if record.outcome == matrix_sdk::encryption::EncryptionReadinessOutcome::Deadline
+                    && record.query
+                        == matrix_sdk::encryption::EncryptionReadinessQueryState::NotStarted
                     && record.retryable
         )
     }));

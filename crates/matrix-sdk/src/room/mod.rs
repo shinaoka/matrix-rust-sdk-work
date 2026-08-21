@@ -2522,6 +2522,7 @@ impl Room {
         let mut query_state = EncryptionReadinessQueryState::NotStarted;
         let fence = async {
             self.wait_for_encryption_sync_readiness().await?;
+            query_state = EncryptionReadinessQueryState::InProgress;
             let counts = match self.query_keys_for_all_active_users().await {
                 Ok(counts) => {
                     query_state = EncryptionReadinessQueryState::Accepted;
