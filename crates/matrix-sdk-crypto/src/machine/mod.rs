@@ -1446,6 +1446,17 @@ impl OlmMachine {
         self.inner.room_key_diagnostics.set_observer(observer);
     }
 
+    /// Return the retained closed creation/rotation reason for an exact
+    /// outbound Megolm session. Raw identifiers remain query inputs and are
+    /// never returned or exposed through diagnostics.
+    pub fn room_key_rotation_reason(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Option<RoomKeyRotationReason> {
+        self.inner.room_key_diagnostics.rotation_reason(room_id, session_id)
+    }
+
     /// Snapshot the aggregate privacy-safe receive-side room-key counters.
     pub fn room_key_receive_counters(&self) -> RoomKeyReceiveCounters {
         self.inner.room_key_diagnostics.receive_counters()
