@@ -1188,6 +1188,21 @@ impl Encryption {
         }
     }
 
+    /// Return the retained closed creation/rotation reason for an exact
+    /// outbound Megolm session. Raw identifiers remain query inputs and are
+    /// never returned or exposed through diagnostics.
+    pub async fn room_key_rotation_reason(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Option<RoomKeyRotationReason> {
+        self.client
+            .olm_machine()
+            .await
+            .as_ref()
+            .and_then(|machine| machine.room_key_rotation_reason(room_id, session_id))
+    }
+
     /// Snapshot the aggregate privacy-safe receive-side room-key counters.
     pub async fn room_key_receive_counters(&self) -> RoomKeyReceiveCounters {
         self.client

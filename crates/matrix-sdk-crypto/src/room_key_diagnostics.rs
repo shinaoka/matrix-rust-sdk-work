@@ -9,12 +9,14 @@
 //! process-local ordinals owned by one [`OlmMachine`](crate::OlmMachine).
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
 
 use ruma::{DeviceId, RoomId, TransactionId, UserId};
+
+const ROTATION_REASON_RETENTION_CAPACITY: usize = 128;
 
 /// A process-local anonymous identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -870,6 +872,7 @@ struct RoomKeyDiagnosticState {
     devices: BTreeMap<(String, String), RoomKeyDiagnosticAlias>,
     active_sessions: BTreeMap<String, String>,
     pending_discards: BTreeMap<String, PendingRoomKeyDiscard>,
+    rotation_reasons: VecDeque<RetainedRotationReason>,
     next_room: u64,
     next_session: u64,
     next_request: u64,
@@ -892,6 +895,12 @@ struct RoomKeyDiagnosticState {
 struct PendingRoomKeyDiscard {
     reason: RoomKeyRotationReason,
     noted_at: Instant,
+}
+
+struct RetainedRotationReason {
+    room_id: String,
+    session_id: String,
+    reason: RoomKeyRotationReason,
 }
 
 pub(crate) struct RoomKeyRotationClassification {
@@ -1425,6 +1434,11 @@ impl RoomKeyDiagnosticHub {
     ) {
         let (observer, event) = {
             let mut state = lock(&self.0);
+            if creation_outcome == RoomKeyCreationOutcome::Created
+                && let Some(session_id) = new_session_id
+            {
+                retain_rotation_reason(&mut state, room_id, session_id, reason);
+            }
             let room = room_alias(&mut state, room_id);
             let previous_session =
                 previous_session_id.map(|session| session_alias(&mut state, room_id, session));
@@ -1448,6 +1462,21 @@ impl RoomKeyDiagnosticHub {
         if let Some(observer) = observer {
             observer(RoomKeyDiagnosticEvent::Rotation(event));
         }
+    }
+
+    pub(crate) fn rotation_reason(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Option<RoomKeyRotationReason> {
+        lock(&self.0)
+            .rotation_reasons
+            .iter()
+            .rev()
+            .find(|retained| {
+                retained.room_id == room_id.as_str() && retained.session_id == session_id
+            })
+            .map(|retained| retained.reason)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1549,6 +1578,30 @@ fn matching_bucket_token(count: usize) -> u8 {
         6..=20 => 3,
         _ => 4,
     }
+}
+
+fn retain_rotation_reason(
+    state: &mut RoomKeyDiagnosticState,
+    room_id: &RoomId,
+    session_id: &str,
+    reason: RoomKeyRotationReason,
+) {
+    if let Some(retained) = state
+        .rotation_reasons
+        .iter_mut()
+        .find(|retained| retained.room_id == room_id.as_str() && retained.session_id == session_id)
+    {
+        retained.reason = reason;
+        return;
+    }
+    if state.rotation_reasons.len() == ROTATION_REASON_RETENTION_CAPACITY {
+        state.rotation_reasons.pop_front();
+    }
+    state.rotation_reasons.push_back(RetainedRotationReason {
+        room_id: room_id.as_str().to_owned(),
+        session_id: session_id.to_owned(),
+        reason,
+    });
 }
 
 fn room_alias(state: &mut RoomKeyDiagnosticState, room_id: &RoomId) -> RoomKeyDiagnosticAlias {
@@ -1747,6 +1800,70 @@ mod tests {
         assert_eq!(
             hub.classify_rotation_reason(room, false, false, true, true).reason,
             RoomKeyRotationReason::Invalidated
+        );
+    }
+
+    #[test]
+    fn retained_rotation_reason_is_exact_bounded_and_creation_only() {
+        let hub = RoomKeyDiagnosticHub::default();
+        let room = room_id!("!retained:example.invalid");
+        hub.emit_rotation(
+            room,
+            None,
+            Some("session-0"),
+            RoomKeyRotationReason::Initial,
+            RoomKeyCreationOutcome::Created,
+            None,
+            1,
+        );
+        assert_eq!(hub.rotation_reason(room, "session-0"), Some(RoomKeyRotationReason::Initial));
+        assert_eq!(hub.rotation_reason(room_id!("!other:example.invalid"), "session-0"), None);
+        assert_eq!(hub.rotation_reason(room, "missing"), None);
+        hub.emit_rotation(
+            room,
+            None,
+            Some("session-0"),
+            RoomKeyRotationReason::ExplicitDiscard,
+            RoomKeyCreationOutcome::Created,
+            None,
+            1,
+        );
+        assert_eq!(
+            hub.rotation_reason(room, "session-0"),
+            Some(RoomKeyRotationReason::ExplicitDiscard),
+            "an exact duplicate updates in place"
+        );
+
+        hub.emit_rotation(
+            room,
+            Some("session-0"),
+            None,
+            RoomKeyRotationReason::KeyShareFailure,
+            RoomKeyCreationOutcome::Failed,
+            None,
+            1,
+        );
+        assert_eq!(
+            hub.rotation_reason(room, "session-0"),
+            Some(RoomKeyRotationReason::ExplicitDiscard),
+            "failed creation must not invent or replace a session attribution"
+        );
+
+        for index in 1..=128 {
+            hub.emit_rotation(
+                room,
+                None,
+                Some(&format!("session-{index}")),
+                RoomKeyRotationReason::ExpiredMessageCount,
+                RoomKeyCreationOutcome::Created,
+                None,
+                1,
+            );
+        }
+        assert_eq!(hub.rotation_reason(room, "session-0"), None);
+        assert_eq!(
+            hub.rotation_reason(room, "session-128"),
+            Some(RoomKeyRotationReason::ExpiredMessageCount)
         );
     }
 
