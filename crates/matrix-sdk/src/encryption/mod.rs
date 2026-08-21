@@ -113,28 +113,38 @@ use crate::{
 pub mod backups;
 pub mod futures;
 pub mod identities;
+mod readiness;
 pub mod recovery;
+pub use readiness::{
+    EncryptionSyncGenerationGuard, EncryptionSyncReadinessSnapshot, EncryptionSyncReadinessState,
+};
+pub(crate) use readiness::{
+    EncryptionSyncReadiness, OutboundSessionReadinessAttempt, OutboundSessionReadinessRegistry,
+    OutboundSessionReadinessState, outbound_session_requires_fence,
+};
 pub mod secret_storage;
 pub(crate) mod tasks;
 pub mod verification;
 
 pub use matrix_sdk_base::crypto::{
-    CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, ForwardedRoomKeyAuthOutcome,
-    IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
-    Index0InitialShareState, Index0ReshareDiagnostic, Index0ReshareOutcome,
-    InitialShareDeviceClass, InitialShareDeviceDiagnostic, InitialShareRepairClaimOutcome,
-    InitialShareRepairDiagnostic, InitialShareRepairOlmState, InitialShareRepairOutcome,
-    InitialShareRepairPreparation, InitialShareSessionDiagnostic, InitialShareStage,
-    KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError, OlmRecoveryCounters,
-    OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome,
-    RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
-    RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
-    RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMemberReloadContext,
-    RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision,
-    RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
-    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
-    RoomKeyRotationDiagnostic, RoomKeyRotationReason, RoomKeyWithheldContent, RoomKeyWithheldEvent,
-    SessionCreationError, SignatureError, VERSION,
+    CrossSigningStatus, CryptoStoreError, DecryptorError, EncryptionReadinessDiagnostic,
+    EncryptionReadinessOutcome, EncryptionReadinessQueryState, EncryptionReadinessSyncState,
+    EventError, ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestDiagnostic,
+    IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage, Index0InitialShareState,
+    Index0ReshareDiagnostic, Index0ReshareOutcome, InitialShareDeviceClass,
+    InitialShareDeviceDiagnostic, InitialShareRepairClaimOutcome, InitialShareRepairDiagnostic,
+    InitialShareRepairOlmState, InitialShareRepairOutcome, InitialShareRepairPreparation,
+    InitialShareSessionDiagnostic, InitialShareStage, KeyExportError, LocalTrust,
+    MediaEncryptionInfo, MegolmError, OlmError, OlmRecoveryCounters, OlmRecoveryDiagnostic,
+    OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome, RequestedRoomKeySession,
+    RoomKeyCreationOutcome, RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent,
+    RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome, RoomKeyImportResult, RoomKeyIngressKind,
+    RoomKeyMemberReloadContext, RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome,
+    RoomKeyMergeDecision, RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic,
+    RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason, RoomKeyRequestAction,
+    RoomKeyRequesterDeviceState, RoomKeyRequesterScope, RoomKeyRotationDiagnostic,
+    RoomKeyRotationReason, RoomKeyWithheldContent, RoomKeyWithheldEvent, SessionCreationError,
+    SignatureError, VERSION,
     olm::{
         SessionCreationError as MegolmSessionCreationError,
         SessionExportError as OlmSessionExportError,
@@ -568,6 +578,52 @@ impl Client {
 
     pub(crate) fn initial_share_repair_enabled(&self) -> bool {
         self.inner.initial_share_repair
+    }
+
+    pub(crate) fn encryption_sync_readiness_enabled(&self) -> bool {
+        self.inner.encryption_sync_readiness.enabled()
+    }
+
+    /// Begin one application-owned encryption-sync generation.
+    #[doc(hidden)]
+    pub fn begin_encryption_sync_generation(&self) -> Option<EncryptionSyncGenerationGuard> {
+        self.inner.encryption_sync_readiness.begin()
+    }
+
+    /// Return the current privacy-safe encryption-sync readiness snapshot.
+    #[doc(hidden)]
+    pub fn encryption_sync_readiness_snapshot(&self) -> EncryptionSyncReadinessSnapshot {
+        self.inner.encryption_sync_readiness.snapshot()
+    }
+
+    /// Subscribe to encryption-sync generation changes.
+    #[doc(hidden)]
+    pub fn subscribe_to_encryption_sync_readiness(
+        &self,
+    ) -> tokio::sync::watch::Receiver<EncryptionSyncReadinessSnapshot> {
+        self.inner.encryption_sync_readiness.subscribe()
+    }
+
+    pub(crate) fn outbound_session_readiness_state(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Option<OutboundSessionReadinessState> {
+        self.inner.outbound_session_readiness.state(room_id, session_id)
+    }
+
+    pub(crate) fn begin_outbound_session_readiness(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Option<OutboundSessionReadinessAttempt> {
+        self.inner.outbound_session_readiness.begin(room_id, session_id)
+    }
+
+    /// Return the bounded readiness-registry eviction count.
+    #[doc(hidden)]
+    pub fn outbound_session_readiness_evictions(&self) -> u64 {
+        self.inner.outbound_session_readiness.evictions()
     }
 
     pub(crate) async fn mark_request_as_sent(

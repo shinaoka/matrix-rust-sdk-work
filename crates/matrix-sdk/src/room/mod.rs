@@ -2468,6 +2468,222 @@ impl Room {
         self.enable_encryption_inner(true).await
     }
 
+    /// Run the standard pre-share and, for an unfenced index-0 session, wait
+    /// for current encryption-sync readiness, query every active member, and
+    /// repeat standard pre-share before event encryption.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) async fn preshare_room_key_with_readiness(&self) -> Result<()> {
+        if !self.client.encryption_sync_readiness_enabled() {
+            return self.preshare_room_key().await;
+        }
+
+        use crate::encryption::{
+            EncryptionReadinessOutcome, EncryptionReadinessQueryState,
+            OutboundSessionReadinessState, outbound_session_requires_fence,
+        };
+        use crate::{EncryptionReadinessError, EncryptionReadinessStage};
+
+        const READINESS_DEADLINE: Duration = Duration::from_secs(10);
+        let transport_lock = self.client.room_key_transport_lock(self.room_id());
+        let _lock = transport_lock.lock().await;
+        let before =
+            self.client.base_client().current_outbound_group_session_id(self.room_id()).await?;
+        self.preshare_room_key_locked().await?;
+        let session =
+            self.client.base_client().current_outbound_group_session_id(self.room_id()).await?;
+        let Some(session) = session else {
+            return Ok(());
+        };
+        let index = self
+            .client
+            .base_client()
+            .current_outbound_group_session_message_index(self.room_id())
+            .await?;
+        let state = self.client.outbound_session_readiness_state(self.room_id(), &session);
+        if state == Some(OutboundSessionReadinessState::Ready) {
+            return Ok(());
+        }
+        let needs_fence = outbound_session_requires_fence(
+            before.as_deref() != Some(session.as_str()),
+            state,
+            index,
+        );
+        if !needs_fence {
+            return Ok(());
+        }
+
+        let mut attempt = self
+            .client
+            .begin_outbound_session_readiness(self.room_id(), &session)
+            .expect("enabled readiness has a fence registry");
+        let deadline = tokio::time::Instant::now() + READINESS_DEADLINE;
+        let mut active_members = 0;
+        let mut returned_devices = 0;
+        let mut query_state = EncryptionReadinessQueryState::NotStarted;
+        let fence = async {
+            self.wait_for_encryption_sync_readiness().await?;
+            let counts = match self.query_keys_for_all_active_users().await {
+                Ok(counts) => {
+                    query_state = EncryptionReadinessQueryState::Accepted;
+                    counts
+                }
+                Err((_, known_active_members)) => {
+                    active_members = known_active_members;
+                    query_state = EncryptionReadinessQueryState::Failed;
+                    return Err(Error::EncryptionReadiness(EncryptionReadinessError::new(
+                        EncryptionReadinessStage::KeyQuery,
+                    )));
+                }
+            };
+            (active_members, returned_devices) = counts;
+            self.preshare_room_key_locked().await.map_err(|_| {
+                Error::EncryptionReadiness(EncryptionReadinessError::new(
+                    EncryptionReadinessStage::SecondShare,
+                ))
+            })?;
+            let after_session = self
+                .client
+                .base_client()
+                .current_outbound_group_session_id(self.room_id())
+                .await
+                .map_err(|_| {
+                    Error::EncryptionReadiness(EncryptionReadinessError::new(
+                        EncryptionReadinessStage::SessionChanged,
+                    ))
+                })?;
+            let after_index = self
+                .client
+                .base_client()
+                .current_outbound_group_session_message_index(self.room_id())
+                .await
+                .map_err(|_| {
+                    Error::EncryptionReadiness(EncryptionReadinessError::new(
+                        EncryptionReadinessStage::SessionChanged,
+                    ))
+                })?;
+            if after_session.as_deref() != Some(session.as_str()) || after_index != Some(0) {
+                return Err(Error::EncryptionReadiness(EncryptionReadinessError::new(
+                    EncryptionReadinessStage::SessionChanged,
+                )));
+            }
+            Ok((counts, after_index))
+        };
+        match tokio::time::timeout_at(deadline, fence).await {
+            Ok(Ok((_, after_index))) => {
+                attempt.mark_ready();
+                self.emit_encryption_readiness_diagnostic(
+                    &session,
+                    EncryptionReadinessOutcome::Ready,
+                    query_state,
+                    active_members,
+                    returned_devices,
+                    after_index,
+                )
+                .await;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let outcome = match &error {
+                    Error::EncryptionReadiness(error) => match error.stage() {
+                        EncryptionReadinessStage::Sync => EncryptionReadinessOutcome::Sync,
+                        EncryptionReadinessStage::KeyQuery => EncryptionReadinessOutcome::KeyQuery,
+                        EncryptionReadinessStage::SecondShare => {
+                            EncryptionReadinessOutcome::SecondShare
+                        }
+                        EncryptionReadinessStage::SessionChanged => {
+                            EncryptionReadinessOutcome::SessionChanged
+                        }
+                        EncryptionReadinessStage::Deadline => EncryptionReadinessOutcome::Deadline,
+                        EncryptionReadinessStage::Cancelled => {
+                            EncryptionReadinessOutcome::Cancelled
+                        }
+                    },
+                    _ => EncryptionReadinessOutcome::Cancelled,
+                };
+                self.emit_encryption_readiness_diagnostic(
+                    &session,
+                    outcome,
+                    query_state,
+                    active_members,
+                    returned_devices,
+                    index,
+                )
+                .await;
+                Err(error)
+            }
+            Err(_) => {
+                self.emit_encryption_readiness_diagnostic(
+                    &session,
+                    EncryptionReadinessOutcome::Deadline,
+                    query_state,
+                    active_members,
+                    returned_devices,
+                    index,
+                )
+                .await;
+                Err(Error::EncryptionReadiness(EncryptionReadinessError::new(
+                    EncryptionReadinessStage::Deadline,
+                )))
+            }
+        }
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    async fn emit_encryption_readiness_diagnostic(
+        &self,
+        session_id: &str,
+        outcome: crate::encryption::EncryptionReadinessOutcome,
+        query: crate::encryption::EncryptionReadinessQueryState,
+        active_members: usize,
+        returned_devices: usize,
+        message_index: Option<u32>,
+    ) {
+        use crate::encryption::{EncryptionReadinessSyncState, EncryptionSyncReadinessState};
+
+        let snapshot = self.client.encryption_sync_readiness_snapshot();
+        let sync = match snapshot.state {
+            EncryptionSyncReadinessState::NotStarted => EncryptionReadinessSyncState::NotStarted,
+            EncryptionSyncReadinessState::Pending => EncryptionReadinessSyncState::Pending,
+            EncryptionSyncReadinessState::Received => EncryptionReadinessSyncState::Received,
+            EncryptionSyncReadinessState::Failed => EncryptionReadinessSyncState::Failed,
+            EncryptionSyncReadinessState::Cancelled => EncryptionReadinessSyncState::Cancelled,
+        };
+        let machine = self.client.olm_machine().await;
+        if let Some(machine) = machine.as_ref() {
+            machine.emit_encryption_readiness_diagnostic(
+                self.room_id(),
+                session_id,
+                snapshot.generation,
+                sync,
+                query,
+                outcome,
+                active_members,
+                returned_devices,
+                message_index,
+                self.client.outbound_session_readiness_evictions(),
+            );
+        }
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    async fn wait_for_encryption_sync_readiness(&self) -> Result<()> {
+        use crate::encryption::EncryptionSyncReadinessState;
+        use crate::{EncryptionReadinessError, EncryptionReadinessStage};
+
+        let mut receiver = self.client.subscribe_to_encryption_sync_readiness();
+        loop {
+            let snapshot = *receiver.borrow_and_update();
+            if snapshot.state == EncryptionSyncReadinessState::Received {
+                return Ok(());
+            }
+            receiver.changed().await.map_err(|_| {
+                Error::EncryptionReadiness(EncryptionReadinessError::new(
+                    EncryptionReadinessStage::Cancelled,
+                ))
+            })?;
+        }
+    }
+
     /// Share a room key with users in the given room.
     ///
     /// This will create Olm sessions with all the users/device pairs in the
@@ -3341,6 +3557,31 @@ impl Room {
         }
 
         Ok(())
+    }
+
+    /// Run one authoritative out-of-band key query for every active member.
+    #[cfg(feature = "e2e-encryption")]
+    async fn query_keys_for_all_active_users(
+        &self,
+    ) -> std::result::Result<(usize, usize), (Error, usize)> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().expect("Olm machine wasn't started");
+        let members = self
+            .client
+            .state_store()
+            .get_user_ids(self.room_id(), RoomMemberships::ACTIVE)
+            .await
+            .map_err(|error| (error.into(), 0))?;
+        let active_members = members.len();
+        let (request_id, request) =
+            olm.query_keys_for_users(members.iter().map(|member| member.borrow()));
+        let response = self
+            .client
+            .keys_query(&request_id, request.device_keys)
+            .await
+            .map_err(|error| (error, active_members))?;
+        let returned_devices = response.device_keys.values().map(BTreeMap::len).sum();
+        Ok((active_members, returned_devices))
     }
 
     /// Send a message-like event with custom JSON content to this room.

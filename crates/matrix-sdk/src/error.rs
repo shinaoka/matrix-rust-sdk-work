@@ -249,6 +249,59 @@ impl RetryKind {
     }
 }
 
+/// Closed stage at which first-event encryption readiness failed.
+#[cfg(feature = "e2e-encryption")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncryptionReadinessStage {
+    /// Waiting for the current encryption-sync generation.
+    Sync,
+    /// Performing the authoritative active-member key query.
+    KeyQuery,
+    /// Repeating standard room-key pre-share.
+    SecondShare,
+    /// The outbound session changed or was no longer at index zero.
+    SessionChanged,
+    /// The single readiness deadline elapsed.
+    Deadline,
+    /// The readiness owner was cancelled.
+    Cancelled,
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl std::fmt::Display for EncryptionReadinessStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Sync => "sync",
+            Self::KeyQuery => "key_query",
+            Self::SecondShare => "second_share",
+            Self::SessionChanged => "session_changed",
+            Self::Deadline => "deadline",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
+/// Privacy-safe retryable first-event readiness error.
+#[cfg(feature = "e2e-encryption")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[error("encryption readiness failed at {stage}")]
+pub struct EncryptionReadinessError {
+    stage: EncryptionReadinessStage,
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl EncryptionReadinessError {
+    /// Construct a closed readiness error.
+    pub fn new(stage: EncryptionReadinessStage) -> Self {
+        Self { stage }
+    }
+
+    /// Return the closed failure stage.
+    pub fn stage(&self) -> EncryptionReadinessStage {
+        self.stage
+    }
+}
+
 /// Internal representation of errors.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -384,6 +437,11 @@ pub enum Error {
     /// Backups are not enabled
     #[error("backups are not enabled")]
     BackupNotEnabled,
+
+    /// First-event encryption readiness did not settle before event encryption.
+    #[cfg(feature = "e2e-encryption")]
+    #[error(transparent)]
+    EncryptionReadiness(EncryptionReadinessError),
 
     /// An encrypted event opted into the secure-backup durability fence but
     /// its current room key was not durably backed up.

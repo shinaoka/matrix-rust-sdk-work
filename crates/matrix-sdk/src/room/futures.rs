@@ -588,7 +588,7 @@ pub(crate) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
 
     // Query keys in case we don't have them for newly synced members.
     room.query_keys_for_untracked_or_dirty_users().await?;
-    room.preshare_room_key().await?;
+    room.preshare_room_key_with_readiness().await?;
 
     if !room.client.initial_share_repair_enabled() {
         room.ensure_room_joined()?;

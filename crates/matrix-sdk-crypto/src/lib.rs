@@ -100,19 +100,21 @@ use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecr
 pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
 pub use room_key_diagnostics::{
-    ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome,
-    IncomingRoomKeyRequestStage, Index0InitialShareState, Index0ReshareDiagnostic,
-    Index0ReshareOutcome, InitialShareDeviceClass, InitialShareDeviceDiagnostic,
-    InitialShareRepairClaimOutcome, InitialShareRepairDiagnostic, InitialShareRepairOlmState,
-    InitialShareRepairOutcome, InitialShareRepairPreparation, InitialShareSessionDiagnostic,
-    InitialShareStage, OlmRecoveryCounters, OlmRecoveryDiagnostic, OlmRecoveryReshareOutcome,
-    OlmRecoverySignalOutcome, RequestedRoomKeySession, RoomKeyCreationOutcome,
-    RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver,
-    RoomKeyFirstShareOutcome, RoomKeyIngressKind, RoomKeyMemberReloadContext,
-    RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision,
-    RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
-    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
-    RoomKeyRotationDiagnostic, RoomKeyRotationReason,
+    EncryptionReadinessDiagnostic, EncryptionReadinessOutcome, EncryptionReadinessQueryState,
+    EncryptionReadinessSyncState, ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestDiagnostic,
+    IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage, Index0InitialShareState,
+    Index0ReshareDiagnostic, Index0ReshareOutcome, InitialShareDeviceClass,
+    InitialShareDeviceDiagnostic, InitialShareRepairClaimOutcome, InitialShareRepairDiagnostic,
+    InitialShareRepairOlmState, InitialShareRepairOutcome, InitialShareRepairPreparation,
+    InitialShareSessionDiagnostic, InitialShareStage, OlmRecoveryCounters, OlmRecoveryDiagnostic,
+    OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome, RequestedRoomKeySession,
+    RoomKeyCreationOutcome, RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent,
+    RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome, RoomKeyIngressKind,
+    RoomKeyMemberReloadContext, RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome,
+    RoomKeyMergeDecision, RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic,
+    RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason, RoomKeyRequestAction,
+    RoomKeyRequesterDeviceState, RoomKeyRequesterScope, RoomKeyRotationDiagnostic,
+    RoomKeyRotationReason,
 };
 use serde::{Deserialize, Serialize};
 pub use session_manager::{

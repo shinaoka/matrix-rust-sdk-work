@@ -320,6 +320,82 @@ pub struct RoomKeyMemberReloadDiagnostic {
     pub discard_outcome: RoomKeyMemberReloadDiscardOutcome,
 }
 
+/// Closed encryption-sync state observed by a first-event readiness fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncryptionReadinessSyncState {
+    /// No generation had started.
+    NotStarted,
+    /// The current generation had not committed a response.
+    Pending,
+    /// The current generation had committed a response.
+    Received,
+    /// The current generation failed.
+    Failed,
+    /// The current generation ended or was cancelled.
+    Cancelled,
+}
+
+/// Closed authoritative key-query state for a readiness fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncryptionReadinessQueryState {
+    /// The query did not start.
+    NotStarted,
+    /// The response was accepted and committed.
+    Accepted,
+    /// The query failed.
+    Failed,
+}
+
+/// Closed first-event readiness outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncryptionReadinessOutcome {
+    /// The exact session became ready at index zero.
+    Ready,
+    /// The current encryption generation did not settle.
+    Sync,
+    /// The authoritative key query failed.
+    KeyQuery,
+    /// The repeated standard pre-share failed.
+    SecondShare,
+    /// The outbound session changed or left index zero.
+    SessionChanged,
+    /// The absolute deadline elapsed.
+    Deadline,
+    /// The fence owner was cancelled.
+    Cancelled,
+}
+
+/// Privacy-safe first-event encryption readiness record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptionReadinessDiagnostic {
+    /// Anonymous room alias.
+    pub room: RoomKeyDiagnosticAlias,
+    /// Anonymous outbound-session alias.
+    pub session: RoomKeyDiagnosticAlias,
+    /// Monotonic process-local encryption-sync generation.
+    pub generation: u64,
+    /// Closed encryption-sync state.
+    pub sync: EncryptionReadinessSyncState,
+    /// Closed full-query state.
+    pub query: EncryptionReadinessQueryState,
+    /// Closed fence outcome.
+    pub outcome: EncryptionReadinessOutcome,
+    /// Active-member count bucket.
+    pub active_members_bucket: u8,
+    /// Devices returned by the full query, bucketed.
+    pub returned_devices_bucket: u8,
+    /// Eligible devices observed by standard initial-share policy, bucketed.
+    pub eligible_devices_bucket: u8,
+    /// Devices whose index-zero share was accepted, bucketed.
+    pub accepted_devices_bucket: u8,
+    /// Current outbound message-index bucket.
+    pub message_index_bucket: u8,
+    /// Number of bounded readiness-registry evictions.
+    pub registry_evictions: u64,
+    /// Whether the send outcome is retryable.
+    pub retryable: bool,
+}
+
 /// Room-key diagnostic event emitted by the crypto machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoomKeyDiagnosticEvent {
@@ -342,6 +418,8 @@ pub enum RoomKeyDiagnosticEvent {
     Index0Reshare(Index0ReshareDiagnostic),
     /// Targeted initial-share Olm repair record (issue #523).
     InitialShareRepair(InitialShareRepairDiagnostic),
+    /// First-event encryption readiness record (issue #577).
+    EncryptionReadiness(EncryptionReadinessDiagnostic),
 }
 
 /// The kind of incoming encrypted room-key event, once the decrypted payload
@@ -1566,6 +1644,53 @@ impl RoomKeyDiagnosticHub {
         };
         if let Some(observer) = observer {
             observer(RoomKeyDiagnosticEvent::IncomingRequest(event));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_encryption_readiness(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        generation: u64,
+        sync: EncryptionReadinessSyncState,
+        query: EncryptionReadinessQueryState,
+        outcome: EncryptionReadinessOutcome,
+        active_members: usize,
+        returned_devices: usize,
+        message_index: Option<u32>,
+        registry_evictions: u64,
+    ) {
+        let (observer, event) = {
+            let mut state = lock(&self.0);
+            let room = room_alias(&mut state, room_id);
+            let session = session_alias(&mut state, room_id, session_id);
+            let initial_share =
+                state.initial_shares.get(&(room_id.to_string(), session_id.to_owned()));
+            let eligible_devices = initial_share
+                .map(|share| share.eligible_own.saturating_add(share.eligible_peer) as usize)
+                .unwrap_or(0);
+            let accepted_devices =
+                initial_share.map(|share| share.accepted_devices.len()).unwrap_or(0);
+            let event = EncryptionReadinessDiagnostic {
+                room,
+                session,
+                generation,
+                sync,
+                query,
+                outcome,
+                active_members_bucket: matching_bucket_token(active_members),
+                returned_devices_bucket: matching_bucket_token(returned_devices),
+                eligible_devices_bucket: matching_bucket_token(eligible_devices),
+                accepted_devices_bucket: matching_bucket_token(accepted_devices),
+                message_index_bucket: matching_bucket_token(message_index.unwrap_or(0) as usize),
+                registry_evictions,
+                retryable: outcome != EncryptionReadinessOutcome::Ready,
+            };
+            (state.observer.clone(), event)
+        };
+        if let Some(observer) = observer {
+            observer(RoomKeyDiagnosticEvent::EncryptionReadiness(event));
         }
     }
 }

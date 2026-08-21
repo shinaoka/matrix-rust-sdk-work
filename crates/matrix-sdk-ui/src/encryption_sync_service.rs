@@ -130,6 +130,7 @@ impl EncryptionSyncService {
         num_iterations: u8,
         _permit: OwnedMutexGuard<EncryptionSyncPermit>,
     ) -> Result<(), Error> {
+        let mut readiness = self.client.begin_encryption_sync_generation();
         let sync = self.sliding_sync.sync();
 
         pin_mut!(sync);
@@ -190,10 +191,16 @@ impl EncryptionSyncService {
 
                     // Cool cool, let's do it again.
                     trace!("Encryption sync received an update!");
+                    if let Some(readiness) = readiness.as_mut() {
+                        readiness.mark_received();
+                    }
                 }
 
                 Some(Err(err)) => {
                     trace!("Encryption sync stopped because of an error: {err:#}");
+                    if let Some(readiness) = readiness.as_mut() {
+                        readiness.mark_failed();
+                    }
                     return Err(Error::SlidingSync(err));
                 }
 
@@ -204,6 +211,9 @@ impl EncryptionSyncService {
             }
         }
 
+        if let Some(readiness) = readiness.as_mut() {
+            readiness.mark_cancelled();
+        }
         Ok(())
     }
 
@@ -219,6 +229,7 @@ impl EncryptionSyncService {
         &self,
         _permit: OwnedMutexGuard<EncryptionSyncPermit>,
     ) -> impl Stream<Item = Result<(), Error>> + '_ {
+        let mut readiness = self.client.begin_encryption_sync_generation();
         stream!({
             let sync = self.sliding_sync.sync();
 
@@ -238,18 +249,27 @@ impl EncryptionSyncService {
 
                         // Cool cool, let's do it again.
                         trace!("Encryption sync received an update!");
+                        if let Some(readiness) = readiness.as_mut() {
+                            readiness.mark_received();
+                        }
                         yield Ok(());
                         continue;
                     }
 
                     Some(Err(err)) => {
                         trace!("Encryption sync stopped because of an error: {err:#}");
+                        if let Some(readiness) = readiness.as_mut() {
+                            readiness.mark_failed();
+                        }
                         yield Err(Error::SlidingSync(err));
                         break;
                     }
 
                     None => {
                         trace!("Encryption sync properly terminated.");
+                        if let Some(readiness) = readiness.as_mut() {
+                            readiness.mark_cancelled();
+                        }
                         break;
                     }
                 }
@@ -302,4 +322,40 @@ pub enum Error {
 
     #[error(transparent)]
     ClientError(matrix_sdk::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use matrix_sdk::{
+        encryption::EncryptionSyncReadinessState, test_utils::mocks::MatrixMockServer,
+    };
+
+    use super::{EncryptionSyncPermit, EncryptionSyncService};
+
+    #[tokio::test]
+    async fn sync_stream_eagerly_starts_and_drop_cancels_its_generation() {
+        let server = MatrixMockServer::new().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.with_encryption_sync_readiness(true))
+            .build()
+            .await;
+        let service =
+            EncryptionSyncService::new(client.clone(), None).await.expect("encryption service");
+        let permit = Arc::new(tokio::sync::Mutex::new(EncryptionSyncPermit::new_for_testing()))
+            .lock_owned()
+            .await;
+        let stream = service.sync(permit);
+        assert_eq!(
+            client.encryption_sync_readiness_snapshot().state,
+            EncryptionSyncReadinessState::Pending
+        );
+        drop(stream);
+        assert_eq!(
+            client.encryption_sync_readiness_snapshot().state,
+            EncryptionSyncReadinessState::Cancelled
+        );
+    }
 }

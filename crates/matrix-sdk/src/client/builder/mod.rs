@@ -135,6 +135,9 @@ pub struct ClientBuilder {
     /// event of a fresh outbound Megolm session (issue #523). Defaults to off.
     #[cfg(feature = "e2e-encryption")]
     initial_share_repair: bool,
+    /// Whether encryption-sync generations gate new outbound Megolm sessions.
+    #[cfg(feature = "e2e-encryption")]
+    encryption_sync_readiness: bool,
     cross_process_lock_config: CrossProcessLockConfig,
     threading_support: ThreadingSupport,
     #[cfg(feature = "experimental-search")]
@@ -174,6 +177,8 @@ impl ClientBuilder {
             index0_duplicate_share: false,
             #[cfg(feature = "e2e-encryption")]
             initial_share_repair: false,
+            #[cfg(feature = "e2e-encryption")]
+            encryption_sync_readiness: false,
             cross_process_lock_config: CrossProcessLockConfig::MultiProcess {
                 holder_name: Self::DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME.to_owned(),
             },
@@ -544,6 +549,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Require current encryption-sync readiness before the first event of a
+    /// newly created or restored index-0 outbound Megolm session.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn with_encryption_sync_readiness(mut self, enabled: bool) -> Self {
+        self.encryption_sync_readiness = enabled;
+        self
+    }
+
     /// Set the cross-process store locks holder name.
     ///
     /// The SDK provides cross-process store locks (see
@@ -695,6 +708,8 @@ impl ClientBuilder {
             self.index0_duplicate_share,
             #[cfg(feature = "e2e-encryption")]
             self.initial_share_repair,
+            #[cfg(feature = "e2e-encryption")]
+            self.encryption_sync_readiness,
             self.cross_process_lock_config,
             #[cfg(feature = "experimental-search")]
             search_index,

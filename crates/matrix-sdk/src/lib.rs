@@ -80,6 +80,8 @@ pub use error::{
     BeaconError, Error, HttpError, HttpResult, NotificationSettingsError, RefreshTokenError,
     Result, RumaApiError,
 };
+#[cfg(feature = "e2e-encryption")]
+pub use error::{EncryptionReadinessError, EncryptionReadinessStage};
 pub use http_client::TransmissionProgress;
 #[cfg(all(feature = "e2e-encryption", feature = "sqlite"))]
 pub use matrix_sdk_sqlite::SqliteCryptoStore;
