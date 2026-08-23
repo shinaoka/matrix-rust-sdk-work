@@ -331,6 +331,7 @@ impl ThreadListService {
     pub async fn paginate(&self) -> Result<(), ClientError> {
         self.inner.paginate().await.map_err(|e| match e {
             UIThreadListServiceError::Sdk(sdk_err) => ClientError::from(sdk_err),
+            UIThreadListServiceError::EventCache(cache_err) => ClientError::from(cache_err),
         })
     }
 
