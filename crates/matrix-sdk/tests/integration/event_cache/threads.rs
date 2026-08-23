@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
@@ -8,17 +8,22 @@ use matrix_sdk::{
     deserialized_responses::{ThreadSummaryStatus, TimelineEvent},
     event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate, TimelineVectorDiffs},
     sleep::sleep,
+    store::StoreConfig,
     test_utils::{
         assert_event_matches_msg,
         mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
     },
-    timeout::timeout,
+};
+use matrix_sdk_base::event_cache::{Event, store::EventCacheStore};
+use matrix_sdk_common::{
+    cross_process_lock::CrossProcessLockConfig, serde_helpers::extract_thread_root,
 };
 use matrix_sdk_test::{ALICE, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{
     OwnedEventId, OwnedRoomId, event_id,
     events::{
-        AnySyncTimelineEvent, Mentions, room::message::RoomMessageEventContentWithoutRelation,
+        AnySyncTimelineEvent, Mentions, relation::RelationType,
+        room::message::RoomMessageEventContentWithoutRelation,
     },
     push::{ConditionalPushRule, Ruleset},
     room_id,
@@ -975,11 +980,9 @@ async fn test_redact_touches_threads() {
 }
 
 #[async_test]
-async fn test_edits_touches_threads() {
-    // We start with a thread with some replies, then receive an edit and an invalid
-    // edit for the replies over sync. We observe that valid edits update the
-    // thread linked chunks as well as the thread summary on the thread root
-    // event. Invalid ones don't update the state.
+async fn test_multiple_valid_edits_update_thread_summary() {
+    // We start with a thread with some replies, then receive multiple valid edits
+    // over sync. The latest edit updates the thread summary.
 
     let s = thread_subscription_test_setup().await;
     let f = s.factory;
@@ -1011,6 +1014,8 @@ async fn test_edits_touches_threads() {
     let (room_events, mut room_stream) = room_event_cache.subscribe().await.unwrap();
 
     // A valid edit for the first reply comes through sync.
+    // Use distinct fixture timestamps so the latest-edit comparator is deterministic.
+    f.set_next_ts(100);
     let valid_edit_event_id = event_id!("$valid_edit");
     s.server
         .sync_room(
@@ -1052,13 +1057,14 @@ async fn test_edits_touches_threads() {
         }
     }
 
-    // An invalid edit for the second reply comes through sync.
-    let invalid_edit_id = event_id!("$invalid_edit");
+    // A second valid edit for the second reply comes through sync.
+    f.set_next_ts(200);
+    let second_edit_id = event_id!("$second_edit");
     s.server
         .sync_room(
             &s.client,
             JoinedRoomBuilder::new(&s.room_id).add_timeline_event(
-                f.text_msg("Nobody speaks english anymore.").event_id(invalid_edit_id).edit(
+                f.text_msg("Nobody speaks english anymore.").event_id(second_edit_id).edit(
                     &room_events[2].event_id().unwrap(),
                     RoomMessageEventContentWithoutRelation::text_plain("edited text"),
                 ),
@@ -1066,16 +1072,351 @@ async fn test_edits_touches_threads() {
         )
         .await;
 
-    // It's a bit hard to know when the update should have been ready. This makes it
-    // hard to prove that no update happened.
-    let result = timeout(room_stream.recv(), Duration::from_secs(1)).await;
-
-    assert!(result.is_err(), "The room stream should have timed out as the edit was invnalid");
+    // The second edit can be delivered separately from the root summary update;
+    // consume the serial stream until the edit itself is observed. The persisted
+    // room snapshot below is the summary assertion.
+    let edit_seen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let Ok(update) = room_stream.recv().await else {
+                break false;
+            };
+            let RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) =
+                update
+            else {
+                continue;
+            };
+            if diffs.iter().any(|diff| {
+                matches!(
+                    diff,
+                    VectorDiff::Append { values }
+                        if values
+                            .iter()
+                            .any(|event| event.event_id().as_deref() == Some(second_edit_id))
+                )
+            }) {
+                break true;
+            }
+        }
+    })
+    .await
+    .expect("second edit should reach the cache stream");
+    assert!(edit_seen);
 
     let room_events = room_event_cache.events().await.unwrap();
     let first = room_events.first().unwrap();
     let thread_summary = first.thread_summary.summary().unwrap();
+    assert_eq!(thread_summary.latest_reply.as_deref(), Some(second_edit_id));
+}
 
-    // The latest reply should still be our valid event, not our invalid one.
-    assert_eq!(thread_summary.latest_reply.as_deref(), Some(valid_edit_event_id));
+#[async_test]
+async fn test_thread_relation_query_and_redaction_state_for_aggregate_spike() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!aggregate-spike:example.org");
+    let root_id = event_id!("$aggregate-root");
+    let reply_a_id = event_id!("$aggregate-a");
+    let reply_b_id = event_id!("$aggregate-b");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+
+    let room = server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_bulk(vec![
+                f.text_msg("root").event_id(root_id).into_raw_sync(),
+                f.text_msg("reply a")
+                    .in_thread(root_id, root_id)
+                    .event_id(reply_a_id)
+                    .into_raw_sync(),
+                f.text_msg("reply b")
+                    .in_thread(root_id, reply_a_id)
+                    .event_id(reply_b_id)
+                    .into_raw_sync(),
+            ]),
+        )
+        .await;
+
+    let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (initial_events, mut room_stream) = room_cache.subscribe().await.unwrap();
+    assert_eq!(initial_events.len(), 3);
+
+    let relation_ids = room_cache
+        .find_event_relations(&root_id, Some(vec![RelationType::Thread]))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.event_id())
+        .collect::<Vec<_>>();
+    assert_eq!(relation_ids, vec![reply_a_id.to_owned(), reply_b_id.to_owned()]);
+
+    let redaction_id = event_id!("$aggregate-redaction-b");
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.redaction(&reply_b_id).event_id(redaction_id)),
+        )
+        .await;
+
+    let redacted_set = loop {
+        let update = room_stream.recv().await.unwrap();
+        let RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) = update
+        else {
+            continue;
+        };
+        if let Some(VectorDiff::Set { value, .. }) = diffs.iter().find(|diff| {
+            matches!(diff, VectorDiff::Set { value, .. } if value.event_id().as_deref() == Some(reply_b_id))
+        }) {
+            break value.clone();
+        }
+    };
+    assert!(redacted_set.raw().get_field::<serde_json::Value>("content").unwrap().is_some());
+    assert!(
+        redacted_set
+            .raw()
+            .get_field::<serde_json::Value>("unsigned")
+            .unwrap()
+            .is_some_and(|unsigned| unsigned.get("redacted_because").is_some())
+    );
+    assert!(extract_thread_root(redacted_set.raw()).is_none());
+
+    let active_ids = room_cache
+        .find_event_relations(&root_id, Some(vec![RelationType::Thread]))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event
+                .raw()
+                .get_field::<serde_json::Value>("unsigned")
+                .unwrap()
+                .is_none_or(|unsigned| unsigned.get("redacted_because").is_none())
+        })
+        .filter_map(|event| event.event_id())
+        .collect::<Vec<_>>();
+    assert_eq!(active_ids, vec![reply_a_id]);
+}
+
+fn is_redacted(event: &Event) -> bool {
+    event
+        .raw()
+        .get_field::<serde_json::Value>("unsigned")
+        .unwrap()
+        .is_some_and(|unsigned| unsigned.get("redacted_because").is_some())
+}
+
+#[async_test]
+async fn test_redaction_before_target_is_replayed_by_cache() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!aggregate-ordering:example.org");
+    let target_id = event_id!("$aggregate-ordering-target");
+    let redaction_id = event_id!("$aggregate-ordering-redaction");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.redaction(&target_id).event_id(redaction_id)),
+        )
+        .await;
+    assert!(room_cache.find_event(&target_id).await.unwrap().is_none());
+
+    let redaction = room_cache
+        .find_event(&redaction_id)
+        .await
+        .unwrap()
+        .expect("redaction should be retained in the cache");
+    assert_eq!(redaction.event_id().as_deref(), Some(redaction_id));
+    let stored_redactions = client
+        .event_cache_store()
+        .lock()
+        .await
+        .unwrap()
+        .as_clean()
+        .unwrap()
+        .get_room_events(room_id, Some("m.room.redaction"), None)
+        .await
+        .unwrap();
+    assert!(
+        stored_redactions.iter().any(|event| event.event_id().as_deref() == Some(redaction_id))
+    );
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("reply arrives after redaction").event_id(target_id).into_raw_sync(),
+            ),
+        )
+        .await;
+
+    let target = room_cache.find_event(&target_id).await.unwrap().expect("target should be cached");
+    assert!(is_redacted(&target), "a retained redaction must apply to a late target");
+}
+
+#[async_test]
+async fn test_redaction_before_target_in_same_batch_is_applied_before_relations() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!aggregate-same-batch:example.org");
+    let root_id = event_id!("$aggregate-same-root");
+    let target_id = event_id!("$aggregate-same-target");
+    let redaction_id = event_id!("$aggregate-same-redaction");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+    let room = server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("root").event_id(root_id).into_raw_sync()),
+        )
+        .await;
+    let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_bulk(vec![
+                f.redaction(&target_id).event_id(redaction_id).into_raw_sync(),
+                f.text_msg("reply arrives in the same batch")
+                    .in_thread(root_id, root_id)
+                    .event_id(target_id)
+                    .into_raw_sync(),
+            ]),
+        )
+        .await;
+
+    let target = room_cache.find_event(&target_id).await.unwrap().expect("target should be cached");
+    assert!(is_redacted(&target));
+    assert!(extract_thread_root(target.raw()).is_none());
+    assert!(
+        room_cache
+            .find_event_relations(&root_id, Some(vec![RelationType::Thread]))
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|event| event.event_id().as_deref() != Some(target_id))
+    );
+}
+
+#[async_test]
+async fn test_redaction_before_target_duplicate_replay_stays_applied() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!aggregate-replay:example.org");
+    let target_id = event_id!("$aggregate-replay-target");
+    let redaction_id = event_id!("$aggregate-replay-redaction");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.redaction(&target_id).event_id(redaction_id)),
+        )
+        .await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("target").event_id(target_id).into_raw_sync()),
+        )
+        .await;
+    assert!(is_redacted(
+        &room_cache.find_event(&target_id).await.unwrap().expect("target should be cached")
+    ));
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_bulk(vec![
+                f.redaction(&target_id).event_id(redaction_id).into_raw_sync(),
+                f.text_msg("target replay").event_id(target_id).into_raw_sync(),
+            ]),
+        )
+        .await;
+
+    assert!(is_redacted(
+        &room_cache.find_event(&target_id).await.unwrap().expect("target should remain cached")
+    ));
+}
+
+#[async_test]
+async fn test_redaction_before_target_rebuilds_after_store_reopen() {
+    let server = MatrixMockServer::new().await;
+    let room_id = room_id!("!aggregate-reopen:example.org");
+    let target_id = event_id!("$aggregate-reopen-target");
+    let redaction_id = event_id!("$aggregate-reopen-redaction");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+    let event_cache_store = Arc::new(matrix_sdk_base::event_cache::store::MemoryStore::new());
+    let state_store = matrix_sdk_base::store::MemoryStore::new();
+    let store_config = StoreConfig::new(CrossProcessLockConfig::multi_process("aggregate-reopen"))
+        .state_store(state_store)
+        .event_cache_store(event_cache_store.clone());
+
+    {
+        let client = server
+            .client_builder()
+            .on_builder(|builder| {
+                builder
+                    .with_threading_support(ThreadingSupport::Enabled { with_subscriptions: false })
+                    .store_config(store_config.clone())
+            })
+            .build()
+            .await;
+        client.event_cache().subscribe().unwrap();
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_event(f.redaction(&target_id).event_id(redaction_id)),
+            )
+            .await;
+        assert!(room_cache.find_event(&target_id).await.unwrap().is_none());
+        assert!(room_cache.find_event(&redaction_id).await.unwrap().is_some());
+    }
+
+    event_cache_store.close().await.unwrap();
+    event_cache_store.reopen().await.unwrap();
+
+    let client = server
+        .client_builder()
+        .on_builder(|builder| {
+            builder
+                .with_threading_support(ThreadingSupport::Enabled { with_subscriptions: false })
+                .store_config(store_config)
+        })
+        .build()
+        .await;
+    client.event_cache().subscribe().unwrap();
+    let room = client.get_room(room_id).expect("room should reload from the state store");
+    let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+    assert!(room_cache.find_event(&redaction_id).await.unwrap().is_some());
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("target after reopen").event_id(target_id).into_raw_sync(),
+            ),
+        )
+        .await;
+
+    assert!(is_redacted(
+        &room_cache.find_event(&target_id).await.unwrap().expect("target should be cached")
+    ));
 }

@@ -104,7 +104,10 @@ pub use self::{
     item::{TimelineItem, TimelineItemKind, TimelineUniqueId},
     latest_event::{LatestEventValue, LatestEventValueLocalState},
     pagination::RestoreFromCacheOutcome,
-    thread_list_service::{ThreadListPaginationState, ThreadListService},
+    thread_list_service::{
+        ThreadListPaginationState, ThreadListService, ThreadRelationAggregate,
+        resolve_thread_relation_aggregate,
+    },
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
