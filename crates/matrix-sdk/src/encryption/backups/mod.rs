@@ -29,7 +29,7 @@ use matrix_sdk_base::crypto::types::events::room::encrypted::EncryptedEvent;
 use matrix_sdk_base::crypto::{
     OlmMachine, RoomKeyImportResult,
     backups::MegolmV1BackupKey,
-    store::types::BackupDecryptionKey,
+    store::types::{BackupDecryptionKey, RoomKeyCounts},
     types::{RoomKeyBackupInfo, requests::KeysBackupRequest},
 };
 #[cfg(feature = "experimental-push-secrets")]
@@ -445,6 +445,20 @@ impl Backups {
     /// Get the current [`BackupState`] for this [`Client`].
     pub fn state(&self) -> BackupState {
         self.client.inner.e2ee.backup_state.global_state.get()
+    }
+
+    /// Get the current room-key upload state without starting or waiting for
+    /// an upload.
+    pub fn upload_state(&self) -> UploadState {
+        self.client.inner.e2ee.backup_state.upload_progress.get()
+    }
+
+    /// Get a snapshot of locally stored and already-backed-up room-key counts
+    /// without starting or waiting for an upload.
+    pub async fn room_key_counts(&self) -> Result<RoomKeyCounts, Error> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        Ok(olm_machine.backup_machine().room_key_counts().await?)
     }
 
     /// Are backups enabled for the current [`Client`]?
@@ -1599,6 +1613,22 @@ mod test {
             .expect("We should be able to check if backups exist on the server");
 
         assert!(!exists, "But now there is no backup");
+    }
+
+    #[async_test]
+    async fn test_room_key_counts_snapshot_does_not_wait_for_upload() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let counts = client
+            .encryption()
+            .backups()
+            .room_key_counts()
+            .await
+            .expect("room-key counts should be readable without running an upload");
+
+        assert_eq!(counts.total, 0);
+        assert_eq!(counts.backed_up, 0);
     }
 
     #[async_test]
