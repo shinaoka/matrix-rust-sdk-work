@@ -14,9 +14,15 @@ use std::{
     time::Instant,
 };
 
-use ruma::{DeviceId, RoomId, TransactionId, UserId};
+use ruma::{DeviceId, OwnedRoomId, RoomId, TransactionId, UserId};
+use serde::{Deserialize, Serialize};
+
+use crate::store::Store;
 
 const ROTATION_REASON_RETENTION_CAPACITY: usize = 128;
+const PERSISTED_ROTATION_REASONS_KEY: &str = "koushi.room_key_rotation_reasons.v1";
+const PERSISTED_ROTATION_REASONS_VERSION: u8 = 1;
+const PERSISTED_ROTATION_REASONS_MAX_BYTES: usize = 128 * 1024;
 
 /// A process-local anonymous identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -189,7 +195,8 @@ pub struct IncomingRoomKeyRequestDiagnostic {
 }
 
 /// Why a new outbound Megolm session was created.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoomKeyRotationReason {
     /// First observed session for the room.
     Initial,
@@ -320,82 +327,87 @@ pub struct RoomKeyMemberReloadDiagnostic {
     pub discard_outcome: RoomKeyMemberReloadDiscardOutcome,
 }
 
-/// Closed encryption-sync state observed by a first-event readiness fence.
+/// Device-policy class for initial-share diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EncryptionReadinessSyncState {
-    /// No generation had started.
-    NotStarted,
-    /// The current generation had not committed a response.
-    Pending,
-    /// The current generation had committed a response.
-    Received,
-    /// The current generation failed.
-    Failed,
-    /// The current generation ended or was cancelled.
-    Cancelled,
+pub enum InitialShareDeviceClass {
+    /// A verified device belonging to this account.
+    VerifiedOwn,
+    /// An unverified device belonging to this account.
+    UnverifiedOwn,
+    /// A verified device belonging to another account.
+    VerifiedPeer,
+    /// An unverified device belonging to another account.
+    UnverifiedPeer,
+    /// A dehydrated device excluded from sharing.
+    Dehydrated,
+    /// The class could not be established safely.
+    Unknown,
 }
 
-/// Closed authoritative key-query state for a readiness fence.
+/// Per-device lifecycle stage of the standard initial room-key share.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EncryptionReadinessQueryState {
-    /// The query did not start.
-    NotStarted,
-    /// The request is in flight and has not settled.
-    InProgress,
-    /// The response was accepted and committed.
-    Accepted,
-    /// The query failed.
-    Failed,
+pub enum InitialShareStage {
+    /// Policy selected this device as an eligible recipient.
+    Eligible,
+    /// No Olm session was available.
+    OlmMissing,
+    /// The room key was encrypted with Olm.
+    OlmEncrypted,
+    /// Olm encryption failed.
+    OlmEncryptionFailed,
+    /// Recipient policy withheld the key.
+    Withheld,
+    /// The to-device request was queued.
+    RequestQueued,
+    /// The homeserver accepted the request.
+    HomeserverAccepted,
+    /// Share state was committed at the given Megolm index.
+    ShareStateCommitted {
+        /// The committed message index.
+        message_index: u32,
+    },
 }
 
-/// Closed first-event readiness outcome.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EncryptionReadinessOutcome {
-    /// The exact session became ready at index zero.
-    Ready,
-    /// The current encryption generation did not settle.
-    Sync,
-    /// The authoritative key query failed.
-    KeyQuery,
-    /// The repeated standard pre-share failed.
-    SecondShare,
-    /// The outbound session changed or left index zero.
-    SessionChanged,
-    /// The absolute deadline elapsed.
-    Deadline,
-    /// The fence owner was cancelled.
-    Cancelled,
-}
-
-/// Privacy-safe first-event encryption readiness record.
+/// Privacy-safe per-device standard initial-share diagnostic.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EncryptionReadinessDiagnostic {
-    /// Anonymous room alias.
-    pub room: RoomKeyDiagnosticAlias,
-    /// Anonymous outbound-session alias.
+pub struct InitialShareDeviceDiagnostic {
+    /// Anonymous session correlation.
     pub session: RoomKeyDiagnosticAlias,
-    /// Monotonic process-local encryption-sync generation.
-    pub generation: u64,
-    /// Closed encryption-sync state.
-    pub sync: EncryptionReadinessSyncState,
-    /// Closed full-query state.
-    pub query: EncryptionReadinessQueryState,
-    /// Closed fence outcome.
-    pub outcome: EncryptionReadinessOutcome,
-    /// Active-member count bucket.
-    pub active_members_bucket: u8,
-    /// Devices returned by the full query, bucketed.
-    pub returned_devices_bucket: u8,
-    /// Eligible devices observed by standard initial-share policy, bucketed.
-    pub eligible_devices_bucket: u8,
-    /// Devices whose index-zero share was accepted, bucketed.
-    pub accepted_devices_bucket: u8,
-    /// Current outbound message-index bucket.
-    pub message_index_bucket: u8,
-    /// Number of bounded readiness-registry evictions.
-    pub registry_evictions: u64,
-    /// Whether the send outcome is retryable.
-    pub retryable: bool,
+    /// Anonymous device correlation.
+    pub device: RoomKeyDiagnosticAlias,
+    /// Device policy class.
+    pub device_class: InitialShareDeviceClass,
+    /// Lifecycle stage.
+    pub stage: InitialShareStage,
+    /// Elapsed time since the first share observation.
+    pub elapsed_ms: u64,
+}
+
+/// Privacy-safe summary emitted when the first room event is encrypted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialShareSessionDiagnostic {
+    /// Anonymous session correlation.
+    pub session: RoomKeyDiagnosticAlias,
+    /// First encrypted event's message index.
+    pub first_event_message_index: u32,
+    /// Whether all initial shares settled before that event.
+    pub all_initial_shares_settled_first: bool,
+    /// Pending-request count bucket.
+    pub pending_requests_bucket: u8,
+    /// Eligible own-device count.
+    pub eligible_own_devices: u32,
+    /// Eligible peer-device count.
+    pub eligible_peer_devices: u32,
+    /// Shares committed at index 0.
+    pub index0_shares_committed: u32,
+    /// Shares committed after index 0.
+    pub after_index0_shares_committed: u32,
+    /// Requests accepted by the homeserver.
+    pub homeserver_accepted_devices: u32,
+    /// Whether no committed share contradicts index-0 creation.
+    pub created_at_index0: bool,
+    /// Elapsed time since the first share observation.
+    pub elapsed_ms: u64,
 }
 
 /// Room-key diagnostic event emitted by the crypto machine.
@@ -407,21 +419,12 @@ pub enum RoomKeyDiagnosticEvent {
     Rotation(RoomKeyRotationDiagnostic),
     /// Full member-list reload and the resulting outbound-session discard.
     MemberReload(RoomKeyMemberReloadDiagnostic),
+    /// Standard initial-share device stage.
+    InitialShare(InitialShareDeviceDiagnostic),
+    /// Standard initial-share session summary.
+    InitialShareSession(InitialShareSessionDiagnostic),
     /// Receive-side room-key lifecycle outcome.
     Receive(RoomKeyReceiveDiagnostic),
-    /// Post-unwedge recovery re-share outcome (issue #477).
-    OlmRecovery(OlmRecoveryDiagnostic),
-    /// Per-device initial-share lifecycle stage (issue #509).
-    InitialShare(InitialShareDeviceDiagnostic),
-    /// Session-scoped initial-share summary at first event encryption (issue
-    /// #509).
-    InitialShareSession(InitialShareSessionDiagnostic),
-    /// Bounded index-0 duplicate-share record (issue #510).
-    Index0Reshare(Index0ReshareDiagnostic),
-    /// Targeted initial-share Olm repair record (issue #523).
-    InitialShareRepair(InitialShareRepairDiagnostic),
-    /// First-event encryption readiness record (issue #577).
-    EncryptionReadiness(EncryptionReadinessDiagnostic),
 }
 
 /// The kind of incoming encrypted room-key event, once the decrypted payload
@@ -506,287 +509,6 @@ pub enum RoomKeyReceiveDiagnosticKind {
 pub struct RoomKeyReceiveDiagnostic {
     /// The closed outcome token.
     pub kind: RoomKeyReceiveDiagnosticKind,
-}
-
-/// Closed outcome of the post-unwedge recovery re-share (issue #477).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OlmRecoverySignalOutcome {
-    /// The unwedge signal was observed for a known device.
-    Observed,
-    /// The unwedge signal was ignored: unknown device.
-    IgnoredUnknownDevice,
-    /// The unwedge signal was ignored: dehydrated device.
-    IgnoredDehydrated,
-    /// The recovery pass failed.
-    Failed,
-}
-
-/// Closed outcome of a per-room post-unwedge re-share (issue #477).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OlmRecoveryReshareOutcome {
-    /// The re-share was queued.
-    Queued,
-    /// A re-share was already pending for the device.
-    AlreadyPending,
-    /// No matching active session was shared with the device.
-    NoMatchingSession,
-    /// Recipient policy or pending rotation blocked the re-share.
-    PolicyBlocked,
-    /// The re-share failed.
-    Failed,
-}
-
-/// A typed, privacy-safe post-unwedge recovery diagnostic (issue #477).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OlmRecoveryDiagnostic {
-    /// The signal outcome token.
-    pub signal: OlmRecoverySignalOutcome,
-    /// The per-room re-share outcome token.
-    pub reshare: Option<OlmRecoveryReshareOutcome>,
-    /// Matching active outbound-session count bucket.
-    pub matching_sessions_bucket: u8,
-    /// Anonymous device correlation (issue #509). Present when the signal or
-    /// re-share is tied to one device; matches the device alias used by the
-    /// initial-share diagnostics.
-    pub device: Option<RoomKeyDiagnosticAlias>,
-}
-
-/// Device-policy class for initial-share diagnostics (issue #509).
-///
-/// A closed token describing how the device was classified by the sharing
-/// policy. It never contains identifiers or key material.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InitialShareDeviceClass {
-    /// A verified device belonging to this account.
-    VerifiedOwn,
-    /// An unverified device belonging to this account.
-    UnverifiedOwn,
-    /// A verified device belonging to another account.
-    VerifiedPeer,
-    /// An unverified device belonging to another account.
-    UnverifiedPeer,
-    /// A dehydrated device (excluded from sharing).
-    Dehydrated,
-    /// The class could not be established safely.
-    Unknown,
-}
-
-/// Per-device lifecycle stage of the initial room-key share (issue #509).
-///
-/// Stages are closed tokens; a device may observe several stages in order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InitialShareStage {
-    /// Policy selected this device as an eligible recipient.
-    Eligible,
-    /// No Olm session was available, so a one-time-key claim was needed and
-    /// an `m.no_olm` withheld notice was queued.
-    OlmMissing,
-    /// The room key was successfully encrypted with Olm for this device.
-    OlmEncrypted,
-    /// Olm encryption for this device failed.
-    OlmEncryptionFailed,
-    /// The device was withheld by recipient policy.
-    Withheld,
-    /// The to-device request carrying the key was queued.
-    RequestQueued,
-    /// The homeserver accepted the to-device request. This is not a
-    /// recipient-side decryption acknowledgement.
-    HomeserverAccepted,
-    /// A to-device send attempt failed. The request may be retried and later
-    /// reach [`InitialShareStage::HomeserverAccepted`].
-    RequestFailed,
-    /// The device's share-state was committed for the session at the given
-    /// Megolm message index.
-    ShareStateCommitted {
-        /// The message index at which the key was shared with the device.
-        message_index: u32,
-    },
-}
-
-/// A typed, privacy-safe per-device initial-share diagnostic (issue #509).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InitialShareDeviceDiagnostic {
-    /// Anonymous session correlation.
-    pub session: RoomKeyDiagnosticAlias,
-    /// Anonymous device correlation, stable across initial share, unwedge
-    /// re-share, and `m.room_key_request` diagnostics for this runtime.
-    pub device: RoomKeyDiagnosticAlias,
-    /// Device-policy class.
-    pub device_class: InitialShareDeviceClass,
-    /// Lifecycle stage reached.
-    pub stage: InitialShareStage,
-    /// Time since this session's initial share was first observed.
-    pub elapsed_ms: u64,
-}
-
-/// A typed, privacy-safe session-scoped initial-share summary (issue #509),
-/// emitted once when the first room event is encrypted for the session.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InitialShareSessionDiagnostic {
-    /// Anonymous session correlation.
-    pub session: RoomKeyDiagnosticAlias,
-    /// Message index of the first encrypted room event.
-    pub first_event_message_index: u32,
-    /// Whether every eligible initial share had settled (no pending to-device
-    /// requests) before the first event was encrypted.
-    pub all_initial_shares_settled_first: bool,
-    /// Pending to-device request count bucket at first-event time.
-    pub pending_requests_bucket: u8,
-    /// Number of eligible own devices.
-    pub eligible_own_devices: u32,
-    /// Number of eligible peer devices.
-    pub eligible_peer_devices: u32,
-    /// Devices whose share-state was committed at message index 0.
-    pub index0_shares_committed: u32,
-    /// Devices whose share-state was committed after index 0.
-    pub after_index0_shares_committed: u32,
-    /// Devices whose to-device request was accepted by the homeserver.
-    pub homeserver_accepted_devices: u32,
-    /// Whether the session was at message index 0 when first shared (true
-    /// when no committed share contradicts it).
-    pub created_at_index0: bool,
-    /// Time since this session's initial share was first observed.
-    pub elapsed_ms: u64,
-}
-
-/// Initial Olm state of an exact initial-share repair candidate (issue #523).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InitialShareRepairOlmState {
-    /// No Olm session existed after the normal pre-share.
-    Missing,
-    /// A usable Olm session existed before repair.
-    Present,
-    /// The session state could not be established safely.
-    Unknown,
-}
-
-/// Result of selecting an initial-share repair attempt (issue #523).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InitialShareRepairPreparation {
-    /// There is no current repair work to perform.
-    NotNeeded,
-    /// A wake was received for a different recipient user.
-    NotMatchingWake,
-    /// The active session or recipient policy invalidated the repair.
-    Cancelled,
-    /// The current recipient policy has no repair target.
-    NoRecipients,
-    /// The bounded attempt was admitted.
-    Attempted,
-}
-
-/// Closed result of the targeted `/keys/claim` attempt (issue #523).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InitialShareRepairClaimOutcome {
-    /// No claim was needed because a candidate already had an Olm session.
-    NotNeeded,
-    /// A claim request was queued for the exact candidate set.
-    Requested,
-    /// The claim response created at least one usable Olm session.
-    Accepted,
-    /// The response contained no usable key for a candidate.
-    Empty,
-    /// The response was unusable or failed verification.
-    Invalid,
-    /// The claim request failed at the homeserver transport boundary.
-    NetworkFailed,
-    /// The SDK or crypto store could not complete claim processing.
-    SdkFailed,
-}
-
-/// Closed result of the bounded initial-share repair (issue #523).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InitialShareRepairOutcome {
-    /// The repaired room-key request was accepted by the homeserver.
-    Settled,
-    /// A matching event-driven wake remains before the fence.
-    WaitingWake,
-    /// The first-event fence expired.
-    Deadline,
-    /// The session or recipient policy was invalidated.
-    Cancelled,
-    /// Recipient policy selected no repair target.
-    NoRecipients,
-    /// The repair operation failed without changing the encrypted event path.
-    Failed,
-}
-
-/// A typed, privacy-safe bounded initial-share repair record (issue #523).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InitialShareRepairDiagnostic {
-    /// Anonymous session correlation.
-    pub session: RoomKeyDiagnosticAlias,
-    /// Initial Olm state.
-    pub initial_olm: InitialShareRepairOlmState,
-    /// Claim result.
-    pub claim: InitialShareRepairClaimOutcome,
-    /// Repair result.
-    pub repair: InitialShareRepairOutcome,
-    /// Own-device coverage bucket.
-    pub own_coverage_bucket: u8,
-    /// Peer users with at least one covered eligible device.
-    pub peer_users_covered_bucket: u8,
-    /// Peer users with zero covered eligible devices.
-    pub peer_users_zero_coverage_bucket: u8,
-    /// Devices still missing Olm.
-    pub missing_devices_bucket: u8,
-    /// First encrypted room-event index when known.
-    pub first_event_message_index: Option<u32>,
-    /// Whether the active session still matches the repaired session.
-    pub same_session: bool,
-    /// Time since the initial share was first observed.
-    pub elapsed_ms: u64,
-}
-
-/// Closed state of the initial index-0 share at the duplicate-share decision
-/// point (issue #510).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Index0InitialShareState {
-    /// Every eligible device settled its index-0 share.
-    Accepted,
-    /// Some eligible device did not settle (pending or failed).
-    Failed,
-    /// Every eligible device was withheld by policy.
-    Withheld,
-    /// No eligible recipient existed.
-    NoRecipients,
-}
-
-/// Closed outcome of the bounded index-0 duplicate share (issue #510).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Index0ReshareOutcome {
-    /// The duplicate to-device requests were sent and accepted by the
-    /// homeserver. This is not a recipient decryption proof.
-    Sent,
-    /// The bounded deadline expired before the duplicate settled.
-    Deadline,
-    /// The attempt was cancelled by a fenced identity change (rotation,
-    /// discard, leave, or runtime replacement).
-    Cancelled,
-    /// Recipient policy blocked the duplicate (e.g. rotation pending).
-    PolicyBlocked,
-    /// The duplicate send failed.
-    Failed,
-    /// No duplicate was needed (already attempted, or no eligible
-    /// recipients).
-    NotNeeded,
-}
-
-/// A typed, privacy-safe bounded index-0 duplicate-share record (issue #510).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Index0ReshareDiagnostic {
-    /// Anonymous session correlation.
-    pub session: RoomKeyDiagnosticAlias,
-    /// Closed initial-share state at the decision point.
-    pub initial_share: Index0InitialShareState,
-    /// Closed duplicate-share outcome.
-    pub reshare: Index0ReshareOutcome,
-    /// Eligible own-device count bucket.
-    pub eligible_own_bucket: u8,
-    /// Eligible peer-device count bucket.
-    pub eligible_peer_bucket: u8,
-    /// Time since this session's initial share was first observed.
-    pub elapsed_ms: u64,
 }
 
 /// Aggregate privacy-safe counters for receive-side room-key handling.
@@ -885,56 +607,14 @@ impl RoomKeyReceiveCounters {
     }
 }
 
-/// Aggregate privacy-safe counters for post-unwedge recovery (issue #477).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct OlmRecoveryCounters {
-    /// Unwedge signals observed for known devices.
-    pub signal_observed: u64,
-    /// Unwedge signals ignored because the device is unknown.
-    pub signal_ignored_unknown_device: u64,
-    /// Unwedge signals ignored because the device is dehydrated.
-    pub signal_ignored_dehydrated: u64,
-    /// Recovery signal processing failures.
-    pub signal_failed: u64,
-    /// Matching active outbound-session count buckets.
-    pub matching_sessions_bucket_0: u64,
-    /// Matching count bucket: exactly one session.
-    pub matching_sessions_bucket_1: u64,
-    /// Matching count bucket: 2-5 sessions.
-    pub matching_sessions_bucket_2_to_5: u64,
-    /// Matching count bucket: 6-20 sessions.
-    pub matching_sessions_bucket_6_to_20: u64,
-    /// Matching count bucket: 21+ sessions.
-    pub matching_sessions_bucket_21_plus: u64,
-    /// Re-shares queued.
-    pub reshare_queued: u64,
-    /// Re-shares skipped because one was already pending.
-    pub reshare_already_pending: u64,
-    /// Re-shares skipped because no matching session was shared with the device.
-    pub reshare_no_matching_session: u64,
-    /// Re-shares blocked by recipient policy or pending rotation.
-    pub reshare_policy_blocked: u64,
-    /// Re-shares that failed.
-    pub reshare_failed: u64,
-}
-
-impl OlmRecoveryCounters {
-    fn record_matching_bucket(&mut self, count: usize) {
-        match count {
-            0 => self.matching_sessions_bucket_0 += 1,
-            1 => self.matching_sessions_bucket_1 += 1,
-            2..=5 => self.matching_sessions_bucket_2_to_5 += 1,
-            6..=20 => self.matching_sessions_bucket_6_to_20 += 1,
-            _ => self.matching_sessions_bucket_21_plus += 1,
-        }
-    }
-}
-
 /// Observer called synchronously with privacy-safe typed events.
 pub type RoomKeyDiagnosticObserver = Arc<dyn Fn(RoomKeyDiagnosticEvent) + Send + Sync>;
 
 #[derive(Clone, Default)]
-pub(crate) struct RoomKeyDiagnosticHub(Arc<Mutex<RoomKeyDiagnosticState>>);
+pub(crate) struct RoomKeyDiagnosticHub(
+    Arc<Mutex<RoomKeyDiagnosticState>>,
+    Arc<tokio::sync::Mutex<()>>,
+);
 
 impl std::fmt::Debug for RoomKeyDiagnosticHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -959,17 +639,8 @@ struct RoomKeyDiagnosticState {
     next_peer: u64,
     next_device: u64,
     receive_counters: RoomKeyReceiveCounters,
-    olm_recovery_counters: OlmRecoveryCounters,
-    /// Device-policy class observed at initial-share eligibility (issue #509).
     device_classes: BTreeMap<RoomKeyDiagnosticAlias, InitialShareDeviceClass>,
-    /// Per-session initial-share tallies (issue #509).
     initial_shares: BTreeMap<(String, String), InitialShareState>,
-    /// Latest initial-share repair snapshot, finalized with the actual first
-    /// room-event index when encryption consumes index 0 (issue #523).
-    initial_share_repairs: BTreeMap<(String, String), InitialShareRepairSnapshot>,
-    /// Per-(room, session) one-shot flag for the bounded index-0 duplicate
-    /// share (issue #510).
-    index0_reshare_attempted: BTreeSet<(String, String)>,
 }
 
 struct PendingRoomKeyDiscard {
@@ -977,10 +648,17 @@ struct PendingRoomKeyDiscard {
     noted_at: Instant,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct RetainedRotationReason {
-    room_id: String,
+    room_id: OwnedRoomId,
     session_id: String,
     reason: RoomKeyRotationReason,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PersistedRotationReasons {
+    version: u8,
+    entries: VecDeque<RetainedRotationReason>,
 }
 
 pub(crate) struct RoomKeyRotationClassification {
@@ -988,7 +666,6 @@ pub(crate) struct RoomKeyRotationClassification {
     pub(crate) discard_elapsed_ms: Option<u64>,
 }
 
-/// Per-session initial-share tally (issue #509).
 #[derive(Default)]
 struct InitialShareState {
     first_seen: Option<Instant>,
@@ -1003,24 +680,41 @@ struct InitialShareState {
     first_event_reported: bool,
 }
 
-#[derive(Clone, Copy)]
-struct InitialShareRepairSnapshot {
-    initial_olm: InitialShareRepairOlmState,
-    claim: InitialShareRepairClaimOutcome,
-    repair: InitialShareRepairOutcome,
-    own_coverage: usize,
-    peer_users_covered: usize,
-    peer_users_zero_coverage: usize,
-    missing_devices: usize,
-    same_session: bool,
-}
-
 struct RequestDiagnosticState {
     alias: RoomKeyDiagnosticAlias,
     first_seen: Instant,
 }
 
 impl RoomKeyDiagnosticHub {
+    pub(crate) async fn restore(store: &Store) -> Self {
+        let hub = Self::default();
+        let Ok(Some(value)) = store.get_custom_value(PERSISTED_ROTATION_REASONS_KEY).await else {
+            return hub;
+        };
+        if value.len() > PERSISTED_ROTATION_REASONS_MAX_BYTES {
+            return hub;
+        }
+        let Ok(persisted) = rmp_serde::from_slice::<PersistedRotationReasons>(&value) else {
+            return hub;
+        };
+        if persisted.version != PERSISTED_ROTATION_REASONS_VERSION
+            || persisted.entries.len() > ROTATION_REASON_RETENTION_CAPACITY
+            || persisted.entries.iter().any(|entry| entry.session_id.is_empty())
+        {
+            return hub;
+        }
+        let mut keys = BTreeSet::new();
+        if persisted
+            .entries
+            .iter()
+            .any(|entry| !keys.insert((entry.room_id.clone(), entry.session_id.clone())))
+        {
+            return hub;
+        }
+        lock(&hub.0).rotation_reasons = persisted.entries;
+        hub
+    }
+
     pub(crate) fn set_observer(&self, observer: Option<RoomKeyDiagnosticObserver>) {
         lock(&self.0).observer = observer;
     }
@@ -1043,90 +737,6 @@ impl RoomKeyDiagnosticHub {
         lock(&self.0).receive_counters
     }
 
-    /// Record a post-unwedge recovery signal outcome (issue #477): update the
-    /// matching aggregate counter and notify the observer.
-    pub(crate) fn emit_olm_recovery_signal(
-        &self,
-        device: Option<(&UserId, &DeviceId)>,
-        outcome: OlmRecoverySignalOutcome,
-    ) {
-        let (observer, event) = {
-            let mut state = lock(&self.0);
-            match outcome {
-                OlmRecoverySignalOutcome::Observed => {
-                    state.olm_recovery_counters.signal_observed += 1
-                }
-                OlmRecoverySignalOutcome::IgnoredUnknownDevice => {
-                    state.olm_recovery_counters.signal_ignored_unknown_device += 1
-                }
-                OlmRecoverySignalOutcome::IgnoredDehydrated => {
-                    state.olm_recovery_counters.signal_ignored_dehydrated += 1
-                }
-                OlmRecoverySignalOutcome::Failed => state.olm_recovery_counters.signal_failed += 1,
-            }
-            (
-                state.observer.clone(),
-                OlmRecoveryDiagnostic {
-                    signal: outcome,
-                    reshare: None,
-                    matching_sessions_bucket: 0,
-                    device: device
-                        .map(|(user_id, device_id)| device_alias(&mut state, user_id, device_id)),
-                },
-            )
-        };
-        if let Some(observer) = observer {
-            observer(RoomKeyDiagnosticEvent::OlmRecovery(event));
-        }
-    }
-
-    /// Record a post-unwedge per-room re-share outcome (issue #477).
-    pub(crate) fn emit_olm_recovery_reshare(
-        &self,
-        device: Option<(&UserId, &DeviceId)>,
-        signal: OlmRecoverySignalOutcome,
-        matching_sessions: usize,
-        reshare: OlmRecoveryReshareOutcome,
-    ) {
-        let (observer, event) = {
-            let mut state = lock(&self.0);
-            state.olm_recovery_counters.record_matching_bucket(matching_sessions);
-            match reshare {
-                OlmRecoveryReshareOutcome::Queued => {
-                    state.olm_recovery_counters.reshare_queued += 1
-                }
-                OlmRecoveryReshareOutcome::AlreadyPending => {
-                    state.olm_recovery_counters.reshare_already_pending += 1
-                }
-                OlmRecoveryReshareOutcome::NoMatchingSession => {
-                    state.olm_recovery_counters.reshare_no_matching_session += 1
-                }
-                OlmRecoveryReshareOutcome::PolicyBlocked => {
-                    state.olm_recovery_counters.reshare_policy_blocked += 1
-                }
-                OlmRecoveryReshareOutcome::Failed => {
-                    state.olm_recovery_counters.reshare_failed += 1
-                }
-            }
-            (
-                state.observer.clone(),
-                OlmRecoveryDiagnostic {
-                    signal,
-                    reshare: Some(reshare),
-                    matching_sessions_bucket: matching_bucket_token(matching_sessions),
-                    device: device
-                        .map(|(user_id, device_id)| device_alias(&mut state, user_id, device_id)),
-                },
-            )
-        };
-        if let Some(observer) = observer {
-            observer(RoomKeyDiagnosticEvent::OlmRecovery(event));
-        }
-    }
-
-    /// Record a per-device initial-share lifecycle stage (issue #509):
-    /// increment nothing here (aggregates live on the Koushi side), cache the
-    /// device-policy class, and notify the observer.
     pub(crate) fn emit_initial_share_device(
         &self,
         room_id: &RoomId,
@@ -1140,8 +750,6 @@ impl RoomKeyDiagnosticHub {
             let mut state = lock(&self.0);
             let session = session_alias(&mut state, room_id, session_id);
             let device = device_alias(&mut state, user_id, device_id);
-            // Callers without `DeviceData` pass `Unknown`; fall back to the
-            // class cached by the `Eligible` emission for this device.
             let device_class = if device_class == InitialShareDeviceClass::Unknown {
                 state
                     .device_classes
@@ -1209,8 +817,6 @@ impl RoomKeyDiagnosticHub {
         }
     }
 
-    /// Record the session-scoped initial-share summary (issue #509). Emitted
-    /// at most once per session, when its first room event is encrypted.
     pub(crate) fn emit_initial_share_session(
         &self,
         room_id: &RoomId,
@@ -1254,183 +860,6 @@ impl RoomKeyDiagnosticHub {
         if let Some(observer) = observer {
             observer(RoomKeyDiagnosticEvent::InitialShareSession(event));
         }
-        self.emit_initial_share_repair_event_index(room_id, session_id, first_event_message_index);
-    }
-
-    fn emit_initial_share_repair_event_index(
-        &self,
-        room_id: &RoomId,
-        session_id: &str,
-        first_event_message_index: u32,
-    ) {
-        let Some((observer, event)) = ({
-            let mut state = lock(&self.0);
-            let key = (room_id.as_str().to_owned(), session_id.to_owned());
-            let snapshot = state.initial_share_repairs.get(&key).copied();
-            snapshot.map(|snapshot| {
-                let session = session_alias(&mut state, room_id, session_id);
-                let elapsed_ms = state
-                    .initial_shares
-                    .get(&key)
-                    .and_then(|tally| tally.first_seen)
-                    .map(|first| first.elapsed().as_millis().min(u64::MAX as u128) as u64)
-                    .unwrap_or(0);
-                (
-                    state.observer.clone(),
-                    InitialShareRepairDiagnostic {
-                        session,
-                        initial_olm: snapshot.initial_olm,
-                        claim: snapshot.claim,
-                        repair: snapshot.repair,
-                        own_coverage_bucket: matching_bucket_token(snapshot.own_coverage),
-                        peer_users_covered_bucket: matching_bucket_token(
-                            snapshot.peer_users_covered,
-                        ),
-                        peer_users_zero_coverage_bucket: matching_bucket_token(
-                            snapshot.peer_users_zero_coverage,
-                        ),
-                        missing_devices_bucket: matching_bucket_token(snapshot.missing_devices),
-                        first_event_message_index: Some(first_event_message_index),
-                        same_session: snapshot.same_session,
-                        elapsed_ms,
-                    },
-                )
-            })
-        }) else {
-            return;
-        };
-        if let Some(observer) = observer {
-            observer(RoomKeyDiagnosticEvent::InitialShareRepair(event));
-        }
-    }
-
-    /// Record a bounded initial-share repair result (issue #523).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn note_initial_share_repair(
-        &self,
-        room_id: &RoomId,
-        session_id: &str,
-        initial_olm: InitialShareRepairOlmState,
-        claim: InitialShareRepairClaimOutcome,
-        repair: InitialShareRepairOutcome,
-        own_coverage: usize,
-        peer_users_covered: usize,
-        peer_users_zero_coverage: usize,
-        missing_devices: usize,
-        first_event_message_index: Option<u32>,
-        same_session: bool,
-    ) {
-        let (observer, event) = {
-            let mut state = lock(&self.0);
-            let session = session_alias(&mut state, room_id, session_id);
-            state.initial_share_repairs.insert(
-                (room_id.as_str().to_owned(), session_id.to_owned()),
-                InitialShareRepairSnapshot {
-                    initial_olm,
-                    claim,
-                    repair,
-                    own_coverage,
-                    peer_users_covered,
-                    peer_users_zero_coverage,
-                    missing_devices,
-                    same_session,
-                },
-            );
-            let elapsed_ms = state
-                .initial_shares
-                .get(&(room_id.as_str().to_owned(), session_id.to_owned()))
-                .and_then(|tally| tally.first_seen)
-                .map(|first| first.elapsed().as_millis().min(u64::MAX as u128) as u64)
-                .unwrap_or(0);
-            let event = InitialShareRepairDiagnostic {
-                session,
-                initial_olm,
-                claim,
-                repair,
-                own_coverage_bucket: matching_bucket_token(own_coverage),
-                peer_users_covered_bucket: matching_bucket_token(peer_users_covered),
-                peer_users_zero_coverage_bucket: matching_bucket_token(peer_users_zero_coverage),
-                missing_devices_bucket: matching_bucket_token(missing_devices),
-                first_event_message_index,
-                same_session,
-                elapsed_ms,
-            };
-            (state.observer.clone(), event)
-        };
-        if let Some(observer) = observer {
-            observer(RoomKeyDiagnosticEvent::InitialShareRepair(event));
-        }
-    }
-
-    /// Whether the bounded index-0 duplicate share was already attempted for
-    /// this (room, session) pair (issue #510).
-    pub(crate) fn index0_reshare_attempted(&self, room_id: &RoomId, session_id: &str) -> bool {
-        lock(&self.0)
-            .index0_reshare_attempted
-            .contains(&(room_id.as_str().to_owned(), session_id.to_owned()))
-    }
-
-    /// Mark the bounded index-0 duplicate share as attempted (issue #510). At
-    /// most one attempt is made per (room, session) pair per runtime.
-    pub(crate) fn mark_index0_reshare_attempted(&self, room_id: &RoomId, session_id: &str) {
-        lock(&self.0)
-            .index0_reshare_attempted
-            .insert((room_id.as_str().to_owned(), session_id.to_owned()));
-    }
-
-    /// Record a bounded index-0 duplicate-share outcome (issue #510): derive
-    /// the closed initial-share state and eligible count buckets from the
-    /// session tally and notify the observer.
-    pub(crate) fn note_index0_reshare(
-        &self,
-        room_id: &RoomId,
-        session_id: &str,
-        outcome: Index0ReshareOutcome,
-    ) {
-        let (observer, event) = {
-            let mut state = lock(&self.0);
-            let session = session_alias(&mut state, room_id, session_id);
-            let tally =
-                state.initial_shares.get(&(room_id.as_str().to_owned(), session_id.to_owned()));
-            let eligible_own = tally.map_or(0, |tally| tally.eligible_own);
-            let eligible_peer = tally.map_or(0, |tally| tally.eligible_peer);
-            let eligible = eligible_own + eligible_peer;
-            let committed =
-                tally.map_or(0, |tally| tally.index0_committed + tally.after0_committed);
-            let withheld = tally.map_or(0, |tally| tally.withheld_devices.len() as u32);
-            let initial_share = if eligible == 0 {
-                Index0InitialShareState::NoRecipients
-            } else if withheld == eligible {
-                Index0InitialShareState::Withheld
-            } else if committed == eligible {
-                Index0InitialShareState::Accepted
-            } else {
-                Index0InitialShareState::Failed
-            };
-            let elapsed_ms = tally
-                .and_then(|tally| tally.first_seen)
-                .map(|first| first.elapsed().as_millis().min(u64::MAX as u128) as u64)
-                .unwrap_or(0);
-            (
-                state.observer.clone(),
-                Index0ReshareDiagnostic {
-                    session,
-                    initial_share,
-                    reshare: outcome,
-                    eligible_own_bucket: matching_bucket_token(eligible_own as usize),
-                    eligible_peer_bucket: matching_bucket_token(eligible_peer as usize),
-                    elapsed_ms,
-                },
-            )
-        };
-        if let Some(observer) = observer {
-            observer(RoomKeyDiagnosticEvent::Index0Reshare(event));
-        }
-    }
-
-    /// Snapshot of the aggregate post-unwedge recovery counters.
-    pub(crate) fn olm_recovery_counters(&self) -> OlmRecoveryCounters {
-        lock(&self.0).olm_recovery_counters
     }
 
     pub(crate) fn emit_member_reload(
@@ -1544,6 +973,42 @@ impl RoomKeyDiagnosticHub {
         }
     }
 
+    pub(crate) async fn emit_rotation_and_persist(
+        &self,
+        store: &Store,
+        room_id: &RoomId,
+        previous_session_id: Option<&str>,
+        new_session_id: Option<&str>,
+        reason: RoomKeyRotationReason,
+        creation_outcome: RoomKeyCreationOutcome,
+        discard_elapsed_ms: Option<u64>,
+        elapsed_ms: u64,
+    ) {
+        let _persistence_guard = self.1.lock().await;
+        self.emit_rotation(
+            room_id,
+            previous_session_id,
+            new_session_id,
+            reason,
+            creation_outcome,
+            discard_elapsed_ms,
+            elapsed_ms,
+        );
+        if creation_outcome != RoomKeyCreationOutcome::Created || new_session_id.is_none() {
+            return;
+        }
+        let persisted = PersistedRotationReasons {
+            version: PERSISTED_ROTATION_REASONS_VERSION,
+            entries: lock(&self.0).rotation_reasons.clone(),
+        };
+        let Ok(value) = rmp_serde::to_vec_named(&persisted) else {
+            return;
+        };
+        if value.len() <= PERSISTED_ROTATION_REASONS_MAX_BYTES {
+            let _ = store.set_custom_value(PERSISTED_ROTATION_REASONS_KEY, value).await;
+        }
+    }
+
     pub(crate) fn rotation_reason(
         &self,
         room_id: &RoomId,
@@ -1554,7 +1019,7 @@ impl RoomKeyDiagnosticHub {
             .iter()
             .rev()
             .find(|retained| {
-                retained.room_id == room_id.as_str() && retained.session_id == session_id
+                retained.room_id.as_str() == room_id.as_str() && retained.session_id == session_id
             })
             .map(|retained| retained.reason)
     }
@@ -1648,53 +1113,6 @@ impl RoomKeyDiagnosticHub {
             observer(RoomKeyDiagnosticEvent::IncomingRequest(event));
         }
     }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn emit_encryption_readiness(
-        &self,
-        room_id: &RoomId,
-        session_id: &str,
-        generation: u64,
-        sync: EncryptionReadinessSyncState,
-        query: EncryptionReadinessQueryState,
-        outcome: EncryptionReadinessOutcome,
-        active_members: usize,
-        returned_devices: usize,
-        message_index: Option<u32>,
-        registry_evictions: u64,
-    ) {
-        let (observer, event) = {
-            let mut state = lock(&self.0);
-            let room = room_alias(&mut state, room_id);
-            let session = session_alias(&mut state, room_id, session_id);
-            let initial_share =
-                state.initial_shares.get(&(room_id.to_string(), session_id.to_owned()));
-            let eligible_devices = initial_share
-                .map(|share| share.eligible_own.saturating_add(share.eligible_peer) as usize)
-                .unwrap_or(0);
-            let accepted_devices =
-                initial_share.map(|share| share.accepted_devices.len()).unwrap_or(0);
-            let event = EncryptionReadinessDiagnostic {
-                room,
-                session,
-                generation,
-                sync,
-                query,
-                outcome,
-                active_members_bucket: matching_bucket_token(active_members),
-                returned_devices_bucket: matching_bucket_token(returned_devices),
-                eligible_devices_bucket: matching_bucket_token(eligible_devices),
-                accepted_devices_bucket: matching_bucket_token(accepted_devices),
-                message_index_bucket: matching_bucket_token(message_index.unwrap_or(0) as usize),
-                registry_evictions,
-                retryable: outcome != EncryptionReadinessOutcome::Ready,
-            };
-            (state.observer.clone(), event)
-        };
-        if let Some(observer) = observer {
-            observer(RoomKeyDiagnosticEvent::EncryptionReadiness(event));
-        }
-    }
 }
 
 fn matching_bucket_token(count: usize) -> u8 {
@@ -1713,11 +1131,9 @@ fn retain_rotation_reason(
     session_id: &str,
     reason: RoomKeyRotationReason,
 ) {
-    if let Some(retained) = state
-        .rotation_reasons
-        .iter_mut()
-        .find(|retained| retained.room_id == room_id.as_str() && retained.session_id == session_id)
-    {
+    if let Some(retained) = state.rotation_reasons.iter_mut().find(|retained| {
+        retained.room_id.as_str() == room_id.as_str() && retained.session_id == session_id
+    }) {
         retained.reason = reason;
         return;
     }
@@ -1725,7 +1141,7 @@ fn retain_rotation_reason(
         state.rotation_reasons.pop_front();
     }
     state.rotation_reasons.push_back(RetainedRotationReason {
-        room_id: room_id.as_str().to_owned(),
+        room_id: room_id.to_owned(),
         session_id: session_id.to_owned(),
         reason,
     });
@@ -2157,7 +1573,6 @@ mod tests {
             InitialShareStage::Withheld,
             InitialShareStage::RequestQueued,
             InitialShareStage::HomeserverAccepted,
-            InitialShareStage::RequestFailed,
             InitialShareStage::ShareStateCommitted { message_index: 0 },
             InitialShareStage::ShareStateCommitted { message_index: 3 },
         ];

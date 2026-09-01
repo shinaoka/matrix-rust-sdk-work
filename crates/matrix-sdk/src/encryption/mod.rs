@@ -19,7 +19,7 @@
 #[cfg(feature = "experimental-send-custom-to-device")]
 use std::ops::Deref;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashSet},
     fmt,
     io::{Cursor, Read, Write},
     iter,
@@ -114,37 +114,28 @@ pub mod backups;
 pub mod futures;
 pub mod identities;
 mod readiness;
-pub mod recovery;
+pub(crate) use readiness::EncryptionSyncReadiness;
 pub use readiness::{
     EncryptionSyncGenerationGuard, EncryptionSyncReadinessSnapshot, EncryptionSyncReadinessState,
 };
-pub(crate) use readiness::{
-    EncryptionSyncReadiness, OutboundSessionReadinessAttempt, OutboundSessionReadinessRegistry,
-    OutboundSessionReadinessState, outbound_session_requires_fence,
-};
+pub mod recovery;
 pub mod secret_storage;
 pub(crate) mod tasks;
 pub mod verification;
 
 pub use matrix_sdk_base::crypto::{
-    CrossSigningStatus, CryptoStoreError, DecryptorError, EncryptionReadinessDiagnostic,
-    EncryptionReadinessOutcome, EncryptionReadinessQueryState, EncryptionReadinessSyncState,
-    EventError, ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestDiagnostic,
-    IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage, Index0InitialShareState,
-    Index0ReshareDiagnostic, Index0ReshareOutcome, InitialShareDeviceClass,
-    InitialShareDeviceDiagnostic, InitialShareRepairClaimOutcome, InitialShareRepairDiagnostic,
-    InitialShareRepairOlmState, InitialShareRepairOutcome, InitialShareRepairPreparation,
-    InitialShareSessionDiagnostic, InitialShareStage, KeyExportError, LocalTrust,
-    MediaEncryptionInfo, MegolmError, OlmError, OlmRecoveryCounters, OlmRecoveryDiagnostic,
-    OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome, RequestedRoomKeySession,
-    RoomKeyCreationOutcome, RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent,
-    RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome, RoomKeyImportResult, RoomKeyIngressKind,
-    RoomKeyMemberReloadContext, RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome,
-    RoomKeyMergeDecision, RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic,
-    RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason, RoomKeyRequestAction,
-    RoomKeyRequesterDeviceState, RoomKeyRequesterScope, RoomKeyRotationDiagnostic,
-    RoomKeyRotationReason, RoomKeyWithheldContent, RoomKeyWithheldEvent, SessionCreationError,
-    SignatureError, VERSION,
+    CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, ForwardedRoomKeyAuthOutcome,
+    IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
+    InitialShareDeviceClass, InitialShareDeviceDiagnostic, InitialShareSessionDiagnostic,
+    InitialShareStage, KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError,
+    RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
+    RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
+    RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMemberReloadDiagnostic,
+    RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision, RoomKeyReceiveCounters,
+    RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
+    RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    RoomKeyRotationDiagnostic, RoomKeyRotationReason, SessionCreationError, SignatureError,
+    VERSION,
     olm::{
         SessionCreationError as MegolmSessionCreationError,
         SessionExportError as OlmSessionExportError,
@@ -546,84 +537,9 @@ impl FromStr for DuplicateOneTimeKeyErrorMessage {
     }
 }
 
-/// Result of one bounded targeted initial-share repair attempt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InitialShareRepairAttempt {
-    /// No repair was needed for this invocation.
-    NotNeeded,
-    /// A wake was for a different recipient user.
-    NotMatchingWake,
-    /// The session or recipient policy invalidated the repair.
-    Cancelled,
-    /// The current recipient policy has no repair target.
-    NoRecipients,
-    /// The repair remains eligible for the one matching wake.
-    WaitingWake,
-    /// The repaired room-key request was queued and accepted.
-    Settled,
-    /// A closed failure diagnostic was emitted for this attempt.
-    Failed,
-}
-
 impl Client {
     pub(crate) async fn olm_machine(&self) -> RwLockReadGuard<'_, Option<OlmMachine>> {
         self.base_client().olm_machine().await
-    }
-
-    /// Whether the retired bounded index-0 duplicate share is enabled (issue #510).
-    #[allow(dead_code)]
-    pub(crate) fn index0_duplicate_share_enabled(&self) -> bool {
-        self.inner.index0_duplicate_share
-    }
-
-    pub(crate) fn initial_share_repair_enabled(&self) -> bool {
-        self.inner.initial_share_repair
-    }
-
-    pub(crate) fn encryption_sync_readiness_enabled(&self) -> bool {
-        self.inner.encryption_sync_readiness.enabled()
-    }
-
-    /// Begin one application-owned encryption-sync generation.
-    #[doc(hidden)]
-    pub fn begin_encryption_sync_generation(&self) -> Option<EncryptionSyncGenerationGuard> {
-        self.inner.encryption_sync_readiness.begin()
-    }
-
-    /// Return the current privacy-safe encryption-sync readiness snapshot.
-    #[doc(hidden)]
-    pub fn encryption_sync_readiness_snapshot(&self) -> EncryptionSyncReadinessSnapshot {
-        self.inner.encryption_sync_readiness.snapshot()
-    }
-
-    /// Subscribe to encryption-sync generation changes.
-    #[doc(hidden)]
-    pub fn subscribe_to_encryption_sync_readiness(
-        &self,
-    ) -> tokio::sync::watch::Receiver<EncryptionSyncReadinessSnapshot> {
-        self.inner.encryption_sync_readiness.subscribe()
-    }
-
-    pub(crate) fn outbound_session_readiness_state(
-        &self,
-        room_id: &RoomId,
-        session_id: &str,
-    ) -> Option<OutboundSessionReadinessState> {
-        self.inner.outbound_session_readiness.state(room_id, session_id)
-    }
-
-    pub(crate) fn begin_outbound_session_readiness(
-        &self,
-        room_id: &RoomId,
-        session_id: &str,
-    ) -> Option<OutboundSessionReadinessAttempt> {
-        self.inner.outbound_session_readiness.begin(room_id, session_id)
-    }
-
-    /// Return the bounded readiness-registry eviction count.
-    #[doc(hidden)]
-    pub fn outbound_session_readiness_evictions(&self) -> u64 {
-        self.inner.outbound_session_readiness.evictions()
     }
 
     pub(crate) async fn mark_request_as_sent(
@@ -772,188 +688,6 @@ impl Client {
         Ok(())
     }
 
-    /// Run one bounded targeted initial-share repair attempt.
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) async fn repair_initial_share(
-        &self,
-        room: &Room,
-        expected_session: Option<&str>,
-        wake_users: Option<&BTreeSet<OwnedUserId>>,
-    ) -> Result<InitialShareRepairAttempt> {
-        use matrix_sdk_base::crypto::{
-            InitialShareRepairClaimOutcome as Claim, InitialShareRepairOutcome as Repair,
-            InitialShareRepairPreparation,
-        };
-
-        if room.state() != matrix_sdk_base::RoomState::Joined {
-            let _ = self
-                .base_client()
-                .note_initial_share_repair(
-                    room.room_id(),
-                    expected_session,
-                    Claim::NotNeeded,
-                    Repair::Cancelled,
-                )
-                .await;
-            return Ok(InitialShareRepairAttempt::Cancelled);
-        }
-
-        let _lock = self.locks().key_claim_lock.lock().await;
-        let (preparation, claim) = match self
-            .base_client()
-            .prepare_initial_share_repair(room.room_id(), wake_users.is_some(), wake_users)
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = self
-                    .base_client()
-                    .note_initial_share_repair(
-                        room.room_id(),
-                        expected_session,
-                        Claim::SdkFailed,
-                        Repair::Failed,
-                    )
-                    .await;
-                return Ok(InitialShareRepairAttempt::Failed);
-            }
-        };
-        match preparation {
-            InitialShareRepairPreparation::NotNeeded => {
-                return Ok(InitialShareRepairAttempt::NotNeeded);
-            }
-            InitialShareRepairPreparation::NotMatchingWake => {
-                return Ok(InitialShareRepairAttempt::NotMatchingWake);
-            }
-            InitialShareRepairPreparation::Cancelled => {
-                let _ = self
-                    .base_client()
-                    .note_initial_share_repair(
-                        room.room_id(),
-                        expected_session,
-                        Claim::NotNeeded,
-                        Repair::Cancelled,
-                    )
-                    .await;
-                return Ok(InitialShareRepairAttempt::Cancelled);
-            }
-            InitialShareRepairPreparation::NoRecipients => {
-                let _ = self
-                    .base_client()
-                    .note_initial_share_repair(
-                        room.room_id(),
-                        expected_session,
-                        Claim::NotNeeded,
-                        Repair::NoRecipients,
-                    )
-                    .await;
-                return Ok(InitialShareRepairAttempt::NoRecipients);
-            }
-            InitialShareRepairPreparation::Attempted => {}
-        }
-
-        let claimed = claim.is_some();
-        let mut claim_response_empty = false;
-        if let Some((request_id, request)) = claim {
-            let response = match self.send(request).await {
-                Ok(response) => response,
-                Err(_) => {
-                    let _ = self
-                        .base_client()
-                        .note_initial_share_repair(
-                            room.room_id(),
-                            expected_session,
-                            Claim::NetworkFailed,
-                            Repair::Failed,
-                        )
-                        .await;
-                    return Ok(InitialShareRepairAttempt::Failed);
-                }
-            };
-            claim_response_empty = response.one_time_keys.is_empty();
-            if self.mark_request_as_sent(&request_id, &response).await.is_err() {
-                let _ = self
-                    .base_client()
-                    .note_initial_share_repair(
-                        room.room_id(),
-                        expected_session,
-                        Claim::SdkFailed,
-                        Repair::Failed,
-                    )
-                    .await;
-                return Ok(InitialShareRepairAttempt::Failed);
-            }
-        }
-
-        let requests = match self.base_client().reshare_initial_share(room.room_id()).await {
-            Ok(requests) => requests,
-            Err(_) => {
-                let _ = self
-                    .base_client()
-                    .note_initial_share_repair(
-                        room.room_id(),
-                        expected_session,
-                        Claim::SdkFailed,
-                        Repair::Failed,
-                    )
-                    .await;
-                return Ok(InitialShareRepairAttempt::Failed);
-            }
-        };
-        let claim_outcome = if !claimed {
-            Claim::NotNeeded
-        } else if !requests.is_empty() {
-            Claim::Accepted
-        } else if claim_response_empty {
-            Claim::Empty
-        } else {
-            Claim::Invalid
-        };
-        for request in &requests {
-            let response = match self.send_to_device(request).await {
-                Ok(response) => response,
-                Err(_) => {
-                    let _ = self
-                        .base_client()
-                        .note_initial_share_repair(
-                            room.room_id(),
-                            expected_session,
-                            Claim::NetworkFailed,
-                            Repair::Failed,
-                        )
-                        .await;
-                    return Ok(InitialShareRepairAttempt::Failed);
-                }
-            };
-            if self.mark_request_as_sent(&request.txn_id, &response).await.is_err() {
-                let _ = self
-                    .base_client()
-                    .note_initial_share_repair(
-                        room.room_id(),
-                        expected_session,
-                        Claim::SdkFailed,
-                        Repair::Failed,
-                    )
-                    .await;
-                return Ok(InitialShareRepairAttempt::Failed);
-            }
-        }
-        let (repair_outcome, attempt) = if requests.is_empty() {
-            (Repair::WaitingWake, InitialShareRepairAttempt::WaitingWake)
-        } else {
-            (Repair::Settled, InitialShareRepairAttempt::Settled)
-        };
-        self.base_client()
-            .note_initial_share_repair(
-                room.room_id(),
-                expected_session,
-                claim_outcome,
-                repair_outcome,
-            )
-            .await?;
-        Ok(attempt)
-    }
-
     /// Upload the E2E encryption keys.
     ///
     /// This uploads the long lived device keys as well as the required amount
@@ -1001,41 +735,13 @@ impl Client {
         &self,
         request: &ToDeviceRequest,
     ) -> HttpResult<ToDeviceResponse> {
-        let txn_id = request.txn_id.clone();
         let request = RumaToDeviceRequest::new_raw(
             request.event_type.clone(),
             request.txn_id.clone(),
             request.messages.clone(),
         );
 
-        let result = self.send(request).await;
-        if result.is_err() {
-            // Issue #509: report the failed to-device attempt through the
-            // crypto diagnostics. The request stays pending and may be
-            // retried; observation only.
-            self.note_to_device_request_failed(&txn_id).await;
-        }
-        result
-    }
-
-    pub(crate) async fn note_to_device_request_failed(&self, request_id: &TransactionId) {
-        if let Some(machine) = self.olm_machine().await.as_ref() {
-            machine.note_to_device_request_failed(request_id);
-        }
-    }
-
-    /// Report the send outcome of a queued index-0 duplicate share (issue
-    /// #510). Observation only; retained for SDK compatibility.
-    #[allow(dead_code)]
-    pub(crate) async fn note_index0_reshare(
-        &self,
-        room_id: &RoomId,
-        session_id: &str,
-        outcome: Index0ReshareOutcome,
-    ) {
-        if let Some(machine) = self.olm_machine().await.as_ref() {
-            machine.note_index0_reshare(room_id, session_id, outcome);
-        }
+        self.send(request).await
     }
 
     pub(crate) async fn send_verification_request(
@@ -1259,19 +965,7 @@ impl Encryption {
             .and_then(|machine| machine.room_key_rotation_reason(room_id, session_id))
     }
 
-    /// Snapshot the aggregate privacy-safe receive-side room-key counters.
-    pub async fn room_key_receive_counters(&self) -> RoomKeyReceiveCounters {
-        self.client
-            .olm_machine()
-            .await
-            .as_ref()
-            .map(|machine| machine.room_key_receive_counters())
-            .unwrap_or_default()
-    }
-
-    /// Whether the local crypto store holds an inbound group session for the
-    /// given room + Megolm session (issue #478 local recovery source).
-    #[doc(hidden)]
+    /// Return whether the local crypto store contains an inbound Megolm session.
     pub async fn has_inbound_group_session(
         &self,
         room_id: &RoomId,
@@ -1287,40 +981,27 @@ impl Encryption {
             .map_err(Into::into)
     }
 
-    /// Drive the immediate post-unwedge re-share pass (issue #477).
-    ///
-    /// Consumes the standard Olm recovery signals collected during a sync
-    /// (fresh inbound Olm sessions for known devices) and re-shares the current
-    /// Megolm session of each affected room to the recovered device, after room
-    /// state for the sync is applied. Bounded per sync; never rotates sessions
-    /// and never sends to a device lacking prior share-state proof.
+    /// Return a privacy-safe count and whether every inbound session for the room starts at index 0.
     #[doc(hidden)]
-    pub async fn on_olm_unwedged(&self, signals: Vec<matrix_sdk_base::crypto::OlmRecoverySignal>) {
-        const MAX_SIGNALS_PER_SYNC: usize = 8;
-        const MAX_ROOMS_PER_SIGNAL: usize = 16;
+    pub async fn inbound_group_session_index0_summary(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(usize, bool)> {
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        let sessions = machine.store().get_inbound_group_sessions_by_room_id(room_id).await?;
+        let count = sessions.len();
+        Ok((count, sessions.iter().all(|session| session.first_known_index() == 0)))
+    }
 
-        for signal in signals.into_iter().take(MAX_SIGNALS_PER_SYNC) {
-            let Some(machine) = self.client.olm_machine().await.as_ref().cloned() else {
-                break;
-            };
-            let Ok(Some(device)) =
-                machine.device_from_curve_key(&signal.user_id, signal.sender_key).await
-            else {
-                continue;
-            };
-            if device.is_dehydrated() {
-                continue;
-            }
-            let room_ids = machine.unwedged_affected_room_ids(&device);
-            for room_id in room_ids.into_iter().take(MAX_ROOMS_PER_SIGNAL) {
-                let Some(room) = self.client.get_room(&room_id) else {
-                    continue;
-                };
-                let _outcome = room.reshare_unwedged_key(&device).await;
-                // No identifier-bearing outcome is logged: only the aggregate
-                // privacy-safe counters carry the closed tokens (issue #477).
-            }
-        }
+    /// Snapshot the aggregate privacy-safe receive-side room-key counters.
+    pub async fn room_key_receive_counters(&self) -> RoomKeyReceiveCounters {
+        self.client
+            .olm_machine()
+            .await
+            .as_ref()
+            .map(|machine| machine.room_key_receive_counters())
+            .unwrap_or_default()
     }
 
     /// Returns the current encryption settings for this client.

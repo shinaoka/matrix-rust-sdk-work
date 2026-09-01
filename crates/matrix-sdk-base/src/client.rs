@@ -27,11 +27,8 @@ use futures_util::Stream;
 use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
-    CollectStrategy, DecryptionSettings, DeviceData, EncryptionSettings, Index0ReshareDecision,
-    InitialShareRepairPreparation, ManualFinalizeStep, ManualIndex0Preparation,
-    ManualIndex0ResendPreparation, ManualIndex0ResendStep, OlmError, OlmMachine,
-    RoomKeyMemberReloadContext, RoomKeyReshareResult, RoomKeyReshareTarget, RoomKeyRotationReason,
-    TrustRequirement, UnwedgeReshareOutcome, store::DynCryptoStore,
+    CollectStrategy, DecryptionSettings, EncryptionSettings, OlmError, OlmMachine,
+    RoomKeyMemberReloadContext, RoomKeyRotationReason, TrustRequirement, store::DynCryptoStore,
     store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
@@ -649,7 +646,7 @@ impl BaseClient {
             Context::new(StateChanges { sync_token: sync_token.clone(), ..Default::default() });
 
         #[cfg(feature = "e2e-encryption")]
-        let processors::e2ee::to_device::Output { processed_to_device_events: to_device, .. } =
+        let processors::e2ee::to_device::Output { processed_to_device_events: to_device } =
             processors::e2ee::to_device::from_sync_v2(
                 &response,
                 olm_machine.as_ref(),
@@ -1085,149 +1082,37 @@ impl BaseClient {
     /// Get a to-device request that will share a room key with users in a room.
     #[cfg(feature = "e2e-encryption")]
     pub async fn share_room_key(&self, room_id: &RoomId) -> Result<Vec<Arc<ToDeviceRequest>>> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
         match self.olm_machine().await.as_ref() {
             Some(o) => {
+                let Some(room) = self.get_room(room_id) else {
+                    return Err(Error::InsufficientData);
+                };
+
+                let history_visibility = room.history_visibility_or_default();
+                let Some(room_encryption_event) = room.encryption_settings() else {
+                    return Err(Error::EncryptionNotEnabled);
+                };
+
+                // Don't share the group session with members that are invited
+                // if the history visibility is set to `Joined`
+                let filter = if history_visibility == HistoryVisibility::Joined {
+                    RoomMemberships::JOIN
+                } else {
+                    RoomMemberships::ACTIVE
+                };
+
+                let members = self.state_store.get_user_ids(room_id, filter).await?;
+
+                let Some(settings) = EncryptionSettings::from_possibly_redacted(
+                    room_encryption_event,
+                    history_visibility,
+                    self.room_key_recipient_strategy.clone(),
+                ) else {
+                    return Err(Error::EncryptionNotEnabled);
+                };
+
                 Ok(o.share_room_key(room_id, members.iter().map(Deref::deref), settings).await?)
             }
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Re-share the current Megolm session of `room_id` to the single recovered
-    /// device after its Olm unwedge (issue #477). Never creates or rotates the
-    /// session; membership and recipient policy are re-evaluated with the
-    /// current member list.
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn reshare_unwedged_room_key(
-        &self,
-        room_id: &RoomId,
-        device: &DeviceData,
-    ) -> Result<UnwedgeReshareOutcome> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(o) => Ok(o.reshare_unwedged_room_key(room_id, &members, settings, device).await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Decide and queue the bounded index-0 duplicate share (issue #510),
-    /// re-evaluating recipient policy against the current member list.
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn reshare_index0_once(&self, room_id: &RoomId) -> Result<Index0ReshareDecision> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(o) => Ok(o
-                .reshare_index0_once(room_id, members.iter().map(Deref::deref), settings)
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    #[cfg(feature = "e2e-encryption")]
-    async fn room_key_share_context(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<(Vec<OwnedUserId>, EncryptionSettings)> {
-        let Some(room) = self.get_room(room_id) else {
-            return Err(Error::InsufficientData);
-        };
-        let history_visibility = room.history_visibility_or_default();
-        let Some(room_encryption_event) = room.encryption_settings() else {
-            return Err(Error::EncryptionNotEnabled);
-        };
-        let filter = if history_visibility == HistoryVisibility::Joined {
-            RoomMemberships::JOIN
-        } else {
-            RoomMemberships::ACTIVE
-        };
-        let members = self.state_store.get_user_ids(room_id, filter).await?;
-        let Some(settings) = EncryptionSettings::from_possibly_redacted(
-            room_encryption_event,
-            history_visibility,
-            self.room_key_recipient_strategy.clone(),
-        ) else {
-            return Err(Error::EncryptionNotEnabled);
-        };
-        Ok((members, settings))
-    }
-
-    /// Prepare a targeted initial-share Olm claim, after re-evaluating the
-    /// current room recipient policy.
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn prepare_initial_share_repair(
-        &self,
-        room_id: &RoomId,
-        wake: bool,
-        wake_users: Option<&BTreeSet<OwnedUserId>>,
-    ) -> Result<(
-        InitialShareRepairPreparation,
-        Option<(ruma::OwnedTransactionId, ruma::api::client::keys::claim_keys::v3::Request)>,
-    )> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .prepare_initial_share_repair(
-                    room_id,
-                    members.iter().map(Deref::deref),
-                    settings,
-                    wake,
-                    wake_users,
-                )
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Re-evaluate the recipient policy captured by the active initial-share
-    /// repair without consuming its retry budget.
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn validate_initial_share_repair(&self, room_id: &RoomId) -> Result<bool> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .validate_initial_share_repair(room_id, members.iter().map(Deref::deref), settings)
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Queue encrypted initial-share repair requests after a targeted claim.
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn reshare_initial_share(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<Vec<Arc<ToDeviceRequest>>> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .reshare_initial_share(room_id, members.iter().map(Deref::deref), settings)
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Record a closed initial-share repair outcome.
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn note_initial_share_repair(
-        &self,
-        room_id: &RoomId,
-        expected_session_id: Option<&str>,
-        claim: matrix_sdk_crypto::InitialShareRepairClaimOutcome,
-        repair: matrix_sdk_crypto::InitialShareRepairOutcome,
-    ) -> Result<()> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .note_initial_share_repair(
-                    room_id,
-                    expected_session_id,
-                    members.iter().map(Deref::deref),
-                    settings,
-                    claim,
-                    repair,
-                )
-                .await?),
             None => panic!("Olm machine wasn't started"),
         }
     }
@@ -1240,179 +1125,6 @@ impl BaseClient {
     ) -> Result<Option<String>> {
         match self.olm_machine().await.as_ref() {
             Some(machine) => Ok(machine.current_outbound_group_session_id(room_id).await),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Return the current outbound group-session message index (issue #538).
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn current_outbound_group_session_message_index(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<Option<u32>> {
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => {
-                Ok(machine.current_outbound_group_session_message_index(room_id).await)
-            }
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Prepare a targeted claim for a forced room-key re-share.
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn prepare_force_reshare_claim(
-        &self,
-        room_id: &RoomId,
-        expected_session_id: Option<&str>,
-        target: RoomKeyReshareTarget,
-    ) -> Result<Option<(ruma::OwnedTransactionId, ruma::api::client::keys::claim_keys::v3::Request)>>
-    {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .prepare_force_reshare_claim(
-                    room_id,
-                    expected_session_id,
-                    target,
-                    members.iter().map(Deref::deref),
-                    settings,
-                )
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Force-share the current outbound room key with eligible target devices.
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn force_reshare_room_key(
-        &self,
-        room_id: &RoomId,
-        expected_session_id: Option<&str>,
-        target: RoomKeyReshareTarget,
-        only_devices: Option<&BTreeMap<OwnedUserId, BTreeSet<ruma::OwnedDeviceId>>>,
-    ) -> Result<RoomKeyReshareResult> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .force_reshare_room_key(
-                    room_id,
-                    expected_session_id,
-                    target,
-                    only_devices,
-                    members.iter().map(Deref::deref),
-                    settings,
-                )
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Prepare a manual index-0 room-key share (issue #538 diagnostic
-    /// control). Atomically captures the current outbound session's index-0
-    /// room-key content, collects the complete eligible recipient set, and
-    /// returns an optional keys-claim request for eligible devices lacking
-    /// an Olm session.
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn prepare_manual_index0_share(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<(
-        ManualIndex0Preparation,
-        Option<(ruma::OwnedTransactionId, ruma::api::client::keys::claim_keys::v3::Request)>,
-    )> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .prepare_manual_index0_share(room_id, members.iter().map(Deref::deref), settings)
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Continue a manual index-0 share (issue #538 diagnostic control):
-    /// re-evaluate recipients, claim newly eligible missing-Olm devices
-    /// (`NeedsClaim`), or queue the index-0 room-key share (`Ready`).
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn finalize_manual_index0_share(
-        &self,
-        preparation: ManualIndex0Preparation,
-    ) -> Result<ManualFinalizeStep> {
-        let (members, settings) = self.room_key_share_context(preparation.room_id()).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .finalize_manual_index0_share(
-                    preparation,
-                    members.iter().map(Deref::deref),
-                    settings,
-                )
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Prepare the one-shot current-session index-0 recovery resend (issue #541).
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn prepare_manual_index0_resend(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<(
-        ManualIndex0ResendPreparation,
-        Option<(ruma::OwnedTransactionId, ruma::api::client::keys::claim_keys::v3::Request)>,
-    )> {
-        let (members, settings) = self.room_key_share_context(room_id).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .prepare_manual_index0_resend(room_id, members.iter().map(Deref::deref), settings)
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Continue the one-shot current-session index-0 recovery resend (issue #541).
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn finalize_manual_index0_resend(
-        &self,
-        preparation: ManualIndex0ResendPreparation,
-    ) -> Result<ManualIndex0ResendStep> {
-        let (members, settings) = self.room_key_share_context(preparation.room_id()).await?;
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .finalize_manual_index0_resend(
-                    preparation,
-                    members.iter().map(Deref::deref),
-                    settings,
-                )
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Remove owned un-sent manual share requests and clear the matching
-    /// keys-claim expectation (issue #538 cleanup).
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn cleanup_manual_pending_requests(
-        &self,
-        room_id: &RoomId,
-        owned_ids: &[ruma::OwnedTransactionId],
-        claim_expectation: Option<&ruma::TransactionId>,
-    ) -> Result<()> {
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine
-                .cleanup_manual_pending_requests(room_id, owned_ids, claim_expectation)
-                .await?),
-            None => panic!("Olm machine wasn't started"),
-        }
-    }
-
-    /// Mark a manual index-0 share request as sent (transactional,
-    /// issue #538).
-    #[cfg(feature = "e2e-encryption")]
-    pub async fn mark_manual_request_as_sent(
-        &self,
-        request_id: &ruma::TransactionId,
-    ) -> Result<()> {
-        match self.olm_machine().await.as_ref() {
-            Some(machine) => Ok(machine.mark_manual_request_as_sent(request_id).await?),
             None => panic!("Olm machine wasn't started"),
         }
     }

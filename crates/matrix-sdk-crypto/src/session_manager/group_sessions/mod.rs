@@ -32,7 +32,6 @@ use ruma::events::AnyStateEventContent;
 use ruma::{
     DeviceId, OwnedDeviceId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId,
     UserId,
-    api::client::keys::claim_keys::v3::Request as KeysClaimRequest,
     events::{AnyMessageLikeEventContent, AnyToDeviceEventContent, ToDeviceEventType},
     serde::Raw,
     to_device::DeviceIdOrAllDevices,
@@ -48,22 +47,18 @@ use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 
 #[cfg(feature = "experimental-encrypted-state-events")]
 use crate::types::events::room::encrypted::RoomEncryptedEventContent;
-use crate::types::events::room_key::RoomKeyContent;
 use crate::{
     Device, DeviceData, EncryptionSettings, LocalTrust, OlmError,
     error::{EventError, MegolmResult, OlmResult},
     identities::device::MaybeEncryptedRoomKey,
     olm::{
         InboundGroupSession, OutboundGroupSession, OutboundGroupSessionEncryptionResult,
-        OutboundStateSnapshot, SenderData, SenderDataFinder, Session, ShareInfo, ShareRequestKind,
-        ShareState, StaticAccountData,
+        SenderData, SenderDataFinder, Session, ShareInfo, ShareState, StaticAccountData,
     },
     room_key_diagnostics::{
-        Index0ReshareOutcome, InitialShareDeviceClass, InitialShareRepairClaimOutcome,
-        InitialShareRepairOlmState, InitialShareRepairOutcome, InitialShareRepairPreparation,
-        InitialShareStage, RoomKeyCreationOutcome, RoomKeyDiagnosticHub,
+        InitialShareDeviceClass, InitialShareStage, RoomKeyCreationOutcome, RoomKeyDiagnosticHub,
     },
-    store::{CryptoStoreError, CryptoStoreWrapper, Result as StoreResult, Store, types::Changes},
+    store::{CryptoStoreWrapper, Result as StoreResult, Store, types::Changes},
     types::{
         events::{
             EventType, room::encrypted::ToDeviceEncryptedEventContent,
@@ -72,390 +67,6 @@ use crate::{
         requests::ToDeviceRequest,
     },
 };
-
-/// Outcome of an immediate post-unwedge room-key re-share (issue #477).
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub enum UnwedgeReshareOutcome {
-    /// No active outbound session was shared with the recovered device.
-    NoMatchingSession,
-    /// A re-share for the device is already pending on the session.
-    AlreadyPending,
-    /// Recipient policy (membership/blacklist/dehydrated/trust/rotation
-    /// pending) blocks the re-share.
-    PolicyBlocked,
-    /// The device's wedging index is not newer than the stored share index.
-    NotNeeded,
-    /// The re-share was queued; the requests still need to be sent.
-    Queued(Vec<Arc<ToDeviceRequest>>),
-    /// The recovery re-share failed with an error.
-    Failed,
-}
-
-/// Outcome of a manual index-0 room-key share (issue #538 diagnostic
-/// control). Closed and privacy-safe: no identifiers, session ids, device
-/// ids, or key material.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManualIndex0ShareOutcome {
-    /// The index-0 key was shared to the eligible set and all requests were
-    /// accepted and marked (or the missing bucket is reported).
-    Completed,
-    /// The room is not encrypted.
-    RefusedNotEncrypted,
-    /// The current outbound session is no longer at message index 0.
-    RefusedIndexAdvanced,
-    /// No outbound session exists for the room.
-    NoSession,
-    /// No recipients are eligible after policy re-evaluation.
-    NoRecipients,
-    /// Recipient policy blocked the share.
-    PolicyBlocked,
-    /// The operation was cancelled because the session/room/account changed.
-    CancelledStale,
-    /// The monotonic deadline expired before completion.
-    Deadline,
-    /// The operation failed.
-    Failed,
-}
-
-/// Closed outcome of the one-time/fallback keys-claim step of a manual
-/// index-0 share.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManualClaimOutcome {
-    NotNeeded,
-    Succeeded,
-    Failed,
-    Deadline,
-}
-
-/// Closed aggregate summary of a manual index-0 share. Counts are buckets
-/// only; no identifiers, session ids, device ids, or key material cross the
-/// boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct ManualIndex0ShareSummary {
-    pub outcome: ManualIndex0ShareOutcome,
-    pub message_index_before: Option<u32>,
-    pub message_index_after: Option<u32>,
-    pub own_eligible: usize,
-    pub own_accepted: usize,
-    pub own_missing: usize,
-    pub peer_eligible: usize,
-    pub peer_accepted: usize,
-    pub peer_missing: usize,
-    pub peer_users_with_zero_accepted: usize,
-    pub claim: ManualClaimOutcome,
-    pub elapsed_ms: u64,
-    pub room_event_sent: bool,
-    pub index0_consumed: bool,
-}
-
-impl ManualIndex0ShareSummary {
-    pub(crate) fn failed() -> Self {
-        Self {
-            outcome: ManualIndex0ShareOutcome::Failed,
-            message_index_before: None,
-            message_index_after: None,
-            own_eligible: 0,
-            own_accepted: 0,
-            own_missing: 0,
-            peer_eligible: 0,
-            peer_accepted: 0,
-            peer_missing: 0,
-            peer_users_with_zero_accepted: 0,
-            claim: ManualClaimOutcome::NotNeeded,
-            elapsed_ms: 0,
-            room_event_sent: false,
-            index0_consumed: false,
-        }
-    }
-}
-
-/// Captured state for a manual index-0 room-key share (issue #538
-/// diagnostic control). Carries the atomically captured index-0 room-key
-/// content and the complete eligible recipient classification so the final
-/// share step can Olm-encrypt the original index-0 key even if a concurrent
-/// normal send advances the session afterwards.
-#[derive(Debug)]
-pub struct ManualIndex0Preparation {
-    /// `Completed` when the preparation captured a usable index-0 session;
-    /// otherwise a refusal outcome (`NoSession`, `RefusedIndexAdvanced`).
-    pub(crate) outcome: ManualIndex0ShareOutcome,
-    /// The room the preparation belongs to (needed for late re-evaluation).
-    pub(crate) room_id: OwnedRoomId,
-    /// The captured outbound session identity.
-    pub(crate) session_id: Option<String>,
-    /// The atomically captured index-0 room-key content. Shared by `Arc`
-    /// because `RoomKeyContent` (and the underlying vodozemac `SessionKey`)
-    /// is not `Clone`; the content is immutable once captured.
-    pub(crate) index0_content: Option<Arc<RoomKeyContent>>,
-    /// Eligible own-other devices (excluding the current device).
-    pub(crate) own_devices: Vec<DeviceData>,
-    /// Eligible peer devices.
-    pub(crate) peer_devices: Vec<DeviceData>,
-    /// Whether a keys-claim was returned to the caller during this
-    /// operation; the final summary reports `claim=Succeeded` when true.
-    pub(crate) claim_occurred: bool,
-}
-
-impl ManualIndex0Preparation {
-    /// The room the preparation belongs to (for late re-evaluation).
-    pub fn room_id(&self) -> &RoomId {
-        &self.room_id
-    }
-
-    pub(crate) fn refused(room_id: &RoomId, outcome: ManualIndex0ShareOutcome) -> Self {
-        Self {
-            outcome,
-            room_id: room_id.to_owned(),
-            session_id: None,
-            index0_content: None,
-            own_devices: Vec::new(),
-            peer_devices: Vec::new(),
-            claim_occurred: false,
-        }
-    }
-}
-
-/// Next step of a manual index-0 share finalization (issue #538 diagnostic
-/// control). The caller transports each returned request, marks it, and then
-/// resumes; `NeedsClaim` loops until `Ready` or a terminal refusal.
-#[derive(Debug)]
-pub enum ManualFinalizeStep {
-    /// More Olm sessions are missing; the caller must send this standard
-    /// keys-claim request (one-time/fallback keys), mark it as sent, and then
-    /// call the finalize step again under the same monotonic deadline. The
-    /// continuation carries the captured index-0 material and the
-    /// claim-occurred flag.
-    NeedsClaim {
-        request_id: OwnedTransactionId,
-        request: KeysClaimRequest,
-        continuation: ManualIndex0Preparation,
-    },
-    /// The index-0 room-key to-device requests are ready to send. The closed
-    /// summary accompanies them; `requests` may be empty.
-    Ready { requests: Vec<Arc<ToDeviceRequest>>, summary: ManualIndex0ShareSummary },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManualIndex0ResendOutcome {
-    Completed,
-    RefusedNotEncrypted,
-    NoSession,
-    InboundSessionMissing,
-    InboundIndexAdvanced,
-    OriginalLedgerMissing,
-    NoRecipients,
-    PolicyBlocked,
-    StaleIdentityRefused,
-    CancelledStale,
-    Deadline,
-    Failed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct ManualIndex0ResendSummary {
-    pub outcome: ManualIndex0ResendOutcome,
-    pub message_index_before: Option<u32>,
-    pub message_index_after: Option<u32>,
-    pub peer_ledger: usize,
-    pub peer_sender_key_changed: usize,
-    pub peer_eligible: usize,
-    pub peer_accepted: usize,
-    pub peer_missing: usize,
-    pub policy_blocked: usize,
-    pub inbound_first_known_index: Option<u32>,
-    pub claim: ManualClaimOutcome,
-    pub elapsed_ms: u64,
-    pub room_event_sent: bool,
-    pub index0_consumed: bool,
-}
-
-impl ManualIndex0ResendSummary {
-    pub fn failed() -> Self {
-        Self {
-            outcome: ManualIndex0ResendOutcome::Failed,
-            message_index_before: None,
-            message_index_after: None,
-            peer_ledger: 0,
-            peer_sender_key_changed: 0,
-            peer_eligible: 0,
-            peer_accepted: 0,
-            peer_missing: 0,
-            policy_blocked: 0,
-            inbound_first_known_index: None,
-            claim: ManualClaimOutcome::NotNeeded,
-            elapsed_ms: 0,
-            room_event_sent: false,
-            index0_consumed: false,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ManualIndex0ResendPreparation {
-    pub(crate) outcome: ManualIndex0ResendOutcome,
-    pub(crate) room_id: OwnedRoomId,
-    pub(crate) session_id: Option<String>,
-    pub(crate) targets: Vec<DeviceData>,
-    pub(crate) claim_occurred: bool,
-    pub(crate) claim_checked: bool,
-    pub(crate) message_index_before: Option<u32>,
-    pub(crate) peer_ledger: usize,
-    pub(crate) peer_eligible: usize,
-    pub(crate) peer_sender_key_changed: usize,
-    pub(crate) policy_blocked: usize,
-    pub(crate) inbound_first_known_index: Option<u32>,
-}
-
-impl ManualIndex0ResendPreparation {
-    pub fn room_id(&self) -> &RoomId {
-        &self.room_id
-    }
-
-    pub fn summary(&self) -> ManualIndex0ResendSummary {
-        ManualIndex0ResendSummary {
-            outcome: self.outcome,
-            message_index_before: self.message_index_before,
-            message_index_after: self.message_index_before,
-            peer_ledger: self.peer_ledger,
-            peer_sender_key_changed: self.peer_sender_key_changed,
-            peer_eligible: self.peer_eligible,
-            peer_accepted: 0,
-            peer_missing: self.peer_eligible,
-            policy_blocked: self.policy_blocked,
-            inbound_first_known_index: self.inbound_first_known_index,
-            claim: if self.claim_occurred {
-                ManualClaimOutcome::Succeeded
-            } else {
-                ManualClaimOutcome::NotNeeded
-            },
-            elapsed_ms: 0,
-            room_event_sent: false,
-            index0_consumed: false,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum ManualIndex0ResendStep {
-    NeedsClaimTargets {
-        targets: BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>,
-        continuation: ManualIndex0ResendPreparation,
-    },
-    NeedsClaim {
-        request_id: OwnedTransactionId,
-        request: KeysClaimRequest,
-        continuation: ManualIndex0ResendPreparation,
-    },
-    Ready {
-        requests: Vec<Arc<ToDeviceRequest>>,
-        summary: ManualIndex0ResendSummary,
-    },
-}
-
-/// Outcome of a manual force-new-outbound-session (issue #538).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManualForceNewOutcome {
-    Completed,
-    RefusedNotEncrypted,
-    CancelledStale,
-    Failed,
-    Deadline,
-}
-
-/// Closed summary of a manual force-new-outbound-session.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct ManualForceNewSummary {
-    pub outcome: ManualForceNewOutcome,
-    pub previous_session_exists: bool,
-    pub fresh_session_created: bool,
-    pub message_index: Option<u32>,
-    pub elapsed_ms: u64,
-}
-
-/// Eligible device class for a forced re-share of the current room key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RoomKeyReshareTarget {
-    /// Devices belonging to the current user, except this device.
-    OwnOtherDevices,
-    /// Devices belonging to other room members.
-    PeerDevices,
-    /// Every eligible device except this device.
-    AllEligible,
-}
-impl RoomKeyReshareTarget {
-    fn matches(
-        self,
-        own_user_id: &UserId,
-        own_device_id: &DeviceId,
-        user_id: &UserId,
-        device_id: &DeviceId,
-    ) -> bool {
-        match self {
-            Self::OwnOtherDevices => user_id == own_user_id && device_id != own_device_id,
-            Self::PeerDevices => user_id != own_user_id,
-            Self::AllEligible => user_id != own_user_id || device_id != own_device_id,
-        }
-    }
-}
-
-/// Result of attempting to force-share the current outbound room key.
-#[derive(Debug)]
-pub enum RoomKeyReshareResult {
-    /// New room-key requests were queued.
-    Sent {
-        /// Requests that the caller must send and mark as sent.
-        requests: Vec<Arc<ToDeviceRequest>>,
-        /// Number of device recipients across the requests.
-        recipient_count: usize,
-        /// Eligible devices that still could not be Olm-encrypted.
-        failed_recipient_count: usize,
-    },
-    /// Eligible target devices existed but none could be Olm-encrypted.
-    UnableToEncrypt {
-        /// Number of devices with an explicit encryption failure.
-        recipient_count: usize,
-    },
-    /// No current outbound session exists.
-    NoSession,
-    /// No target device is currently eligible for a new request.
-    NoRecipients,
-    /// The current session does not match the caller's expected session.
-    StaleSession,
-}
-
-/// Decision of the bounded index-0 duplicate share (issue #510).
-#[derive(Debug)]
-pub enum Index0ReshareDecision {
-    /// No duplicate was needed (index already consumed, session absent, or
-    /// already attempted for this session).
-    NotNeeded,
-    /// Recipient policy blocked the duplicate (e.g. rotation pending); the
-    /// session was neither rotated nor replaced.
-    PolicyBlocked,
-    /// The attempt was cancelled by a fenced identity change (the active
-    /// session changed while the decision was being made).
-    Cancelled,
-    /// Eligible targets existed but none could be Olm-encrypted.
-    UnableToEncrypt {
-        /// Number of devices with an explicit encryption failure.
-        recipient_count: usize,
-    },
-    /// A duplicate was queued; the requests still need to be sent and marked
-    /// as sent by the caller within the bounded deadline.
-    Queued {
-        /// The outbound session identity the duplicate belongs to.
-        session_id: String,
-        /// New `m.room.encrypted` to-device requests carrying the room key.
-        requests: Vec<Arc<ToDeviceRequest>>,
-        /// Eligible devices that still could not be Olm-encrypted.
-        failed_recipient_count: usize,
-    },
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct GroupSessionCache {
@@ -529,60 +140,8 @@ impl GroupSessionCache {
         self.sessions_being_shared.write().remove(id)
     }
 
-    /// Find the outbound session that owns the given still-pending to-device
-    /// request (issue #509 failure diagnostics). Checks the being-shared map
-    /// first, then the active sessions.
-    pub(crate) fn find_request_owner(&self, id: &TransactionId) -> Option<OutboundGroupSession> {
-        if let Some(session) = self.sessions_being_shared.read().get(id) {
-            return Some(session.clone());
-        }
-        self.sessions
-            .read()
-            .values()
-            .find(|session| session.pending_request_recipients(id).is_some())
-            .cloned()
-    }
-
     fn mark_as_being_shared(&self, id: OwnedTransactionId, session: OutboundGroupSession) {
         self.sessions_being_shared.write().insert(id, session);
-    }
-}
-
-struct OutboundStateRollback {
-    session: OutboundGroupSession,
-    snapshot: Option<OutboundStateSnapshot>,
-    sessions: GroupSessionCache,
-    request_ids: Vec<OwnedTransactionId>,
-    remove_owner_on_drop: bool,
-}
-
-impl OutboundStateRollback {
-    fn new(
-        session: OutboundGroupSession,
-        snapshot: OutboundStateSnapshot,
-        sessions: GroupSessionCache,
-        request_ids: Vec<OwnedTransactionId>,
-        remove_owner_on_drop: bool,
-    ) -> Self {
-        Self { session, snapshot: Some(snapshot), sessions, request_ids, remove_owner_on_drop }
-    }
-
-    fn disarm(mut self) {
-        self.snapshot.take();
-    }
-}
-
-impl Drop for OutboundStateRollback {
-    fn drop(&mut self) {
-        let Some(snapshot) = self.snapshot.take() else {
-            return;
-        };
-        self.session.restore_state(snapshot);
-        if self.remove_owner_on_drop {
-            for request_id in &self.request_ids {
-                self.sessions.remove_from_being_shared(request_id);
-            }
-        }
     }
 }
 
@@ -598,101 +157,17 @@ pub(crate) struct GroupSessionManager {
 }
 
 impl GroupSessionManager {
+    const MAX_TO_DEVICE_MESSAGES: usize = 250;
+
+    pub fn new(store: Store, room_key_diagnostics: RoomKeyDiagnosticHub) -> Self {
+        Self { store: store.clone(), sessions: GroupSessionCache::new(store), room_key_diagnostics }
+    }
+
     pub(crate) async fn current_outbound_group_session_id(
         &self,
         room_id: &RoomId,
     ) -> Option<String> {
         self.sessions.get_or_load(room_id).await.map(|session| session.session_id().to_owned())
-    }
-
-    /// Load the current outbound group session for a room, if one exists
-    /// (manual index-0 share, issue #538).
-    pub(crate) async fn current_outbound_session(
-        &self,
-        room_id: &RoomId,
-    ) -> Option<OutboundGroupSession> {
-        self.sessions.get_or_load(room_id).await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn find_request_owner(
-        &self,
-        request_id: &TransactionId,
-    ) -> Option<OutboundGroupSession> {
-        self.sessions.find_request_owner(request_id)
-    }
-
-    /// Remove owned un-sent manual share requests (issue #538 cleanup) from
-    /// the outbound session's pending set and the being-shared map, and
-    /// durably persist the session. Called on every non-completed/partial
-    /// exit so no manual request survives to be drained by a later normal
-    /// preshare.
-    pub(crate) async fn cleanup_manual_pending_requests(
-        &self,
-        room_id: &RoomId,
-        owned_ids: &[OwnedTransactionId],
-    ) -> StoreResult<()> {
-        if owned_ids.is_empty() {
-            return Ok(());
-        }
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok(());
-        };
-        let snapshot = outbound.snapshot_state();
-        let rollback = OutboundStateRollback::new(
-            outbound.clone(),
-            snapshot,
-            self.sessions.clone(),
-            owned_ids.to_vec(),
-            false,
-        );
-        let mut owned = Vec::new();
-        for id in owned_ids {
-            if self.sessions.find_request_owner(id).is_some() {
-                if let Err(error) = outbound.remove_request(id) {
-                    return Err(error);
-                }
-                owned.push(id.clone());
-            }
-        }
-        if owned.is_empty() {
-            return Ok(());
-        }
-        let mut changes = Changes::default();
-        changes.outbound_group_sessions.push(outbound.clone());
-        match self.store.save_changes(changes).await {
-            Ok(()) => {
-                for id in owned {
-                    self.sessions.remove_from_being_shared(&id);
-                }
-                rollback.disarm();
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Collect the complete eligible recipient devices for the current
-    /// outbound session of a room (manual index-0 share, issue #538). The
-    /// caller owns the policy re-evaluation and the per-device
-    /// classification; this is the same recipient collection the normal
-    /// share path uses.
-    pub(crate) async fn collect_recipients_for_current_outbound(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: &EncryptionSettings,
-    ) -> OlmResult<Option<CollectRecipientsResult>> {
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok(None);
-        };
-        Ok(Some(self.collect_session_recipients(users, encryption_settings, &outbound).await?))
-    }
-
-    const MAX_TO_DEVICE_MESSAGES: usize = 250;
-
-    pub fn new(store: Store, room_key_diagnostics: RoomKeyDiagnosticHub) -> Self {
-        Self { store: store.clone(), sessions: GroupSessionCache::new(store), room_key_diagnostics }
     }
 
     pub async fn invalidate_group_session(&self, room_id: &RoomId) -> StoreResult<bool> {
@@ -710,10 +185,9 @@ impl GroupSessionManager {
     }
 
     pub async fn mark_request_as_sent(&self, request_id: &TransactionId) -> StoreResult<()> {
-        let Some(session) = self.sessions.find_request_owner(request_id) else {
+        let Some(session) = self.sessions.remove_from_being_shared(request_id) else {
             return Ok(());
         };
-        let pre_mark = session.snapshot_state();
 
         // Issue #509: report the homeserver acceptance and the per-device
         // share-state commit for every device whose key share this request
@@ -742,13 +216,7 @@ impl GroupSessionManager {
             }
         }
 
-        let no_olm = match session.mark_request_as_sent(request_id) {
-            Ok(no_olm) => no_olm,
-            Err(error) => {
-                session.restore_state(pre_mark);
-                return Err(error);
-            }
-        };
+        let no_olm = session.mark_request_as_sent(request_id);
 
         let mut changes = Changes::default();
 
@@ -770,194 +238,12 @@ impl GroupSessionManager {
         }
 
         changes.outbound_group_sessions.push(session.clone());
-        match self.store.save_changes(changes).await {
-            Ok(()) => {
-                self.sessions.remove_from_being_shared(request_id);
-                Ok(())
-            }
-            Err(error) => {
-                session.restore_state(pre_mark);
-                Err(error)
-            }
-        }
-    }
-
-    /// Mark a manual index-0 share request as sent with a transactional
-    /// persist-first order (issue #538): the outbound session is persisted
-    /// with the request removed BEFORE the in-memory pending/being-shared
-    /// maps are committed, so a persistence failure rolls back the in-memory
-    /// state and no manual request survives a reload. The `m.no_olm`
-    /// withheld handling of the normal mark path is intentionally not
-    /// performed here: devices that could not be Olm-encrypted are reported
-    /// in the closed summary as missing and their queued requests are
-    /// removed by the cleanup path.
-    pub(crate) async fn mark_manual_request_as_sent(
-        &self,
-        request_id: &TransactionId,
-    ) -> StoreResult<()> {
-        let Some(session) = self.sessions.find_request_owner(request_id) else {
-            return Ok(());
-        };
-        let rollback = OutboundStateRollback::new(
-            session.clone(),
-            session.snapshot_state(),
-            self.sessions.clone(),
-            vec![request_id.to_owned()],
-            false,
-        );
-        let Some(_removed) = session.remove_request_captured(request_id) else {
-            if session.pending_request_ids().iter().any(|id| id == request_id) {
-                rollback.disarm();
-                return Err(CryptoStoreError::backend(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "missing manual request kind",
-                )));
-            }
-            // Nothing pending for this request id; nothing to do.
-            rollback.disarm();
-            return Ok(());
-        };
-
-        let mut changes = Changes::default();
-        changes.outbound_group_sessions.push(session.clone());
-        match self.store.save_changes(changes).await {
-            Ok(()) => {
-                self.sessions.remove_from_being_shared(request_id);
-                rollback.disarm();
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Report a failed to-device send attempt for a still-pending room-key
-    /// request (issue #509). The request is not removed; a later retry that
-    /// the homeserver accepts still emits `HomeserverAccepted`.
-    pub(crate) fn note_to_device_request_failed(&self, request_id: &TransactionId) {
-        let Some(session) = self.sessions.find_request_owner(request_id) else {
-            return;
-        };
-        let Some(devices) = session.pending_request_recipients(request_id) else {
-            return;
-        };
-        let room_id = session.room_id().to_owned();
-        let session_id = session.session_id().to_owned();
-        for (user_id, device_id) in devices {
-            self.room_key_diagnostics.emit_initial_share_device(
-                &room_id,
-                &session_id,
-                &user_id,
-                &device_id,
-                InitialShareDeviceClass::Unknown,
-                InitialShareStage::RequestFailed,
-            );
-        }
+        self.store.save_changes(changes).await
     }
 
     #[cfg(test)]
     pub fn get_outbound_group_session(&self, room_id: &RoomId) -> Option<OutboundGroupSession> {
         self.sessions.get(room_id)
-    }
-
-    /// Rooms whose active outbound session was previously shared with `device`
-    /// at an `olm_wedging_index` older than the device's current index
-    /// (issue #477). Only the in-memory active session set is scanned; sessions
-    /// not loaded this runtime re-share on their normal next `share_room_key`
-    /// pass.
-    pub(crate) fn unwedged_affected_room_ids(&self, device: &DeviceData) -> Vec<OwnedRoomId> {
-        let room_ids: Vec<_> = self
-            .sessions
-            .sessions
-            .read()
-            .iter()
-            .filter_map(|(room_id, session)| match session.sharing_view().get_share_state(device) {
-                ShareState::Shared { olm_wedging_index, .. }
-                    if olm_wedging_index < device.olm_wedging_index =>
-                {
-                    Some(room_id.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        self.room_key_diagnostics.emit_olm_recovery_signal(
-            Some((device.user_id(), device.device_id())),
-            crate::room_key_diagnostics::OlmRecoverySignalOutcome::Observed,
-        );
-        room_ids
-    }
-
-    /// Re-share the current Megolm session of `room_id` to the single recovered
-    /// device after its Olm unwedge (issue #477).
-    ///
-    /// Never creates or rotates the session: rotation is left to the normal
-    /// send path. Membership and recipient policy are re-evaluated with the
-    /// current member list, so a device whose user left, or that became
-    /// blacklisted/dehydrated/untrusted, is never sent the key.
-    pub(crate) async fn reshare_unwedged_room_key(
-        &self,
-        room_id: &RoomId,
-        members: &[OwnedUserId],
-        settings: EncryptionSettings,
-        device: &DeviceData,
-    ) -> OlmResult<UnwedgeReshareOutcome> {
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok(UnwedgeReshareOutcome::NoMatchingSession);
-        };
-        let ShareState::Shared { olm_wedging_index, .. } =
-            outbound.sharing_view().get_share_state(device)
-        else {
-            return Ok(UnwedgeReshareOutcome::NoMatchingSession);
-        };
-        if olm_wedging_index >= device.olm_wedging_index {
-            return Ok(UnwedgeReshareOutcome::NotNeeded);
-        }
-        if outbound.sharing_view().has_pending_share(device) {
-            return Ok(UnwedgeReshareOutcome::AlreadyPending);
-        }
-
-        // Re-evaluate full recipient policy with the current member list
-        // (leavers excluded, blacklist/dehydrated/trust filtered) and detect
-        // any policy cause that requires rotation.
-        let CollectRecipientsResult { should_rotate, devices, .. } = self
-            .collect_session_recipients(
-                members.iter().map(|user| user.as_ref()),
-                &settings,
-                &outbound,
-            )
-            .await?;
-        if should_rotate {
-            // Leave rotation to the normal send path; never rotate solely to
-            // recover Olm delivery.
-            return Ok(UnwedgeReshareOutcome::PolicyBlocked);
-        }
-        let eligible = devices.get(device.user_id()).is_some_and(|devices| {
-            devices.iter().any(|candidate| candidate.device_id() == device.device_id())
-        });
-        if !eligible {
-            return Ok(UnwedgeReshareOutcome::PolicyBlocked);
-        }
-
-        let mut changes = Changes::default();
-        let withheld = self
-            .encrypt_for_devices(
-                vec![device.clone()],
-                &outbound,
-                &mut changes,
-                ShareRequestKind::Normal,
-            )
-            .await?;
-        self.handle_withheld_devices(&outbound, withheld, ShareRequestKind::Normal)?;
-        if !changes.is_empty() {
-            self.store.save_changes(changes).await?;
-        }
-        let outcome = UnwedgeReshareOutcome::Queued(outbound.pending_requests());
-        self.room_key_diagnostics.emit_olm_recovery_reshare(
-            Some((device.user_id(), device.device_id())),
-            crate::room_key_diagnostics::OlmRecoverySignalOutcome::Observed,
-            1,
-            crate::room_key_diagnostics::OlmRecoveryReshareOutcome::Queued,
-        );
-        Ok(outcome)
     }
 
     pub async fn encrypt(
@@ -1081,15 +367,20 @@ impl GroupSessionManager {
                 let created =
                     self.create_outbound_group_session(room_id, settings, own_sender_data).await;
                 match &created {
-                    Ok((outbound, _)) => self.room_key_diagnostics.emit_rotation(
-                        room_id,
-                        Some(&previous),
-                        Some(outbound.session_id()),
-                        classification.reason,
-                        RoomKeyCreationOutcome::Created,
-                        classification.discard_elapsed_ms,
-                        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                    ),
+                    Ok((outbound, _)) => {
+                        self.room_key_diagnostics
+                            .emit_rotation_and_persist(
+                                &self.store,
+                                room_id,
+                                Some(&previous),
+                                Some(outbound.session_id()),
+                                classification.reason,
+                                RoomKeyCreationOutcome::Created,
+                                classification.discard_elapsed_ms,
+                                started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                            )
+                            .await
+                    }
                     Err(_) => self.room_key_diagnostics.emit_rotation(
                         room_id,
                         Some(&previous),
@@ -1112,15 +403,20 @@ impl GroupSessionManager {
             let created =
                 self.create_outbound_group_session(room_id, settings, own_sender_data).await;
             match &created {
-                Ok((outbound, _)) => self.room_key_diagnostics.emit_rotation(
-                    room_id,
-                    None,
-                    Some(outbound.session_id()),
-                    classification.reason,
-                    RoomKeyCreationOutcome::Created,
-                    classification.discard_elapsed_ms,
-                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                ),
+                Ok((outbound, _)) => {
+                    self.room_key_diagnostics
+                        .emit_rotation_and_persist(
+                            &self.store,
+                            room_id,
+                            None,
+                            Some(outbound.session_id()),
+                            classification.reason,
+                            RoomKeyCreationOutcome::Created,
+                            classification.discard_elapsed_ms,
+                            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        )
+                        .await
+                }
                 Err(_) => self.room_key_diagnostics.emit_rotation(
                     room_id,
                     None,
@@ -1231,14 +527,13 @@ impl GroupSessionManager {
         outbound: OutboundGroupSession,
         sessions: GroupSessionCache,
         room_key_diagnostics: RoomKeyDiagnosticHub,
-        request_kind: ShareRequestKind,
     ) -> OlmResult<(Vec<Session>, Vec<(DeviceData, WithheldCode)>)> {
         let (result, share_infos) =
             Self::encrypt_session_for(store, outbound.clone(), chunk, room_key_diagnostics).await?;
 
         if let Some(request) = result.to_device_request {
             let id = request.txn_id.clone();
-            outbound.add_request_with_kind(id.clone(), request.into(), share_infos, request_kind);
+            outbound.add_request(id.clone(), request.into(), share_infos);
             sessions.mark_as_being_shared(id, outbound.clone());
         }
 
@@ -1303,7 +598,6 @@ impl GroupSessionManager {
         recipient_devices: Vec<DeviceData>,
         group_session: &OutboundGroupSession,
         changes: &mut Changes,
-        request_kind: ShareRequestKind,
     ) -> OlmResult<Vec<(DeviceData, WithheldCode)>> {
         // If we have some recipients, log them here.
         if !recipient_devices.is_empty() {
@@ -1337,7 +631,6 @@ impl GroupSessionManager {
                     group_session.clone(),
                     self.sessions.clone(),
                     self.room_key_diagnostics.clone(),
-                    request_kind,
                 ))
             })
             .collect();
@@ -1348,149 +641,6 @@ impl GroupSessionManager {
         // was used to encrypt the room key to be persisted again. This is
         // needed because each encryption step will mutate the Olm session,
         // ratcheting its state forward.
-        for result in join_all(tasks).await {
-            let result = result.expect("Encryption task panicked");
-
-            let (used_sessions, failed_no_olm) = result?;
-
-            changes.sessions.extend(used_sessions);
-            withheld_devices.extend(failed_no_olm);
-        }
-
-        Ok(withheld_devices)
-    }
-
-    /// Encrypt a caller-supplied room-key content (the atomically captured
-    /// index-0 key, issue #538) for the given devices and create to-device
-    /// requests that send the encrypted content to them.
-    #[allow(clippy::too_many_arguments)]
-    async fn encrypt_session_for_content(
-        store: Arc<CryptoStoreWrapper>,
-        group_session: OutboundGroupSession,
-        index0_content: Arc<RoomKeyContent>,
-        devices: Vec<DeviceData>,
-        room_key_diagnostics: RoomKeyDiagnosticHub,
-    ) -> OlmResult<(
-        EncryptForDevicesResult,
-        BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, ShareInfo>>,
-    )> {
-        let mut result_builder = EncryptForDevicesResultBuilder::default();
-        let mut share_infos = BTreeMap::new();
-
-        let encrypt = |store: Arc<CryptoStoreWrapper>,
-                       device: DeviceData,
-                       content: Arc<RoomKeyContent>| async move {
-            let encryption_result =
-                device.maybe_encrypt_room_key_content(store.as_ref(), &content).await;
-
-            (device, encryption_result)
-        };
-
-        let tasks: Vec<_> = devices
-            .iter()
-            .map(|d| spawn(encrypt(store.clone(), d.clone(), index0_content.clone())))
-            .collect();
-
-        let results = join_all(tasks).await;
-
-        for result in results {
-            let (device, encryption_result) = result.expect("Encryption task panicked");
-
-            match encryption_result {
-                Ok(MaybeEncryptedRoomKey::Encrypted { used_session, share_info, message }) => {
-                    result_builder.on_successful_encryption(&device, *used_session, message);
-
-                    let user_id = device.user_id().to_owned();
-                    let device_id = device.device_id().to_owned();
-                    share_infos
-                        .entry(user_id)
-                        .or_insert_with(BTreeMap::new)
-                        .insert(device_id, *share_info);
-                }
-                Ok(MaybeEncryptedRoomKey::MissingSession) => {
-                    result_builder.on_missing_session(device);
-                }
-                Err(error) => {
-                    room_key_diagnostics.emit_initial_share_device(
-                        group_session.room_id(),
-                        group_session.session_id(),
-                        device.user_id(),
-                        device.device_id(),
-                        InitialShareDeviceClass::Unknown,
-                        InitialShareStage::OlmEncryptionFailed,
-                    );
-                    return Err(error);
-                }
-            }
-        }
-
-        Ok((result_builder.into_result(), share_infos))
-    }
-
-    /// Queue to-device requests carrying a caller-supplied room-key content
-    /// (manual index-0 share, issue #538).
-    async fn encrypt_request_content(
-        store: Arc<CryptoStoreWrapper>,
-        chunk: Vec<DeviceData>,
-        outbound: OutboundGroupSession,
-        index0_content: Arc<RoomKeyContent>,
-        sessions: GroupSessionCache,
-        room_key_diagnostics: RoomKeyDiagnosticHub,
-    ) -> OlmResult<(Vec<Session>, Vec<(DeviceData, WithheldCode)>)> {
-        let (result, share_infos) = Self::encrypt_session_for_content(
-            store,
-            outbound.clone(),
-            index0_content,
-            chunk,
-            room_key_diagnostics,
-        )
-        .await?;
-
-        if let Some(request) = result.to_device_request {
-            let id = request.txn_id.clone();
-            outbound.add_request_with_kind(
-                id.clone(),
-                request.into(),
-                share_infos,
-                ShareRequestKind::Manual,
-            );
-            sessions.mark_as_being_shared(id, outbound.clone());
-        }
-
-        Ok((result.updated_olm_sessions, result.no_olm_devices))
-    }
-
-    /// Encrypt the caller-supplied index-0 room-key content for the given
-    /// recipient devices and queue the to-device requests on the outbound
-    /// session (manual index-0 share, issue #538).
-    pub(crate) async fn encrypt_for_devices_content(
-        &self,
-        recipient_devices: Vec<DeviceData>,
-        group_session: &OutboundGroupSession,
-        index0_content: Arc<RoomKeyContent>,
-        changes: &mut Changes,
-    ) -> OlmResult<Vec<(DeviceData, WithheldCode)>> {
-        if !recipient_devices.is_empty() {
-            // The to-device requests are persisted with the session.
-            changes.outbound_group_sessions = vec![group_session.clone()];
-        }
-
-        let tasks: Vec<_> = recipient_devices
-            .chunks(Self::MAX_TO_DEVICE_MESSAGES)
-            .map(|chunk| {
-                spawn(Self::encrypt_request_content(
-                    self.store.crypto_store(),
-                    chunk.to_vec(),
-                    group_session.clone(),
-                    index0_content.clone(),
-                    self.sessions.clone(),
-                    self.room_key_diagnostics.clone(),
-                ))
-            })
-            .collect();
-
-        let mut withheld_devices = Vec::new();
-
         for result in join_all(tasks).await {
             let result = result.expect("Encryption task panicked");
 
@@ -1537,7 +687,6 @@ impl GroupSessionManager {
         &self,
         group_session: &OutboundGroupSession,
         withheld_devices: Vec<(DeviceData, WithheldCode)>,
-        request_kind: ShareRequestKind,
     ) -> OlmResult<()> {
         // Convert a withheld code for the group session into a to-device event content.
         let to_content = |code| {
@@ -1594,12 +743,7 @@ impl GroupSessionManager {
         for (request, share_info) in result {
             if !request.messages.is_empty() {
                 let txn_id = request.txn_id.to_owned();
-                group_session.add_request_with_kind(
-                    txn_id.to_owned(),
-                    request.into(),
-                    share_info,
-                    request_kind,
-                );
+                group_session.add_request(txn_id.to_owned(), request.into(), share_info);
 
                 self.sessions.mark_as_being_shared(txn_id, group_session.clone());
             }
@@ -1655,600 +799,6 @@ impl GroupSessionManager {
     ///
     /// # Arguments
     ///
-    fn resend_preparation(
-        room_id: &RoomId,
-        outcome: ManualIndex0ResendOutcome,
-        message_index_before: Option<u32>,
-        inbound_first_known_index: Option<u32>,
-    ) -> ManualIndex0ResendPreparation {
-        ManualIndex0ResendPreparation {
-            outcome,
-            room_id: room_id.to_owned(),
-            session_id: None,
-            targets: Vec::new(),
-            claim_occurred: false,
-            claim_checked: false,
-            message_index_before,
-            peer_ledger: 0,
-            peer_eligible: 0,
-            peer_sender_key_changed: 0,
-            policy_blocked: 0,
-            inbound_first_known_index,
-        }
-    }
-
-    async fn collect_resend_targets(
-        &self,
-        outbound: &OutboundGroupSession,
-        users: impl Iterator<Item = &UserId>,
-        settings: &EncryptionSettings,
-    ) -> OlmResult<(Vec<DeviceData>, usize, usize, usize, bool, bool)> {
-        let Some(ledger) = outbound.initial_share_ledger() else {
-            return Ok((Vec::new(), 0, 0, 0, false, false));
-        };
-        let account = self.store.static_account();
-        let mut invalid_identity_ids = BTreeSet::new();
-        for (user_id, devices) in &ledger {
-            for (device_id, info) in devices {
-                let ShareInfo::Shared(shared) = info else { continue };
-                if user_id == account.user_id() && device_id == account.device_id() {
-                    continue;
-                }
-                let current = self.store.get_device(user_id, device_id).await?;
-                if current
-                    .as_ref()
-                    .is_none_or(|device| device.curve25519_key() != Some(shared.sender_key))
-                {
-                    invalid_identity_ids.insert((user_id.clone(), device_id.clone()));
-                }
-            }
-        }
-        let CollectRecipientsResult { should_rotate, devices, .. } =
-            self.collect_session_recipients(users, settings, outbound).await?;
-        let eligible = devices
-            .into_values()
-            .flatten()
-            .map(|device| ((device.user_id().to_owned(), device.device_id().to_owned()), device))
-            .collect::<BTreeMap<_, _>>();
-        let mut targets = Vec::new();
-        let mut peer_ledger = 0;
-        let mut sender_key_changed = 0;
-        let mut policy_blocked = 0;
-        for (user_id, devices) in ledger {
-            for (device_id, info) in devices {
-                let ShareInfo::Shared(shared) = info else { continue };
-                if user_id != account.user_id() || device_id != account.device_id() {
-                    if user_id != account.user_id() {
-                        peer_ledger += 1;
-                    }
-                } else {
-                    continue;
-                }
-                let key = (user_id.clone(), device_id.clone());
-                if invalid_identity_ids.contains(&key) {
-                    if user_id != account.user_id() {
-                        sender_key_changed += 1;
-                    }
-                    continue;
-                }
-                let Some(device) = eligible.get(&key) else {
-                    policy_blocked += 1;
-                    continue;
-                };
-                if device.curve25519_key() != Some(shared.sender_key) {
-                    if user_id != account.user_id() {
-                        sender_key_changed += 1;
-                    }
-                    continue;
-                }
-                targets.push(device.clone());
-            }
-        }
-        Ok((
-            targets,
-            peer_ledger,
-            sender_key_changed,
-            policy_blocked,
-            should_rotate,
-            !invalid_identity_ids.is_empty(),
-        ))
-    }
-
-    /// Prepare the manual index-0 recovery resend (issue #541). This reads
-    /// only the immutable initial-share ledger, never the live share/pending
-    /// view, and accepts an outbound session at any message index.
-    pub async fn prepare_manual_index0_resend(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<(ManualIndex0ResendPreparation, Option<(OwnedTransactionId, KeysClaimRequest)>)>
-    {
-        let settings = encryption_settings.into();
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok((
-                Self::resend_preparation(room_id, ManualIndex0ResendOutcome::NoSession, None, None),
-                None,
-            ));
-        };
-        let message_index_before = outbound.message_index().await;
-        if outbound.expired() || outbound.invalidated() {
-            return Ok((
-                Self::resend_preparation(
-                    room_id,
-                    ManualIndex0ResendOutcome::PolicyBlocked,
-                    Some(message_index_before),
-                    None,
-                ),
-                None,
-            ));
-        }
-        let session_id = outbound.session_id().to_owned();
-        let Some(inbound) = self.store.get_inbound_group_session(room_id, &session_id).await?
-        else {
-            return Ok((
-                Self::resend_preparation(
-                    room_id,
-                    ManualIndex0ResendOutcome::InboundSessionMissing,
-                    Some(message_index_before),
-                    None,
-                ),
-                None,
-            ));
-        };
-        let first_known_index = inbound.first_known_index();
-        if inbound.room_id() != room_id || inbound.session_id() != session_id {
-            return Ok((
-                Self::resend_preparation(
-                    room_id,
-                    ManualIndex0ResendOutcome::InboundSessionMissing,
-                    Some(message_index_before),
-                    Some(first_known_index),
-                ),
-                None,
-            ));
-        }
-        if first_known_index != 0 {
-            return Ok((
-                Self::resend_preparation(
-                    room_id,
-                    ManualIndex0ResendOutcome::InboundIndexAdvanced,
-                    Some(message_index_before),
-                    Some(first_known_index),
-                ),
-                None,
-            ));
-        }
-        if !outbound.initial_share_tracking_enabled() || outbound.initial_share_ledger().is_none() {
-            return Ok((
-                Self::resend_preparation(
-                    room_id,
-                    ManualIndex0ResendOutcome::OriginalLedgerMissing,
-                    Some(message_index_before),
-                    Some(first_known_index),
-                ),
-                None,
-            ));
-        }
-        let has_shared_proof = outbound.initial_share_ledger().is_some_and(|ledger| {
-            ledger.iter().any(|(user_id, devices)| {
-                devices.iter().any(|(device_id, info)| {
-                    matches!(info, ShareInfo::Shared(_))
-                        && !(user_id == self.store.user_id() && device_id == self.store.device_id())
-                })
-            })
-        });
-        if !has_shared_proof {
-            return Ok((
-                Self::resend_preparation(
-                    room_id,
-                    ManualIndex0ResendOutcome::OriginalLedgerMissing,
-                    Some(message_index_before),
-                    Some(first_known_index),
-                ),
-                None,
-            ));
-        }
-        let (
-            targets,
-            peer_ledger,
-            sender_key_changed,
-            policy_blocked,
-            should_rotate,
-            identity_invalid,
-        ) = self.collect_resend_targets(&outbound, users, &settings).await?;
-        if identity_invalid {
-            let mut preparation = Self::resend_preparation(
-                room_id,
-                ManualIndex0ResendOutcome::StaleIdentityRefused,
-                Some(message_index_before),
-                Some(first_known_index),
-            );
-            preparation.peer_ledger = peer_ledger;
-            preparation.peer_sender_key_changed = sender_key_changed;
-            preparation.policy_blocked = policy_blocked;
-            return Ok((preparation, None));
-        }
-        if should_rotate {
-            let mut preparation = Self::resend_preparation(
-                room_id,
-                ManualIndex0ResendOutcome::PolicyBlocked,
-                Some(message_index_before),
-                Some(first_known_index),
-            );
-            preparation.peer_ledger = peer_ledger;
-            preparation.policy_blocked = policy_blocked;
-            return Ok((preparation, None));
-        }
-        if sender_key_changed > 0 {
-            let mut preparation = Self::resend_preparation(
-                room_id,
-                ManualIndex0ResendOutcome::StaleIdentityRefused,
-                Some(message_index_before),
-                Some(first_known_index),
-            );
-            preparation.peer_ledger = peer_ledger;
-            preparation.peer_sender_key_changed = sender_key_changed;
-            preparation.policy_blocked = policy_blocked;
-            return Ok((preparation, None));
-        }
-        if targets.is_empty() {
-            let outcome = if sender_key_changed > 0 {
-                ManualIndex0ResendOutcome::StaleIdentityRefused
-            } else if policy_blocked > 0 {
-                ManualIndex0ResendOutcome::PolicyBlocked
-            } else {
-                ManualIndex0ResendOutcome::NoRecipients
-            };
-            let mut preparation = Self::resend_preparation(
-                room_id,
-                outcome,
-                Some(message_index_before),
-                Some(first_known_index),
-            );
-            preparation.peer_ledger = peer_ledger;
-            preparation.peer_sender_key_changed = sender_key_changed;
-            preparation.policy_blocked = policy_blocked;
-            return Ok((preparation, None));
-        }
-        let peer_eligible =
-            targets.iter().filter(|device| device.user_id() != self.store.user_id()).count();
-        let preparation = ManualIndex0ResendPreparation {
-            outcome: ManualIndex0ResendOutcome::Completed,
-            room_id: room_id.to_owned(),
-            session_id: Some(session_id),
-            targets,
-            claim_occurred: false,
-            claim_checked: false,
-            message_index_before: Some(message_index_before),
-            peer_ledger,
-            peer_eligible,
-            peer_sender_key_changed: sender_key_changed,
-            policy_blocked,
-            inbound_first_known_index: Some(first_known_index),
-        };
-        Ok((preparation, None))
-    }
-
-    fn summary_for_preparation(
-        preparation: &ManualIndex0ResendPreparation,
-        outcome: ManualIndex0ResendOutcome,
-    ) -> ManualIndex0ResendSummary {
-        let mut summary = preparation.summary();
-        summary.outcome = outcome;
-        summary
-    }
-
-    /// Finalize the manual recovery resend after each claim response.
-    pub async fn finalize_manual_index0_resend(
-        &self,
-        mut preparation: ManualIndex0ResendPreparation,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<ManualIndex0ResendStep> {
-        if preparation.outcome != ManualIndex0ResendOutcome::Completed {
-            return Ok(ManualIndex0ResendStep::Ready {
-                requests: Vec::new(),
-                summary: ManualIndex0ResendSummary {
-                    outcome: preparation.outcome,
-                    message_index_before: preparation.message_index_before,
-                    message_index_after: preparation.message_index_before,
-                    peer_ledger: preparation.peer_ledger,
-                    peer_sender_key_changed: preparation.peer_sender_key_changed,
-                    peer_eligible: preparation.peer_eligible,
-                    peer_accepted: 0,
-                    peer_missing: 0,
-                    policy_blocked: preparation.policy_blocked,
-                    inbound_first_known_index: preparation.inbound_first_known_index,
-                    claim: ManualClaimOutcome::NotNeeded,
-                    elapsed_ms: 0,
-                    room_event_sent: false,
-                    index0_consumed: false,
-                },
-            });
-        }
-        let settings = encryption_settings.into();
-        let Some(outbound) = self.sessions.get_or_load(&preparation.room_id).await else {
-            let summary =
-                Self::summary_for_preparation(&preparation, ManualIndex0ResendOutcome::NoSession);
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        };
-        if outbound.expired() || outbound.invalidated() {
-            let summary = Self::summary_for_preparation(
-                &preparation,
-                ManualIndex0ResendOutcome::PolicyBlocked,
-            );
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        }
-        if preparation.session_id.as_deref() != Some(outbound.session_id()) {
-            let summary = Self::summary_for_preparation(
-                &preparation,
-                ManualIndex0ResendOutcome::CancelledStale,
-            );
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        }
-        let Some(inbound) = self
-            .store
-            .get_inbound_group_session(&preparation.room_id, outbound.session_id())
-            .await?
-        else {
-            let summary = Self::summary_for_preparation(
-                &preparation,
-                ManualIndex0ResendOutcome::InboundSessionMissing,
-            );
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        };
-        if inbound.room_id() != preparation.room_id || inbound.session_id() != outbound.session_id()
-        {
-            let summary = Self::summary_for_preparation(
-                &preparation,
-                ManualIndex0ResendOutcome::InboundSessionMissing,
-            );
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        }
-        if inbound.first_known_index() != 0 {
-            let mut summary = Self::summary_for_preparation(
-                &preparation,
-                ManualIndex0ResendOutcome::InboundIndexAdvanced,
-            );
-            summary.inbound_first_known_index = Some(inbound.first_known_index());
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        }
-        let (
-            current_targets,
-            peer_ledger,
-            sender_key_changed,
-            policy_blocked,
-            should_rotate,
-            identity_invalid,
-        ) = self.collect_resend_targets(&outbound, users, &settings).await?;
-        if identity_invalid {
-            let mut summary = ManualIndex0ResendSummary::failed();
-            summary.outcome = ManualIndex0ResendOutcome::StaleIdentityRefused;
-            summary.message_index_before = preparation.message_index_before;
-            summary.message_index_after = preparation.message_index_before;
-            summary.peer_ledger = peer_ledger;
-            summary.peer_eligible = preparation.peer_eligible;
-            summary.peer_sender_key_changed = sender_key_changed;
-            summary.policy_blocked = policy_blocked;
-            summary.peer_missing = summary.peer_eligible;
-            summary.inbound_first_known_index = Some(0);
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        }
-        if should_rotate {
-            let mut summary = ManualIndex0ResendSummary::failed();
-            summary.outcome = ManualIndex0ResendOutcome::PolicyBlocked;
-            summary.message_index_before = preparation.message_index_before;
-            summary.message_index_after = preparation.message_index_before;
-            summary.peer_ledger = peer_ledger;
-            summary.policy_blocked = policy_blocked;
-            summary.inbound_first_known_index = Some(0);
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        }
-        let prepared_ids = preparation
-            .targets
-            .iter()
-            .map(|device| (device.user_id().to_owned(), device.device_id().to_owned()))
-            .collect::<BTreeSet<_>>();
-        if sender_key_changed > 0 {
-            let mut summary = ManualIndex0ResendSummary::failed();
-            summary.outcome = ManualIndex0ResendOutcome::StaleIdentityRefused;
-            summary.message_index_before = preparation.message_index_before;
-            summary.message_index_after = preparation.message_index_before;
-            summary.peer_ledger = preparation.peer_ledger;
-            summary.peer_sender_key_changed = sender_key_changed;
-            summary.policy_blocked = preparation.policy_blocked;
-            summary.peer_missing = summary.peer_eligible;
-            summary.inbound_first_known_index = Some(0);
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        }
-        preparation.targets = current_targets
-            .into_iter()
-            .filter(|device| {
-                prepared_ids.contains(&(device.user_id().to_owned(), device.device_id().to_owned()))
-            })
-            .collect();
-        preparation.peer_eligible = preparation
-            .targets
-            .iter()
-            .filter(|device| device.user_id() != self.store.user_id())
-            .count();
-        preparation.peer_sender_key_changed = sender_key_changed;
-        preparation.policy_blocked = policy_blocked;
-        if preparation.targets.is_empty() {
-            let outcome = if sender_key_changed > 0 {
-                ManualIndex0ResendOutcome::StaleIdentityRefused
-            } else if policy_blocked > 0 {
-                ManualIndex0ResendOutcome::PolicyBlocked
-            } else {
-                ManualIndex0ResendOutcome::NoRecipients
-            };
-            let claim = if preparation.claim_occurred {
-                ManualClaimOutcome::Succeeded
-            } else {
-                ManualClaimOutcome::NotNeeded
-            };
-            return Ok(ManualIndex0ResendStep::Ready {
-                requests: Vec::new(),
-                summary: ManualIndex0ResendSummary {
-                    outcome,
-                    message_index_before: preparation.message_index_before,
-                    message_index_after: preparation.message_index_before,
-                    peer_ledger,
-                    peer_sender_key_changed: sender_key_changed,
-                    peer_eligible: 0,
-                    peer_accepted: 0,
-                    peer_missing: preparation.peer_eligible,
-                    policy_blocked,
-                    inbound_first_known_index: Some(0),
-                    claim,
-                    elapsed_ms: 0,
-                    room_event_sent: false,
-                    index0_consumed: false,
-                },
-            });
-        }
-        let claim_targets = preparation.targets.iter().fold(
-            BTreeMap::<OwnedUserId, BTreeSet<OwnedDeviceId>>::new(),
-            |mut result, device| {
-                result
-                    .entry(device.user_id().to_owned())
-                    .or_default()
-                    .insert(device.device_id().to_owned());
-                result
-            },
-        );
-        if !preparation.claim_checked {
-            return Ok(ManualIndex0ResendStep::NeedsClaimTargets {
-                targets: claim_targets,
-                continuation: preparation,
-            });
-        }
-        let Some(ledger) = outbound.initial_share_ledger() else {
-            let summary = Self::summary_for_preparation(
-                &preparation,
-                ManualIndex0ResendOutcome::OriginalLedgerMissing,
-            );
-            return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-        };
-        let mut validated_devices = Vec::new();
-        for target in &preparation.targets {
-            let expected_key = ledger
-                .get(target.user_id())
-                .and_then(|devices| devices.get(target.device_id()))
-                .and_then(|info| match info {
-                    ShareInfo::Shared(shared) => Some(shared.sender_key),
-                    ShareInfo::Withheld(_) => None,
-                });
-            let Some(expected_key) = expected_key else {
-                let mut summary = Self::summary_for_preparation(
-                    &preparation,
-                    ManualIndex0ResendOutcome::StaleIdentityRefused,
-                );
-                summary.peer_sender_key_changed = summary.peer_sender_key_changed.saturating_add(1);
-                return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-            };
-            let Some(device) = self.store.get_device(target.user_id(), target.device_id()).await?
-            else {
-                let mut summary = Self::summary_for_preparation(
-                    &preparation,
-                    ManualIndex0ResendOutcome::StaleIdentityRefused,
-                );
-                summary.peer_sender_key_changed = summary.peer_sender_key_changed.saturating_add(1);
-                return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-            };
-            if device.curve25519_key() != Some(expected_key)
-                || target.curve25519_key() != Some(expected_key)
-            {
-                let mut summary = Self::summary_for_preparation(
-                    &preparation,
-                    ManualIndex0ResendOutcome::StaleIdentityRefused,
-                );
-                summary.peer_sender_key_changed = summary.peer_sender_key_changed.saturating_add(1);
-                return Ok(ManualIndex0ResendStep::Ready { requests: Vec::new(), summary });
-            }
-            validated_devices.push((target, device, expected_key));
-        }
-        let mut changes = Changes::default();
-        let mut staged = Vec::new();
-        for (target, device, expected_key) in validated_devices {
-            let (used_session, content) =
-                device.encrypt_room_key_for_forwarding(inbound.clone(), Some(0)).await?;
-            changes.sessions.push(used_session);
-            let event_type = content.event_type().to_owned();
-            let request = Arc::new(ToDeviceRequest::new(
-                target.user_id(),
-                target.device_id().to_owned(),
-                &event_type,
-                content.cast(),
-            ));
-            let mut share_infos = BTreeMap::new();
-            share_infos.entry(target.user_id().to_owned()).or_insert_with(BTreeMap::new).insert(
-                target.device_id().to_owned(),
-                ShareInfo::new_shared(expected_key, 0, Default::default()),
-            );
-            staged.push((request, share_infos));
-        }
-        let pre_queue = outbound.snapshot_state();
-        let mut requests = Vec::new();
-        let mut request_ids = Vec::new();
-        let rollback_ids = staged.iter().map(|(request, _)| request.txn_id.clone()).collect();
-        let rollback = OutboundStateRollback::new(
-            outbound.clone(),
-            pre_queue,
-            self.sessions.clone(),
-            rollback_ids,
-            true,
-        );
-        for (request, share_infos) in staged {
-            let txn_id = request.txn_id.clone();
-            outbound.add_request_with_kind(
-                txn_id.clone(),
-                request.clone(),
-                share_infos,
-                ShareRequestKind::Manual,
-            );
-            self.sessions.mark_as_being_shared(txn_id.clone(), outbound.clone());
-            request_ids.push(txn_id);
-            requests.push(request);
-        }
-        changes.outbound_group_sessions.push(outbound.clone());
-        if let Err(error) = self.store.save_changes(changes).await {
-            return Err(error.into());
-        }
-        rollback.disarm();
-        let peer_accepted = preparation
-            .targets
-            .iter()
-            .filter(|device| device.user_id() != self.store.user_id())
-            .count();
-        let peer_missing = 0;
-        let claim = if preparation.claim_occurred {
-            ManualClaimOutcome::Succeeded
-        } else {
-            ManualClaimOutcome::NotNeeded
-        };
-        Ok(ManualIndex0ResendStep::Ready {
-            requests,
-            summary: ManualIndex0ResendSummary {
-                outcome: ManualIndex0ResendOutcome::Completed,
-                message_index_before: preparation.message_index_before,
-                message_index_after: preparation.message_index_before,
-                peer_ledger: preparation.peer_ledger,
-                peer_sender_key_changed: preparation.peer_sender_key_changed,
-                peer_eligible: preparation.peer_eligible,
-                peer_accepted,
-                peer_missing,
-                policy_blocked: preparation.policy_blocked,
-                inbound_first_known_index: Some(0),
-                claim,
-                elapsed_ms: 0,
-                room_event_sent: false,
-                index0_consumed: false,
-            },
-        })
-    }
-
     /// `room_id` - The room id of the room where the room key will be used.
     ///
     /// `users` - The list of users that should receive the room key.
@@ -2278,7 +828,6 @@ impl GroupSessionManager {
                 SenderData::unknown(),
             )
             .await?;
-        let created_session = inbound.is_some();
         tracing::Span::current().record("session_id", outbound.session_id());
 
         // Having an inbound group session here means that we created a new
@@ -2320,7 +869,6 @@ impl GroupSessionManager {
                 device,
             )
             .await?;
-        let created_session = created_session || should_rotate;
 
         // Filter out the devices that already received this room key or have a
         // to-device message already queued up.
@@ -2374,34 +922,19 @@ impl GroupSessionManager {
         // for the m.room_key_withheld events since we might have more of those
         // coming from the `collect_session_recipients()` method. Instead they get
         // returned by the method.
-        let unable_to_encrypt_devices = self
-            .encrypt_for_devices(
-                devices,
-                &outbound,
-                &mut changes,
-                if created_session { ShareRequestKind::Initial } else { ShareRequestKind::Normal },
-            )
-            .await?;
+        let unable_to_encrypt_devices =
+            self.encrypt_for_devices(devices, &outbound, &mut changes).await?;
 
         // Issue #509: report devices that had no Olm session (the SDK claims a
         // one-time key and queues an `m.no_olm` withheld notice).
-        for (device, code) in &unable_to_encrypt_devices {
+        for (device, _code) in &unable_to_encrypt_devices {
             self.room_key_diagnostics.emit_initial_share_device(
                 room_id,
                 outbound.session_id(),
                 device.user_id(),
                 device.device_id(),
                 initial_share_device_class(&account, device),
-                if code == &WithheldCode::NoOlm {
-                    InitialShareStage::OlmMissing
-                } else {
-                    InitialShareStage::Withheld
-                },
-            );
-        }
-        if created_session && outbound.message_index().await == 0 {
-            outbound.record_initial_share_missing(
-                unable_to_encrypt_devices.iter().map(|(device, _)| device.clone()),
+                InitialShareStage::OlmMissing,
             );
         }
 
@@ -2410,11 +943,7 @@ impl GroupSessionManager {
 
         // Now handle and add the withheld recipients to the resulting requests to the
         // `OutboundGroupSession`.
-        self.handle_withheld_devices(
-            &outbound,
-            withheld_devices,
-            if created_session { ShareRequestKind::Initial } else { ShareRequestKind::Normal },
-        )?;
+        self.handle_withheld_devices(&outbound, withheld_devices)?;
 
         // The to-device requests get added to the outbound group session, this
         // way we're making sure that they are persisted and scoped to the
@@ -2457,7 +986,7 @@ impl GroupSessionManager {
             if !outbound.shared() {
                 debug!("The room key doesn't need to be shared with anyone. Marking as shared.");
 
-                outbound.commit_empty_initial_share();
+                outbound.mark_as_shared();
                 changes.outbound_group_sessions.push(outbound.clone());
             }
         } else {
@@ -2479,551 +1008,9 @@ impl GroupSessionManager {
         Ok(requests)
     }
 
-    /// Re-evaluate the exact devices that failed the initial Olm share and
-    /// return only those devices as a targeted claim set.
-    pub(crate) async fn initial_share_repair_targets(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-        wake: bool,
-        wake_users: Option<&BTreeSet<OwnedUserId>>,
-        validate_only: bool,
-    ) -> OlmResult<(
-        InitialShareRepairPreparation,
-        Option<BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>>,
-    )> {
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok((InitialShareRepairPreparation::NotNeeded, None));
-        };
-        if outbound.message_index().await != 0 {
-            return Ok((InitialShareRepairPreparation::NotNeeded, None));
-        }
-        if outbound.invalidated() {
-            return Ok((InitialShareRepairPreparation::Cancelled, None));
-        }
-
-        let candidates = outbound.initial_share_repair_candidates();
-        if candidates.is_empty() {
-            return Ok((InitialShareRepairPreparation::NotNeeded, None));
-        }
-        if wake
-            && wake_users.is_some_and(|users| {
-                !candidates.iter().any(|device| users.contains(device.user_id()))
-            })
-        {
-            return Ok((InitialShareRepairPreparation::NotMatchingWake, None));
-        }
-
-        let settings = encryption_settings.into();
-        let CollectRecipientsResult { should_rotate, devices, .. } =
-            self.collect_session_recipients(users, &settings, &outbound).await?;
-        if should_rotate {
-            return Ok((InitialShareRepairPreparation::Cancelled, None));
-        }
-
-        let current = self.sessions.get_or_load(room_id).await;
-        if current.is_none_or(|current| current.session_id() != outbound.session_id()) {
-            return Ok((InitialShareRepairPreparation::Cancelled, None));
-        }
-
-        let candidate_ids: BTreeSet<_> = candidates
-            .iter()
-            .map(|device| (device.user_id().to_owned(), device.device_id().to_owned()))
-            .collect();
-        let sharing = outbound.sharing_view();
-        let mut targets = BTreeMap::new();
-        for device in devices.into_values().flatten() {
-            let key = (device.user_id().to_owned(), device.device_id().to_owned());
-            if candidate_ids.contains(&key)
-                && !sharing.has_pending_share(&device)
-                && matches!(sharing.get_share_state(&device), ShareState::NotShared)
-            {
-                targets.entry(key.0).or_insert_with(BTreeSet::new).insert(key.1);
-            }
-        }
-        let target_ids = targets
-            .iter()
-            .flat_map(|(user_id, devices)| {
-                devices.iter().map(|device_id| (user_id.clone(), device_id.clone()))
-            })
-            .collect::<BTreeSet<_>>();
-        if !outbound.initial_share_repair_policy_matches(&target_ids) {
-            return Ok((InitialShareRepairPreparation::Cancelled, None));
-        }
-        if validate_only {
-            return Ok((InitialShareRepairPreparation::NotNeeded, None));
-        }
-        if targets.is_empty() {
-            let all_candidates_are_shared = candidates
-                .iter()
-                .all(|device| matches!(sharing.get_share_state(device), ShareState::Shared { .. }));
-            return Ok((
-                if all_candidates_are_shared {
-                    InitialShareRepairPreparation::NotNeeded
-                } else {
-                    InitialShareRepairPreparation::NoRecipients
-                },
-                None,
-            ));
-        }
-        if !outbound.begin_initial_share_repair(wake, target_ids) {
-            return Ok((InitialShareRepairPreparation::NotNeeded, None));
-        }
-
-        Ok((InitialShareRepairPreparation::Attempted, Some(targets)))
-    }
-
-    /// Encrypt the current room key for the still-eligible initial-share
-    /// repair candidates after a targeted claim response.
-    pub(crate) async fn reshare_initial_share(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<Vec<Arc<ToDeviceRequest>>> {
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok(Vec::new());
-        };
-        if outbound.message_index().await != 0 || outbound.invalidated() {
-            return Ok(Vec::new());
-        }
-
-        let settings = encryption_settings.into();
-        let CollectRecipientsResult { should_rotate, devices, .. } =
-            self.collect_session_recipients(users, &settings, &outbound).await?;
-        if should_rotate {
-            return Ok(Vec::new());
-        }
-
-        let candidate_ids: BTreeSet<_> = outbound
-            .initial_share_repair_candidates()
-            .into_iter()
-            .map(|device| (device.user_id().to_owned(), device.device_id().to_owned()))
-            .collect();
-        let devices = {
-            let sharing = outbound.sharing_view();
-            devices
-                .into_values()
-                .flatten()
-                .filter(|device| {
-                    candidate_ids
-                        .contains(&(device.user_id().to_owned(), device.device_id().to_owned()))
-                        && !sharing.has_pending_share(device)
-                        && matches!(sharing.get_share_state(device), ShareState::NotShared)
-                })
-                .collect::<Vec<_>>()
-        };
-        if devices.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let previous_request_ids =
-            outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
-        let mut changes = Changes::default();
-        let unable_to_encrypt = self
-            .encrypt_for_devices(devices, &outbound, &mut changes, ShareRequestKind::Normal)
-            .await?;
-        let account = self.store.static_account();
-        for (device, code) in &unable_to_encrypt {
-            self.room_key_diagnostics.emit_initial_share_device(
-                room_id,
-                outbound.session_id(),
-                device.user_id(),
-                device.device_id(),
-                initial_share_device_class(&account, device),
-                if code == &WithheldCode::NoOlm {
-                    InitialShareStage::OlmMissing
-                } else {
-                    InitialShareStage::Withheld
-                },
-            );
-        }
-
-        let requests = outbound
-            .pending_requests()
-            .into_iter()
-            .filter(|request| {
-                !previous_request_ids.contains(&request.txn_id)
-                    && request.event_type.to_string() == "m.room.encrypted"
-            })
-            .collect::<Vec<_>>();
-        for request in &requests {
-            for (user_id, devices) in &request.messages {
-                for device_id in devices.keys() {
-                    let DeviceIdOrAllDevices::DeviceId(device_id) = device_id else {
-                        continue;
-                    };
-                    self.room_key_diagnostics.emit_initial_share_device(
-                        room_id,
-                        outbound.session_id(),
-                        user_id,
-                        device_id,
-                        InitialShareDeviceClass::Unknown,
-                        InitialShareStage::OlmEncrypted,
-                    );
-                    self.room_key_diagnostics.emit_initial_share_device(
-                        room_id,
-                        outbound.session_id(),
-                        user_id,
-                        device_id,
-                        InitialShareDeviceClass::Unknown,
-                        InitialShareStage::RequestQueued,
-                    );
-                }
-            }
-        }
-        if !changes.is_empty() {
-            self.store.save_changes(changes).await?;
-        }
-        Ok(requests)
-    }
-
-    /// Record the closed repair outcome using the current authoritative share
-    /// state and eligible recipient set.
-    pub(crate) async fn note_initial_share_repair(
-        &self,
-        room_id: &RoomId,
-        expected_session_id: Option<&str>,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-        claim: InitialShareRepairClaimOutcome,
-        repair: InitialShareRepairOutcome,
-    ) -> OlmResult<()> {
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok(());
-        };
-        let session_id = expected_session_id.unwrap_or_else(|| outbound.session_id());
-        let same_session = session_id == outbound.session_id() && !outbound.invalidated();
-        if !same_session {
-            self.room_key_diagnostics.note_initial_share_repair(
-                room_id,
-                session_id,
-                InitialShareRepairOlmState::Unknown,
-                claim,
-                InitialShareRepairOutcome::Cancelled,
-                0,
-                0,
-                0,
-                0,
-                None,
-                false,
-            );
-            return Ok(());
-        }
-
-        let settings = encryption_settings.into();
-        let CollectRecipientsResult { devices, .. } =
-            self.collect_session_recipients(users, &settings, &outbound).await?;
-        let account = self.store.static_account();
-        let candidates: BTreeSet<_> = outbound
-            .initial_share_repair_candidates()
-            .into_iter()
-            .map(|device| (device.user_id().to_owned(), device.device_id().to_owned()))
-            .collect();
-        let mut own_coverage = 0;
-        let mut eligible_peer_users = BTreeSet::new();
-        let mut covered_peer_users = BTreeSet::new();
-        let mut missing_devices = 0;
-        let sharing = outbound.sharing_view();
-        for device in devices.into_values().flatten() {
-            let covered = matches!(sharing.get_share_state(&device), ShareState::Shared { .. });
-            if device.user_id() == account.user_id {
-                if covered {
-                    own_coverage += 1;
-                }
-            } else {
-                eligible_peer_users.insert(device.user_id().to_owned());
-                if covered {
-                    covered_peer_users.insert(device.user_id().to_owned());
-                }
-            }
-            if candidates.contains(&(device.user_id().to_owned(), device.device_id().to_owned()))
-                && !covered
-            {
-                missing_devices += 1;
-            }
-        }
-        drop(sharing);
-        self.room_key_diagnostics.note_initial_share_repair(
-            room_id,
-            session_id,
-            if candidates.is_empty() {
-                InitialShareRepairOlmState::Present
-            } else {
-                InitialShareRepairOlmState::Missing
-            },
-            claim,
-            repair,
-            own_coverage,
-            covered_peer_users.len(),
-            eligible_peer_users.difference(&covered_peer_users).count(),
-            missing_devices,
-            None,
-            true,
-        );
-        Ok(())
-    }
-
-    /// Select the exact eligible target devices for a forced re-share.
-    pub(crate) async fn force_reshare_targets(
-        &self,
-        room_id: &RoomId,
-        expected_session_id: Option<&str>,
-        target: RoomKeyReshareTarget,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<Option<BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>>> {
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok(None);
-        };
-        if expected_session_id.is_some_and(|expected| expected != outbound.session_id()) {
-            return Ok(None);
-        }
-        let settings = encryption_settings.into();
-        let CollectRecipientsResult { devices, .. } =
-            self.collect_session_recipients(users, &settings, &outbound).await?;
-        let account = self.store.static_account();
-        let sharing = outbound.sharing_view();
-        let mut targets = BTreeMap::new();
-        for device in devices.into_values().flatten() {
-            if target.matches(
-                account.user_id(),
-                account.device_id(),
-                device.user_id(),
-                device.device_id(),
-            ) && !sharing.has_pending_share(&device)
-            {
-                targets
-                    .entry(device.user_id().to_owned())
-                    .or_insert_with(BTreeSet::new)
-                    .insert(device.device_id().to_owned());
-            }
-        }
-        if targets.is_empty() { Ok(None) } else { Ok(Some(targets)) }
-    }
-
-    /// Force-share the current outbound session without creating or rotating it.
-    pub async fn force_reshare_room_key(
-        &self,
-        room_id: &RoomId,
-        expected_session_id: Option<&str>,
-        target: RoomKeyReshareTarget,
-        only_devices: Option<&BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>>,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<RoomKeyReshareResult> {
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok(RoomKeyReshareResult::NoSession);
-        };
-        if expected_session_id.is_some_and(|expected| expected != outbound.session_id()) {
-            return Ok(RoomKeyReshareResult::StaleSession);
-        }
-
-        let encryption_settings = encryption_settings.into();
-        let CollectRecipientsResult { devices, .. } =
-            self.collect_session_recipients(users, &encryption_settings, &outbound).await?;
-        let account = self.store.static_account();
-        let devices = {
-            let sharing = outbound.sharing_view();
-            devices
-                .into_values()
-                .flatten()
-                .filter(|device| {
-                    let target_matches = target.matches(
-                        account.user_id(),
-                        account.device_id(),
-                        device.user_id(),
-                        device.device_id(),
-                    );
-                    let exact_target_matches = only_devices.is_none_or(|targets| {
-                        targets
-                            .get(device.user_id())
-                            .is_some_and(|devices| devices.contains(device.device_id()))
-                    });
-                    let pending = sharing.has_pending_share(device);
-                    target_matches
-                        && exact_target_matches
-                        && !pending
-                        && !outbound.has_failed_manual_reshare(device)
-                })
-                .collect::<Vec<_>>()
-        };
-        if devices.is_empty() {
-            return Ok(RoomKeyReshareResult::NoRecipients);
-        }
-
-        let previous_request_ids =
-            outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
-        let mut changes = Changes::default();
-        let unable_to_encrypt = self
-            .encrypt_for_devices(devices, &outbound, &mut changes, ShareRequestKind::Normal)
-            .await?;
-        for (device, code) in &unable_to_encrypt {
-            self.room_key_diagnostics.emit_initial_share_device(
-                room_id,
-                outbound.session_id(),
-                device.user_id(),
-                device.device_id(),
-                initial_share_device_class(&account, device),
-                if code == &WithheldCode::NoOlm {
-                    InitialShareStage::OlmMissing
-                } else {
-                    InitialShareStage::Withheld
-                },
-            );
-        }
-        let requests = outbound
-            .pending_requests()
-            .into_iter()
-            .filter(|request| !previous_request_ids.contains(&request.txn_id))
-            .collect::<Vec<_>>();
-        for (device, _) in &unable_to_encrypt {
-            outbound.record_failed_manual_reshare(device);
-        }
-        let failed_recipient_count = unable_to_encrypt.len();
-        if requests.is_empty() {
-            return Ok(if failed_recipient_count == 0 {
-                RoomKeyReshareResult::NoRecipients
-            } else {
-                RoomKeyReshareResult::UnableToEncrypt { recipient_count: failed_recipient_count }
-            });
-        }
-        let recipient_count = requests.iter().map(|request| request.message_count()).sum();
-        self.store.save_changes(changes).await?;
-        Self::log_room_key_sharing_result(&requests);
-        Ok(RoomKeyReshareResult::Sent { requests, recipient_count, failed_recipient_count })
-    }
-
-    /// Decide and queue the bounded index-0 duplicate share (issue #510).
-    ///
-    /// For a newly created outbound session still at message index 0, at most
-    /// once per (room, session) per runtime, re-evaluate recipient policy and
-    /// queue a duplicate standard `m.room_key` share. Never creates or rotates
-    /// the session, never sends to the current device, never repeats, and
-    /// never emits a diagnostic when the index-0 window never opened.
-    pub async fn reshare_index0_once(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<Index0ReshareDecision> {
-        let Some(outbound) = self.sessions.get_or_load(room_id).await else {
-            return Ok(Index0ReshareDecision::NotNeeded);
-        };
-        let session_id = outbound.session_id().to_owned();
-        if outbound.message_index().await != 0 {
-            return Ok(Index0ReshareDecision::NotNeeded);
-        }
-        if self.room_key_diagnostics.index0_reshare_attempted(room_id, &session_id) {
-            self.room_key_diagnostics.note_index0_reshare(
-                room_id,
-                &session_id,
-                Index0ReshareOutcome::NotNeeded,
-            );
-            return Ok(Index0ReshareDecision::NotNeeded);
-        }
-
-        // Re-evaluate membership, trust, blacklist, history visibility, and
-        // collect strategy with the current member list. Rotation stays on the
-        // normal send path; the duplicate never rotates.
-        let settings = encryption_settings.into();
-        let CollectRecipientsResult { should_rotate, devices, .. } =
-            self.collect_session_recipients(users, &settings, &outbound).await?;
-        if should_rotate {
-            self.room_key_diagnostics.mark_index0_reshare_attempted(room_id, &session_id);
-            self.room_key_diagnostics.note_index0_reshare(
-                room_id,
-                &session_id,
-                Index0ReshareOutcome::PolicyBlocked,
-            );
-            return Ok(Index0ReshareDecision::PolicyBlocked);
-        }
-
-        // Fence: the active session must still be the one we decided on.
-        let current = self.sessions.get_or_load(room_id).await;
-        if current.is_none_or(|current| current.session_id() != session_id) {
-            self.room_key_diagnostics.mark_index0_reshare_attempted(room_id, &session_id);
-            self.room_key_diagnostics.note_index0_reshare(
-                room_id,
-                &session_id,
-                Index0ReshareOutcome::Cancelled,
-            );
-            return Ok(Index0ReshareDecision::Cancelled);
-        }
-
-        let account = self.store.static_account();
-        let devices: Vec<_> = devices
-            .into_values()
-            .flatten()
-            .filter(|device| {
-                // Never duplicate to the current device.
-                if device.user_id() == account.user_id && device.device_id() == account.device_id {
-                    return false;
-                }
-                let sharing = outbound.sharing_view();
-                // Target every eligible device that already settled or was
-                // never shared, excluding devices with a pending request and
-                // withheld/changed-key devices.
-                !sharing.has_pending_share(device)
-                    && matches!(
-                        sharing.get_share_state(device),
-                        ShareState::NotShared | ShareState::Shared { .. }
-                    )
-            })
-            .collect();
-        self.room_key_diagnostics.mark_index0_reshare_attempted(room_id, &session_id);
-        if devices.is_empty() {
-            self.room_key_diagnostics.note_index0_reshare(
-                room_id,
-                &session_id,
-                Index0ReshareOutcome::NotNeeded,
-            );
-            return Ok(Index0ReshareDecision::NotNeeded);
-        }
-
-        let previous_request_ids =
-            outbound.pending_request_ids().into_iter().collect::<BTreeSet<_>>();
-        let mut changes = Changes::default();
-        let unable_to_encrypt = self
-            .encrypt_for_devices(devices, &outbound, &mut changes, ShareRequestKind::Normal)
-            .await?;
-        for (device, code) in &unable_to_encrypt {
-            self.room_key_diagnostics.emit_initial_share_device(
-                room_id,
-                outbound.session_id(),
-                device.user_id(),
-                device.device_id(),
-                initial_share_device_class(&account, device),
-                if code == &WithheldCode::NoOlm {
-                    InitialShareStage::OlmMissing
-                } else {
-                    InitialShareStage::Withheld
-                },
-            );
-        }
-        let requests = outbound
-            .pending_requests()
-            .into_iter()
-            .filter(|request| {
-                !previous_request_ids.contains(&request.txn_id)
-                    && request.event_type.to_string() == "m.room.encrypted"
-            })
-            .collect::<Vec<_>>();
-        let failed_recipient_count = unable_to_encrypt.len();
-        if requests.is_empty() {
-            return Ok(if failed_recipient_count == 0 {
-                Index0ReshareDecision::NotNeeded
-            } else {
-                Index0ReshareDecision::UnableToEncrypt { recipient_count: failed_recipient_count }
-            });
-        }
-        self.store.save_changes(changes).await?;
-        Ok(Index0ReshareDecision::Queued { session_id, requests, failed_recipient_count })
-    }
-
     /// Collect the devices belonging to the given user, and send the details of
-    /// a room key bundle to those devices.    ///
+    /// a room key bundle to those devices.
+    ///
     /// Returns a list of to-device requests which must be sent.
     ///
     /// For security reasons, only "safe" [`CollectStrategy`]s are supported, in
@@ -3336,8 +1323,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        DecryptionSettings, EncryptionSettings, LocalTrust, OlmMachine, RoomKeyReshareResult,
-        RoomKeyReshareTarget, TrustRequirement,
+        DecryptionSettings, EncryptionSettings, LocalTrust, OlmMachine, TrustRequirement,
         identities::DeviceData,
         machine::{
             EncryptionSyncChanges, test_helpers::get_machine_pair_with_setup_sessions_test_helper,
@@ -3515,129 +1501,6 @@ mod tests {
             .map(|r| r.message_count())
             .sum();
         assert_eq!(withheld_count, 2);
-    }
-
-    #[async_test]
-    async fn test_force_reshare_reuses_current_session_without_repeating_pending_requests() {
-        let machine = machine_with_shared_room_key_test_helper().await;
-        let room_id = room_id!("!test:localhost");
-        let keys_claim = keys_claim_response();
-        let users = || keys_claim.one_time_keys.keys().map(Deref::deref);
-        let outbound =
-            machine.inner.group_session_manager.get_outbound_group_session(room_id).unwrap();
-        let session_id = outbound.session_id().to_owned();
-
-        assert!(
-            machine
-                .share_room_key(room_id, users(), EncryptionSettings::default())
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        let first = machine
-            .force_reshare_room_key(
-                room_id,
-                Some(&session_id),
-                RoomKeyReshareTarget::AllEligible,
-                None,
-                users(),
-                EncryptionSettings::default(),
-            )
-            .await
-            .unwrap();
-        let RoomKeyReshareResult::Sent { requests, recipient_count, .. } = first else {
-            panic!("expected forced requests");
-        };
-        assert!(!requests.is_empty());
-        assert!(recipient_count > 0);
-        assert_eq!(outbound.session_id(), session_id);
-
-        assert!(matches!(
-            machine
-                .force_reshare_room_key(
-                    room_id,
-                    Some(&session_id),
-                    RoomKeyReshareTarget::AllEligible,
-                    None,
-                    users(),
-                    EncryptionSettings::default(),
-                )
-                .await
-                .unwrap(),
-            RoomKeyReshareResult::NoRecipients
-        ));
-    }
-
-    #[async_test]
-    async fn test_force_reshare_rejects_missing_and_stale_sessions_without_creating_one() {
-        let machine = machine().await;
-        let room_id = room_id!("!missing:localhost");
-        let keys_claim = keys_claim_response();
-        let users = || keys_claim.one_time_keys.keys().map(Deref::deref);
-
-        assert!(matches!(
-            machine
-                .force_reshare_room_key(
-                    room_id,
-                    None,
-                    RoomKeyReshareTarget::AllEligible,
-                    None,
-                    users(),
-                    EncryptionSettings::default(),
-                )
-                .await
-                .unwrap(),
-            RoomKeyReshareResult::NoSession
-        ));
-        assert!(machine.inner.group_session_manager.get_outbound_group_session(room_id).is_none());
-
-        let current_room = room_id!("!test:localhost");
-        machine.share_room_key(current_room, users(), EncryptionSettings::default()).await.unwrap();
-        assert!(matches!(
-            machine
-                .force_reshare_room_key(
-                    current_room,
-                    Some("stale"),
-                    RoomKeyReshareTarget::AllEligible,
-                    None,
-                    users(),
-                    EncryptionSettings::default(),
-                )
-                .await
-                .unwrap(),
-            RoomKeyReshareResult::StaleSession
-        ));
-    }
-
-    #[test]
-    fn test_force_reshare_targets_exclude_the_current_device() {
-        let own_user = user_id!("@alice:example.org");
-        let own_device = device_id!("CURRENT");
-        let other_device = device_id!("OTHER");
-        let peer_user = user_id!("@bob:example.org");
-
-        assert!(RoomKeyReshareTarget::OwnOtherDevices.matches(
-            own_user,
-            own_device,
-            own_user,
-            other_device
-        ));
-        assert!(!RoomKeyReshareTarget::OwnOtherDevices.matches(
-            own_user,
-            own_device,
-            peer_user,
-            other_device
-        ));
-        assert!(RoomKeyReshareTarget::PeerDevices.matches(
-            own_user,
-            own_device,
-            peer_user,
-            other_device
-        ));
-        assert!(
-            !RoomKeyReshareTarget::AllEligible.matches(own_user, own_device, own_user, own_device)
-        );
     }
 
     fn count_withheld_from(requests: &[Arc<ToDeviceRequest>], code: WithheldCode) -> usize {
@@ -4064,7 +1927,7 @@ mod tests {
             let decryption_settings =
                 DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-            let (decrypted, _, _) =
+            let (decrypted, _) =
                 machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
 
             assert_eq!(1, decrypted.len());
@@ -4134,7 +1997,7 @@ mod tests {
             let decryption_settings =
                 DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-            let (decrypted, _, _) =
+            let (decrypted, _) =
                 machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
 
             assert_eq!(1, decrypted.len());
@@ -4237,7 +2100,7 @@ mod tests {
         let decryption_settings =
             DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-        let (decrypted, _, _) =
+        let (decrypted, _) =
             bob.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
         assert_eq!(1, decrypted.len());
         use crate::types::events::EventType;
