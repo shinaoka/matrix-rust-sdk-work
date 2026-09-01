@@ -49,7 +49,7 @@ use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, ttl::TtlValu
 use ruma::events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent};
 use ruma::{
     DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName,
-    OwnedUserId, RoomAliasId, RoomId, RoomOrAliasId, ServerName, UInt, UserId,
+    RoomAliasId, RoomId, RoomOrAliasId, ServerName, UInt, UserId,
     api::{
         FeatureFlag, MatrixVersion, Metadata, OutgoingRequest, SupportedVersions,
         client::{
@@ -271,22 +271,9 @@ pub(crate) struct ClientLocks {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) group_session_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
 
-    /// Handler making every concurrent index-0 sender await the same bounded
-    /// initial-share repair fence for a room session.
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) initial_share_repair_deduplicated_handler:
-        DeduplicatingHandler<(OwnedRoomId, String)>,
-
     /// Lock making sure we're only doing one key claim request at a time.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) key_claim_lock: Mutex<()>,
-
-    /// True per-room serialization locks shared by the normal preshare path
-    /// and the manual encryption-debug executors (issue #538). The
-    /// deduplicating handler is coalescing, not a mutex.
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) room_key_transport_locks:
-        std::sync::Mutex<BTreeMap<OwnedRoomId, Arc<tokio::sync::Mutex<()>>>>,
 
     /// Handler to ensure that only one members request is running at a time,
     /// given a room.
@@ -323,13 +310,6 @@ pub(crate) struct ClientLocks {
     /// outside the `OlmMachine`.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) crypto_store_generation: Arc<Mutex<Option<u64>>>,
-}
-
-/// Candidate users whose device-key/Olm availability changed in a sync.
-#[cfg(feature = "e2e-encryption")]
-#[derive(Clone)]
-pub(crate) struct InitialShareRepairWake {
-    pub(crate) users: BTreeSet<OwnedUserId>,
 }
 
 pub(crate) struct ClientInner {
@@ -411,16 +391,6 @@ pub(crate) struct ClientInner {
     /// store.
     pub(crate) sync_beat: event_listener::Event,
 
-    /// E2EE-only wake source for bounded initial-share repair. The payload is
-    /// the changed user set, so unrelated sync traffic cannot consume the one
-    /// repair wake.
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) initial_share_repair_wakes: broadcast::Sender<InitialShareRepairWake>,
-
-    /// Explicit cancellation for in-flight initial-share repair on logout.
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) initial_share_repair_cancellation: broadcast::Sender<()>,
-
     /// A central cache for events, inactive first.
     ///
     /// It becomes active when [`EventCache::subscribe`] is called.
@@ -441,23 +411,9 @@ pub(crate) struct ClientInner {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) enable_share_history_on_invite: bool,
 
-    /// Whether to run the bounded index-0 duplicate share before the first
-    /// room event of a fresh outbound Megolm session (issue #510).
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) index0_duplicate_share: bool,
-
-    /// Whether to run targeted initial-share Olm repair before the first room
-    /// event of a fresh outbound Megolm session (issue #523).
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) initial_share_repair: bool,
-
-    /// Generation-scoped readiness for the application-owned encryption sync.
+    /// Read-only lifecycle observation for the application-owned encryption sync.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) encryption_sync_readiness: crate::encryption::EncryptionSyncReadiness,
-
-    /// Bounded exact-session registry for first-event readiness.
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) outbound_session_readiness: crate::encryption::OutboundSessionReadinessRegistry,
 
     /// Data related to the [`SendQueue`].
     ///
@@ -513,9 +469,6 @@ impl ClientInner {
         latest_events: OnceCell<LatestEvents>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
         #[cfg(feature = "e2e-encryption")] enable_share_history_on_invite: bool,
-        #[cfg(feature = "e2e-encryption")] index0_duplicate_share: bool,
-        #[cfg(feature = "e2e-encryption")] initial_share_repair: bool,
-        #[cfg(feature = "e2e-encryption")] encryption_sync_readiness: bool,
         cross_process_lock_config: CrossProcessLockConfig,
         #[cfg(feature = "experimental-search")] search_index_handler: SearchIndex,
         thread_subscription_catchup: OnceCell<Arc<ThreadSubscriptionCatchup>>,
@@ -548,10 +501,6 @@ impl ClientInner {
             room_updates_publication_sequence: RoomUpdatesPublicationSequence::default(),
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
-            #[cfg(feature = "e2e-encryption")]
-            initial_share_repair_wakes: broadcast::Sender::new(8),
-            #[cfg(feature = "e2e-encryption")]
-            initial_share_repair_cancellation: broadcast::Sender::new(1),
             event_cache,
             send_queue_data: send_queue,
             latest_events,
@@ -562,17 +511,7 @@ impl ClientInner {
             #[cfg(feature = "e2e-encryption")]
             enable_share_history_on_invite,
             #[cfg(feature = "e2e-encryption")]
-            index0_duplicate_share,
-            #[cfg(feature = "e2e-encryption")]
-            initial_share_repair,
-            #[cfg(feature = "e2e-encryption")]
-            encryption_sync_readiness: crate::encryption::EncryptionSyncReadiness::new(
-                encryption_sync_readiness,
-            ),
-            #[cfg(feature = "e2e-encryption")]
-            outbound_session_readiness: crate::encryption::OutboundSessionReadinessRegistry::new(
-                encryption_sync_readiness,
-            ),
+            encryption_sync_readiness: crate::encryption::EncryptionSyncReadiness::new(),
             server_max_upload_size: Mutex::new(OnceCell::new()),
             #[cfg(feature = "experimental-search")]
             search_index: search_index_handler,
@@ -610,13 +549,6 @@ impl Debug for Client {
 }
 
 impl Client {
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) fn notify_initial_share_repair_wake(&self, users: BTreeSet<OwnedUserId>) {
-        if !users.is_empty() {
-            let _ = self.inner.initial_share_repair_wakes.send(InitialShareRepairWake { users });
-        }
-    }
-
     /// Create a new [`Client`] that will use the given homeserver.
     ///
     /// # Arguments
@@ -650,18 +582,31 @@ impl Client {
         &self.inner.locks
     }
 
-    /// The true per-room serialization lock shared by the normal preshare
-    /// path and the manual encryption-debug executors (issue #538). The
-    /// `group_session_deduplicated_handler` is coalescing (a waiting caller
-    /// adopts the leader's outcome), not a mutex, so a real per-room lock is
-    /// required to serialize manual index-0 share / force-new against
-    /// normal preshare.
+    /// Begin one application-owned encryption-sync observation generation.
     #[cfg(feature = "e2e-encryption")]
-    pub(crate) fn room_key_transport_lock(&self, room_id: &RoomId) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.inner.locks.room_key_transport_locks.lock().unwrap();
-        map.entry(room_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    #[doc(hidden)]
+    pub fn begin_encryption_sync_generation(
+        &self,
+    ) -> crate::encryption::EncryptionSyncGenerationGuard {
+        self.inner.encryption_sync_readiness.begin()
+    }
+
+    /// Return the current privacy-safe encryption-sync lifecycle snapshot.
+    #[cfg(feature = "e2e-encryption")]
+    #[doc(hidden)]
+    pub fn encryption_sync_readiness_snapshot(
+        &self,
+    ) -> crate::encryption::EncryptionSyncReadinessSnapshot {
+        self.inner.encryption_sync_readiness.snapshot()
+    }
+
+    /// Subscribe to encryption-sync lifecycle changes.
+    #[cfg(feature = "e2e-encryption")]
+    #[doc(hidden)]
+    pub fn subscribe_to_encryption_sync_readiness(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::encryption::EncryptionSyncReadinessSnapshot> {
+        self.inner.encryption_sync_readiness.subscribe()
     }
 
     pub(crate) fn auth_ctx(&self) -> &AuthCtx {
@@ -1648,12 +1593,10 @@ impl Client {
         match auth_api {
             AuthApi::Matrix(matrix_auth) => {
                 matrix_auth.logout().await?;
+                Ok(())
             }
-            AuthApi::OAuth(oauth) => oauth.logout().await?,
+            AuthApi::OAuth(oauth) => Ok(oauth.logout().await?),
         }
-        #[cfg(feature = "e2e-encryption")]
-        let _ = self.inner.initial_share_repair_cancellation.send(());
-        Ok(())
     }
 
     /// Get or upload a sync filter.
@@ -2153,8 +2096,6 @@ impl Client {
             .auth_ctx
             .session_change_sender
             .send(SessionChange::UnknownToken(unknown_token_data.clone()));
-        #[cfg(feature = "e2e-encryption")]
-        let _ = self.inner.initial_share_repair_cancellation.send(());
     }
 
     /// Fetches server versions from network; no caching.
@@ -3000,18 +2941,6 @@ impl Client {
         }
 
         let response = self.send(request).with_request_config(request_config).await?;
-        #[cfg(feature = "e2e-encryption")]
-        let repair_wake_users = {
-            let mut users = response.device_lists.changed.iter().cloned().collect::<BTreeSet<_>>();
-            if !response.device_one_time_keys_count.is_empty()
-                || response.device_unused_fallback_key_types.is_some()
-            {
-                if let Some(user_id) = self.user_id() {
-                    users.insert(user_id.to_owned());
-                }
-            }
-            users
-        };
         let next_batch = response.next_batch.clone();
         let response = if sync_settings.save_sync_token {
             self.process_sync(response).await?
@@ -3024,8 +2953,6 @@ impl Client {
             error!(error = ?e, "Error while sending outgoing E2EE requests");
         }
 
-        #[cfg(feature = "e2e-encryption")]
-        self.notify_initial_share_repair_wake(repair_wake_users);
         self.inner.sync_beat.notify(usize::MAX);
 
         Ok(SyncResponse::new(next_batch, response))
@@ -3408,12 +3335,6 @@ impl Client {
                 self.inner.e2ee.encryption_settings,
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.enable_share_history_on_invite,
-                #[cfg(feature = "e2e-encryption")]
-                self.inner.index0_duplicate_share,
-                #[cfg(feature = "e2e-encryption")]
-                self.inner.initial_share_repair,
-                #[cfg(feature = "e2e-encryption")]
-                self.inner.encryption_sync_readiness.enabled(),
                 cross_process_lock_config,
                 #[cfg(feature = "experimental-search")]
                 self.inner.search_index.clone(),

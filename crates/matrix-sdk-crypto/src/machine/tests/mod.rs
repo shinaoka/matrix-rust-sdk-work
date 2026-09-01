@@ -89,14 +89,11 @@ use crate::{
 };
 
 mod decryption_verification_state;
-mod index0_reshare;
 mod initial_share_diagnostics;
 mod interactive_verification;
-mod issue_523;
-mod manual_index0_share;
 mod megolm_sender_data;
 mod olm_encryption;
-mod olm_recovery_reshare;
+mod persisted_rotation_reason;
 mod room_key_receive_diagnostics;
 mod room_settings;
 mod send_encrypted_to_device;
@@ -530,7 +527,7 @@ async fn send_room_key_to_device(
     let decryption_settings =
         DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
-    let (events, room_keys, _) = receiver
+    receiver
         .receive_sync_changes(
             EncryptionSyncChanges {
                 to_device_events: vec![event],
@@ -541,8 +538,7 @@ async fn send_room_key_to_device(
             },
             &decryption_settings,
         )
-        .await?;
-    Ok((events, room_keys))
+        .await
 }
 
 /// Create an alice, bob pair where alice's device is dehydrated. Create a

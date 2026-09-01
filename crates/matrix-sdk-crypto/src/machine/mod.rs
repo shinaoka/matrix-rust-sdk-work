@@ -15,12 +15,13 @@
 #[cfg(feature = "experimental-encrypted-state-events")]
 use std::borrow::Borrow;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
 
 use itertools::Itertools;
+#[cfg(feature = "experimental-send-custom-to-device")]
 use matrix_sdk_common::deserialized_responses::WithheldCode;
 use matrix_sdk_common::{
     BoxFuture,
@@ -37,8 +38,7 @@ use matrix_sdk_common::{
 use ruma::events::{AnyStateEventContent, StateEventContent};
 use ruma::{
     DeviceId, DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch, OneTimeKeyAlgorithm, OwnedDeviceId,
-    OwnedDeviceKeyId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt,
-    UserId,
+    OwnedDeviceKeyId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
     api::client::{
         dehydrated_device::DehydratedDeviceData,
         keys::{
@@ -84,18 +84,11 @@ use crate::{
         SenderDataFinder, SessionType, StaticAccountData,
     },
     room_key_diagnostics::{
-        EncryptionReadinessOutcome, EncryptionReadinessQueryState, EncryptionReadinessSyncState,
-        Index0ReshareOutcome, InitialShareRepairClaimOutcome, InitialShareRepairOutcome,
-        InitialShareRepairPreparation, OlmRecoveryCounters, OlmRecoverySignalOutcome,
         RoomKeyDiagnosticHub, RoomKeyDiagnosticObserver, RoomKeyIngressKind,
         RoomKeyMemberReloadContext, RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision,
         RoomKeyReceiveCounters, RoomKeyReceiveDiagnosticKind, RoomKeyRotationReason,
     },
-    session_manager::{
-        GroupSessionManager, Index0ReshareDecision, ManualClaimOutcome, ManualFinalizeStep,
-        ManualIndex0Preparation, ManualIndex0ResendPreparation, ManualIndex0ResendStep,
-        ManualIndex0ShareOutcome, ManualIndex0ShareSummary, SessionManager, UnwedgeReshareOutcome,
-    },
+    session_manager::{GroupSessionManager, SessionManager},
     store::{
         CryptoStoreWrapper, IntoCryptoStore, MemoryStore, Result as StoreResult, SecretImportError,
         Store, StoreTransaction,
@@ -146,26 +139,6 @@ pub struct OlmMachine {
     pub(crate) inner: Arc<OlmMachineInner>,
 }
 
-/// Internal standard Olm-unwedge recovery signal (issue #477).
-///
-/// Collected when a fresh inbound Olm session is accepted for a known,
-/// non-dehydrated sender device (its `olm_wedging_index` advanced). Consumed by
-/// the post-sync re-share pass; never exported into diagnostics.
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct OlmRecoverySignal {
-    /// Sender user of the to-device event that created the fresh session.
-    pub user_id: OwnedUserId,
-    /// Sender curve key of the fresh session.
-    pub sender_key: Curve25519PublicKey,
-}
-
-impl OlmRecoverySignal {
-    pub(crate) fn new(user_id: OwnedUserId, sender_key: Curve25519PublicKey) -> Self {
-        Self { user_id, sender_key }
-    }
-}
-
 pub struct OlmMachineInner {
     /// The unique user id that owns this account.
     user_id: OwnedUserId,
@@ -196,11 +169,6 @@ pub struct OlmMachineInner {
     /// A state machine that handles creating room key backups.
     backup_machine: BackupMachine,
     room_key_diagnostics: RoomKeyDiagnosticHub,
-
-    /// Standard Olm-unwedge recovery signals collected during the current sync
-    /// (issue #477): a fresh inbound Olm session was accepted for a known,
-    /// non-dehydrated sender device, whose `olm_wedging_index` advanced.
-    olm_recovery_signals: std::sync::Mutex<Vec<OlmRecoverySignal>>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -263,6 +231,7 @@ impl OlmMachine {
             identity_manager,
             self.store().private_identity(),
             None,
+            RoomKeyDiagnosticHub::default(),
         ))
     }
 
@@ -287,8 +256,8 @@ impl OlmMachine {
         identity_manager: IdentityManager,
         user_identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
         maybe_backup_key: Option<MegolmV1BackupKey>,
+        room_key_diagnostics: RoomKeyDiagnosticHub,
     ) -> Self {
-        let room_key_diagnostics = RoomKeyDiagnosticHub::default();
         store.set_room_key_diagnostics(room_key_diagnostics.clone());
         let group_session_manager =
             GroupSessionManager::new(store.clone(), room_key_diagnostics.clone());
@@ -319,7 +288,6 @@ impl OlmMachine {
             identity_manager,
             backup_machine,
             room_key_diagnostics,
-            olm_recovery_signals: std::sync::Mutex::new(Vec::new()),
         });
 
         Self { inner }
@@ -450,6 +418,7 @@ impl OlmMachine {
         // FIXME: We might want in the future a more generic high-level data migration
         // mechanism (at the store wrapper layer).
         Self::migration_post_verified_latch_support(&store, &identity_manager).await?;
+        let room_key_diagnostics = RoomKeyDiagnosticHub::restore(&store).await;
 
         Ok(Self::new_helper(
             device_id,
@@ -458,6 +427,7 @@ impl OlmMachine {
             identity_manager,
             identity,
             maybe_backup_key,
+            room_key_diagnostics,
         ))
     }
 
@@ -486,12 +456,6 @@ impl OlmMachine {
     /// Get the crypto store associated with this `OlmMachine` instance.
     pub fn store(&self) -> &Store {
         &self.inner.store
-    }
-
-    #[cfg(any(test, feature = "testing"))]
-    /// Clear cached Olm sessions without mutating durable test data.
-    pub async fn clear_olm_sessions_for_testing(&self) {
-        self.store().clear_olm_sessions_for_testing().await;
     }
 
     /// The unique user id that owns this `OlmMachine` instance.
@@ -1343,6 +1307,11 @@ impl OlmMachine {
             .await
     }
 
+    /// Return the current outbound group-session identifier, if one exists.
+    pub async fn current_outbound_group_session_id(&self, room_id: &RoomId) -> Option<String> {
+        self.inner.group_session_manager.current_outbound_group_session_id(room_id).await
+    }
+
     /// Forces the currently active room key, which is used to encrypt messages,
     /// to be rotated.
     ///
@@ -1393,42 +1362,6 @@ impl OlmMachine {
         result
     }
 
-    /// Rooms whose active outbound session was previously shared with `device`
-    /// at an `olm_wedging_index` older than the device's current index
-    /// (issue #477).
-    #[doc(hidden)]
-    pub fn unwedged_affected_room_ids(&self, device: &DeviceData) -> Vec<OwnedRoomId> {
-        self.inner.group_session_manager.unwedged_affected_room_ids(device)
-    }
-
-    /// Resolve a known device by its sender curve key (issue #477).
-    #[doc(hidden)]
-    pub async fn device_from_curve_key(
-        &self,
-        user_id: &UserId,
-        curve_key: Curve25519PublicKey,
-    ) -> StoreResult<Option<Device>> {
-        self.inner.store.get_device_from_curve_key(user_id, curve_key).await
-    }
-
-    /// Re-share the current Megolm session of `room_id` to the single recovered
-    /// device after its Olm unwedge (issue #477). Never creates or rotates the
-    /// session; membership and recipient policy are re-evaluated with the
-    /// current member list.
-    #[doc(hidden)]
-    pub async fn reshare_unwedged_room_key(
-        &self,
-        room_id: &RoomId,
-        members: &[OwnedUserId],
-        settings: EncryptionSettings,
-        device: &DeviceData,
-    ) -> OlmResult<UnwedgeReshareOutcome> {
-        self.inner
-            .group_session_manager
-            .reshare_unwedged_room_key(room_id, members, settings, device)
-            .await
-    }
-
     /// Invalidate a room key because room membership or device eligibility
     /// changed. This is behaviorally identical to [`Self::discard_room_key`]
     /// and only supplies a typed diagnostic reason.
@@ -1447,36 +1380,6 @@ impl OlmMachine {
         self.inner.room_key_diagnostics.set_observer(observer);
     }
 
-    /// Emit one privacy-safe first-event encryption readiness record.
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn emit_encryption_readiness_diagnostic(
-        &self,
-        room_id: &RoomId,
-        session_id: &str,
-        generation: u64,
-        sync: EncryptionReadinessSyncState,
-        query: EncryptionReadinessQueryState,
-        outcome: EncryptionReadinessOutcome,
-        active_members: usize,
-        returned_devices: usize,
-        message_index: Option<u32>,
-        registry_evictions: u64,
-    ) {
-        self.inner.room_key_diagnostics.emit_encryption_readiness(
-            room_id,
-            session_id,
-            generation,
-            sync,
-            query,
-            outcome,
-            active_members,
-            returned_devices,
-            message_index,
-            registry_evictions,
-        );
-    }
-
     /// Return the retained closed creation/rotation reason for an exact
     /// outbound Megolm session. Raw identifiers remain query inputs and are
     /// never returned or exposed through diagnostics.
@@ -1491,466 +1394,6 @@ impl OlmMachine {
     /// Snapshot the aggregate privacy-safe receive-side room-key counters.
     pub fn room_key_receive_counters(&self) -> RoomKeyReceiveCounters {
         self.inner.room_key_diagnostics.receive_counters()
-    }
-
-    /// Snapshot the aggregate privacy-safe post-unwedge recovery counters
-    /// (issue #477).
-    #[doc(hidden)]
-    pub fn olm_recovery_counters(&self) -> OlmRecoveryCounters {
-        self.inner.room_key_diagnostics.olm_recovery_counters()
-    }
-
-    /// Report a failed to-device send attempt for a still-pending room-key
-    /// request (issue #509). Observation only; the request stays pending and
-    /// a later accepted retry still reports `HomeserverAccepted`.
-    pub fn note_to_device_request_failed(&self, request_id: &TransactionId) {
-        self.inner.group_session_manager.note_to_device_request_failed(request_id);
-    }
-
-    /// Select and prepare a bounded targeted claim for initial-share repair.
-    ///
-    /// The preparation result is closed and does not expose recipient
-    /// identifiers; the optional request is present only when one or more
-    /// selected devices still lack an Olm session.
-    #[doc(hidden)]
-    pub async fn prepare_initial_share_repair(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-        wake: bool,
-        wake_users: Option<&BTreeSet<OwnedUserId>>,
-    ) -> OlmResult<(InitialShareRepairPreparation, Option<(OwnedTransactionId, KeysClaimRequest)>)>
-    {
-        let settings = encryption_settings.into();
-        let (preparation, targets) = self
-            .inner
-            .group_session_manager
-            .initial_share_repair_targets(room_id, users, settings, wake, wake_users, false)
-            .await?;
-        let Some(targets) = targets else {
-            return Ok((preparation, None));
-        };
-
-        let request = self.inner.session_manager.get_missing_sessions_for_devices(targets).await?;
-        Ok((preparation, request))
-    }
-
-    /// Re-evaluate the recipient policy captured by the active initial-share
-    /// repair without consuming its one-wake budget.
-    #[doc(hidden)]
-    pub async fn validate_initial_share_repair(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<bool> {
-        let (preparation, _) = self
-            .inner
-            .group_session_manager
-            .initial_share_repair_targets(room_id, users, encryption_settings, false, None, true)
-            .await?;
-        Ok(!matches!(preparation, InitialShareRepairPreparation::Cancelled))
-    }
-
-    /// Queue the encrypted index-0 room-key repair after a targeted claim.
-    #[doc(hidden)]
-    pub async fn reshare_initial_share(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<Vec<Arc<ToDeviceRequest>>> {
-        self.inner
-            .group_session_manager
-            .reshare_initial_share(room_id, users, encryption_settings)
-            .await
-    }
-
-    /// Record a closed initial-share repair outcome.
-    #[doc(hidden)]
-    pub async fn note_initial_share_repair(
-        &self,
-        room_id: &RoomId,
-        expected_session_id: Option<&str>,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-        claim: InitialShareRepairClaimOutcome,
-        repair: InitialShareRepairOutcome,
-    ) -> OlmResult<()> {
-        self.inner
-            .group_session_manager
-            .note_initial_share_repair(
-                room_id,
-                expected_session_id,
-                users,
-                encryption_settings,
-                claim,
-                repair,
-            )
-            .await
-    }
-
-    /// Decide and queue the bounded index-0 duplicate share (issue #510). See
-    /// [`GroupSessionManager::reshare_index0_once`].
-    pub async fn reshare_index0_once(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<Index0ReshareDecision> {
-        self.inner
-            .group_session_manager
-            .reshare_index0_once(room_id, users, encryption_settings)
-            .await
-    }
-
-    /// Report the send outcome of a queued index-0 duplicate share (issue
-    /// #510): `Sent`, `Failed`, or `Deadline`. Observation only.
-    pub fn note_index0_reshare(
-        &self,
-        room_id: &RoomId,
-        session_id: &str,
-        outcome: Index0ReshareOutcome,
-    ) {
-        self.inner.room_key_diagnostics.note_index0_reshare(room_id, session_id, outcome);
-    }
-
-    /// Prepare a manual index-0 room-key share (issue #538 diagnostic
-    /// control).
-    ///
-    /// Atomically captures the current outbound session's index-0 room-key
-    /// content (under the same lock scope event encryption uses), collects
-    /// the complete eligible recipient set, classifies own-other vs peer
-    /// devices, and returns an optional keys-claim request for eligible
-    /// devices that lack an Olm session. The returned
-    /// [`ManualIndex0Preparation`] owns the captured content so a concurrent
-    /// normal send cannot invalidate it.
-    pub async fn prepare_manual_index0_share(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<(ManualIndex0Preparation, Option<(OwnedTransactionId, KeysClaimRequest)>)> {
-        let settings = encryption_settings.into();
-        let Some(outbound) =
-            self.inner.group_session_manager.current_outbound_session(room_id).await
-        else {
-            return Ok((
-                ManualIndex0Preparation::refused(room_id, ManualIndex0ShareOutcome::NoSession),
-                None,
-            ));
-        };
-        let Some((_, index0_content)) = outbound.index0_key_material().await else {
-            return Ok((
-                ManualIndex0Preparation::refused(
-                    room_id,
-                    ManualIndex0ShareOutcome::RefusedIndexAdvanced,
-                ),
-                None,
-            ));
-        };
-        let session_id = outbound.session_id().to_owned();
-        let Some(recipients) = self
-            .inner
-            .group_session_manager
-            .collect_recipients_for_current_outbound(room_id, users, &settings)
-            .await?
-        else {
-            return Ok((
-                ManualIndex0Preparation::refused(room_id, ManualIndex0ShareOutcome::NoSession),
-                None,
-            ));
-        };
-        let account = self.inner.store.static_account();
-        let (own_devices, peer_devices): (Vec<DeviceData>, Vec<DeviceData>) = recipients
-            .devices
-            .into_values()
-            .flatten()
-            .filter(|device| {
-                device.user_id() != account.user_id() || device.device_id() != account.device_id()
-            })
-            .partition(|device| device.user_id() == account.user_id());
-
-        let claim_targets = own_devices.iter().chain(peer_devices.iter()).fold(
-            BTreeMap::<OwnedUserId, BTreeSet<OwnedDeviceId>>::new(),
-            |mut acc, device| {
-                acc.entry(device.user_id().to_owned())
-                    .or_default()
-                    .insert(device.device_id().to_owned());
-                acc
-            },
-        );
-        let claim = if claim_targets.is_empty() {
-            None
-        } else {
-            self.inner.session_manager.get_missing_sessions_for_devices(claim_targets).await?
-        };
-        // A claim returned by the preparation step counts as an occurred
-        // claim for the final summary (issue #538).
-        let claim_occurred = claim.is_some();
-
-        Ok((
-            ManualIndex0Preparation {
-                outcome: ManualIndex0ShareOutcome::Completed,
-                room_id: room_id.to_owned(),
-                session_id: Some(session_id),
-                index0_content: Some(Arc::new(index0_content)),
-                own_devices,
-                peer_devices,
-                claim_occurred,
-            },
-            claim,
-        ))
-    }
-
-    /// Continue a manual index-0 share (issue #538 diagnostic control).
-    ///
-    /// Re-evaluates the recipient policy (membership, history visibility,
-    /// trust, blacklist, current-device exclusion) at this point, claims
-    /// one-time/fallback keys for any newly eligible devices that lack an
-    /// Olm session (`NeedsClaim` — the caller sends and marks the claim,
-    /// then calls this again under the same monotonic deadline), and once no
-    /// claim is needed queues the standard Olm-encrypted index-0
-    /// `m.room_key` to the complete eligible set. Never sends a room event
-    /// and never consumes index 0.
-    pub async fn finalize_manual_index0_share(
-        &self,
-        mut preparation: ManualIndex0Preparation,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<ManualFinalizeStep> {
-        let settings = encryption_settings.into();
-        let room_id = preparation.room_id.clone();
-
-        // A refusal captured during preparation is terminal.
-        let Some(index0_content) = preparation.index0_content.take() else {
-            let mut summary = ManualIndex0ShareSummary::failed();
-            summary.outcome = preparation.outcome;
-            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
-        };
-        let Some(expected_session_id) = preparation.session_id.clone() else {
-            return Ok(ManualFinalizeStep::Ready {
-                requests: Vec::new(),
-                summary: ManualIndex0ShareSummary::failed(),
-            });
-        };
-
-        let Some(outbound) =
-            self.inner.group_session_manager.current_outbound_session(&room_id).await
-        else {
-            let mut summary = ManualIndex0ShareSummary::failed();
-            summary.outcome = ManualIndex0ShareOutcome::NoSession;
-            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
-        };
-        if outbound.session_id() != expected_session_id {
-            let mut summary = ManualIndex0ShareSummary::failed();
-            summary.outcome = ManualIndex0ShareOutcome::CancelledStale;
-            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
-        }
-
-        // Late re-evaluation: a join during the claim stage is included.
-        let Some(recipients) = self
-            .inner
-            .group_session_manager
-            .collect_recipients_for_current_outbound(&room_id, users, &settings)
-            .await?
-        else {
-            let mut summary = ManualIndex0ShareSummary::failed();
-            summary.outcome = ManualIndex0ShareOutcome::NoSession;
-            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
-        };
-        let account = self.inner.store.static_account();
-        let (own_devices, peer_devices): (Vec<DeviceData>, Vec<DeviceData>) = recipients
-            .devices
-            .into_values()
-            .flatten()
-            .filter(|device| {
-                device.user_id() != account.user_id() || device.device_id() != account.device_id()
-            })
-            .partition(|device| device.user_id() == account.user_id());
-
-        // Any newly eligible device lacking an Olm session needs a claim
-        // first; the caller transports it and resumes.
-        let claim_targets = own_devices.iter().chain(&peer_devices).fold(
-            BTreeMap::<OwnedUserId, BTreeSet<OwnedDeviceId>>::new(),
-            |mut acc, device| {
-                acc.entry(device.user_id().to_owned())
-                    .or_default()
-                    .insert(device.device_id().to_owned());
-                acc
-            },
-        );
-        let claim = if claim_targets.is_empty() {
-            None
-        } else {
-            self.inner.session_manager.get_missing_sessions_for_devices(claim_targets).await?
-        };
-        if let Some((request_id, request)) = claim {
-            preparation.claim_occurred = true;
-            return Ok(ManualFinalizeStep::NeedsClaim {
-                request_id,
-                request,
-                continuation: preparation,
-            });
-        }
-        let claim_outcome = if preparation.claim_occurred {
-            ManualClaimOutcome::Succeeded
-        } else {
-            ManualClaimOutcome::NotNeeded
-        };
-
-        // An empty eligible set is a refusal, not a success: crypto excludes
-        // the current device, so a creator-only room must not report
-        // Completed with zero recipients (issue #538).
-        if own_devices.is_empty() && peer_devices.is_empty() {
-            let mut summary = ManualIndex0ShareSummary::failed();
-            summary.outcome = ManualIndex0ShareOutcome::NoRecipients;
-            summary.claim = claim_outcome;
-            return Ok(ManualFinalizeStep::Ready { requests: Vec::new(), summary });
-        }
-
-        // Queue the index-0 share to the complete eligible set.
-        let all_devices = own_devices.iter().chain(&peer_devices).cloned().collect::<Vec<_>>();
-        let mut changes = Changes::default();
-        let withheld = self
-            .inner
-            .group_session_manager
-            .encrypt_for_devices_content(
-                all_devices.clone(),
-                &outbound,
-                index0_content,
-                &mut changes,
-            )
-            .await?;
-        if !changes.is_empty() {
-            self.inner.store.save_changes(changes).await?;
-        }
-        let requests = outbound.pending_manual_requests();
-
-        // Closed summary buckets (no identifiers).
-        let own_missing = withheld
-            .iter()
-            .filter(|(device, code)| {
-                *code == WithheldCode::NoOlm && device.user_id() == account.user_id()
-            })
-            .count();
-        let peer_missing = withheld
-            .iter()
-            .filter(|(device, code)| {
-                *code == WithheldCode::NoOlm && device.user_id() != account.user_id()
-            })
-            .count();
-        let own_accepted = own_devices.len().saturating_sub(own_missing);
-        let peer_accepted = peer_devices.len().saturating_sub(peer_missing);
-
-        let peer_users_total: BTreeSet<OwnedUserId> =
-            peer_devices.iter().map(|device| device.user_id().to_owned()).collect();
-        let peer_users_with_acceptance: BTreeSet<OwnedUserId> = peer_devices
-            .iter()
-            .filter(|device| {
-                !withheld.iter().any(|(withheld_device, code)| {
-                    *code == WithheldCode::NoOlm
-                        && withheld_device.user_id() == device.user_id()
-                        && withheld_device.device_id() == device.device_id()
-                })
-            })
-            .map(|device| device.user_id().to_owned())
-            .collect();
-        let peer_users_with_zero_accepted =
-            peer_users_total.difference(&peer_users_with_acceptance).count();
-
-        let summary = ManualIndex0ShareSummary {
-            outcome: ManualIndex0ShareOutcome::Completed,
-            message_index_before: Some(0),
-            message_index_after: Some(0),
-            own_eligible: own_devices.len(),
-            own_accepted,
-            own_missing,
-            peer_eligible: peer_devices.len(),
-            peer_accepted,
-            peer_missing,
-            peer_users_with_zero_accepted,
-            claim: claim_outcome,
-            elapsed_ms: 0,
-            room_event_sent: false,
-            index0_consumed: false,
-        };
-
-        Ok(ManualFinalizeStep::Ready { requests, summary })
-    }
-
-    /// Prepare the one-shot index-0 recovery resend (issue #541).
-    pub async fn prepare_manual_index0_resend(
-        &self,
-        room_id: &RoomId,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<(ManualIndex0ResendPreparation, Option<(OwnedTransactionId, KeysClaimRequest)>)>
-    {
-        let (preparation, _) = self
-            .inner
-            .group_session_manager
-            .prepare_manual_index0_resend(room_id, users, encryption_settings)
-            .await?;
-        let claim_targets = preparation.targets.iter().fold(
-            BTreeMap::<OwnedUserId, BTreeSet<OwnedDeviceId>>::new(),
-            |mut result, device| {
-                result
-                    .entry(device.user_id().to_owned())
-                    .or_default()
-                    .insert(device.device_id().to_owned());
-                result
-            },
-        );
-        let claim = if claim_targets.is_empty() {
-            None
-        } else {
-            self.inner.session_manager.get_missing_sessions_for_devices(claim_targets).await?
-        };
-        let mut preparation = preparation;
-        if claim.is_some() {
-            preparation.claim_occurred = true;
-        }
-        Ok((preparation, claim))
-    }
-
-    /// Continue the one-shot index-0 recovery resend after claims.
-    pub async fn finalize_manual_index0_resend(
-        &self,
-        preparation: ManualIndex0ResendPreparation,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<ManualIndex0ResendStep> {
-        let users = users.map(ToOwned::to_owned).collect::<Vec<_>>();
-        let settings = encryption_settings.into();
-        let step = self
-            .inner
-            .group_session_manager
-            .finalize_manual_index0_resend(
-                preparation,
-                users.iter().map(|user| user.as_ref()),
-                settings.clone(),
-            )
-            .await?;
-        let ManualIndex0ResendStep::NeedsClaimTargets { targets, mut continuation } = step else {
-            return Ok(step);
-        };
-        if let Some((request_id, request)) =
-            self.inner.session_manager.get_missing_sessions_for_devices(targets).await?
-        {
-            continuation.claim_occurred = true;
-            return Ok(ManualIndex0ResendStep::NeedsClaim { request_id, request, continuation });
-        }
-        continuation.claim_checked = true;
-        self.inner
-            .group_session_manager
-            .finalize_manual_index0_resend(
-                continuation,
-                users.iter().map(|user| user.as_ref()),
-                settings,
-            )
-            .await
     }
 
     /// Get to-device requests to share a room key with users in a room.
@@ -1979,89 +1422,6 @@ impl OlmMachine {
         encryption_settings: impl Into<EncryptionSettings>,
     ) -> OlmResult<Vec<Arc<ToDeviceRequest>>> {
         self.inner.group_session_manager.share_room_key(room_id, users, encryption_settings).await
-    }
-
-    /// Return the current outbound group-session identifier, if one exists.
-    pub async fn current_outbound_group_session_id(&self, room_id: &RoomId) -> Option<String> {
-        self.inner.group_session_manager.current_outbound_group_session_id(room_id).await
-    }
-
-    /// Return the current outbound group-session message index (the index of
-    /// the next message), if a session exists (issue #538).
-    pub async fn current_outbound_group_session_message_index(
-        &self,
-        room_id: &RoomId,
-    ) -> Option<u32> {
-        let outbound = self.inner.group_session_manager.current_outbound_session(room_id).await?;
-        Some(outbound.message_index().await)
-    }
-
-    /// Remove owned un-sent manual share requests and clear the matching
-    /// keys-claim expectation (issue #538 cleanup). Called on every
-    /// non-completed/partial exit of a manual index-0 share.
-    pub async fn cleanup_manual_pending_requests(
-        &self,
-        room_id: &RoomId,
-        owned_ids: &[OwnedTransactionId],
-        claim_expectation: Option<&TransactionId>,
-    ) -> StoreResult<()> {
-        if let Some(claim_id) = claim_expectation {
-            self.inner.session_manager.cancel_keys_claim_expectation(claim_id);
-        }
-        self.inner.group_session_manager.cleanup_manual_pending_requests(room_id, owned_ids).await
-    }
-
-    /// Mark a manual index-0 share request as sent with a transactional
-    /// persist-first order (issue #538).
-    pub async fn mark_manual_request_as_sent(&self, request_id: &TransactionId) -> StoreResult<()> {
-        self.inner.group_session_manager.mark_manual_request_as_sent(request_id).await
-    }
-
-    /// Force-share the current outbound session without creating or rotating it.
-    pub async fn force_reshare_room_key(
-        &self,
-        room_id: &RoomId,
-        expected_session_id: Option<&str>,
-        target: crate::RoomKeyReshareTarget,
-        only_devices: Option<&BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>>>,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<crate::RoomKeyReshareResult> {
-        self.inner
-            .group_session_manager
-            .force_reshare_room_key(
-                room_id,
-                expected_session_id,
-                target,
-                only_devices,
-                users,
-                encryption_settings,
-            )
-            .await
-    }
-
-    /// Prepare a targeted claim for devices selected by a forced room-key
-    /// re-share. The request contains only devices in the selected target set
-    /// that currently lack an Olm session.
-    #[doc(hidden)]
-    pub async fn prepare_force_reshare_claim(
-        &self,
-        room_id: &RoomId,
-        expected_session_id: Option<&str>,
-        target: crate::RoomKeyReshareTarget,
-        users: impl Iterator<Item = &UserId>,
-        encryption_settings: impl Into<EncryptionSettings>,
-    ) -> OlmResult<Option<(OwnedTransactionId, KeysClaimRequest)>> {
-        let settings = encryption_settings.into();
-        let Some(targets) = self
-            .inner
-            .group_session_manager
-            .force_reshare_targets(room_id, expected_session_id, target, users, settings.clone())
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(self.inner.session_manager.get_missing_sessions_for_devices(targets).await?)
     }
 
     /// Encrypts the given content using Olm for each of the given devices.
@@ -2538,41 +1898,9 @@ impl OlmMachine {
 
         // New sessions modify the account so we need to save that
         // one as well.
-        let is_new_session = matches!(&decrypted.session, SessionType::New(_));
         match decrypted.session {
             SessionType::New(s) | SessionType::Existing(s) => {
                 changes.sessions.push(s);
-            }
-        }
-
-        // #477: a fresh inbound Olm session for a known, non-dehydrated sender
-        // device is the standard unwedge signal (the device's
-        // `olm_wedging_index` was just advanced). Surface it for the post-sync
-        // recovery re-share pass.
-        if is_new_session {
-            match self
-                .store()
-                .get_device_from_curve_key(&e.sender, decrypted.result.sender_key)
-                .await
-            {
-                Ok(Some(device)) if !device.is_dehydrated() => {
-                    self.inner
-                        .olm_recovery_signals
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push(OlmRecoverySignal::new(
-                            e.sender.clone(),
-                            decrypted.result.sender_key,
-                        ));
-                }
-                Ok(Some(device)) => self.inner.room_key_diagnostics.emit_olm_recovery_signal(
-                    Some((device.user_id(), device.device_id())),
-                    OlmRecoverySignalOutcome::IgnoredDehydrated,
-                ),
-                _ => self
-                    .inner
-                    .room_key_diagnostics
-                    .emit_olm_recovery_signal(None, OlmRecoverySignalOutcome::IgnoredUnknownDevice),
             }
         }
 
@@ -2681,7 +2009,7 @@ impl OlmMachine {
         &self,
         sync_changes: EncryptionSyncChanges<'_>,
         decryption_settings: &DecryptionSettings,
-    ) -> OlmResult<(Vec<ProcessedToDeviceEvent>, Vec<RoomKeyInfo>, Vec<OlmRecoverySignal>)> {
+    ) -> OlmResult<(Vec<ProcessedToDeviceEvent>, Vec<RoomKeyInfo>)> {
         let mut store_transaction = self.inner.store.transaction().await;
 
         let (events, changes) = self
@@ -2704,15 +2032,7 @@ impl OlmMachine {
         }
         store_transaction.commit().await?;
 
-        let olm_recovery_signals = std::mem::take(
-            &mut *self
-                .inner
-                .olm_recovery_signals
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-
-        Ok((events, room_key_updates, olm_recovery_signals))
+        Ok((events, room_key_updates))
     }
 
     /// Initial processing of the changes specified within a sync response.

@@ -91,23 +91,15 @@ pub use identities::{
     Device, DeviceData, LocalTrust, OtherUserIdentity, OtherUserIdentityData, OwnUserIdentity,
     OwnUserIdentityData, UserDevices, UserIdentity, UserIdentityData,
 };
-pub use machine::{
-    CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine, OlmRecoverySignal,
-};
-pub use matrix_sdk_common::deserialized_responses::WithheldCode;
+pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine};
 use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecryptInfo};
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
 pub use room_key_diagnostics::{
-    EncryptionReadinessDiagnostic, EncryptionReadinessOutcome, EncryptionReadinessQueryState,
-    EncryptionReadinessSyncState, ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestDiagnostic,
-    IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage, Index0InitialShareState,
-    Index0ReshareDiagnostic, Index0ReshareOutcome, InitialShareDeviceClass,
-    InitialShareDeviceDiagnostic, InitialShareRepairClaimOutcome, InitialShareRepairDiagnostic,
-    InitialShareRepairOlmState, InitialShareRepairOutcome, InitialShareRepairPreparation,
-    InitialShareSessionDiagnostic, InitialShareStage, OlmRecoveryCounters, OlmRecoveryDiagnostic,
-    OlmRecoveryReshareOutcome, OlmRecoverySignalOutcome, RequestedRoomKeySession,
+    ForwardedRoomKeyAuthOutcome, IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome,
+    IncomingRoomKeyRequestStage, InitialShareDeviceClass, InitialShareDeviceDiagnostic,
+    InitialShareSessionDiagnostic, InitialShareStage, RequestedRoomKeySession,
     RoomKeyCreationOutcome, RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent,
     RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome, RoomKeyIngressKind,
     RoomKeyMemberReloadContext, RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome,
@@ -117,15 +109,7 @@ pub use room_key_diagnostics::{
     RoomKeyRotationReason,
 };
 use serde::{Deserialize, Serialize};
-pub use session_manager::{
-    CollectStrategy, Index0ReshareDecision, ManualClaimOutcome, ManualFinalizeStep,
-    ManualForceNewOutcome, ManualForceNewSummary, ManualIndex0Preparation,
-    ManualIndex0ResendOutcome, ManualIndex0ResendPreparation, ManualIndex0ResendStep,
-    ManualIndex0ResendSummary, ManualIndex0ShareOutcome, ManualIndex0ShareSummary,
-    RoomKeyReshareResult, RoomKeyReshareTarget, UnwedgeReshareOutcome,
-};
-pub use types::events::room_key_withheld::{RoomKeyWithheldContent, RoomKeyWithheldEvent};
-
+pub use session_manager::CollectStrategy;
 pub use store::{
     CryptoStoreError, SecretImportError, SecretInfo,
     types::{CrossSigningKeyExport, TrackedUser},

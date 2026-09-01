@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 
 use futures_util::future::try_join_all;
-use matrix_sdk_base::crypto::OlmRecoverySignal;
 use matrix_sdk_base::{
     RequestedRequiredStates, ThreadSubscriptionCatchupToken, sync::SyncResponse, timer,
 };
@@ -169,18 +168,12 @@ impl Client {
 pub(crate) struct SlidingSyncResponseProcessor {
     client: Client,
     to_device_events: Vec<ProcessedToDeviceEvent>,
-    olm_recovery_signals: Vec<OlmRecoverySignal>,
     response: Option<SyncResponse>,
 }
 
 impl SlidingSyncResponseProcessor {
     pub fn new(client: Client) -> Self {
-        Self {
-            client,
-            to_device_events: Vec::new(),
-            olm_recovery_signals: Vec::new(),
-            response: None,
-        }
+        Self { client, to_device_events: Vec::new(), response: None }
     }
 
     #[cfg(feature = "e2e-encryption")]
@@ -193,19 +186,7 @@ impl SlidingSyncResponseProcessor {
         // `handle_room_response` before this function), so panic is fine.
         assert!(self.response.is_none());
 
-        #[cfg(feature = "e2e-encryption")]
-        let mut repair_wake_users =
-            extensions.e2ee.device_lists.changed.iter().cloned().collect::<BTreeSet<_>>();
-        #[cfg(feature = "e2e-encryption")]
-        if !extensions.e2ee.device_one_time_keys_count.is_empty()
-            || extensions.e2ee.device_unused_fallback_key_types.is_some()
-        {
-            if let Some(user_id) = self.client.user_id() {
-                repair_wake_users.insert(user_id.to_owned());
-            }
-        }
-
-        if let Some((to_device_events, olm_recovery_signals)) = self
+        self.to_device_events = if let Some(to_device_events) = self
             .client
             .base_client()
             .process_sliding_sync_e2ee(
@@ -218,14 +199,10 @@ impl SlidingSyncResponseProcessor {
             // Some new keys might have been received, so trigger a backup if needed.
             self.client.encryption().backups().maybe_trigger_backup();
 
-            self.to_device_events = to_device_events;
-            self.olm_recovery_signals = olm_recovery_signals;
+            to_device_events
         } else {
-            self.to_device_events = Vec::new();
+            Vec::new()
         };
-
-        #[cfg(feature = "e2e-encryption")]
-        self.client.notify_initial_share_repair_wake(repair_wake_users);
 
         Ok(())
     }
@@ -286,17 +263,6 @@ impl SlidingSyncResponseProcessor {
         response.to_device.extend(self.to_device_events);
 
         self.client.call_sync_response_handlers(&response).await?;
-
-        // #477: room state for this sync was applied above; drive the immediate
-        // post-unwedge re-share for any standard Olm recovery signals observed
-        // in this sync (current membership is authoritative).
-        if !self.olm_recovery_signals.is_empty() {
-            #[cfg(feature = "e2e-encryption")]
-            self.client.notify_initial_share_repair_wake(
-                self.olm_recovery_signals.iter().map(|signal| signal.user_id.clone()).collect(),
-            );
-            self.client.encryption().on_olm_unwedged(self.olm_recovery_signals).await;
-        }
 
         Ok(response)
     }
