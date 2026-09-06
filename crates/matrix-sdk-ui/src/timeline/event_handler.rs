@@ -989,7 +989,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 RemoteEventTimelineItem {
                     event_id: event_id.clone(),
                     transaction_id: txn_id.clone(),
-                    read_receipts: self.ctx.read_receipts.clone(),
+                    read_receipts: self.ctx.read_receipts.clone().into(),
                     is_own: self.ctx.sender == self.meta.own_user_id,
                     is_highlighted: self.ctx.is_highlighted,
                     encryption_info: encryption_info.clone(),

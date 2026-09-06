@@ -76,6 +76,15 @@ async fn test_read_receipts_updates_on_live_events() {
     assert_eq!(event_b.read_receipts().len(), 1);
     assert!(event_b.read_receipts().get(*BOB).is_some());
 
+    let cloned_b = event_b.clone();
+    assert!(
+        std::ptr::eq(
+            event_b.read_receipt_snapshot().get(*BOB).unwrap(),
+            cloned_b.read_receipt_snapshot().get(*BOB).unwrap(),
+        ),
+        "cloning a timeline item must share receipt records, even after full-map access"
+    );
+
     // Implicit read receipt of Bob is updated.
     timeline.handle_live_event(f.text_msg("C").sender(*BOB)).await;
 

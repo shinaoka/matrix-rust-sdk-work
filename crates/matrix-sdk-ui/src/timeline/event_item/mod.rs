@@ -37,6 +37,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 mod content;
 mod local;
+mod read_receipt_snapshot;
 mod remote;
 
 pub use self::{
@@ -47,6 +48,7 @@ pub use self::{
         RoomMembershipChange, RoomPinnedEventsChange, Sticker, ThreadSummary, TimelineItemContent,
     },
     local::{EventSendState, MediaUploadProgress},
+    read_receipt_snapshot::ReadReceiptSnapshot,
 };
 pub(super) use self::{
     content::{
@@ -293,8 +295,21 @@ impl EventTimelineItem {
     ///
     /// Note that currently this ignores threads.
     pub fn read_receipts(&self) -> &IndexMap<OwnedUserId, Receipt> {
-        static EMPTY_RECEIPTS: LazyLock<IndexMap<OwnedUserId, Receipt>> =
-            LazyLock::new(Default::default);
+        self.read_receipt_snapshot().as_index_map()
+    }
+
+    /// Borrow the structurally shared receipt collection without materializing a map.
+    ///
+    /// Clone the returned collection to retain a cheap immutable snapshot.
+    ///
+    /// ```
+    /// # fn observe(item: &matrix_sdk_ui::timeline::EventTimelineItem) {
+    /// let receipts = item.read_receipt_snapshot().clone();
+    /// assert_eq!(receipts.iter().len(), receipts.len());
+    /// # }
+    /// ```
+    pub fn read_receipt_snapshot(&self) -> &ReadReceiptSnapshot {
+        static EMPTY_RECEIPTS: LazyLock<ReadReceiptSnapshot> = LazyLock::new(Default::default);
         match &self.kind {
             EventTimelineItemKind::Local(_) => &EMPTY_RECEIPTS,
             EventTimelineItemKind::Remote(remote_event) => &remote_event.read_receipts,
