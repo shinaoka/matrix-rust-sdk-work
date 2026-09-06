@@ -347,9 +347,9 @@ impl ReadReceipts {
             // item for an event in all_remote_events, but this extra check is
             // cheap.
             if let Some(remote_prev_item) = prev_item.as_event() {
-                let prev_receipts = remote_prev_item.read_receipts().clone();
+                let prev_receipts = remote_prev_item.read_receipt_snapshot().clone();
                 for (user_id, _) in &hidden {
-                    if !prev_receipts.contains_key(user_id) {
+                    if prev_receipts.get(user_id).is_none() {
                         continue;
                     }
                     let mut up = ReadReceiptTimelineUpdate {
@@ -764,7 +764,7 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
         }
 
         trace!("replacing read receipts with the new ones");
-        remote_prev_event_item.read_receipts = read_receipts;
+        remote_prev_event_item.read_receipts = read_receipts.into();
         self.items.replace(prev_item_pos, TimelineItem::new(prev_event_item, prev_event_item_id));
     }
 }
