@@ -37,9 +37,22 @@ use ruma::{OwnedUserId, UserId, events::receipt::Receipt};
 /// ```
 #[derive(Default)]
 pub struct ReadReceiptSnapshot {
-    by_user: OrdMap<OwnedUserId, (usize, Receipt)>,
+    by_user: OrdMap<OwnedUserId, IndexedReceipt>,
     order: Vector<OwnedUserId>,
     legacy: OnceLock<IndexMap<OwnedUserId, Receipt>>,
+}
+
+#[derive(Clone)]
+struct IndexedReceipt {
+    slot: usize,
+    receipt: Receipt,
+}
+
+impl PartialEq for IndexedReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        // The slot is compatibility-order bookkeeping, not a logical receipt field.
+        self.receipt.ts == other.receipt.ts && self.receipt.thread == other.receipt.thread
+    }
 }
 
 impl Clone for ReadReceiptSnapshot {
@@ -61,7 +74,7 @@ impl ReadReceiptSnapshot {
 
     /// Borrow a reader's receipt without materializing the full compatibility map.
     pub fn get(&self, user_id: &UserId) -> Option<&Receipt> {
-        self.by_user.get(user_id).map(|(_, receipt)| receipt)
+        self.by_user.get(user_id).map(|entry| &entry.receipt)
     }
 
     /// Borrow receipts in the same order as the full-map accessor.
@@ -71,28 +84,59 @@ impl ReadReceiptSnapshot {
             .map(|user_id| (user_id, self.get(user_id).expect("ordered receipt is indexed")))
     }
 
+    /// Borrow logical per-user changes from an earlier snapshot to this one.
+    ///
+    /// `Some(receipt)` denotes an addition or update; `None` denotes removal.
+    /// Changes compare timestamps and thread scope, not insertion-order slots.
+    /// Shared tree branches are skipped; independently rebuilt snapshots may
+    /// require a full comparison. Neither compatibility map is materialized.
+    ///
+    /// ```
+    /// use matrix_sdk_ui::timeline::ReadReceiptSnapshot;
+    /// use ruma::{user_id, events::receipt::Receipt};
+    /// let user = user_id!("@reader:example.org");
+    /// let before = ReadReceiptSnapshot::default();
+    /// let after = ReadReceiptSnapshot::from([(user.to_owned(), Receipt::default())]);
+    /// let (changed_user, receipt) = after.changes_since(&before).next().unwrap();
+    /// assert_eq!(changed_user.as_str(), user.as_str());
+    /// assert!(receipt.is_some());
+    /// assert!(before.changes_since(&after).next().unwrap().1.is_none());
+    /// ```
+    pub fn changes_since<'a>(
+        &'a self,
+        previous: &'a Self,
+    ) -> impl Iterator<Item = (&'a OwnedUserId, Option<&'a Receipt>)> {
+        previous.by_user.diff(&self.by_user).map(|change| match change {
+            imbl::ordmap::DiffItem::Add(user, entry)
+            | imbl::ordmap::DiffItem::Update { new: (user, entry), .. } => {
+                (user, Some(&entry.receipt))
+            }
+            imbl::ordmap::DiffItem::Remove(user, _) => (user, None),
+        })
+    }
+
     pub(in crate::timeline) fn insert(
         &mut self,
         user_id: OwnedUserId,
         receipt: Receipt,
     ) -> Option<Receipt> {
-        let slot = if let Some((slot, _)) = self.by_user.get(&user_id) {
-            *slot
+        let slot = if let Some(entry) = self.by_user.get(&user_id) {
+            entry.slot
         } else {
             let slot = self.order.len();
             self.order.push_back(user_id.clone());
             slot
         };
         self.legacy.take();
-        self.by_user.insert(user_id, (slot, receipt)).map(|(_, receipt)| receipt)
+        self.by_user.insert(user_id, IndexedReceipt { slot, receipt }).map(|entry| entry.receipt)
     }
 
     pub(in crate::timeline) fn swap_remove(&mut self, user_id: &UserId) -> Option<Receipt> {
-        let (slot, receipt) = self.by_user.remove(user_id)?;
+        let IndexedReceipt { slot, receipt } = self.by_user.remove(user_id)?;
         let last = self.order.pop_back().expect("receipt order matches its index");
         if slot < self.order.len() {
             self.order.set(slot, last.clone());
-            self.by_user.get_mut(&last).expect("last receipt is indexed").0 = slot;
+            self.by_user.get_mut(&last).expect("last receipt is indexed").slot = slot;
         }
         self.legacy.take();
         Some(receipt)
@@ -146,6 +190,45 @@ mod tests {
     }
 
     #[test]
+    fn logical_changes_ignore_order_slots_and_preserve_receipt_fields() {
+        let users: Vec<OwnedUserId> =
+            (0..1500).map(|i| format!("@reader-{i}:example.org").parse().unwrap()).collect();
+        let before: ReadReceiptSnapshot =
+            users.iter().cloned().map(|user| (user, Receipt::default())).collect();
+        let mut after = before.clone();
+        after.swap_remove(&users[0]);
+        let changes: Vec<_> = after.changes_since(&before).collect();
+        assert_eq!(changes.len(), 1, "moving the last ordering slot is not a receipt change");
+        assert_eq!(changes[0].0, &users[0]);
+        assert!(changes[0].1.is_none());
+
+        let timestamped = Receipt::new(ruma::MilliSecondsSinceUnixEpoch(1_u32.into()));
+        after.insert(users[42].clone(), timestamped);
+        let mut threaded = Receipt::default();
+        threaded.thread = ruma::events::receipt::ReceiptThread::Main;
+        after.insert(users[43].clone(), threaded);
+        after.insert(users[44].clone(), Receipt::default());
+        let added: OwnedUserId = "@new-reader:example.org".parse().unwrap();
+        after.insert(added.clone(), Receipt::default());
+        let changes: std::collections::BTreeMap<_, _> = after.changes_since(&before).collect();
+        assert_eq!(changes.len(), 4);
+        assert!(changes[&users[0]].is_none());
+        assert_eq!(
+            changes[&users[42]].unwrap().ts,
+            Some(ruma::MilliSecondsSinceUnixEpoch(1_u32.into()))
+        );
+        assert_eq!(changes[&users[43]].unwrap().thread, ruma::events::receipt::ReceiptThread::Main);
+        assert!(changes[&added].is_some());
+        assert_eq!(before.changes_since(&after).count(), 4);
+        assert_eq!(before.changes_since(&before).count(), 0);
+        assert_eq!(before.len(), 1500);
+        assert!(before.get(&users[0]).is_some());
+        assert!(before.get(&users[42]).unwrap().ts.is_none());
+        assert!(before.legacy.get().is_none());
+        assert!(after.legacy.get().is_none());
+    }
+
+    #[test]
     fn shared_clone_and_mutations_preserve_indexmap_order_and_cached_values() {
         let users: Vec<OwnedUserId> =
             (0..1500).map(|i| format!("@reader-{i}:example.org").parse().unwrap()).collect();
@@ -171,7 +254,7 @@ mod tests {
             );
             assert_same(&actual, &expected);
             for (slot, user) in actual.order.iter().enumerate() {
-                assert_eq!(actual.by_user.get(user).unwrap().0, slot);
+                assert_eq!(actual.by_user.get(user).unwrap().slot, slot);
             }
         }
         let replacement = Receipt::new(ruma::MilliSecondsSinceUnixEpoch(1_u32.into()));
