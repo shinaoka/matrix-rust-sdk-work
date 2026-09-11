@@ -1049,8 +1049,6 @@ mod tests {
         let sync_service = SyncService::builder(client.clone()).build().await?;
         let room_list_service = sync_service.room_list_service();
         let mut committed = room_list_service.committed_all_rooms_response();
-        let mut event_cache_commits =
-            client.event_cache().subscribe_to_committed_room_updates_responses();
 
         assert_eq!(committed.get().sequence(), 0);
         assert!(!committed.get().pos_present());
@@ -1082,10 +1080,6 @@ mod tests {
         let latest = committed.get();
         assert_eq!(latest.sequence(), 1);
         assert!(latest.pos_present());
-        assert!(
-            event_cache_commits.borrow_and_update().is_some(),
-            "the all-rooms observable must advance after the event-cache response commit"
-        );
         let debug = format!("{latest:?}");
         assert!(!debug.contains("private-pos-value"));
         assert!(!debug.contains("room_id"));

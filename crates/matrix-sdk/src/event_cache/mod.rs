@@ -28,16 +28,10 @@
 #![forbid(missing_docs)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
-    sync::{
-        Arc, OnceLock, RwLock as StdRwLock, RwLockReadGuard, RwLockWriteGuard,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, OnceLock, RwLock as StdRwLock, RwLockReadGuard, RwLockWriteGuard},
 };
-
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 
 use futures_util::future::try_join_all;
 use matrix_sdk_base::{
@@ -52,7 +46,7 @@ use ruma::{OwnedRoomId, RoomId};
 use tokio::sync::{
     Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
     broadcast::{Receiver, Sender, channel},
-    mpsc, watch,
+    mpsc,
 };
 use tracing::{error, instrument, trace};
 
@@ -102,147 +96,6 @@ pub use redecryptor::{
 pub use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 pub use crate::event_cache::automatic_pagination::AutomaticPagination;
-
-/// Retained, token-free provenance for one room update after its event-cache
-/// topology mutation has committed.
-#[derive(Clone, PartialEq, Eq)]
-pub struct CommittedRoomTimelineObservation {
-    room_id: OwnedRoomId,
-    sequence: u64,
-    response_sequence: u64,
-    timeline: Option<RoomTimelineSyncObservation>,
-}
-
-impl CommittedRoomTimelineObservation {
-    /// Room routed by this observation.
-    pub fn room_id(&self) -> &RoomId {
-        &self.room_id
-    }
-
-    /// Monotonic process-local committed-response sequence.
-    pub fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    /// Monotonic process-local sync-response sequence that produced this room
-    /// update.
-    pub fn response_sequence(&self) -> u64 {
-        self.response_sequence
-    }
-
-    /// Whether this response contained a timeline update.
-    pub fn has_timeline_update(&self) -> bool {
-        self.timeline.is_some()
-    }
-
-    /// Whether this response inserted an opaque timeline gap.
-    pub fn has_inserted_gap(&self) -> bool {
-        self.timeline.as_ref().and_then(RoomTimelineSyncObservation::inserted_gap).is_some()
-    }
-
-    /// Exact opaque gap descriptor inserted by this committed response.
-    pub fn inserted_gap(&self) -> Option<&RoomTimelineGapDescriptor> {
-        self.timeline.as_ref().and_then(RoomTimelineSyncObservation::inserted_gap)
-    }
-}
-
-impl fmt::Debug for CommittedRoomTimelineObservation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CommittedRoomTimelineObservation")
-            .field("sequence", &self.sequence)
-            .field("response_sequence", &self.response_sequence)
-            .field("has_timeline_update", &self.has_timeline_update())
-            .field("has_inserted_gap", &self.has_inserted_gap())
-            .finish()
-    }
-}
-
-/// Membership of a room in one committed room-updates response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommittedRoomUpdateMembership {
-    /// The response contained a joined-room update.
-    Joined,
-    /// The response contained a left-room update.
-    Left,
-    /// The response contained an invited-room update.
-    Invited,
-    /// The response did not contain the room in any membership section.
-    Absent,
-}
-
-/// Token-free fence published after all event-cache topology mutations for one
-/// room-updates response have committed.
-#[derive(Clone, PartialEq, Eq)]
-pub struct CommittedRoomUpdatesResponse {
-    response_sequence: u64,
-    joined_room_ids: Arc<HashSet<OwnedRoomId>>,
-    left_room_ids: Arc<HashSet<OwnedRoomId>>,
-    invited_room_ids: Arc<HashSet<OwnedRoomId>>,
-    joined_timeline_observations: Arc<HashMap<OwnedRoomId, CommittedRoomTimelineObservation>>,
-}
-
-impl CommittedRoomUpdatesResponse {
-    /// Monotonic process-local sequence of the committed room-updates response.
-    pub fn response_sequence(&self) -> u64 {
-        self.response_sequence
-    }
-
-    /// Number of joined rooms present in this response.
-    pub fn joined_room_count(&self) -> usize {
-        self.joined_room_ids.len()
-    }
-
-    /// Number of left rooms present in this response.
-    pub fn left_room_count(&self) -> usize {
-        self.left_room_ids.len()
-    }
-
-    /// Number of invited rooms present in this response.
-    pub fn invited_room_count(&self) -> usize {
-        self.invited_room_ids.len()
-    }
-
-    /// Return the membership section containing `room_id`, or
-    /// [`CommittedRoomUpdateMembership::Absent`] if the room was omitted.
-    pub fn room_membership(&self, room_id: &RoomId) -> CommittedRoomUpdateMembership {
-        if self.joined_room_ids.contains(room_id) {
-            CommittedRoomUpdateMembership::Joined
-        } else if self.left_room_ids.contains(room_id) {
-            CommittedRoomUpdateMembership::Left
-        } else if self.invited_room_ids.contains(room_id) {
-            CommittedRoomUpdateMembership::Invited
-        } else {
-            CommittedRoomUpdateMembership::Absent
-        }
-    }
-
-    /// Return the committed timeline observation when this response contained
-    /// a joined-room update and its event-cache processing succeeded.
-    ///
-    /// A joined room without an observation was present in the response but
-    /// failed before its topology mutation committed. Callers must not infer
-    /// absence from that case.
-    pub fn room_timeline_observation(
-        &self,
-        room_id: &RoomId,
-    ) -> Option<&CommittedRoomTimelineObservation> {
-        self.joined_timeline_observations.get(room_id)
-    }
-}
-
-impl fmt::Debug for CommittedRoomUpdatesResponse {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CommittedRoomUpdatesResponse")
-            .field("response_sequence", &self.response_sequence)
-            .field("joined_room_count", &self.joined_room_count())
-            .field("left_room_count", &self.left_room_count())
-            .field("invited_room_count", &self.invited_room_count())
-            .field("joined_timeline_observation_count", &self.joined_timeline_observations.len())
-            .finish()
-    }
-}
 
 /// An error observed in the [`EventCache`].
 #[derive(thiserror::Error, Clone, Debug)]
@@ -369,8 +222,6 @@ impl EventCache {
     pub(crate) fn new(client: &Arc<ClientInner>, event_cache_store: EventCacheStoreLock) -> Self {
         let (generic_update_sender, _) = channel(128);
         let (linked_chunk_update_sender, _) = channel(128);
-        let (committed_room_timeline_sender, _) = watch::channel(Arc::new(HashMap::new()));
-        let (committed_room_updates_response_sender, _) = watch::channel(None);
 
         let weak_client = WeakClient::from_inner(client);
 
@@ -390,11 +241,6 @@ impl EventCache {
                 auto_shrink_sender: Default::default(),
                 generic_update_sender,
                 linked_chunk_update_sender,
-                committed_room_timeline_sequence: AtomicU64::new(0),
-                committed_room_timeline_sender,
-                committed_room_updates_response_sender,
-                #[cfg(test)]
-                fail_next_joined_room_update: AtomicBool::new(false),
                 #[cfg(feature = "e2e-encryption")]
                 redecryption_channels,
                 automatic_pagination: OnceLock::new(),
@@ -437,7 +283,7 @@ impl EventCache {
             // Spawn the task that will listen to all the room updates at once.
             let listen_updates_task = task_monitor.spawn_infinite_task("event_cache::room_updates_task", tasks::room_updates_task(
                 self.inner.clone(),
-                client.subscribe_to_sequenced_room_updates(),
+                client.subscribe_to_all_room_updates(),
             )).abort_on_drop();
 
             let ignore_user_list_update_task = task_monitor.spawn_infinite_task("event_cache::ignore_user_list_update_task", tasks::ignore_user_list_update_task(
@@ -525,7 +371,7 @@ impl EventCache {
     /// For benchmarking purposes only.
     #[doc(hidden)]
     pub async fn handle_room_updates(&self, updates: RoomUpdates) -> Result<()> {
-        self.inner.handle_room_updates(updates, 0).await
+        self.inner.handle_room_updates(updates).await
     }
 
     /// Check whether [`EventCache::subscribe`] has been called.
@@ -593,21 +439,6 @@ impl EventCache {
     /// receiver of this channel will not trigger any side-effect.
     pub fn subscribe_to_room_generic_updates(&self) -> Receiver<RoomEventCacheGenericUpdate> {
         self.inner.generic_update_sender.subscribe()
-    }
-
-    /// Subscribe to the retained latest committed timeline observation for
-    /// every joined room.
-    pub fn subscribe_to_committed_room_timeline_observations(
-        &self,
-    ) -> watch::Receiver<Arc<HashMap<OwnedRoomId, CommittedRoomTimelineObservation>>> {
-        self.inner.committed_room_timeline_sender.subscribe()
-    }
-
-    /// Subscribe to the retained latest room-updates response commit fence.
-    pub fn subscribe_to_committed_room_updates_responses(
-        &self,
-    ) -> watch::Receiver<Option<CommittedRoomUpdatesResponse>> {
-        self.inner.committed_room_updates_response_sender.subscribe()
     }
 
     /// Returns a reference to the [`AutomaticPagination`] API, if enabled at
@@ -735,14 +566,6 @@ struct EventCacheInner {
     /// See doc comment of [`RoomEventCacheLinkedChunkUpdate`].
     linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
 
-    committed_room_timeline_sequence: AtomicU64,
-    committed_room_timeline_sender:
-        watch::Sender<Arc<HashMap<OwnedRoomId, CommittedRoomTimelineObservation>>>,
-    committed_room_updates_response_sender: watch::Sender<Option<CommittedRoomUpdatesResponse>>,
-
-    #[cfg(test)]
-    fail_next_joined_room_update: AtomicBool,
-
     /// A test helper receiver that will be emitted every time the thread
     /// subscriber task subscribed to a new thread.
     ///
@@ -763,11 +586,6 @@ struct EventCacheInner {
 type AutoShrinkChannelPayload = OwnedRoomId;
 
 impl EventCacheInner {
-    #[cfg(test)]
-    fn fail_next_joined_room_update_for_testing(&self) {
-        self.fail_next_joined_room_update.store(true, Ordering::Release);
-    }
-
     fn client(&self) -> Result<Client> {
         self.client.get().ok_or(EventCacheError::ClientDropped)
     }
@@ -837,11 +655,7 @@ impl EventCacheInner {
 
     /// Handles a single set of room updates at once.
     #[instrument(skip(self, updates))]
-    async fn handle_room_updates(
-        &self,
-        updates: RoomUpdates,
-        response_sequence: u64,
-    ) -> Result<()> {
+    async fn handle_room_updates(&self, updates: RoomUpdates) -> Result<()> {
         // First, take the lock that indicates we're processing updates, to avoid
         // handling multiple updates concurrently.
         let _lock = {
@@ -853,11 +667,6 @@ impl EventCacheInner {
         // a performance regression, even for large sync updates. Lacking time
         // to investigate, this code remains sequential for now. See also
         // https://github.com/matrix-org/matrix-rust-sdk/pull/5426.
-
-        let joined_room_ids = Arc::new(updates.joined.keys().cloned().collect());
-        let left_room_ids = Arc::new(updates.left.keys().cloned().collect());
-        let invited_room_ids = Arc::new(updates.invited.keys().cloned().collect());
-        let mut joined_timeline_observations = HashMap::new();
 
         // Left rooms.
         for (room_id, left_room_update) in updates.left {
@@ -881,62 +690,15 @@ impl EventCacheInner {
                 continue;
             };
 
-            let previous_timeline_sequence = caches
-                .room
-                .latest_sync_observation()
-                .await
-                .map(|observation| observation.sequence());
-
-            let result = {
-                #[cfg(test)]
-                {
-                    if self.fail_next_joined_room_update.swap(false, Ordering::AcqRel) {
-                        Err(EventCacheError::ClientDropped)
-                    } else {
-                        caches.handle_joined_room_update(joined_room_update).await
-                    }
-                }
-                #[cfg(not(test))]
-                caches.handle_joined_room_update(joined_room_update).await
-            };
-            if let Err(err) = result {
+            if let Err(err) = caches.handle_joined_room_update(joined_room_update).await {
                 // Non-fatal error, try to continue to the next room.
                 error!(%room_id, "handling joined room update: {err}");
                 continue;
             }
-
-            let timeline =
-                caches.room.latest_sync_observation().await.filter(|observation| {
-                    Some(observation.sequence()) != previous_timeline_sequence
-                });
-            let sequence = self
-                .committed_room_timeline_sequence
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1);
-            let observation = CommittedRoomTimelineObservation {
-                room_id: room_id.clone(),
-                sequence,
-                response_sequence,
-                timeline,
-            };
-            let mut retained = self.committed_room_timeline_sender.borrow().as_ref().clone();
-            retained.insert(room_id.clone(), observation.clone());
-            joined_timeline_observations.insert(room_id, observation);
-            self.committed_room_timeline_sender.send_replace(Arc::new(retained));
         }
 
         // Invited rooms.
         // TODO: we don't anything with `updates.invite` at this point.
-
-        self.committed_room_updates_response_sender.send_replace(Some(
-            CommittedRoomUpdatesResponse {
-                response_sequence,
-                joined_room_ids,
-                left_room_ids,
-                invited_room_ids,
-                joined_timeline_observations: Arc::new(joined_timeline_observations),
-            },
-        ));
 
         Ok(())
     }
@@ -1034,33 +796,10 @@ mod tests {
     use ruma::{event_id, room_id, user_id};
     use tokio::time::sleep;
 
-    use super::{CommittedRoomUpdateMembership, EventCacheError, RoomEventCacheGenericUpdate};
+    use super::{EventCacheError, RoomEventCacheGenericUpdate};
     use crate::test_utils::{
         assert_event_matches_msg, client::MockClientBuilder, logged_in_client,
     };
-
-    #[async_test]
-    async fn test_committed_response_does_not_classify_failed_joined_processing_as_absent() {
-        let room_id = room_id!("!joined-processing-failed:example.org");
-        let client = logged_in_client(None).await;
-        client.base_client().get_or_create_room(room_id, RoomState::Joined);
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
-        let mut responses = event_cache.subscribe_to_committed_room_updates_responses();
-        event_cache.inner.fail_next_joined_room_update_for_testing();
-
-        let mut updates = RoomUpdates::default();
-        updates.joined.insert(room_id.to_owned(), JoinedRoomUpdate::default());
-        event_cache.inner.handle_room_updates(updates, 7).await.unwrap();
-
-        let response = responses
-            .borrow_and_update()
-            .clone()
-            .expect("the committed response must still be published after a joined-room failure");
-
-        assert_eq!(response.room_membership(room_id), CommittedRoomUpdateMembership::Joined);
-        assert!(response.room_timeline_observation(room_id).is_none());
-    }
 
     #[async_test]
     async fn test_must_explicitly_subscribe() {
@@ -1121,7 +860,7 @@ mod tests {
         updates.joined.insert(room_id2.to_owned(), joined_room_update2);
 
         // Have the event cache handle them.
-        event_cache.inner.handle_room_updates(updates, 0).await.unwrap();
+        event_cache.inner.handle_room_updates(updates).await.unwrap();
 
         // We can find the events in a single room.
         let room1 = client.get_room(room_id1).unwrap();

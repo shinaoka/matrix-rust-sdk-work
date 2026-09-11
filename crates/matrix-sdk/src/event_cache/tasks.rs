@@ -20,6 +20,7 @@ use std::{
 use eyeball::Subscriber;
 use matrix_sdk_base::{
     linked_chunk::OwnedLinkedChunkId, serde_helpers::extract_thread_root_from_content,
+    sync::RoomUpdates,
 };
 use ruma::{OwnedEventId, OwnedTransactionId};
 use tokio::{
@@ -36,7 +37,7 @@ use super::{
     RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdate, TimelineVectorDiffs,
 };
 use crate::{
-    client::{SequencedRoomUpdates, WeakClient},
+    client::WeakClient,
     send_queue::{LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate},
 };
 
@@ -44,17 +45,15 @@ use crate::{
 #[instrument(skip_all)]
 pub(super) async fn room_updates_task(
     inner: Arc<EventCacheInner>,
-    mut room_updates_feed: Receiver<SequencedRoomUpdates>,
+    mut room_updates_feed: Receiver<RoomUpdates>,
 ) {
     trace!("Spawning the listen task");
     loop {
         match room_updates_feed.recv().await {
-            Ok(batch) => {
+            Ok(updates) => {
                 trace!("Receiving `RoomUpdates`");
 
-                if let Err(err) =
-                    inner.handle_room_updates(batch.updates, batch.response_sequence).await
-                {
+                if let Err(err) = inner.handle_room_updates(updates).await {
                     match err {
                         EventCacheError::ClientDropped => {
                             // The client has dropped, exit the listen task.
