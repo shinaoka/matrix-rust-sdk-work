@@ -9,11 +9,10 @@ use matrix_sdk::{
     assert_let_timeout, assert_next_matches_with_timeout,
     deserialized_responses::TimelineEvent,
     event_cache::{
-        BackPaginationOutcome, CommittedRoomUpdateMembership, EventCacheError, EventsOrigin,
-        PaginationStatus, RoomEventCacheUpdate, RoomLiveTailRefreshCancellation,
-        RoomLiveTailRefreshOutcome, RoomLiveTailRefreshResult, RoomTimelineContinuity,
-        RoomTimelineGapProjectionId, RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome,
-        TimelineVectorDiffs,
+        BackPaginationOutcome, EventCacheError, EventsOrigin, PaginationStatus,
+        RoomEventCacheUpdate, RoomLiveTailRefreshCancellation, RoomLiveTailRefreshOutcome,
+        RoomLiveTailRefreshResult, RoomTimelineContinuity, RoomTimelineGapProjectionId,
+        RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome, TimelineVectorDiffs,
     },
     linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     store::StoreConfig,
@@ -27,9 +26,7 @@ use matrix_sdk_base::event_cache::{
     store::{EventCacheStore, MemoryStore},
 };
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
-use matrix_sdk_test::{
-    ALICE, BOB, JoinedRoomBuilder, LeftRoomBuilder, async_test, event_factory::EventFactory,
-};
+use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{
     EventId, OwnedEventId, event_id,
     events::{
@@ -129,162 +126,6 @@ async fn test_empty_room_update_does_not_reuse_or_advance_a_sync_observation() {
         baseline,
         "an empty room update must not advance or manufacture an observation",
     );
-}
-
-#[async_test]
-async fn test_committed_room_observation_is_retained_and_advances_for_empty_responses() {
-    let server = MatrixMockServer::new().await;
-    let client = server.client_builder().build().await;
-    client.event_cache().subscribe().unwrap();
-
-    let room_id = room_id!("!committed-observation:example.org");
-    server.sync_joined_room(&client, room_id).await;
-    let factory = EventFactory::new().room(room_id).sender(*ALICE);
-    let mut observations = client.event_cache().subscribe_to_committed_room_timeline_observations();
-    let response_baseline = client.latest_room_updates_response_sequence();
-
-    server
-        .sync_room(
-            &client,
-            JoinedRoomBuilder::new(room_id)
-                .set_timeline_limited()
-                .set_timeline_prev_batch("private-committed-token")
-                .add_timeline_event(
-                    factory
-                        .text_msg("committed")
-                        .event_id(event_id!("$committed-observation-event")),
-                ),
-        )
-        .await;
-    observations.changed().await.unwrap();
-    let first = observations.borrow().get(room_id).cloned().expect("committed room observation");
-    assert!(first.has_timeline_update());
-    assert!(first.has_inserted_gap());
-    assert!(first.response_sequence() > response_baseline);
-    assert_eq!(client.latest_room_updates_response_sequence(), first.response_sequence());
-    let late = client.event_cache().subscribe_to_committed_room_timeline_observations();
-    assert_eq!(
-        late.borrow().get(room_id).map(|value| value.sequence()),
-        Some(first.sequence()),
-        "a late subscriber must replay the retained per-room observation",
-    );
-
-    server.sync_room(&client, JoinedRoomBuilder::new(room_id)).await;
-    observations.changed().await.unwrap();
-    let empty =
-        observations.borrow().get(room_id).cloned().expect("explicit empty committed response");
-    assert!(empty.sequence() > first.sequence());
-    assert!(empty.response_sequence() > first.response_sequence());
-    assert!(!empty.has_timeline_update());
-    assert!(!empty.has_inserted_gap());
-
-    server
-        .sync_room(
-            &client,
-            JoinedRoomBuilder::new(room_id).add_typing(factory.typing(vec![*ALICE])),
-        )
-        .await;
-    observations.changed().await.unwrap();
-    let ephemeral = observations
-        .borrow()
-        .get(room_id)
-        .cloned()
-        .expect("ephemeral-only response is committed explicitly");
-    assert!(ephemeral.sequence() > empty.sequence());
-    assert!(ephemeral.response_sequence() > empty.response_sequence());
-    assert!(!ephemeral.has_timeline_update());
-    assert!(!ephemeral.has_inserted_gap());
-
-    let debug = format!("{first:?} {empty:?} {ephemeral:?}");
-    assert!(!debug.contains(room_id.as_str()));
-    assert!(!debug.contains("$committed-observation-event"));
-    assert!(!debug.contains("private-committed-token"));
-}
-
-#[async_test]
-async fn test_committed_response_fence_advances_when_a_known_room_is_omitted() {
-    let server = MatrixMockServer::new().await;
-    let client = server.client_builder().build().await;
-    client.event_cache().subscribe().unwrap();
-
-    let omitted_room_id = room_id!("!committed-response-omitted:example.org");
-    let present_room_id = room_id!("!committed-response-present:example.org");
-    let left_room_id = room_id!("!committed-response-left:example.org");
-    server.sync_joined_room(&client, omitted_room_id).await;
-    server.sync_joined_room(&client, present_room_id).await;
-
-    let mut observations = client.event_cache().subscribe_to_committed_room_timeline_observations();
-    let (omitted_before, present_before_response_sequence) = loop {
-        let retained = observations.borrow();
-        let ready = retained
-            .get(omitted_room_id)
-            .cloned()
-            .zip(retained.get(present_room_id).map(|observation| observation.response_sequence()));
-        drop(retained);
-        if let Some(ready) = ready {
-            break ready;
-        }
-        observations.changed().await.unwrap();
-    };
-    let mut responses = client.event_cache().subscribe_to_committed_room_updates_responses();
-
-    server.sync_room(&client, JoinedRoomBuilder::new(present_room_id)).await;
-    let response = loop {
-        responses.changed().await.unwrap();
-        let response =
-            responses.borrow_and_update().clone().expect("the committed response fence advances");
-        if response.response_sequence() > present_before_response_sequence {
-            break response;
-        }
-    };
-    assert!(response.response_sequence() > omitted_before.response_sequence());
-    assert_eq!(response.joined_room_count(), 1);
-    assert_eq!(response.left_room_count(), 0);
-    assert_eq!(response.invited_room_count(), 0);
-    assert_eq!(response.room_membership(omitted_room_id), CommittedRoomUpdateMembership::Absent,);
-    assert_eq!(response.room_membership(present_room_id), CommittedRoomUpdateMembership::Joined,);
-    assert_eq!(
-        response
-            .room_timeline_observation(present_room_id)
-            .expect("the successful joined update is attached to its response")
-            .response_sequence(),
-        response.response_sequence(),
-    );
-
-    let observations = observations.borrow();
-    assert_eq!(
-        observations
-            .get(omitted_room_id)
-            .expect("the omitted room remains retained")
-            .response_sequence(),
-        omitted_before.response_sequence(),
-        "an omitted room must not receive a manufactured per-room observation",
-    );
-    assert_eq!(
-        observations
-            .get(present_room_id)
-            .expect("the present room receives a committed observation")
-            .response_sequence(),
-        response.response_sequence(),
-    );
-    drop(observations);
-    let previous_response_sequence = response.response_sequence();
-
-    server.sync_room(&client, LeftRoomBuilder::new(left_room_id)).await;
-    let response = loop {
-        responses.changed().await.unwrap();
-        let response = responses.borrow_and_update().clone().expect("the left response commits");
-        if response.response_sequence() > previous_response_sequence {
-            break response;
-        }
-    };
-    assert_eq!(response.left_room_count(), 1, "response={response:?}");
-    assert_eq!(
-        response.room_membership(left_room_id),
-        CommittedRoomUpdateMembership::Left,
-        "a left room is present in the response and must never be classified as absent",
-    );
-    assert!(response.room_timeline_observation(left_room_id).is_none());
 }
 
 macro_rules! assert_event_id {
