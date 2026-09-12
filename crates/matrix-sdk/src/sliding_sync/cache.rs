@@ -499,17 +499,15 @@ mod tests {
         assert!(restored_sync.has_restored_room_subscriptions());
         assert!(restored_sync.subscribed_rooms().contains(restored_room_id));
 
-        let retained = restored_sync.reconcile_subscriptions(&[restored_room_id], None, false);
-        assert!(!retained.changed);
-        assert!(retained.added.is_empty());
-        assert!(retained.retained.contains(restored_room_id));
+        let subscribed_before = restored_sync.subscribed_rooms();
+        restored_sync.set_room_subscriptions(&[restored_room_id], None, false);
+        assert_eq!(restored_sync.subscribed_rooms(), subscribed_before);
 
         let added_room_id = room_id!("!added:example.org");
-        let expanded =
-            restored_sync.reconcile_subscriptions(&[restored_room_id, added_room_id], None, false);
-        assert!(expanded.changed);
-        assert!(expanded.retained.contains(restored_room_id));
-        assert!(expanded.added.contains(added_room_id));
+        restored_sync.set_room_subscriptions(&[restored_room_id, added_room_id], None, false);
+        let expanded = restored_sync.subscribed_rooms();
+        assert!(expanded.contains(restored_room_id));
+        assert!(expanded.contains(added_room_id));
 
         // Expiration invalidates the position and its coverage claim together.
         restored_sync.expire_session().await;
