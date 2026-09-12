@@ -865,9 +865,10 @@ impl RoomPagination {
             new_gap,
             &topo_ordered_events,
         );
-        // `post_process_new_events` begins by flushing the linked-chunk updates
-        // to the EventCacheStore. The persisted inspection below therefore
-        // proves the repair survives cache reconstruction.
+        // Flush the linked-chunk updates to the EventCacheStore before
+        // post-processing, so the persisted inspection below proves the repair
+        // survives cache reconstruction.
+        state.propagate_changes().await?;
         state.post_process_upserted_events(topo_ordered_events.iter(), None).await?;
         let timeline_event_diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
         let persisted_after =

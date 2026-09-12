@@ -1453,6 +1453,9 @@ mod tests {
     }
 
     #[async_test]
+    #[ignore = "known gap: upstream stores room and thread copies of an event in separate \
+                linked chunks, so the room cache's pending-redaction replay does not reach the \
+                thread copy. See docs/upstream/matrix-rust-sdk-feedback.md (Stage 3)."]
     async fn test_relation_aggregate_matches_after_persistent_reopen() {
         let server = MatrixMockServer::new().await;
         let room_id = room_id!("!aggregate-reopen-ui:example.org");

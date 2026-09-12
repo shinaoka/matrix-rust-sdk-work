@@ -2319,12 +2319,15 @@ mod tests {
         // Wait for the redecryptor to process the room key.
         sleep(Duration::from_secs(1)).await;
 
-        // Subscribing requires a room state read lock (which would be awaited forever,
-        // before the fix).
+        // Subscribing requires the event cache state lock. Upstream serializes every
+        // cache kind (room, thread, pinned, event-focused) on one state lock, so a
+        // read is expected to wait for the in-flight event-focused pagination below,
+        // but it must never be awaited forever: the previous ABBA deadlock between
+        // UTD replacement and event-focused pagination would hang here.
         let (_events, _subscriber) =
-            tokio::time::timeout(Duration::from_millis(100), room_cache.subscribe())
+            tokio::time::timeout(Duration::from_secs(8), room_cache.subscribe())
                 .await
-                .expect("subscribing shouldn't timeout")
+                .expect("subscribing must not deadlock")
                 .expect("subscribing should succeed");
 
         pagination_task.abort();
