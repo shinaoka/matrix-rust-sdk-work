@@ -624,21 +624,6 @@ impl RoomPagination {
         ))
     }
 
-    /// Repair one persisted room-timeline gap with a single bounded network
-    /// request.
-    ///
-    /// The descriptor is revalidated before and after the request. If sync or
-    /// another pagination changed the gap topology,
-    /// [`RoomTimelineGapRepairOutcome::Stale`] is returned without applying
-    /// the response.
-    pub async fn repair_timeline_gap(
-        &self,
-        descriptor: &RoomTimelineGapDescriptor,
-        budget: RoomTimelineGapRepairBudget,
-    ) -> Result<RoomTimelineGapRepairOutcome> {
-        Ok(self.repair_timeline_gap_task(descriptor, budget, None).await?.outcome)
-    }
-
     /// Repair one gap while causally tagging any published timeline update.
     pub async fn repair_timeline_gap_with_projection(
         &self,
