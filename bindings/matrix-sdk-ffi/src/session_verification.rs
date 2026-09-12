@@ -26,7 +26,7 @@ use matrix_sdk::{
 };
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::UserId;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::{
     client::UserProfile, error::ClientError, runtime::get_runtime_handle, utils::Timestamp,
@@ -77,7 +77,7 @@ pub trait SessionVerificationControllerDelegate: SyncOutsideWasm + SendOutsideWa
     fn did_finish(&self);
 }
 
-pub type Delegate = Arc<RwLock<Option<Box<dyn SessionVerificationControllerDelegate>>>>;
+pub type Delegate = Arc<RwLock<Option<Arc<dyn SessionVerificationControllerDelegate>>>>;
 
 #[derive(Clone, uniffi::Object)]
 pub struct SessionVerificationController {
@@ -92,7 +92,7 @@ pub struct SessionVerificationController {
 #[matrix_sdk_ffi_macros::export]
 impl SessionVerificationController {
     pub fn set_delegate(&self, delegate: Option<Box<dyn SessionVerificationControllerDelegate>>) {
-        *self.delegate.write().unwrap() = delegate;
+        *self.delegate.write().unwrap() = delegate.map(Arc::from);
     }
 
     /// Set this particular request as the currently active one and register for
@@ -170,7 +170,7 @@ impl SessionVerificationController {
             Ok(Some(verification)) => {
                 *self.sas_verification.write().unwrap() = Some(verification.clone());
 
-                if let Some(delegate) = &*self.delegate.read().unwrap() {
+                if let Some(delegate) = Self::current_delegate(&self.delegate) {
                     delegate.did_start_sas_verification()
                 }
 
@@ -179,7 +179,7 @@ impl SessionVerificationController {
                     .spawn(Self::listen_to_sas_verification_changes(verification, delegate));
             }
             _ => {
-                if let Some(delegate) = &*self.delegate.read().unwrap() {
+                if let Some(delegate) = Self::current_delegate(&self.delegate) {
                     delegate.did_fail()
                 }
             }
@@ -246,15 +246,36 @@ impl SessionVerificationController {
         sender: &UserId,
         flow_id: impl AsRef<str>,
     ) {
-        if sender != self.user_identity.user_id()
-            && let Some(status) = self.encryption.cross_signing_status().await
-            && !status.is_complete()
-        {
-            warn!(
-                "Cannot verify other users until our own device's cross-signing status \
-                 is complete: {status:?}"
-            );
-            return;
+        let cross_signing_status = self.encryption.cross_signing_status().await;
+
+        if sender != self.user_identity.user_id() {
+            if !cross_signing_status.as_ref().is_some_and(|status| status.is_complete()) {
+                error!(
+                    "Cannot verify other users until our own device's cross-signing status \
+                     is complete: {cross_signing_status:?}"
+                );
+                return;
+            }
+        } else if !cross_signing_status.as_ref().is_some_and(|status| status.has_self_signing) {
+            // Signing one of our own devices needs the private self-signing key. Not
+            // having it is only fine while we are the session that is about to be
+            // verified. If we are already verified the flow could only fail, so
+            // don't surface the request at all.
+            let we_are_verified = self
+                .encryption
+                .get_own_device()
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|device| device.is_cross_signed_by_owner());
+
+            if we_are_verified {
+                error!(
+                    "Cannot verify another one of our devices, this session is missing \
+                     the private self-signing key: {cross_signing_status:?}"
+                );
+                return;
+            }
         }
 
         let Some(request) = self.encryption.get_verification_request(sender, flow_id).await else {
@@ -272,7 +293,7 @@ impl SessionVerificationController {
             return;
         };
 
-        if let Some(delegate) = &*self.delegate.read().unwrap() {
+        if let Some(delegate) = Self::current_delegate(&self.delegate) {
             delegate.did_receive_verification_request(SessionVerificationRequestDetails {
                 sender_profile,
                 flow_id: request.flow_id().into(),
@@ -306,6 +327,16 @@ impl SessionVerificationController {
         Ok(())
     }
 
+    /// Clone the current delegate out of the lock, releasing the read guard
+    /// before it is returned. Callbacks must never be invoked while the guard
+    /// is held: a delegate that detaches itself via `set_delegate` (which takes
+    /// the write guard) would otherwise deadlock. See issue #6669.
+    fn current_delegate(
+        delegate: &Delegate,
+    ) -> Option<Arc<dyn SessionVerificationControllerDelegate>> {
+        delegate.read().unwrap().clone()
+    }
+
     async fn listen_to_verification_request_changes(
         verification_request: VerificationRequest,
         sas_verification: Arc<RwLock<Option<SasVerification>>>,
@@ -324,27 +355,26 @@ impl SessionVerificationController {
                     *sas_verification.write().unwrap() = Some(verification.clone());
 
                     if verification.accept().await.is_ok() {
-                        if let Some(delegate) = &*delegate.read().unwrap() {
-                            delegate.did_start_sas_verification()
+                        if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                            current_delegate.did_start_sas_verification()
                         }
 
-                        let delegate = delegate.clone();
                         get_runtime_handle().spawn(Self::listen_to_sas_verification_changes(
                             verification,
-                            delegate,
+                            delegate.clone(),
                         ));
-                    } else if let Some(delegate) = &*delegate.read().unwrap() {
-                        delegate.did_fail()
+                    } else if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                        current_delegate.did_fail()
                     }
                 }
                 VerificationRequestState::Ready { .. } => {
-                    if let Some(delegate) = &*delegate.read().unwrap() {
-                        delegate.did_accept_verification_request()
+                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                        current_delegate.did_accept_verification_request()
                     }
                 }
                 VerificationRequestState::Cancelled(..) => {
-                    if let Some(delegate) = &*delegate.read().unwrap() {
-                        delegate.did_cancel();
+                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                        current_delegate.did_cancel();
                     }
                 }
                 _ => {}
@@ -358,9 +388,9 @@ impl SessionVerificationController {
         while let Some(state) = stream.next().await {
             match state {
                 SasState::KeysExchanged { emojis, decimals } => {
-                    if let Some(delegate) = &*delegate.read().unwrap() {
+                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
                         if let Some(emojis) = emojis {
-                            delegate.did_receive_verification_data(
+                            current_delegate.did_receive_verification_data(
                                 SessionVerificationData::Emojis {
                                     emojis: emojis
                                         .emojis
@@ -376,7 +406,7 @@ impl SessionVerificationController {
                                 },
                             );
                         } else {
-                            delegate.did_receive_verification_data(
+                            current_delegate.did_receive_verification_data(
                                 SessionVerificationData::Decimals {
                                     values: vec![decimals.0, decimals.1, decimals.2],
                                 },
@@ -385,16 +415,16 @@ impl SessionVerificationController {
                     }
                 }
                 SasState::Done { .. } => {
-                    if let Some(delegate) = &*delegate.read().unwrap() {
-                        delegate.did_finish()
+                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                        current_delegate.did_finish()
                     }
                     break;
                 }
                 SasState::Cancelled(_cancel_info) => {
                     // TODO: The cancel_info is usable, we should tell the user why we were
                     // cancelled.
-                    if let Some(delegate) = &*delegate.read().unwrap() {
-                        delegate.did_cancel()
+                    if let Some(current_delegate) = Self::current_delegate(&delegate) {
+                        current_delegate.did_cancel()
                     }
                     break;
                 }
@@ -404,5 +434,49 @@ impl SessionVerificationController {
                 | SasState::Confirmed => (),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, RwLock};
+
+    use super::{
+        Delegate, SessionVerificationController, SessionVerificationControllerDelegate,
+        SessionVerificationData, SessionVerificationRequestDetails,
+    };
+
+    /// A delegate that detaches itself from within a callback. The only
+    /// documented way to detach is `set_delegate(None)`, which takes the
+    /// delegate write guard. Mirrors the deadlock repro from issue #6669.
+    struct ReentrantDelegate {
+        slot: Delegate,
+    }
+
+    impl SessionVerificationControllerDelegate for ReentrantDelegate {
+        fn did_cancel(&self) {
+            *self.slot.write().unwrap() = None;
+        }
+        fn did_receive_verification_request(&self, _: SessionVerificationRequestDetails) {}
+        fn did_accept_verification_request(&self) {}
+        fn did_start_sas_verification(&self) {}
+        fn did_receive_verification_data(&self, _: SessionVerificationData) {}
+        fn did_fail(&self) {}
+        fn did_finish(&self) {}
+    }
+
+    #[test]
+    fn invoking_a_callback_does_not_hold_the_delegate_read_guard() {
+        let slot: Delegate = Arc::new(RwLock::new(None));
+        *slot.write().unwrap() = Some(Arc::new(ReentrantDelegate { slot: slot.clone() }));
+
+        // `current_delegate` must release the read guard before the callback
+        // runs. If it held the guard, the re-entrant `set_delegate` (write
+        // guard) inside `did_cancel` would deadlock here.
+        if let Some(delegate) = SessionVerificationController::current_delegate(&slot) {
+            delegate.did_cancel();
+        }
+
+        assert!(slot.read().unwrap().is_none(), "delegate should have detached itself");
     }
 }

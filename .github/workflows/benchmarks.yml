@@ -82,7 +82,7 @@ jobs:
           echo "Disk space after cleanup"
           df -h
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -97,7 +97,7 @@ jobs:
         run: cargo codspeed build -p benchmarks --bench ${{ matrix.benchmark }} --features codspeed
 
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@9d332c4d90b43981c3e55ae8e38e68709996240f
+        uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea
         with:
           run: cargo codspeed run
           mode: simulation

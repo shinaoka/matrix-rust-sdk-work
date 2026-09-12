@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod live_tail;
 pub mod pagination;
+mod live_tail;
 mod state;
-mod subscriber;
 mod updates;
 
 use std::{
@@ -29,52 +28,42 @@ use std::{
 
 use eyeball::SharedObservable;
 use matrix_sdk_base::{
-    deserialized_responses::AmbiguityChange,
+    deserialized_responses::{AmbiguityChange, ThreadSummary},
     event_cache::Event,
-    sync::{JoinedRoomUpdate, LeftRoomUpdate, Timeline},
+    sync::Timeline,
 };
 use ruma::{
     EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId,
-    events::{AnyRoomAccountDataEvent, AnySyncEphemeralRoomEvent, relation::RelationType},
+    events::{AnyRoomAccountDataEvent, relation::RelationType},
     serde::Raw,
 };
-pub(super) use state::{
-    LockedRoomEventCacheState, RoomEventCacheStateLockReadGuard, RoomEventCacheStateLockWriteGuard,
-};
-pub use subscriber::RoomEventCacheSubscriber;
-use tokio::sync::{Notify, RwLock, broadcast::Receiver, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tracing::{instrument, trace, warn};
-pub use updates::{
-    RoomEventCacheGenericUpdate, RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdate,
-    RoomEventCacheUpdateSender,
+
+use self::pagination::{RoomPagination, RoomTimelineGapDescriptor};
+pub use self::{
+    state::RoomEventCacheState,
+    updates::{
+        RoomEventCacheGenericUpdate, RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdate,
+        RoomEventCacheUpdateSender,
+    },
 };
-
-use self::pagination::RoomTimelineGapDescriptor;
-
 use super::{
-    super::{AutoShrinkChannelPayload, EventCacheError, EventsOrigin, Result, RoomPagination},
+    super::{
+        EventsOrigin, Result,
+        states::{CacheStateLock, StateLockWriteGuard, selectors::RoomStateSelector},
+    },
     TimelineVectorDiffs,
     event_linked_chunk::sort_positions_descending,
-    thread::pagination::ThreadPagination,
+    pagination::SharedPaginationStatus,
+    read_receipts::MaybeReceiptEventContent,
+    subscriber::{AutoShrinkMessage, Subscriber},
 };
-use crate::{
-    client::WeakClient,
-    event_cache::{
-        EventFocusThreadMode,
-        caches::{event_focused::EventFocusedCache, pagination::SharedPaginationStatus},
-    },
-    room::WeakRoom,
-};
-
-/// A subset of an event cache, for a room.
-///
-/// Cloning is shallow, and thus is cheap to do.
-#[derive(Clone)]
-pub struct RoomEventCache {
-    inner: Arc<RoomEventCacheInner>,
-}
+use crate::room::WeakRoom;
 
 /// Token-free provenance for the latest room timeline committed from sync.
+///
+/// Matrix desktop fork patch surface: not part of upstream matrix-sdk.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RoomTimelineSyncObservation {
     pub(super) sequence: u64,
@@ -126,6 +115,14 @@ impl fmt::Debug for RoomTimelineSyncObservation {
     }
 }
 
+/// A subset of an event cache, for a room.
+///
+/// Cloning is shallow, and thus is cheap to do.
+#[derive(Clone)]
+pub struct RoomEventCache {
+    inner: Arc<RoomEventCacheInner>,
+}
+
 impl fmt::Debug for RoomEventCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RoomEventCache").finish_non_exhaustive()
@@ -137,26 +134,44 @@ impl RoomEventCache {
     pub(super) fn new(
         room_id: OwnedRoomId,
         weak_room: WeakRoom,
-        state: LockedRoomEventCacheState,
+        own_user_id: OwnedUserId,
+        state: CacheStateLock<RoomStateSelector>,
         shared_pagination_status: SharedObservable<SharedPaginationStatus>,
-        auto_shrink_sender: mpsc::Sender<AutoShrinkChannelPayload>,
+        auto_shrink_sender: mpsc::Sender<AutoShrinkMessage>,
         update_sender: RoomEventCacheUpdateSender,
     ) -> Self {
         Self {
-            inner: Arc::new(RoomEventCacheInner::new(
+            inner: Arc::new(RoomEventCacheInner {
                 room_id,
                 weak_room,
+                own_user_id,
                 state,
-                shared_pagination_status,
-                auto_shrink_sender,
                 update_sender,
-            )),
+                pagination_batch_token_notifier: Notify::new(),
+                pagination_operation_lock: Default::default(),
+                auto_shrink_sender,
+                shared_pagination_status,
+                latest_sync_observation: Default::default(),
+                next_sync_observation_sequence: AtomicU64::new(1),
+                #[cfg(feature = "testing")]
+                live_tail_commit_test_hook: Default::default(),
+            }),
         }
     }
 
     /// Get the room ID for this [`RoomEventCache`].
     pub fn room_id(&self) -> &RoomId {
         &self.inner.room_id
+    }
+
+    /// Get the owner of this [`RoomEventCache`].
+    pub(super) fn own_user_id(&self) -> &OwnedUserId {
+        &self.inner.own_user_id
+    }
+
+    /// Get the weak room of this [`RoomEventCache`].
+    pub(super) fn weak_room(&self) -> &WeakRoom {
+        &self.inner.weak_room
     }
 
     /// Read all current events.
@@ -169,168 +184,29 @@ impl RoomEventCache {
         Ok(state.room_linked_chunk().events().map(|(_position, item)| item.clone()).collect())
     }
 
-    /// Return the latest committed sync-timeline observation, if any.
-    pub async fn latest_sync_observation(&self) -> Option<RoomTimelineSyncObservation> {
-        self.inner.latest_sync_observation.read().await.clone()
-    }
-
     /// Subscribe to this room updates, after getting the initial list of
     /// events.
     ///
     /// Use [`RoomEventCache::events`] to get all current events without the
-    /// subscriber. Creating, and especially dropping, a
-    /// [`RoomEventCacheSubscriber`] isn't free, as it triggers side-effects.
-    pub async fn subscribe(&self) -> Result<(Vec<Event>, RoomEventCacheSubscriber)> {
+    /// subscriber. Creating, and especially dropping, a [`Subscriber`] isn't
+    /// free, as it triggers side-effects.
+    pub async fn subscribe(&self) -> Result<(Vec<Event>, Subscriber<RoomEventCacheUpdate>)> {
         let state = self.inner.state.read().await?;
         let events =
             state.room_linked_chunk().events().map(|(_position, item)| item.clone()).collect();
 
-        let subscriber_count = state.subscriber_count();
-        let previous_subscriber_count = subscriber_count.fetch_add(1, Ordering::SeqCst);
-        trace!("added a room event cache subscriber; new count: {}", previous_subscriber_count + 1);
+        let subscribers_handle = state.subscribers_handle();
 
-        let subscriber = RoomEventCacheSubscriber::new(
+        let subscriber = Subscriber::new(
             self.inner.update_sender.new_room_receiver(),
-            self.inner.room_id.clone(),
+            AutoShrinkMessage::Room { room_id: self.inner.room_id.clone() },
             self.inner.auto_shrink_sender.clone(),
-            subscriber_count.clone(),
+            subscribers_handle,
         );
+
+        trace!("added a room event cache subscriber; new count: {}", subscribers_handle.count());
 
         Ok((events, subscriber))
-    }
-
-    /// Subscribe to thread for a given root event, and get a (maybe empty)
-    /// initially known list of events for that thread.
-    pub async fn subscribe_to_thread(
-        &self,
-        thread_root: OwnedEventId,
-    ) -> Result<(Vec<Event>, Receiver<TimelineVectorDiffs>)> {
-        let mut state = self.inner.state.write().await?;
-
-        state.subscribe_to_thread(thread_root).await
-    }
-
-    /// Subscribe to the pinned event cache for this room.
-    ///
-    /// This is a persisted view over the pinned events of a room.
-    ///
-    /// The pinned events will be initially reloaded from storage, and/or loaded
-    /// from a network request to fetch the latest pinned events and their
-    /// relations, to update it as needed. The list of pinned events will
-    /// also be kept up-to-date as new events are pinned, and new
-    /// related events show up from other sources.
-    pub async fn subscribe_to_pinned_events(
-        &self,
-    ) -> Result<(Vec<Event>, Receiver<TimelineVectorDiffs>)> {
-        let room = self.inner.weak_room.get().ok_or(EventCacheError::ClientDropped)?;
-        let state = self.inner.state.read().await?;
-
-        state.subscribe_to_pinned_events(room).await
-    }
-
-    /// Create or get an event-focused timeline cache for this room.
-    ///
-    /// This creates a timeline centered around a specific event (e.g., for
-    /// permalinks), in a given mode, supporting both forward and backward
-    /// pagination.
-    ///
-    /// If the focused event is part of a thread, the timeline will
-    /// automatically use thread-specific pagination.
-    ///
-    /// If the thread mode is defined to [`EventFocusThreadMode::ForceThread`],
-    /// the timeline will be focused on the thread root of the thread the
-    /// target event belongs to, or it will consider that the target event
-    /// itself is the thread root.
-    #[instrument(skip(self), fields(room_id = %self.inner.room_id, event_id = %event_id, thread_mode = ?thread_mode))]
-    pub async fn get_or_create_event_focused_cache(
-        &self,
-        event_id: OwnedEventId,
-        num_context_events: u16,
-        thread_mode: EventFocusThreadMode,
-    ) -> Result<EventFocusedCache> {
-        let room = self.inner.weak_room.get().ok_or(EventCacheError::ClientDropped)?;
-        let guard = self.inner.state.read().await?;
-
-        // Check if we already have a cache for this event.
-        if let Some(cache) = guard.get_event_focused_cache(event_id.clone(), thread_mode) {
-            trace!("the cache was already created, returning it");
-            return Ok(cache);
-        }
-
-        // Create a new cache.
-        let linked_chunk_update_sender = guard.state.linked_chunk_update_sender.clone();
-
-        // Make sure to drop the guard before calling `start_from` below, as it may need
-        // to lock the room event cache's state again, when memoizing events
-        // received from the network response.
-        drop(guard);
-
-        let room_id = room.room_id().to_owned();
-        let weak_room = WeakRoom::new(WeakClient::from_client(&room.client()), room_id.clone());
-
-        trace!("creating a fresh event-focused cache");
-        let cache = EventFocusedCache::new(weak_room, event_id.clone(), linked_chunk_update_sender);
-
-        // Initialize the cache from the server.
-        cache.start_from(room, num_context_events, thread_mode).await?;
-
-        let mut guard = self.inner.state.write().await?;
-
-        // Check again if we already have a cache for this event, just in case there was
-        // a race with another caller during initialization.
-        if let Some(cache) = guard.get_event_focused_cache(event_id.clone(), thread_mode) {
-            trace!("another cache has been racily created, returning it");
-            return Ok(cache);
-        }
-
-        // Insert the cache in the map.
-        guard.insert_event_focused_cache(event_id, thread_mode, cache.clone());
-
-        Ok(cache)
-    }
-
-    /// Rebuild an event-focused cache from the homeserver and replace any
-    /// cached instance for the same focus. This is intentionally separate
-    /// from [`Self::get_or_create_event_focused_cache`]: callers use it only
-    /// after observing that a previously reused cache is still empty.
-    #[instrument(skip(self), fields(room_id = %self.inner.room_id, event_id = %event_id, thread_mode = ?thread_mode))]
-    pub async fn refresh_event_focused_cache(
-        &self,
-        event_id: OwnedEventId,
-        num_context_events: u16,
-        thread_mode: EventFocusThreadMode,
-    ) -> Result<EventFocusedCache> {
-        let room = self.inner.weak_room.get().ok_or(EventCacheError::ClientDropped)?;
-        let linked_chunk_update_sender =
-            self.inner.state.read().await?.state.linked_chunk_update_sender.clone();
-        let room_id = room.room_id().to_owned();
-        let weak_room = WeakRoom::new(WeakClient::from_client(&room.client()), room_id);
-        let cache = EventFocusedCache::new(weak_room, event_id.clone(), linked_chunk_update_sender);
-
-        trace!("refreshing an empty event-focused cache");
-        cache.start_from(room, num_context_events, thread_mode).await?;
-
-        self.inner.state.write().await?.insert_event_focused_cache(
-            event_id,
-            thread_mode,
-            cache.clone(),
-        );
-        Ok(cache)
-    }
-
-    /// Get an event-focused cache for this event and thread mode, if it exists.
-    ///
-    /// Otherwise, returns `None`.
-    ///
-    /// Use [`Self::get_or_create_event_focused_cache`] for ensuring such a
-    /// cache exists.
-    #[instrument(skip(self), fields(room_id = %self.inner.room_id))]
-    pub async fn get_event_focused_cache(
-        &self,
-        event_id: OwnedEventId,
-        thread_mode: EventFocusThreadMode,
-    ) -> Result<Option<EventFocusedCache>> {
-        Ok(self.inner.state.read().await?.get_event_focused_cache(event_id, thread_mode))
     }
 
     /// Return a [`RoomPagination`] type useful for running back-pagination
@@ -339,16 +215,19 @@ impl RoomEventCache {
         RoomPagination::new(self.inner.clone())
     }
 
-    /// Inspect all persisted timeline gaps without exposing pagination tokens
-    /// or linked-chunk identifiers.
-    pub async fn inspect_timeline_gaps(&self) -> Result<pagination::RoomTimelineGapInspection> {
-        self.pagination().inspect_timeline_gaps().await
+    /// Latest room timeline committed from sync, if any.
+    ///
+    /// Matrix desktop fork patch surface: not part of upstream matrix-sdk.
+    pub async fn latest_sync_observation(&self) -> Option<RoomTimelineSyncObservation> {
+        self.inner.latest_sync_observation.read().await.clone()
     }
 
-    /// Return a [`ThreadPagination`] type useful for running back-pagination
-    /// queries in the `thread_id` thread.
-    pub async fn thread_pagination(&self, thread_id: OwnedEventId) -> Result<ThreadPagination> {
-        Ok(self.inner.state.write().await?.get_or_reload_thread(thread_id).pagination())
+    /// Inspect all persisted timeline gaps without exposing pagination tokens
+    /// or linked-chunk identifiers.
+    ///
+    /// Matrix desktop fork patch surface: not part of upstream matrix-sdk.
+    pub async fn inspect_timeline_gaps(&self) -> Result<pagination::RoomTimelineGapInspection> {
+        self.pagination().inspect_timeline_gaps().await
     }
 
     /// Try to find a single event in this room, starting from the most recent
@@ -404,7 +283,7 @@ impl RoomEventCache {
             .state
             .read()
             .await?
-            .find_event_with_relations(event_id, filter.clone())
+            .find_event_with_relations(event_id, filter)
             .await
             .ok()
             .flatten())
@@ -430,53 +309,65 @@ impl RoomEventCache {
         self.inner.state.read().await?.find_event_relations(event_id, filter.clone()).await
     }
 
-    /// Clear all the storage for this [`RoomEventCache`].
-    ///
-    /// This will get rid of all the events from the linked chunk and persisted
-    /// storage.
-    pub async fn clear(&self) -> Result<()> {
-        // Clear the linked chunk and persisted storage.
-        let updates_as_vector_diffs = self.inner.state.write().await?.reset().await?;
-
-        // Notify observers about the update.
-        self.inner.update_sender.send(
-            RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
-                diffs: updates_as_vector_diffs,
-                origin: EventsOrigin::Cache,
-            }),
-            Some(RoomEventCacheGenericUpdate { room_id: self.inner.room_id.clone() }),
-        );
-
-        Ok(())
-    }
-
     /// Return a reference to the state.
-    pub(in super::super) fn state(&self) -> &LockedRoomEventCacheState {
+    pub(in super::super) fn state(&self) -> &CacheStateLock<RoomStateSelector> {
         &self.inner.state
     }
 
-    /// Handle a [`JoinedRoomUpdate`].
+    /// Handle an update from a joined room.
     #[instrument(skip_all, fields(room_id = %self.room_id()))]
-    pub(super) async fn handle_joined_room_update(&self, updates: JoinedRoomUpdate) -> Result<()> {
+    pub(super) async fn handle_joined_room_update(
+        &self,
+        timeline: Timeline,
+        read_receipts: MaybeReceiptEventContent,
+        account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
+        ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
+        avatar_changes: Option<BTreeMap<OwnedUserId, Option<OwnedMxcUri>>>,
+    ) -> Result<()> {
         self.inner
-            .handle_timeline(
-                updates.timeline,
-                updates.ephemeral.clone(),
-                updates.ambiguity_changes,
-                updates.avatar_changes,
-            )
+            .handle_timeline(timeline, read_receipts, ambiguity_changes, avatar_changes)
             .await?;
-        self.inner.handle_account_data(updates.account_data);
+        self.inner.handle_account_data(account_data);
 
         Ok(())
     }
 
-    /// Handle a [`LeftRoomUpdate`].
+    /// Handle an update from a left room.
     #[instrument(skip_all, fields(room_id = %self.room_id()))]
-    pub(super) async fn handle_left_room_update(&self, updates: LeftRoomUpdate) -> Result<()> {
+    pub(super) async fn handle_left_room_update(
+        &self,
+        timeline: Timeline,
+        ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
+    ) -> Result<()> {
         self.inner
-            .handle_timeline(updates.timeline, Vec::new(), updates.ambiguity_changes, None)
+            .handle_timeline(timeline, MaybeReceiptEventContent::none(), ambiguity_changes, None)
             .await?;
+
+        Ok(())
+    }
+
+    pub(in super::super) async fn update_thread_summary(
+        &self,
+        thread_id: &EventId,
+        new_thread_summary: Option<ThreadSummary>,
+    ) -> Result<()> {
+        let timeline_event_diffs = self
+            .inner
+            .state
+            .write()
+            .await?
+            .update_thread_summary(thread_id, new_thread_summary)
+            .await?;
+
+        if !timeline_event_diffs.is_empty() {
+            self.inner.update_sender.send(
+                RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                    diffs: timeline_event_diffs,
+                    origin: EventsOrigin::Sync,
+                }),
+                Some(RoomEventCacheGenericUpdate { room_id: self.inner.room_id.clone() }),
+            );
+        }
 
         Ok(())
     }
@@ -489,22 +380,6 @@ impl RoomEventCache {
     /// Handle a single event from the `SendQueue`.
     pub(crate) async fn insert_sent_event_from_send_queue(&self, event: Event) -> Result<()> {
         self.inner.insert_sent_event_from_send_queue(event).await
-    }
-
-    /// Save some events in the event cache, for further retrieval with
-    /// [`Self::event`].
-    pub(crate) async fn save_events(&self, events: impl IntoIterator<Item = Event>) {
-        match self.inner.state.write().await {
-            Ok(mut state_guard) => {
-                if let Err(err) = state_guard.save_events(events).await {
-                    warn!("couldn't save event in the event cache: {err}");
-                }
-            }
-
-            Err(err) => {
-                warn!("couldn't save event in the event cache: {err}");
-            }
-        }
     }
 
     /// Return a nice debug string (a vector of lines) for the linked chunk of
@@ -526,63 +401,45 @@ pub(super) struct RoomEventCacheInner {
     /// The room id for this room.
     room_id: OwnedRoomId,
 
-    pub weak_room: WeakRoom,
+    weak_room: WeakRoom,
 
-    /// State for this room's event cache.
-    pub state: LockedRoomEventCacheState,
+    /// The user's own user id.
+    own_user_id: OwnedUserId,
+
+    /// State for this room's cache.
+    state: CacheStateLock<RoomStateSelector>,
 
     /// A notifier that we received a new pagination token.
-    pub pagination_batch_token_notifier: Notify,
+    pagination_batch_token_notifier: Notify,
 
-    pub shared_pagination_status: SharedObservable<SharedPaginationStatus>,
+    shared_pagination_status: SharedObservable<SharedPaginationStatus>,
 
     /// Serializes ordinary, automatic, cache-only, and targeted room
     /// pagination operations.
-    pub pagination_operation_lock: Arc<RwLock<()>>,
+    pagination_operation_lock: Arc<RwLock<()>>,
 
     /// Sender to the auto-shrink channel.
     ///
     /// See doc comment around [`EventCache::auto_shrink_linked_chunk_task`] for
     /// more details.
-    auto_shrink_sender: mpsc::Sender<AutoShrinkChannelPayload>,
+    auto_shrink_sender: mpsc::Sender<AutoShrinkMessage>,
 
     /// Update sender for this room.
     update_sender: RoomEventCacheUpdateSender,
 
+    /// Latest room timeline committed from sync, if any.
     latest_sync_observation: RwLock<Option<RoomTimelineSyncObservation>>,
+
+    /// Monotonic process-local sequence for [`Self::latest_sync_observation`].
     next_sync_observation_sequence: AtomicU64,
 
+    /// One-shot test hook pausing a live-tail commit after the write lock is
+    /// acquired.
     #[cfg(feature = "testing")]
     live_tail_commit_test_hook: std::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl RoomEventCacheInner {
-    /// Creates a new cache for a room, and subscribes to room updates, so as
-    /// to handle new timeline events.
-    fn new(
-        room_id: OwnedRoomId,
-        weak_room: WeakRoom,
-        state: LockedRoomEventCacheState,
-        shared_pagination_status: SharedObservable<SharedPaginationStatus>,
-        auto_shrink_sender: mpsc::Sender<AutoShrinkChannelPayload>,
-        update_sender: RoomEventCacheUpdateSender,
-    ) -> Self {
-        Self {
-            room_id,
-            weak_room,
-            state,
-            update_sender,
-            pagination_batch_token_notifier: Default::default(),
-            pagination_operation_lock: Default::default(),
-            auto_shrink_sender,
-            shared_pagination_status,
-            latest_sync_observation: Default::default(),
-            next_sync_observation_sequence: AtomicU64::new(1),
-            #[cfg(feature = "testing")]
-            live_tail_commit_test_hook: Default::default(),
-        }
-    }
-
     fn handle_account_data(&self, account_data: Vec<Raw<AnyRoomAccountDataEvent>>) {
         if account_data.is_empty() {
             return;
@@ -628,14 +485,14 @@ impl RoomEventCacheInner {
     async fn handle_timeline(
         &self,
         timeline: Timeline,
-        ephemeral_events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+        read_receipts: MaybeReceiptEventContent,
         ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
         avatar_changes: Option<BTreeMap<OwnedUserId, Option<OwnedMxcUri>>>,
     ) -> Result<()> {
         self.handle_timeline_inner(
             self.state.write().await?,
             timeline,
-            ephemeral_events,
+            read_receipts,
             ambiguity_changes,
             avatar_changes,
         )
@@ -656,7 +513,7 @@ impl RoomEventCacheInner {
                 .handle_timeline_inner(
                     state,
                     Timeline { limited: false, prev_batch: None, events: vec![event] },
-                    Vec::new(),
+                    MaybeReceiptEventContent::none(),
                     BTreeMap::new(),
                     None,
                 )
@@ -668,26 +525,25 @@ impl RoomEventCacheInner {
 
     async fn handle_timeline_inner(
         &self,
-        mut state: RoomEventCacheStateLockWriteGuard<'_>,
+        mut state: StateLockWriteGuard<'_, RoomEventCacheState>,
         timeline: Timeline,
-        ephemeral_events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+        read_receipts: MaybeReceiptEventContent,
         ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
         avatar_changes: Option<BTreeMap<OwnedUserId, Option<OwnedMxcUri>>>,
     ) -> Result<()> {
         if timeline.events.is_empty()
             && timeline.prev_batch.is_none()
-            && ephemeral_events.is_empty()
+            && read_receipts.is_none()
             && ambiguity_changes.is_empty()
             && avatar_changes.as_ref().is_none_or(|avatars| avatars.is_empty())
         {
             return Ok(());
         }
 
-        // Add all the events to the backend.
         trace!("adding new events");
 
         let (stored_prev_batch_token, timeline_event_diffs, mut sync_observation) =
-            state.handle_sync(timeline, &ephemeral_events).await?;
+            state.handle_sync(timeline, &read_receipts).await?;
 
         drop(state);
 
@@ -715,9 +571,9 @@ impl RoomEventCacheInner {
             );
         }
 
-        if !ephemeral_events.is_empty() {
+        if let Some(read_receipts) = read_receipts.into_inner() {
             self.update_sender
-                .send(RoomEventCacheUpdate::AddEphemeralEvents { events: ephemeral_events }, None);
+                .send(RoomEventCacheUpdate::AddReadReceiptEvent { event: read_receipts }, None);
         }
 
         if !ambiguity_changes.is_empty() || avatar_changes.as_ref().is_some_and(|c| !c.is_empty()) {
@@ -731,14 +587,6 @@ impl RoomEventCacheInner {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(in super::super) enum PostProcessingOrigin {
-    Sync,
-    Backpagination,
-    #[cfg(feature = "e2e-encryption")]
-    Redecryption,
-}
-
 #[cfg(test)]
 mod tests {
     use matrix_sdk_base::{RoomState, event_cache::Event};
@@ -749,72 +597,7 @@ mod tests {
         room_id, user_id,
     };
 
-    use crate::event_cache::EventFocusThreadMode;
-    use crate::test_utils::{
-        logged_in_client,
-        mocks::{MatrixMockServer, RoomContextResponseTemplate},
-    };
-
-    #[async_test]
-    async fn test_refresh_event_focused_cache_replaces_the_reused_snapshot() {
-        let room_id = room_id!("!focused:example.org");
-        let target_event_id = event_id!("$focused");
-        let server = MatrixMockServer::new().await;
-        let client = server.client_builder().build().await;
-        let factory = EventFactory::new().room(room_id).sender(user_id!("@alice:example.org"));
-        let mode = EventFocusThreadMode::Automatic { hide_threaded_events: false };
-
-        server
-            .mock_room_event_context()
-            .room(room_id)
-            .ok(RoomContextResponseTemplate::new(
-                factory.text_msg("first").event_id(target_event_id).into_event(),
-            ))
-            .mock_once()
-            .mount()
-            .await;
-        let room = server.sync_joined_room(&client, room_id).await;
-        client.event_cache().subscribe().unwrap();
-        let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
-        let first = room_cache
-            .get_or_create_event_focused_cache(target_event_id.to_owned(), 20, mode)
-            .await
-            .unwrap();
-        let (first_events, _) = first.subscribe().await;
-        assert_eq!(
-            first_events[0].kind.raw().get_field::<serde_json::Value>("content").unwrap().and_then(
-                |content| content.get("body").and_then(|body| body.as_str()).map(str::to_owned)
-            ),
-            Some("first".to_owned())
-        );
-
-        server
-            .mock_room_event_context()
-            .room(room_id)
-            .ok(RoomContextResponseTemplate::new(
-                factory.text_msg("second").event_id(target_event_id).into_event(),
-            ))
-            .mock_once()
-            .mount()
-            .await;
-        let refreshed = room_cache
-            .refresh_event_focused_cache(target_event_id.to_owned(), 20, mode)
-            .await
-            .unwrap();
-        let (refreshed_events, _) = refreshed.subscribe().await;
-        assert_eq!(
-            refreshed_events[0]
-                .kind
-                .raw()
-                .get_field::<serde_json::Value>("content")
-                .unwrap()
-                .and_then(|content| content
-                    .get("body")
-                    .and_then(|body| body.as_str())
-                    .map(str::to_owned)),
-            Some("second".to_owned())
-        );
-    }
+    use crate::test_utils::logged_in_client;
 
     #[async_test]
     async fn test_find_event_by_id_with_edit_relation() {
@@ -933,14 +716,18 @@ mod tests {
 
         let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
 
-        // Save the original event.
-        room_event_cache.save_events([original_event]).await;
+        {
+            let mut state = room_event_cache.inner.state.write().await.unwrap();
 
-        // Save the related event.
-        room_event_cache.save_events([related_event]).await;
+            // Save the original event.
+            state.save_events([original_event]).await.unwrap();
 
-        // Save the associated related event, which redacts the related event.
-        room_event_cache.save_events([associated_related_event]).await;
+            // Save the related event.
+            state.save_events([related_event]).await.unwrap();
+
+            // Save the associated related event, which redacts the related event.
+            state.save_events([associated_related_event]).await.unwrap();
+        }
 
         let filter = Some(vec![RelationType::Replacement]);
         let (event, related_events) = room_event_cache
@@ -1000,14 +787,18 @@ mod tests {
 
         let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
 
-        // Save the original event.
-        room_event_cache.save_events([original_event]).await;
+        {
+            let mut state = room_event_cache.inner.state.write().await.unwrap();
 
-        // Save the related event.
-        room_event_cache.save_events([related_event]).await;
+            // Save the original event.
+            state.save_events([original_event]).await.unwrap();
 
-        // Save the associated related event, which redacts the related event.
-        room_event_cache.save_events([associated_related_event]).await;
+            // Save the related event.
+            state.save_events([related_event]).await.unwrap();
+
+            // Save the associated related event, which redacts the related event.
+            state.save_events([associated_related_event]).await.unwrap();
+        }
 
         let (event, related_events) = room_event_cache
             .find_event_with_relations(original_id, None)
@@ -1043,22 +834,28 @@ mod tests {
 
         let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
 
-        // Save the original event.
-        let original_event_id = original_event.event_id().unwrap();
-        room_event_cache.save_events([original_event]).await;
+        let original_event_id = original_event.event_id().unwrap().to_owned();
+        let related_id = related_event.event_id().unwrap().to_owned();
 
-        // Save an unrelated event to check it's not in the related events list.
-        let unrelated_id = event_id!("$2");
-        room_event_cache
-            .save_events([event_factory
-                .text_msg("An unrelated event")
-                .event_id(unrelated_id)
-                .into()])
-            .await;
+        {
+            let mut state = room_event_cache.inner.state.write().await.unwrap();
 
-        // Save the related event.
-        let related_id = related_event.event_id().unwrap();
-        room_event_cache.save_events([related_event]).await;
+            // Save the original event.
+            state.save_events([original_event]).await.unwrap();
+
+            // Save an unrelated event to check it's not in the related events list.
+            let unrelated_id = event_id!("$2");
+            state
+                .save_events([event_factory
+                    .text_msg("An unrelated event")
+                    .event_id(unrelated_id)
+                    .into()])
+                .await
+                .unwrap();
+
+            // Save the related event.
+            state.save_events([related_event]).await.unwrap();
+        }
 
         let (event, related_events) = room_event_cache
             .find_event_with_relations(&original_event_id, None)
@@ -1094,7 +891,7 @@ mod timed_tests {
             lazy_loader::from_all_chunks,
         },
         store::StoreConfig,
-        sync::{JoinedRoomUpdate, Timeline},
+        sync::Timeline,
     };
     use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use matrix_sdk_test::{ALICE, BOB, async_test, event_factory::EventFactory};
@@ -1109,17 +906,16 @@ mod timed_tests {
     use tokio::task::yield_now;
 
     use super::{
-        super::{
-            super::TimelineVectorDiffs, lock::Reload as _,
-            pagination::LoadMoreEventsBackwardsOutcome,
-        },
-        RoomEventCache, RoomEventCacheGenericUpdate, RoomEventCacheUpdate,
+        super::{super::TimelineVectorDiffs, pagination::LoadMoreEventsBackwardsOutcome},
+        MaybeReceiptEventContent, RoomEventCache, RoomEventCacheGenericUpdate,
+        RoomEventCacheUpdate,
     };
     use crate::{assert_let_timeout, test_utils::client::MockClientBuilder};
 
     #[async_test]
     async fn test_write_to_storage() {
         let room_id = room_id!("!galette:saucisse.bzh");
+        let event_id_0 = event_id!("$ev0");
         let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
 
         let event_cache_store = Arc::new(MemoryStore::new());
@@ -1149,11 +945,17 @@ mod timed_tests {
         let timeline = Timeline {
             limited: true,
             prev_batch: Some("raclette".to_owned()),
-            events: vec![f.text_msg("hey yo").sender(*ALICE).into_event()],
+            events: vec![f.text_msg("hey yo").event_id(event_id_0).into_event()],
         };
 
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate { timeline, ..Default::default() })
+            .handle_joined_room_update(
+                timeline,
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1185,9 +987,7 @@ mod timed_tests {
         // Then we have the stored event.
         assert_matches!(chunks.next().unwrap().content(), ChunkContent::Items(events) => {
             assert_eq!(events.len(), 1);
-            let deserialized = events[0].raw().deserialize().unwrap();
-            assert_let!(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(msg)) = deserialized);
-            assert_eq!(msg.as_original().unwrap().content.body(), "hey yo");
+            assert_eq!(events[0].event_id(), Some(event_id_0));
         });
 
         // That's all, folks!
@@ -1232,7 +1032,13 @@ mod timed_tests {
         let timeline = Timeline { limited: false, prev_batch: None, events: vec![ev] };
 
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate { timeline, ..Default::default() })
+            .handle_joined_room_update(
+                timeline,
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1296,8 +1102,8 @@ mod timed_tests {
         let event_id1 = event_id!("$1");
         let event_id2 = event_id!("$2");
 
-        let ev1 = f.text_msg("hello world").sender(*ALICE).event_id(event_id1).into_event();
-        let ev2 = f.text_msg("how's it going").sender(*BOB).event_id(event_id2).into_event();
+        let ev1 = f.text_msg("hello world").event_id(event_id1).into_event();
+        let ev2 = f.text_msg("how's it going").event_id(event_id2).into_event();
 
         // Prefill the store with some data.
         event_cache_store
@@ -1366,7 +1172,7 @@ mod timed_tests {
         let (items, mut stream) = room_event_cache.subscribe().await.unwrap();
         let mut generic_stream = event_cache.subscribe_to_room_generic_updates();
 
-        // The rooms knows about all cached events.
+        // The room knows about all cached events.
         {
             assert!(room_event_cache.find_event(event_id1).await.unwrap().is_some());
             assert!(room_event_cache.find_event(event_id2).await.unwrap().is_some());
@@ -1406,7 +1212,7 @@ mod timed_tests {
         }
 
         // After clearing,…
-        room_event_cache.clear().await.unwrap();
+        event_cache.clear_all_rooms().await.unwrap();
 
         //… we get an update that the content has been cleared.
         assert_let_timeout!(
@@ -1423,25 +1229,21 @@ mod timed_tests {
         assert_eq!(received_room_id, room_id);
         assert!(generic_stream.is_empty());
 
-        // Events individually are not forgotten by the event cache, after clearing a
-        // room.
-        assert!(room_event_cache.find_event(event_id1).await.unwrap().is_some());
+        // Events are forgotten by the event cache, after clearing a room.
+        assert!(room_event_cache.find_event(event_id1).await.unwrap().is_none());
 
-        // But their presence in a linked chunk is forgotten.
+        // And their presence in a linked chunk is forgotten.
         let items = room_event_cache.events().await.unwrap();
         assert!(items.is_empty());
 
-        // The event cache store too.
-        let linked_chunk = from_all_chunks::<3, _, _>(
-            event_cache_store.load_all_chunks(LinkedChunkId::Room(room_id)).await.unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-
-        // Note: while the event cache store could return `None` here, clearing it will
-        // reset it to its initial form, maintaining the invariant that it
-        // contains a single items chunk that's empty.
-        assert_eq!(linked_chunk.num_items(), 0);
+        // The event cache store is fully empty.
+        assert!(
+            event_cache_store
+                .load_all_chunks(LinkedChunkId::Room(room_id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[async_test]
@@ -1573,7 +1375,13 @@ mod timed_tests {
         let timeline = Timeline { limited: false, prev_batch: None, events: vec![ev2] };
 
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate { timeline, ..Default::default() })
+            .handle_joined_room_update(
+                timeline,
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1679,14 +1487,17 @@ mod timed_tests {
         // Propagate an update including a limited timeline with one message and a
         // prev-batch token.
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate {
-                timeline: Timeline {
+            .handle_joined_room_update(
+                Timeline {
                     limited: true,
                     prev_batch: Some("raclette".to_owned()),
                     events: vec![f.text_msg("hey yo").into_event()],
                 },
-                ..Default::default()
-            })
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1745,14 +1556,17 @@ mod timed_tests {
         // Now, propagate an update for another message, but the timeline isn't limited
         // this time.
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate {
-                timeline: Timeline {
+            .handle_joined_room_update(
+                Timeline {
                     limited: false,
                     prev_batch: Some("fondue".to_owned()),
                     events: vec![f.text_msg("sup").into_event()],
                 },
-                ..Default::default()
-            })
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1847,7 +1661,7 @@ mod timed_tests {
         // Sanity check: lazily loaded, so only includes one item at start.
         let (events, mut stream) = room_event_cache.subscribe().await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_id().as_deref(), Some(evid2));
+        assert_eq!(events[0].event_id(), Some(evid2));
         assert!(stream.is_empty());
 
         let mut generic_stream = event_cache.subscribe_to_room_generic_updates();
@@ -1855,7 +1669,7 @@ mod timed_tests {
         // Force loading the full linked chunk by back-paginating.
         let outcome = room_event_cache.pagination().run_backwards_once(20).await.unwrap();
         assert_eq!(outcome.events.len(), 1);
-        assert_eq!(outcome.events[0].event_id().as_deref(), Some(evid1));
+        assert_eq!(outcome.events[0].event_id(), Some(evid1));
         assert!(outcome.reached_start);
 
         // We also get an update about the loading from the store.
@@ -1865,7 +1679,7 @@ mod timed_tests {
         );
         assert_eq!(diffs.len(), 1);
         assert_matches!(&diffs[0], VectorDiff::Insert { index: 0, value } => {
-            assert_eq!(value.event_id().as_deref(), Some(evid1));
+            assert_eq!(value.event_id(), Some(evid1));
         });
 
         assert!(stream.is_empty());
@@ -1881,10 +1695,7 @@ mod timed_tests {
         room_event_cache
             .inner
             .state
-            .write()
-            .await
-            .unwrap()
-            .reload()
+            .reload_no_preprocessing()
             .await
             .expect("shrinking should succeed");
 
@@ -1897,7 +1708,7 @@ mod timed_tests {
         assert_matches!(&diffs[0], VectorDiff::Clear);
         assert_matches!(&diffs[1], VectorDiff::Append { values} => {
             assert_eq!(values.len(), 1);
-            assert_eq!(values[0].event_id().as_deref(), Some(evid2));
+            assert_eq!(values[0].event_id(), Some(evid2));
         });
 
         assert!(stream.is_empty());
@@ -1909,13 +1720,13 @@ mod timed_tests {
         // When reading the events, we do get only the last one.
         let events = room_event_cache.events().await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_id().as_deref(), Some(evid2));
+        assert_eq!(events[0].event_id(), Some(evid2));
 
         // But if we back-paginate, we don't need access to network to find out about
         // the previous event.
         let outcome = room_event_cache.pagination().run_backwards_once(20).await.unwrap();
         assert_eq!(outcome.events.len(), 1);
-        assert_eq!(outcome.events[0].event_id().as_deref(), Some(evid1));
+        assert_eq!(outcome.events[0].event_id(), Some(evid1));
         assert!(outcome.reached_start);
     }
 
@@ -2000,7 +1811,7 @@ mod timed_tests {
             let mut events = room_linked_chunk.events();
             let (pos, ev) = events.next().unwrap();
             assert_eq!(pos, Position::new(ChunkIdentifier::new(1), 0));
-            assert_eq!(ev.event_id().as_deref(), Some(evid3));
+            assert_eq!(ev.event_id(), Some(evid3));
             assert_eq!(room_linked_chunk.event_order(pos), Some(2));
 
             // No other loaded events.
@@ -2028,14 +1839,17 @@ mod timed_tests {
         // events.
         let evid4 = event_id!("$4");
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate {
-                timeline: Timeline {
+            .handle_joined_room_update(
+                Timeline {
                     limited: true,
                     prev_batch: Some("fondue".to_owned()),
                     events: vec![ev3, f.text_msg("sup").event_id(evid4).into_event()],
                 },
-                ..Default::default()
-            })
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -2047,11 +1861,11 @@ mod timed_tests {
             let mut events = room_linked_chunk.events();
 
             let (pos, ev) = events.next().unwrap();
-            assert_eq!(ev.event_id().as_deref(), Some(evid3));
+            assert_eq!(ev.event_id(), Some(evid3));
             assert_eq!(room_linked_chunk.event_order(pos), Some(2));
 
             let (pos, ev) = events.next().unwrap();
-            assert_eq!(ev.event_id().as_deref(), Some(evid4));
+            assert_eq!(ev.event_id(), Some(evid4));
             assert_eq!(room_linked_chunk.event_order(pos), Some(3));
 
             // No other loaded events.
@@ -2136,7 +1950,7 @@ mod timed_tests {
         // Sanity check: lazily loaded, so only includes one item at start.
         let (events1, mut stream1) = room_event_cache.subscribe().await.unwrap();
         assert_eq!(events1.len(), 1);
-        assert_eq!(events1[0].event_id().as_deref(), Some(evid2));
+        assert_eq!(events1[0].event_id(), Some(evid2));
         assert!(stream1.is_empty());
 
         let mut generic_stream = event_cache.subscribe_to_room_generic_updates();
@@ -2144,7 +1958,7 @@ mod timed_tests {
         // Force loading the full linked chunk by back-paginating.
         let outcome = room_event_cache.pagination().run_backwards_once(20).await.unwrap();
         assert_eq!(outcome.events.len(), 1);
-        assert_eq!(outcome.events[0].event_id().as_deref(), Some(evid1));
+        assert_eq!(outcome.events[0].event_id(), Some(evid1));
         assert!(outcome.reached_start);
 
         // We also get an update about the loading from the store. Ignore it, for this
@@ -2155,7 +1969,7 @@ mod timed_tests {
         );
         assert_eq!(diffs.len(), 1);
         assert_matches!(&diffs[0], VectorDiff::Insert { index: 0, value } => {
-            assert_eq!(value.event_id().as_deref(), Some(evid1));
+            assert_eq!(value.event_id(), Some(evid1));
         });
 
         assert!(stream1.is_empty());
@@ -2171,9 +1985,15 @@ mod timed_tests {
         // the second subscribers sees them all.
         let (events2, stream2) = room_event_cache.subscribe().await.unwrap();
         assert_eq!(events2.len(), 2);
-        assert_eq!(events2[0].event_id().as_deref(), Some(evid1));
-        assert_eq!(events2[1].event_id().as_deref(), Some(evid2));
+        assert_eq!(events2[0].event_id(), Some(evid1));
+        assert_eq!(events2[1].event_id(), Some(evid2));
         assert!(stream2.is_empty());
+
+        // Grab a receiver for testing no diffs is sent.
+        let subscriber = {
+            let state = room_event_cache.inner.state.read().await.unwrap();
+            state.update_sender.new_room_receiver()
+        };
 
         // Drop the first stream, and wait a bit.
         drop(stream1);
@@ -2191,13 +2011,17 @@ mod timed_tests {
         {
             // Check the inner state: there's no more shared auto-shrinker.
             let state = room_event_cache.inner.state.read().await.unwrap();
-            assert_eq!(state.subscriber_count().load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(state.subscribers_handle().count(), 0);
+
+            // No diff is sent when the linked chunk has auto-shrunk.
+            assert!(subscriber.is_empty());
+            assert!(generic_stream.is_empty());
         }
 
         // Getting the events will only give us the latest chunk.
         let events3 = room_event_cache.events().await.unwrap();
         assert_eq!(events3.len(), 1);
-        assert_eq!(events3[0].event_id().as_deref(), Some(evid2));
+        assert_eq!(events3[0].event_id(), Some(evid2));
     }
 
     #[async_test]
@@ -2269,7 +2093,7 @@ mod timed_tests {
         assert_matches!(
             room_event_cache
                 .rfind_map_event_in_memory_by(|event| {
-                    (event.sender().as_deref() == Some(*BOB)).then(|| event.event_id())
+                    (event.sender().as_deref() == Some(*BOB)).then(|| event.event_id().map(ToOwned::to_owned))
                 })
                 .await,
             Ok(Some(event_id)) => {
@@ -2282,7 +2106,7 @@ mod timed_tests {
         assert_matches!(
             room_event_cache
                 .rfind_map_event_in_memory_by(|event| {
-                    (event.sender().as_deref() == Some(*ALICE)).then(|| event.event_id())
+                    (event.sender().as_deref() == Some(*ALICE)).then(|| event.event_id().map(ToOwned::to_owned))
                 })
                 .await,
             Ok(Some(event_id)) => {
@@ -2294,7 +2118,8 @@ mod timed_tests {
         assert!(
             room_event_cache
                 .rfind_map_event_in_memory_by(|event| {
-                    (event.sender().as_deref() == Some(user_id)).then(|| event.event_id())
+                    (event.sender().as_deref() == Some(user_id))
+                        .then(|| event.event_id().map(ToOwned::to_owned))
                 })
                 .await
                 .unwrap()
@@ -2410,7 +2235,7 @@ mod timed_tests {
 
             // Initial updates contain `ev_id_1` only.
             assert_eq!(initial_updates.len(), 1);
-            assert_eq!(initial_updates[0].event_id().as_deref(), Some(ev_id_1));
+            assert_eq!(initial_updates[0].event_id(), Some(ev_id_1));
             assert!(updates_stream.is_empty());
 
             // `ev_id_1` must be loaded in memory.
@@ -2430,7 +2255,7 @@ mod timed_tests {
                     assert_matches!(
                         &diffs[0],
                         VectorDiff::Insert { index: 0, value: event } => {
-                            assert_eq!(event.event_id().as_deref(), Some(ev_id_0));
+                            assert_eq!(event.event_id(), Some(ev_id_0));
                         }
                     );
                 }
@@ -2450,7 +2275,7 @@ mod timed_tests {
 
             // Initial updates contain `ev_id_1` only.
             assert_eq!(initial_updates.len(), 1);
-            assert_eq!(initial_updates[0].event_id().as_deref(), Some(ev_id_1));
+            assert_eq!(initial_updates[0].event_id(), Some(ev_id_1));
             assert!(updates_stream.is_empty());
 
             // `ev_id_1` must be loaded in memory.
@@ -2470,7 +2295,7 @@ mod timed_tests {
                     assert_matches!(
                         &diffs[0],
                         VectorDiff::Insert { index: 0, value: event } => {
-                            assert_eq!(event.event_id().as_deref(), Some(ev_id_0));
+                            assert_eq!(event.event_id(), Some(ev_id_0));
                         }
                     );
                 }
@@ -2508,7 +2333,7 @@ mod timed_tests {
                             &diffs[1],
                             VectorDiff::Append { values: events } => {
                                 assert_eq!(events.len(), 1);
-                                assert_eq!(events[0].event_id().as_deref(), Some(ev_id_1));
+                                assert_eq!(events[0].event_id(), Some(ev_id_1));
                             }
                         );
                     }
@@ -2528,7 +2353,7 @@ mod timed_tests {
                         assert_matches!(
                             &diffs[0],
                             VectorDiff::Insert { index: 0, value: event } => {
-                                assert_eq!(event.event_id().as_deref(), Some(ev_id_0));
+                                assert_eq!(event.event_id(), Some(ev_id_0));
                             }
                         );
                     }
@@ -2559,7 +2384,7 @@ mod timed_tests {
                             &diffs[1],
                             VectorDiff::Append { values: events } => {
                                 assert_eq!(events.len(), 1);
-                                assert_eq!(events[0].event_id().as_deref(), Some(ev_id_1));
+                                assert_eq!(events[0].event_id(), Some(ev_id_1));
                             }
                         );
                     }
@@ -2579,7 +2404,7 @@ mod timed_tests {
                         assert_matches!(
                             &diffs[0],
                             VectorDiff::Insert { index: 0, value: event } => {
-                                assert_eq!(event.event_id().as_deref(), Some(ev_id_0));
+                                assert_eq!(event.event_id(), Some(ev_id_0));
                             }
                         );
                     }
@@ -2613,7 +2438,7 @@ mod timed_tests {
                             &diffs[1],
                             VectorDiff::Append { values: events } => {
                                 assert_eq!(events.len(), 1);
-                                assert_eq!(events[0].event_id().as_deref(), Some(ev_id_1));
+                                assert_eq!(events[0].event_id(), Some(ev_id_1));
                             }
                         );
                     }
@@ -2640,7 +2465,7 @@ mod timed_tests {
                         assert_matches!(
                             &diffs[0],
                             VectorDiff::Insert { index: 0, value: event } => {
-                                assert_eq!(event.event_id().as_deref(), Some(ev_id_0));
+                                assert_eq!(event.event_id(), Some(ev_id_0));
                             }
                         );
                     }
@@ -2669,7 +2494,7 @@ mod timed_tests {
                             &diffs[1],
                             VectorDiff::Append { values: events } => {
                                 assert_eq!(events.len(), 1);
-                                assert_eq!(events[0].event_id().as_deref(), Some(ev_id_1));
+                                assert_eq!(events[0].event_id(), Some(ev_id_1));
                             }
                         );
                     }
@@ -2696,7 +2521,7 @@ mod timed_tests {
                         assert_matches!(
                             &diffs[0],
                             VectorDiff::Insert { index: 0, value: event } => {
-                                assert_eq!(event.event_id().as_deref(), Some(ev_id_0));
+                                assert_eq!(event.event_id(), Some(ev_id_0));
                             }
                         );
                     }
@@ -2725,7 +2550,7 @@ mod timed_tests {
                             &diffs[1],
                             VectorDiff::Append { values: events } => {
                                 assert_eq!(events.len(), 1);
-                                assert_eq!(events[0].event_id().as_deref(), Some(ev_id_1));
+                                assert_eq!(events[0].event_id(), Some(ev_id_1));
                             }
                         );
                     }
@@ -2749,7 +2574,7 @@ mod timed_tests {
                         assert_matches!(
                             &diffs[0],
                             VectorDiff::Insert { index: 0, value: event } => {
-                                assert_eq!(event.event_id().as_deref(), Some(ev_id_0));
+                                assert_eq!(event.event_id(), Some(ev_id_0));
                             }
                         );
                     }
@@ -2775,7 +2600,7 @@ mod timed_tests {
                             &diffs[1],
                             VectorDiff::Append { values: events } => {
                                 assert_eq!(events.len(), 1);
-                                assert_eq!(events[0].event_id().as_deref(), Some(ev_id_1));
+                                assert_eq!(events[0].event_id(), Some(ev_id_1));
                             }
                         );
                     }
@@ -2799,7 +2624,7 @@ mod timed_tests {
                         assert_matches!(
                             &diffs[0],
                             VectorDiff::Insert { index: 0, value: event } => {
-                                assert_eq!(event.event_id().as_deref(), Some(ev_id_0));
+                                assert_eq!(event.event_id(), Some(ev_id_0));
                             }
                         );
                     }
@@ -2893,7 +2718,7 @@ mod timed_tests {
         event_cache.subscribe().unwrap();
 
         let mut generic_stream = event_cache.subscribe_to_room_generic_updates();
-        let (room_event_cache, _drop_handles) = event_cache.for_room(room_id).await.unwrap();
+        let (room_event_cache, _drop_handles) = event_cache.room(room_id).await.unwrap();
         let (events, mut stream) = room_event_cache.subscribe().await.unwrap();
 
         assert!(events.is_empty());
@@ -2913,7 +2738,13 @@ mod timed_tests {
         let account_data = vec![read_marker_event; 100];
 
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate { account_data, ..Default::default() })
+            .handle_joined_room_update(
+                Default::default(),
+                MaybeReceiptEventContent::none(),
+                account_data,
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -2932,7 +2763,7 @@ mod timed_tests {
     async fn event_loaded(room_event_cache: &RoomEventCache, event_id: &EventId) -> bool {
         room_event_cache
             .rfind_map_event_in_memory_by(|event| {
-                (event.event_id().as_deref() == Some(event_id)).then_some(())
+                (event.event_id() == Some(event_id)).then_some(())
             })
             .await
             .unwrap()

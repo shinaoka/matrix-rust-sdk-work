@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 // The http mocking library is not supported for wasm32
 #![cfg(not(target_family = "wasm"))]
 use matrix_sdk::test_utils::logged_in_client_with_server;
@@ -8,6 +9,8 @@ use wiremock::{
 };
 
 mod account;
+#[cfg(feature = "unstable-msc4426")]
+mod automatic_call_status;
 mod client;
 mod edit_validation;
 #[cfg(feature = "e2e-encryption")]

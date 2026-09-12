@@ -50,7 +50,7 @@ use super::{
             BackPaginationOutcome, LoadMoreEventsBackwardsOutcome, PaginatedCache, Pagination,
         },
     },
-    PostProcessingOrigin, RoomEventCacheInner, RoomEventCacheUpdate,
+    RoomEventCacheInner, RoomEventCacheUpdate,
 };
 use crate::{event_cache::caches::pagination::SharedPaginationStatus, room::MessagesOptions};
 
@@ -359,13 +359,15 @@ pub(super) fn inspect_ordered_chunks(
                     chunks[..index].iter().rev().find_map(|chunk| match &chunk.content {
                         ChunkContent::Gap(_) => None,
                         ChunkContent::Items(events) => {
-                            events.iter().rev().find_map(Event::event_id)
+                            events.iter().rev().find_map(|event| event.event_id().map(|id| id.to_owned()))
                         }
                     });
                 let newer_event_id =
                     chunks[index + 1..].iter().find_map(|chunk| match &chunk.content {
                         ChunkContent::Gap(_) => None,
-                        ChunkContent::Items(events) => events.iter().find_map(Event::event_id),
+                        ChunkContent::Items(events) => {
+                            events.iter().find_map(|event| event.event_id().map(|id| id.to_owned()))
+                        }
                     });
                 Some((chunk.identifier, gap.token.clone(), older_event_id, newer_event_id))
             }
@@ -866,13 +868,7 @@ impl RoomPagination {
         // `post_process_new_events` begins by flushing the linked-chunk updates
         // to the EventCacheStore. The persisted inspection below therefore
         // proves the repair survives cache reconstruction.
-        state
-            .post_process_new_events(
-                topo_ordered_events,
-                PostProcessingOrigin::Backpagination,
-                None,
-            )
-            .await?;
+        state.post_process_upserted_events(topo_ordered_events.iter(), None).await?;
         let timeline_event_diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
         let persisted_after =
             state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
@@ -1128,8 +1124,7 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
             });
         }
 
-        let prev_first_chunk =
-            state.room_linked_chunk().chunks().next().expect("a linked chunk is never empty");
+        let prev_first_chunk = state.room_linked_chunk().first_chunk();
 
         // The first chunk is not a gap, we can load its previous chunk.
         let linked_chunk_id = LinkedChunkId::Room(&state.state.room_id);
@@ -1319,18 +1314,14 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
             in_memory_duplicated_event_ids,
             in_store_duplicated_event_ids,
             non_empty_all_duplicates: all_duplicates,
-        } = {
-            let room_linked_chunk = state.room_linked_chunk();
-
-            filter_duplicate_events(
-                &state.state.own_user_id,
-                &state.store,
-                LinkedChunkId::Room(&state.state.room_id),
-                room_linked_chunk,
-                events,
-            )
-            .await?
-        };
+        } = filter_duplicate_events(
+            &state.state.own_user_id,
+            &state.store,
+            LinkedChunkId::Room(&state.state.room_id),
+            state.room_linked_chunk(),
+            events,
+        )
+        .await?;
 
         // If not all the events have been back-paginated, we need to remove the
         // previous ones, otherwise we can end up with misordered events.
@@ -1362,12 +1353,15 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
         // the inverted order; reorder them.
         let topo_ordered_events = events.iter().rev().cloned().collect::<Vec<_>>();
 
-        let new_gap = new_token.map(|prev_token| Gap { token: prev_token });
+        let new_gap = new_token.as_ref().map(|prev_token| Gap { token: prev_token.clone() });
         let reached_start = state.room_linked_chunk_mut().push_backwards_pagination_events(
             prev_gap_id,
             new_gap,
             &topo_ordered_events,
         );
+
+        // Update the store.
+        state.propagate_changes().await?;
 
         // A back-pagination can't include new read receipt events, as those are
         // ephemeral events not included in /messages responses, so we can
@@ -1378,14 +1372,8 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
         // receipt.
         let receipt_event = None;
 
-        // Note: this flushes updates to the store.
-        state
-            .post_process_new_events(
-                topo_ordered_events,
-                PostProcessingOrigin::Backpagination,
-                receipt_event,
-            )
-            .await?;
+        // Post-process newly inserted events.
+        state.post_process_upserted_events(topo_ordered_events.iter(), receipt_event).await?;
 
         let timeline_event_diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
 
@@ -1400,5 +1388,11 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
         }
 
         Ok(Some(BackPaginationOutcome { events, reached_start }))
+    }
+}
+
+impl fmt::Debug for RoomPagination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("RoomPagination").finish_non_exhaustive()
     }
 }

@@ -15,7 +15,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use matrix_sdk_base::crypto::types::events::UtdCause;
-use ruma::events::{MessageLikeEventContent, room::MediaSource as RumaMediaSource};
+use ruma::events::{
+    MessageLikeEventContent, MessageLikeEventType, room::MediaSource as RumaMediaSource,
+};
 
 use super::{
     content::{BeaconInfo, LiveLocationContent, Reaction},
@@ -23,7 +25,6 @@ use super::{
 };
 use crate::{
     error::ClientError,
-    event::MessageLikeEventType,
     ruma::{ImageInfo, MediaSource, MediaSourceExt, Mentions, MessageType, PollKind},
     timeline::content::ReactionSenderData,
     utils::Timestamp,
@@ -194,7 +195,7 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
             },
             Kind::Other(other) => Self {
                 kind: MsgLikeKind::Other {
-                    event_type: MessageLikeEventType::Other(other.event_type().to_string()),
+                    event_type: MessageLikeEventType::from(other.event_type().to_string()),
                 },
                 reactions,
                 in_reply_to,
@@ -289,11 +290,6 @@ pub struct PollAnswer {
 pub struct ThreadSummary {
     pub latest_event: EmbeddedEventDetails,
     pub num_replies: u32,
-    /// The user's own public read receipt event id, for this particular thread.
-    pub public_read_receipt_event_id: Option<String>,
-    /// The user's own private read receipt event id, for this particular
-    /// thread.
-    pub private_read_receipt_event_id: Option<String>,
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -312,10 +308,6 @@ impl From<matrix_sdk_ui::timeline::ThreadSummary> for ThreadSummary {
         Self {
             latest_event: EmbeddedEventDetails::from(value.latest_event),
             num_replies: value.num_replies,
-            public_read_receipt_event_id: value.public_read_receipt_event_id.map(|v| v.to_string()),
-            private_read_receipt_event_id: value
-                .private_read_receipt_event_id
-                .map(|v| v.to_string()),
         }
     }
 }

@@ -109,6 +109,9 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::SpaceChild, "*"),
     // Required for live location sharing to work - beacon events reference this state.
     (StateEventType::BeaconInfo, "*"),
+    // Required for `Room::retention`/`Room::effective_retention` (MSC1763) to see
+    // room-level retention overrides.
+    (StateEventType::RoomRetention, ""),
 ];
 
 /// The default `required_state` constant value for sliding sync room
@@ -323,6 +326,9 @@ impl RoomListService {
                 rooms: Some(vec![http::request::ExtensionRoomConfig::AllSubscribed])
             }))
             .with_typing_extension(assign!(http::request::Typing::default(), {
+                enabled: Some(true),
+            }))
+            .with_profiles_extension(assign!(http::request::Profiles::default(), {
                 enabled: Some(true),
             }));
 
@@ -688,7 +694,7 @@ impl RoomListService {
         self.client.get_room(room_id).ok_or_else(|| Error::RoomNotFound(room_id.to_owned()))
     }
 
-    /// Subscribe to rooms.
+    /// Set the room subscriptions to exactly `room_ids`.
     ///
     /// It means that all events from these rooms will be received every time,
     /// no matter how the `RoomList` is configured.
@@ -697,12 +703,67 @@ impl RoomListService {
     /// room in `room_ids`, so that the [`LatestEventValue`] will automatically
     /// be calculated and updated for these rooms, for free.
     ///
-    /// All previous room subscriptions will be forgotten.
-    ///
     /// [listen_to_room]: matrix_sdk::latest_events::LatestEvents::listen_to_room
     /// [`LatestEventValue`]: matrix_sdk::latest_events::LatestEventValue
-    pub async fn subscribe_to_rooms(&self, room_ids: &[&RoomId]) {
-        self.subscribe_to_rooms_with_generation(room_ids).await;
+    pub async fn set_room_subscriptions(&self, room_ids: &[&RoomId]) {
+        // Read the state before the await: the state machine can drift meanwhile.
+        let cancel_in_flight_request = self.must_cancel_in_flight_request();
+
+        self.listen_to_latest_events(room_ids).await;
+
+        self.sliding_sync.set_room_subscriptions(
+            room_ids,
+            Some(room_subscription_settings()),
+            cancel_in_flight_request,
+        )
+    }
+
+    /// Remove the room subscriptions of `room_ids`.
+    ///
+    /// The latest events of these rooms are still listened to.
+    pub fn remove_room_subscriptions(&self, room_ids: &[&RoomId]) {
+        self.sliding_sync.remove_room_subscriptions(room_ids, self.must_cancel_in_flight_request())
+    }
+
+    /// Remove all the room subscriptions, then subscribe to `room_ids`.
+    ///
+    /// Contrary to [`Self::set_room_subscriptions`], the members of every room
+    /// of `room_ids` are marked as missing, so that they are re-fetched.
+    pub async fn reset_and_add_room_subscriptions(&self, room_ids: &[&RoomId]) {
+        // Read the state before the await: the state machine can drift meanwhile.
+        let cancel_in_flight_request = self.must_cancel_in_flight_request();
+
+        self.listen_to_latest_events(room_ids).await;
+
+        self.sliding_sync.reset_and_add_room_subscriptions(
+            room_ids,
+            Some(room_subscription_settings()),
+            cancel_in_flight_request,
+        )
+    }
+
+    async fn listen_to_latest_events(&self, room_ids: &[&RoomId]) {
+        if !self.client.event_cache().has_subscribed() {
+            return;
+        }
+
+        let latest_events = self.client.latest_events().await;
+
+        for room_id in room_ids {
+            if let Err(error) = latest_events.listen_to_room(room_id).await {
+                // A failure here must not fail the room subscription.
+                error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+            }
+        }
+    }
+
+    fn must_cancel_in_flight_request(&self) -> bool {
+        match self.state_machine.get() {
+            State::Init | State::Recovering | State::Error { .. } | State::Terminated { .. } => {
+                false
+            }
+            State::SettingUp | State::Running => true,
+        }
     }
 
     /// Replace room subscriptions and return their process-local generation.
@@ -731,40 +792,10 @@ impl RoomListService {
         &self,
         room_ids: &[&RoomId],
     ) -> RoomSubscriptionReconcile {
-        // Calculate the settings for the room subscriptions.
-        let settings = assign!(http::request::RoomSubscription::default(), {
-            required_state: required_state_for_user(DEFAULT_REQUIRED_STATE, self.client.user_id())
-            .into_iter()
-            .chain(
-                DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
-                    (state_event.clone(), (*value).to_owned())
-                })
-            )
-            .collect(),
-            timeline_limit: UInt::from(DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT),
-        });
+        // Read the state before the await: the state machine can drift meanwhile.
+        let cancel_in_flight_request = self.must_cancel_in_flight_request();
 
-        // Decide whether the in-flight request (if any) should be cancelled if needed.
-        let cancel_in_flight_request = match self.state_machine.get() {
-            State::Init | State::Recovering | State::Error { .. } | State::Terminated { .. } => {
-                false
-            }
-            State::SettingUp | State::Running => true,
-        };
-
-        // Before subscribing, let's listen these rooms to calculate their latest
-        // events.
-        if self.client.event_cache().has_subscribed() {
-            let latest_events = self.client.latest_events().await;
-
-            for room_id in room_ids {
-                if latest_events.listen_to_room(room_id).await.is_err() {
-                    // Closed-token only: never log the room id or the raw error.
-                    // The failure is unlikely and must not fail the subscribe.
-                    error!("room subscription latest-event listener failed");
-                }
-            }
-        }
+        self.listen_to_latest_events(room_ids).await;
 
         let desired: BTreeSet<OwnedRoomId> =
             room_ids.iter().map(|room_id| (*room_id).to_owned()).collect();
@@ -772,77 +803,77 @@ impl RoomListService {
         // Reconcile under the same lock used by iteration capture and
         // publication commit: no observer can observe an intermediate set or a
         // mismatched generation/checkpoint view.
-        let result = {
-            let mut state = self.room_subscription_state.lock().unwrap();
-            // The authoritative delta is computed by the Sliding Sync
-            // primitive under its subscription write lock, so a session
-            // expiry (UnknownPos) that cleared the map without touching the
-            // logical active set is detected as a change with no read/write
-            // race.
-            let desired_refs: Vec<&RoomId> =
-                desired.iter().map(|room_id| room_id.as_ref()).collect();
-            let delta = self.sliding_sync.reconcile_subscriptions(
-                &desired_refs,
-                Some(settings),
-                cancel_in_flight_request,
-            );
+        let mut state = self.room_subscription_state.lock().unwrap();
 
-            if !delta.changed {
-                // A session expiry can clear the actual map while the logical
-                // set and checkpoints still describe the pre-expiry rooms;
-                // bring them in line even on the no-op path.
-                state.active_rooms = desired.clone();
-                let checkpoints = self.room_subscription_checkpoints.get();
-                let retained_checkpoints: BTreeMap<_, _> = (*checkpoints)
-                    .iter()
-                    .filter(|(room_id, _)| delta.retained.contains(*room_id))
-                    .map(|(room_id, checkpoint)| (room_id.clone(), checkpoint.clone()))
-                    .collect();
-                let checkpoints_retained = !retained_checkpoints.is_empty();
-                // set_if_not_eq: an ordinary identical-set reconcile must not
-                // emit checkpoint-channel churn; an expiry repair that actually
-                // changes the map still notifies.
-                self.room_subscription_checkpoints.set_if_not_eq(Arc::new(retained_checkpoints));
-                return RoomSubscriptionReconcile {
-                    generation: RoomSubscriptionGeneration(state.generation),
-                    noop: true,
-                    added: 0,
-                    removed: 0,
-                    retained: delta.retained.len(),
-                    checkpoints_retained,
-                    added_rooms: BTreeSet::new(),
-                    retained_rooms: delta.retained.clone(),
-                };
-            }
+        // The standard Sliding Sync API applies the desired set; read the actual
+        // subscribed set before and after. A session expiry (UnknownPos) can clear
+        // the actual map without touching the logical active set, which shows up
+        // as an addition here.
+        let before = self.sliding_sync.subscribed_rooms();
 
-            state.generation = state.generation.wrapping_add(1).max(1);
+        self.sliding_sync.set_room_subscriptions(
+            room_ids,
+            Some(room_subscription_settings()),
+            cancel_in_flight_request,
+        );
+
+        let after = self.sliding_sync.subscribed_rooms();
+        let added: BTreeSet<OwnedRoomId> = after.difference(&before).cloned().collect();
+        let removed: BTreeSet<OwnedRoomId> = before.difference(&after).cloned().collect();
+        let retained: BTreeSet<OwnedRoomId> = before.intersection(&after).cloned().collect();
+        let noop = before == desired && after == desired;
+
+        if noop {
             state.active_rooms = desired;
-
-            // Retain checkpoints only for rooms still subscribed after this
-            // reconciliation; added and removed rooms lose theirs.
             let checkpoints = self.room_subscription_checkpoints.get();
             let retained_checkpoints: BTreeMap<_, _> = (*checkpoints)
                 .iter()
-                .filter(|(room_id, _)| delta.retained.contains(*room_id))
+                .filter(|(room_id, _)| retained.contains(*room_id))
                 .map(|(room_id, checkpoint)| (room_id.clone(), checkpoint.clone()))
                 .collect();
             let checkpoints_retained = !retained_checkpoints.is_empty();
+            // set_if_not_eq: an ordinary identical-set reconcile must not emit
+            // checkpoint-channel churn; an expiry repair that actually changes the
+            // map still notifies.
             self.room_subscription_checkpoints.set_if_not_eq(Arc::new(retained_checkpoints));
-
-            RoomSubscriptionReconcile {
+            return RoomSubscriptionReconcile {
                 generation: RoomSubscriptionGeneration(state.generation),
-                noop: false,
-                added: delta.added.len(),
-                removed: delta.removed.len(),
-                retained: delta.retained.len(),
+                noop: true,
+                added: 0,
+                removed: 0,
+                retained: retained.len(),
                 checkpoints_retained,
-                added_rooms: delta.added,
-                retained_rooms: delta.retained,
-            }
-        };
+                added_rooms: BTreeSet::new(),
+                retained_rooms: retained,
+            };
+        }
 
-        result
+        state.generation = state.generation.wrapping_add(1).max(1);
+        state.active_rooms = desired;
+
+        // Retain checkpoints only for rooms still subscribed after this
+        // reconciliation; added and removed rooms lose theirs.
+        let checkpoints = self.room_subscription_checkpoints.get();
+        let retained_checkpoints: BTreeMap<_, _> = (*checkpoints)
+            .iter()
+            .filter(|(room_id, _)| retained.contains(*room_id))
+            .map(|(room_id, checkpoint)| (room_id.clone(), checkpoint.clone()))
+            .collect();
+        let checkpoints_retained = !retained_checkpoints.is_empty();
+        self.room_subscription_checkpoints.set_if_not_eq(Arc::new(retained_checkpoints));
+
+        RoomSubscriptionReconcile {
+            generation: RoomSubscriptionGeneration(state.generation),
+            noop: false,
+            added: added.len(),
+            removed: removed.len(),
+            retained: retained.len(),
+            checkpoints_retained,
+            added_rooms: added,
+            retained_rooms: retained,
+        }
     }
+
 
     /// The actual Sliding Sync subscribed-room set (the authoritative request
     /// state, which a session expiry can clear independently of the logical
@@ -977,6 +1008,21 @@ impl RoomListService {
     pub fn sliding_sync_for_testing(&self) -> &SlidingSync {
         &self.sliding_sync
     }
+}
+
+fn room_subscription_settings() -> http::request::RoomSubscription {
+    assign!(http::request::RoomSubscription::default(), {
+        required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
+            (state_event.clone(), (*value).to_owned())
+        })
+        .chain(
+            DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
+                (state_event.clone(), (*value).to_owned())
+            })
+        )
+        .collect(),
+        timeline_limit: UInt::from(DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT),
+    })
 }
 
 /// [`RoomList`]'s errors.

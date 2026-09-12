@@ -30,7 +30,7 @@ use imbl::Vector;
 use matrix_sdk::{
     Result, Room, check_validity_of_replacement_events,
     deserialized_responses::TimelineEvent,
-    event_cache::{RoomEventCache, RoomEventCacheSubscriber, RoomEventCacheUpdate},
+    event_cache::{RoomEventCache, RoomEventCacheUpdate, Subscriber as EventCacheSubscriber},
     locks::Mutex,
     paginators::PaginationToken,
     room::ListThreadsOptions,
@@ -480,7 +480,7 @@ impl ThreadListService {
         room: &Room,
         timeline_event: TimelineEvent,
     ) -> Option<ThreadListItemEvent> {
-        let event_id = timeline_event.event_id()?;
+        let event_id = timeline_event.event_id()?.to_owned();
         let timestamp = timeline_event.timestamp()?;
         let sender = timeline_event.sender()?;
         let is_own = room.own_user_id() == sender;
@@ -518,7 +518,7 @@ impl ThreadListService {
 
         let mut originals = HashMap::new();
         for event in related_events {
-            let Some(event_id) = event.event_id() else { continue };
+            let Some(event_id) = event.event_id().map(|id| id.to_owned()) else { continue };
             if Self::is_redacted_raw_event(event.raw())
                 || extract_relation(event.raw())
                     != Some((RelationType::Thread, root_event_id.to_owned()))
@@ -563,7 +563,9 @@ impl ThreadListService {
         original: &Event,
         max_timestamp: MilliSecondsSinceUnixEpoch,
     ) -> Result<Option<TimelineEvent>, ThreadListServiceError> {
-        let Some(original_id) = original.event_id() else { return Ok(None) };
+        let Some(original_id) = original.event_id().map(|id| id.to_owned()) else {
+            return Ok(None);
+        };
         let related_edits = room_event_cache
             .find_event_relations(&original_id, Some(vec![RelationType::Replacement]))
             .await?;
@@ -571,7 +573,7 @@ impl ThreadListService {
         let mut latest = None;
 
         for edit in related_edits {
-            let Some(edit_id) = edit.event_id() else { continue };
+            let Some(edit_id) = edit.event_id().map(|id| id.to_owned()) else { continue };
             if !seen_ids.insert(edit_id.clone())
                 || edit_id == original_id
                 || Self::is_redacted_raw_event(edit.raw())
@@ -616,7 +618,7 @@ impl ThreadListService {
     /// reconcile every tracked root.
     async fn event_cache_listener_loop(
         room: &Room,
-        subscriber: &mut RoomEventCacheSubscriber,
+        subscriber: &mut EventCacheSubscriber<RoomEventCacheUpdate>,
         items: Arc<Mutex<ObservableVector<ThreadListItem>>>,
         proofs: Arc<Mutex<HashMap<OwnedEventId, ThreadRelationProof>>>,
     ) {
@@ -783,10 +785,11 @@ struct ThreadList {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use assert_matches::assert_matches;
     use futures_util::{StreamExt, pin_mut};
     use matrix_sdk::{
         ThreadingSupport,
-        event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate},
+        event_cache::{RoomEventCacheUpdate, Subscriber as EventCacheSubscriber},
         store::StoreConfig,
         test_utils::mocks::MatrixMockServer,
     };
@@ -797,7 +800,13 @@ mod tests {
         MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, event_id,
         events::{
             AnyTimelineEvent,
-            room::{ImageInfo, message::RoomMessageEventContentWithoutRelation},
+            room::{
+                ImageInfo,
+                encrypted::{
+                    EncryptedEventScheme, MegolmV1AesSha2ContentInit, RoomEncryptedEventContent,
+                },
+                message::{RedactedRoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+            },
             sticker::StickerEventContent,
         },
         owned_mxc_uri, room_id,
@@ -813,6 +822,7 @@ mod tests {
         ResolverTestGate, ThreadListPaginationState, ThreadListService, ThreadRelationAggregate,
         resolve_thread_relation_aggregate, resolver_test_gate_slot,
     };
+    use crate::timeline::{MsgLikeContent, MsgLikeKind, TimelineItemContent};
 
     struct ResolverTestGateHandle {
         entered: watch::Receiver<bool>,
@@ -876,7 +886,9 @@ mod tests {
         )
     }
 
-    async fn wait_for_timeline_update(subscriber: &mut RoomEventCacheSubscriber) {
+    async fn wait_for_timeline_update(
+        subscriber: &mut EventCacheSubscriber<RoomEventCacheUpdate>,
+    ) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match subscriber.recv().await {
@@ -1910,6 +1922,114 @@ mod tests {
         let item = &service.items()[0];
         assert_eq!(item.num_replies, 2);
         assert_eq!(item.latest_event.as_ref().unwrap().event_id, final_reply_id);
+    }
+
+    #[async_test]
+    async fn test_redacted_root_with_encrypted_latest_event() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+        let root_id = event_id!("$root");
+        let latest_id = event_id!("$latest");
+
+        // The bundled latest reply is encrypted (E2EE room).
+        let encrypted_latest = f
+            .event(RoomEncryptedEventContent::new(
+                EncryptedEventScheme::MegolmV1AesSha2(
+                    MegolmV1AesSha2ContentInit {
+                        ciphertext: "ciphertext".to_owned(),
+                        sender_key: "sender-key".to_owned(),
+                        device_id: "device-id".to_owned().into(),
+                        session_id: "session-id".to_owned(),
+                    }
+                    .into(),
+                ),
+                None,
+            ))
+            .event_id(latest_id)
+            .into_raw_sync()
+            .cast_unchecked();
+
+        // Redacted thread root, still carrying a bundled thread summary whose
+        // latest event is still encrypted.
+        let thread_root = f
+            .redacted(sender_id, RedactedRoomMessageEventContent::new())
+            .event_id(root_id)
+            .with_bundled_thread_summary(encrypted_latest, 3, false)
+            .into_raw();
+
+        server.mock_room_threads().ok(vec![thread_root], None).mock_once().mount().await;
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let service = ThreadListService::new(room);
+
+        service.paginate().await.expect("paginate failed");
+
+        let items = service.items();
+        assert_eq!(items.len(), 1);
+
+        // The latest event is still encrypted: it must be surfaced as a UTD,
+        // not as an unsupported/other event.
+        let latest = items[0].latest_event.as_ref().expect("should have latest_event");
+        assert_matches!(
+            latest.content,
+            Some(TimelineItemContent::MsgLike(MsgLikeContent {
+                kind: MsgLikeKind::UnableToDecrypt(_),
+                ..
+            }))
+        );
+    }
+
+    #[async_test]
+    async fn test_redacted_root_still_listed_with_summary() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+        let root_id = event_id!("$root");
+        let reply_id = event_id!("$reply");
+
+        let reply_event =
+            f.text_msg("Reply in thread").event_id(reply_id).into_raw_sync().cast_unchecked();
+
+        // Redacted thread root, still carrying a bundled thread summary.
+        let thread_root = f
+            .redacted(sender_id, RedactedRoomMessageEventContent::new())
+            .event_id(root_id)
+            .with_bundled_thread_summary(reply_event, 3, false)
+            .into_raw();
+
+        server.mock_room_threads().ok(vec![thread_root], None).mock_once().mount().await;
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let service = ThreadListService::new(room);
+
+        service.paginate().await.expect("paginate failed");
+
+        let items = service.items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].root_event.event_id, root_id);
+        assert_eq!(items[0].num_replies, 3);
+
+        // The redacted root is surfaced as a redacted message.
+        assert!(matches!(
+            items[0].root_event.content,
+            Some(TimelineItemContent::MsgLike(MsgLikeContent { kind: MsgLikeKind::Redacted, .. }))
+        ));
+
+        // The plaintext latest reply is surfaced as a regular message.
+        let latest = items[0].latest_event.as_ref().expect("should have latest_event");
+        assert_eq!(latest.event_id, reply_id);
+        assert!(matches!(
+            latest.content,
+            Some(TimelineItemContent::MsgLike(MsgLikeContent {
+                kind: MsgLikeKind::Message(_),
+                ..
+            }))
+        ));
     }
 
     /// Builds a [`ThreadListService`] and makes the room known to the client
