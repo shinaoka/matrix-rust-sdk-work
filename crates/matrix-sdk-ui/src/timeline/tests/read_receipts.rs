@@ -56,7 +56,8 @@ async fn test_read_receipts_updates_on_live_events() {
             track_read_receipts: TimelineReadReceiptTracking::AllEvents,
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
     let mut stream = timeline.subscribe().await;
 
     let f = &timeline.factory;
@@ -130,7 +131,8 @@ async fn test_read_receipts_updates_on_back_paginated_events() {
             track_read_receipts: TimelineReadReceiptTracking::AllEvents,
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
     let room_id = room_id!("!room:localhost");
 
     let f = EventFactory::new().room(room_id);
@@ -172,7 +174,8 @@ async fn test_read_receipts_updates_on_filtered_events() {
             event_filter: Arc::new(filter_notice),
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
     let mut stream = timeline.subscribe().await;
 
     let f = &timeline.factory;
@@ -273,7 +276,8 @@ async fn test_read_receipts_updates_on_filtered_events_with_stored() {
             event_filter: Arc::new(filter_notice),
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
     let f = &timeline.factory;
     let mut stream = timeline.subscribe().await;
 
@@ -343,7 +347,8 @@ async fn test_read_receipts_updates_on_back_paginated_filtered_events() {
             event_filter: Arc::new(filter_notice),
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
     let mut stream = timeline.subscribe().await;
     let room_id = room_id!("!room:localhost");
 
@@ -556,7 +561,8 @@ async fn test_initial_public_unthreaded_receipt() {
             track_read_receipts: TimelineReadReceiptTracking::AllEvents,
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
 
     let (receipt_event_id, _) = timeline.controller.latest_user_read_receipt(*ALICE).await.unwrap();
     assert_eq!(receipt_event_id, event_id);
@@ -584,7 +590,8 @@ async fn test_initial_public_main_thread_receipt() {
             track_read_receipts: TimelineReadReceiptTracking::AllEvents,
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
 
     let (receipt_event_id, _) = timeline.controller.latest_user_read_receipt(*ALICE).await.unwrap();
     assert_eq!(receipt_event_id, event_id);
@@ -612,7 +619,8 @@ async fn test_initial_private_unthreaded_receipt() {
             track_read_receipts: TimelineReadReceiptTracking::AllEvents,
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
 
     let (receipt_event_id, _) = timeline.controller.latest_user_read_receipt(*ALICE).await.unwrap();
     assert_eq!(receipt_event_id, event_id);
@@ -640,7 +648,8 @@ async fn test_initial_private_main_thread_receipt() {
             track_read_receipts: TimelineReadReceiptTracking::AllEvents,
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
 
     let (receipt_event_id, _) = timeline.controller.latest_user_read_receipt(*ALICE).await.unwrap();
     assert_eq!(receipt_event_id, event_id);
@@ -657,7 +666,8 @@ async fn test_clear_read_receipts() {
             track_read_receipts: TimelineReadReceiptTracking::AllEvents,
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
     let f = &timeline.factory;
 
     let event_a_content = RoomMessageEventContent::text_plain("A");
@@ -740,7 +750,8 @@ async fn test_implicit_read_receipt_before_explicit_read_receipt() {
             track_read_receipts: TimelineReadReceiptTracking::AllEvents,
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
 
     // Check that the receipts are at the correct place.
     let (receipt_event_id, _) = timeline.controller.latest_user_read_receipt(*ALICE).await.unwrap();
@@ -805,7 +816,8 @@ async fn test_threaded_latest_user_read_receipt() {
             track_read_receipts: TimelineReadReceiptTracking::AllEvents,
             ..Default::default()
         })
-        .build();
+        .build()
+        .await;
 
     // Sanity check: no read receipts before any events.
     assert!(timeline.controller.latest_user_read_receipt(*ALICE).await.is_none());
@@ -880,7 +892,8 @@ async fn test_unthreaded_client_updates_threaded_read_receipts() {
             ..Default::default()
         })
         .focus(TimelineFocus::Live { hide_threaded_events: true })
-        .build();
+        .build()
+        .await;
     let mut stream = timeline.subscribe().await;
 
     let event_b = event_id!("$event_b");

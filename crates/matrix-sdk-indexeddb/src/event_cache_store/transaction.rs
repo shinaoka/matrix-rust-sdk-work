@@ -26,11 +26,12 @@ use crate::{
     error::AsyncErrorDeps,
     event_cache_store::{
         serializer::indexed_types::{
-            IndexedChunk, IndexedChunkIdKey, IndexedEvent, IndexedEventIdKey,
-            IndexedEventPositionKey, IndexedEventRelationKey, IndexedEventRoomKey, IndexedGapIdKey,
-            IndexedLease, IndexedLeaseIdKey, IndexedNextChunkIdKey,
+            IndexedChunk, IndexedChunkIdKey, IndexedEvent, IndexedEventError,
+            IndexedEventEventIdKey, IndexedEventIdKey, IndexedEventPositionKey,
+            IndexedEventRelationKey, IndexedEventRoomKey, IndexedGapIdKey, IndexedLease,
+            IndexedLeaseIdKey, IndexedNextChunkIdKey, IndexedThread, IndexedThreadIdKey,
         },
-        types::{Chunk, ChunkType, Event, Gap, Lease, Position},
+        types::{Chunk, ChunkType, Event, Gap, Lease, Position, Thread},
     },
     serializer::indexed_type::{
         IndexedTypeSerializer,
@@ -148,8 +149,8 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
     /// exists, it will be overwritten. When the item is successfully put, the
     /// function returns the intermediary type [`IndexedLease`] in case
     /// inspection is needed.
-    pub async fn put_lease(&self, lease: &Lease) -> Result<IndexedLease, TransactionError> {
-        self.put_item(lease).await
+    pub fn put_lease(&self, lease: &Lease) -> Result<IndexedLease, TransactionError> {
+        self.put_item(lease)
     }
 
     /// Query IndexedDB for chunks that match the given chunk identifier and the
@@ -256,7 +257,7 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
     /// function returns the intermediary type [`IndexedChunk`] in case
     /// inspection is needed.
     pub async fn add_chunk(&self, chunk: &Chunk) -> Result<IndexedChunk, TransactionError> {
-        let indexed = self.add_item(chunk).await?;
+        let indexed = self.add_item(chunk)?;
         if let Some(previous) = chunk.previous {
             let previous_identifier = ChunkIdentifier::new(previous);
             let mut previous_chunk = self
@@ -264,7 +265,7 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
                 .await?
                 .ok_or(TransactionError::ItemNotFound)?;
             previous_chunk.next = Some(chunk.identifier);
-            self.put_item(&previous_chunk).await?;
+            self.put_item(&previous_chunk)?;
         }
         if let Some(next) = chunk.next {
             let next_identifier = ChunkIdentifier::new(next);
@@ -273,7 +274,7 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
                 .await?
                 .ok_or(TransactionError::ItemNotFound)?;
             next_chunk.previous = Some(chunk.identifier);
-            self.put_item(&next_chunk).await?;
+            self.put_item(&next_chunk)?;
         }
         Ok(indexed)
     }
@@ -294,7 +295,7 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
                     self.get_chunk_by_id(linked_chunk_id, previous_identifier).await?
                 {
                     previous_chunk.next = chunk.next;
-                    self.put_item(&previous_chunk).await?;
+                    self.put_item(&previous_chunk)?;
                 }
             }
             if let Some(next) = chunk.next {
@@ -303,7 +304,7 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
                     self.get_chunk_by_id(linked_chunk_id, next_identifier).await?
                 {
                     next_chunk.previous = chunk.previous;
-                    self.put_item(&next_chunk).await?;
+                    self.put_item(&next_chunk)?;
                 }
             }
             self.delete_item_by_key::<Chunk, IndexedChunkIdKey>((linked_chunk_id, chunk_id))
@@ -337,6 +338,16 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
     ) -> Result<Option<Event>, TransactionError> {
         let key = self.serializer().encode_key((linked_chunk_id, event_id));
         self.get_item_by_key::<Event, IndexedEventIdKey>(key).await
+    }
+
+    /// Query IndexedDB for events that match the given event id across all
+    /// linked chunks.
+    pub async fn get_events_by_event_id(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Vec<Event>, TransactionError> {
+        let key = self.serializer().encode_key::<_, IndexedEventEventIdKey>(event_id);
+        self.get_items_by_key::<Event, IndexedEventEventIdKey>(key).await
     }
 
     /// Query IndexedDB for events that match the given event id in the given
@@ -423,46 +434,132 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
         self.get_items_by_key::<Event, IndexedEventRelationKey>(range).await
     }
 
-    /// Puts an event in IndexedDB. If an event with the same key already
-    /// exists, it will be overwritten. When the item is successfully put, the
-    /// function returns the intermediary type [`IndexedEvent`] in case
-    /// inspection is needed.
-    pub async fn put_event(&self, event: &Event) -> Result<IndexedEvent, TransactionError> {
-        if let Some(position) = event.position() {
-            // For some reason, we can't simply replace an event with `put_item`
-            // because we can get an error stating that the data violates a uniqueness
-            // constraint on the `events_position` index. This is NOT expected, but
-            // it is not clear if this improperly implemented in the browser or the
-            // library we are using.
-            //
-            // As a workaround, if the event has a position, we delete it first and
-            // then call `put_item`. This should be fine as it all happens within the
-            // context of a single transaction.
-            self.delete_event_by_position(event.linked_chunk_id(), position).await?;
-        }
-        self.put_item(event).await
+    /// Adds an event to IndexedDB.
+    ///
+    /// If an event with the same key already exists, actions are
+    /// taken based on the following conditions. If the provided
+    /// event is an [`Event::InBand`] and the existing event is an
+    /// [`Event::OutOfBand`], the provided event will replace the
+    /// existing event. Otherwise, the provided event will be rejected.
+    /// This functionality allows events to be promoted from
+    /// out-of-band events to in-band events, but not vice versa.
+    ///
+    /// Additionally, if an event with the same ID already exists anywhere
+    /// in the store, every instance is updated with the provided content, i.e.,
+    /// across all linked chunks.
+    ///
+    /// When the event is successfully added, the function returns
+    /// the intermediary type [`IndexedEvent`] in case inspection
+    /// is needed.
+    pub async fn add_event(&self, event: &Event) -> Result<IndexedEvent, TransactionError> {
+        let linked_chunk_id = event.linked_chunk_id();
+        let Some(event_id) = event.event_id() else {
+            return Err(TransactionError::Serialization(Box::new(IndexedEventError::NoEventId)));
+        };
+
+        let existing = self.get_event_by_id(linked_chunk_id, event_id).await?;
+
+        let indexed =
+            if matches!(event, Event::InBand(_)) && matches!(existing, Some(Event::OutOfBand(_))) {
+                self.put_item(event)?
+            } else {
+                self.add_item(event)?
+            };
+
+        self.update_events_by_event_id(event_id, |existing| {
+            existing.with_content(event.content().clone())
+        })
+        .await?;
+
+        Ok(indexed)
     }
 
-    /// Delete events in the given position range matching the given linked
-    /// chunk id
-    pub async fn delete_events_by_position(
+    /// Puts an event in IndexedDB. If an event with the same key already
+    /// exists in it will be overwritten.
+    ///
+    /// Additionally, if an event with the same ID exists in any other linked
+    /// chunk, every instance is updated with the provided content.
+    ///
+    /// When the item is successfully put, the function returns the intermediary
+    /// type [`IndexedEvent`] in case inspection is needed.
+    pub async fn put_event(&self, event: &Event) -> Result<IndexedEvent, TransactionError> {
+        let Some(event_id) = event.event_id() else {
+            return Err(TransactionError::Serialization(Box::new(IndexedEventError::NoEventId)));
+        };
+
+        let indexed = self.put_item(event)?;
+
+        self.update_events_by_event_id(event_id, |existing| {
+            existing.with_content(event.content().clone())
+        })
+        .await?;
+
+        Ok(indexed)
+    }
+
+    /// Update all events in the store matching the given event ID by reading
+    /// them, applying the function `F`, and then writing them back to
+    /// IndexedDB.
+    ///
+    /// Note that this is a potentially expensive operation, as IndexedDB
+    /// does not provide modification utilities.
+    pub async fn update_events_by_event_id<F: Fn(Event) -> Event>(
+        &self,
+        event_id: &EventId,
+        f: F,
+    ) -> Result<(), TransactionError> {
+        self.update_items_by_key_components::<Event, IndexedEventEventIdKey, F>(event_id, f).await
+    }
+
+    /// Update events in the given position range matching the given linked
+    /// chunk id by reading them, applying the function `F`, and then writing
+    /// them back to IndexedDB.
+    ///
+    /// Note that this is a potentially expensive operation, as IndexedDB
+    /// does not provide modification utilities.
+    pub async fn update_events_by_position<F: Fn(Event) -> Event>(
         &self,
         linked_chunk_id: LinkedChunkId<'_>,
         range: impl Into<IndexedKeyRange<Position>>,
+        f: F,
     ) -> Result<(), TransactionError> {
-        self.delete_items_by_key_components::<Event, IndexedEventPositionKey>(
+        self.update_items_by_key_components::<Event, IndexedEventPositionKey, F>(
             range.into().map(|position| (linked_chunk_id, position)),
+            f,
         )
         .await
     }
 
-    /// Delete event in the given position matching the given linked chunk id
+    /// Delete event in the given position matching the given linked chunk id.
+    ///
+    /// Note that after removing the event, the index of each subsequent event
+    /// in the same chunk will be decremented by one. This is a potentially
+    /// expensive operation, as updating the indices requires reading the event,
+    /// then modifying it, then writing it back to IndexedDB.
     pub async fn delete_event_by_position(
         &self,
         linked_chunk_id: LinkedChunkId<'_>,
         position: Position,
     ) -> Result<(), TransactionError> {
-        self.delete_item_by_key::<Event, IndexedEventPositionKey>((linked_chunk_id, position)).await
+        self.delete_item_by_key::<Event, IndexedEventPositionKey>((linked_chunk_id, position))
+            .await?;
+
+        // After deleting an event, every subsequent event in the chunk
+        // must shift it's recorded index down one position.
+        let lower = (linked_chunk_id, position);
+        let upper = IndexedEventPositionKey::upper_key_components_with_prefix((
+            linked_chunk_id,
+            ChunkIdentifier::new(position.chunk_identifier),
+        ));
+        let range = IndexedKeyRange::Bound(lower, upper).map(|(_, position)| position);
+
+        self.update_events_by_position(linked_chunk_id, range, |mut event| {
+            if let Event::InBand(i) = &mut event {
+                i.position.index -= 1;
+            }
+            event
+        })
+        .await
     }
 
     /// Delete events in the given chunk matching the given linked chunk id
@@ -491,7 +588,11 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
             ChunkIdentifier::new(position.chunk_identifier),
         ));
         let range = IndexedKeyRange::Bound(lower, upper).map(|(_, position)| position);
-        self.delete_events_by_position(linked_chunk_id, range).await
+
+        self.delete_items_by_key_components::<Event, IndexedEventPositionKey>(
+            range.map(|position| (linked_chunk_id, position)),
+        )
+        .await
     }
 
     /// Delete all events matching the given linked chunk id
@@ -528,5 +629,32 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
         linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<(), TransactionError> {
         self.delete_items_by_linked_chunk_id::<Gap, IndexedGapIdKey>(linked_chunk_id).await
+    }
+
+    /// Load a thread info.
+    pub async fn load_thread_info(
+        &self,
+        room_id: &RoomId,
+        thread_id: &EventId,
+    ) -> Result<Option<Thread>, TransactionError> {
+        self.get_item_by_key_components::<Thread, IndexedThreadIdKey>((room_id, thread_id)).await
+    }
+
+    /// Update a thread info.
+    pub fn update_thread_info(&self, thread: &Thread) -> Result<IndexedThread, TransactionError> {
+        self.put_item(thread)
+    }
+
+    /// List all threads (remembered with [`Self::update_thread_info`]) for a
+    /// particular room ID.
+    pub async fn get_threads_by_room_id(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Thread>, TransactionError> {
+        self.get_items_by_key::<Thread, IndexedThreadIdKey>(IndexedKeyRange::all_with_prefix(
+            room_id,
+            self.serializer().inner(),
+        ))
+        .await
     }
 }

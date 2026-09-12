@@ -15,7 +15,7 @@
 use std::{fmt::Debug, sync::Arc};
 
 use eyeball_im::VectorDiff;
-use futures_util::{StreamExt, pin_mut};
+use futures_util::StreamExt;
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::spaces::{
     SpaceFilter as UISpaceFilter, SpaceRoom as UISpaceRoom, SpaceRoomList as UISpaceRoomList,
@@ -138,6 +138,59 @@ impl SpaceService {
         Ok(parents.into_iter().map(Into::into).collect())
     }
 
+    /// Returns the room IDs of all known direct parents of the given child
+    /// space or room.
+    ///
+    /// This is a much cheaper version of [`Self::joined_parents_of_child()`]
+    /// that doesn't build any `SpaceRoom` instances, it only reads the
+    /// existing space graph.
+    ///
+    /// The returned IDs are always joined spaces, as that's all the space graph
+    /// includes. Note that an empty result either means that the child is a
+    /// top-level space (which has no direct parents) or the child isn't part of
+    /// the space graph at all.
+    /// See [`Self::top_level_ancestors_of()`] if you need that particular level
+    /// of detail.
+    ///
+    /// Note: Unlike [`Self::top_level_joined_spaces()`], this method does not
+    /// recompute the space graph nor notify subscribers about changes.
+    pub async fn joined_parent_ids_of_child(
+        &self,
+        child_id: String,
+    ) -> Result<Vec<String>, ClientError> {
+        let child_id = RoomId::parse(child_id)?;
+
+        let parent_ids = self.inner.joined_parent_ids_of_child(&child_id).await;
+
+        Ok(parent_ids.into_iter().map(Into::into).collect())
+    }
+
+    /// Returns the room IDs of the top-level joined space(s) that the given
+    /// child room/space descends from, by walking the space graph upwards.
+    ///
+    /// A room/space can be the child of multiple spaces, so this might return
+    /// multiple top-level spaces (in no order).
+    ///
+    /// A top-level space is its own only ancestor, which makes
+    /// `top_level_ancestors_of(id) == [id]` a cheap top-level space check.
+    ///
+    /// Returns an empty vector if the room isn't part of the graph, which is
+    /// notably the case for a room that was joined too recently for the graph
+    /// to have been rebuilt.
+    ///
+    /// Note: Unlike [`Self::top_level_joined_spaces()`], this method does not
+    /// recompute the space graph nor notify subscribers about changes.
+    pub async fn top_level_ancestors_of(
+        &self,
+        child_id: String,
+    ) -> Result<Vec<String>, ClientError> {
+        let child_id = RoomId::parse(child_id)?;
+
+        let ancestor_ids = self.inner.top_level_ancestors_of(&child_id).await;
+
+        Ok(ancestor_ids.into_iter().map(Into::into).collect())
+    }
+
     /// Returns the corresponding `SpaceRoom` for the given room ID, or `None`
     /// if it isn't known.
     pub async fn get_space_room(&self, room_id: String) -> Result<Option<SpaceRoom>, ClientError> {
@@ -219,11 +272,11 @@ impl SpaceRoomList {
         &self,
         listener: Box<dyn SpaceRoomListSpaceListener>,
     ) -> Arc<TaskHandle> {
-        let space_updates = self.inner.subscribe_to_space_updates();
+        let mut space_updates = self.inner.subscribe_to_space_updates();
+
+        listener.on_update(space_updates.next_now().map(Into::into));
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(space_updates);
-
             while let Some(space) = space_updates.next().await {
                 listener.on_update(space.map(Into::into));
             }
@@ -240,11 +293,11 @@ impl SpaceRoomList {
         &self,
         listener: Box<dyn SpaceRoomListPaginationStateListener>,
     ) -> Arc<TaskHandle> {
-        let pagination_state = self.inner.subscribe_to_pagination_state_updates();
+        let mut pagination_state = self.inner.subscribe_to_pagination_state_updates();
+
+        listener.on_update(pagination_state.next_now());
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(pagination_state);
-
             while let Some(state) = pagination_state.next().await {
                 listener.on_update(state);
             }

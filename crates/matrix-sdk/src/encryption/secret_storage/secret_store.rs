@@ -57,7 +57,7 @@ fn signed_content_matches(left: &DeviceKeys, right: &DeviceKeys) -> bool {
         .is_some_and(|(left, right)| left == right)
 }
 
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, doc = include_str!("../../../../../.cargo/mermaid.html"))]
 /// Secure key/value storage for Matrix users.
 ///
 /// The `SecretStore` struct encapsulates the secret storage mechanism for

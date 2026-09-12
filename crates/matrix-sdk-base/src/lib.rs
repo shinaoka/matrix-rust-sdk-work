@@ -60,8 +60,9 @@ pub use http;
 pub use matrix_sdk_crypto as crypto;
 pub use room::{
     CallIntentConsensus, EncryptionState, PredecessorRoom, Room, RoomCreateWithCreatorEventContent,
-    RoomDisplayName, RoomHero, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
-    RoomMember, RoomMembersMissingReason, RoomMembersUpdate, RoomMemberships, RoomRecencyStamp,
+    RoomDisplayName, RoomHero, RoomHeroWithProfile, RoomInfo, RoomInfoNotableUpdate,
+    RoomInfoNotableUpdateReasons, RoomMember, RoomMembersMissingReason, RoomMembersUpdate,
+    RoomMemberships, RoomRecencyStamp,
     RoomState, RoomStateFilter, SuccessorRoom, apply_redaction,
 };
 pub use store::{

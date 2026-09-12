@@ -20,8 +20,7 @@ use matrix_sdk_base::{
     linked_chunk::{self, OwnedLinkedChunkId},
 };
 use ruma::{
-    OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, events::AnySyncEphemeralRoomEvent,
-    serde::Raw,
+    OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, events::receipt::ReceiptEventContent,
 };
 use tokio::sync::broadcast::{Receiver, Sender};
 
@@ -51,11 +50,10 @@ pub enum RoomEventCacheUpdate {
     /// The room has received updates for the timeline as _diffs_.
     UpdateTimelineEvents(TimelineVectorDiffs),
 
-    /// The room has received new ephemeral events.
-    AddEphemeralEvents {
-        /// XXX: this is temporary, until read receipts are handled in the event
-        /// cache
-        events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+    /// The room has received a new read receipt event.
+    AddReadReceiptEvent {
+        /// The event containing the receipts.
+        event: ReceiptEventContent,
     },
 }
 
@@ -136,6 +134,11 @@ impl RoomEventCacheUpdateSender {
         if let Some(generic_update) = generic_update {
             let _ = self.generic_sender.send(generic_update);
         }
+    }
+
+    /// Get the generic update sender.
+    pub(in super::super) fn generic_update_sender(&self) -> &Sender<RoomEventCacheGenericUpdate> {
+        &self.generic_sender
     }
 
     /// Create a new [`Receiver`] of [`RoomEventCacheUpdate`].

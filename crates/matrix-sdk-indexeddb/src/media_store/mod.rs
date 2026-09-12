@@ -151,7 +151,7 @@ impl MediaStore for IndexeddbMediaStore {
         };
 
         Ok(if let Some(lease) = lease {
-            transaction.put_lease(&lease).await?;
+            transaction.put_lease(&lease)?;
             transaction.commit().await?;
 
             Some(lease.generation)
@@ -185,7 +185,7 @@ impl MediaStore for IndexeddbMediaStore {
             // delete before adding, in case `from` and `to` generate the same key
             transaction.delete_media_metadata_by_id(from).await?;
             metadata.request_parameters = to.clone();
-            transaction.add_media_metadata(&metadata).await?;
+            transaction.add_media_metadata(&metadata)?;
             transaction.commit().await?;
         }
         Ok(())
@@ -213,15 +213,6 @@ impl MediaStore for IndexeddbMediaStore {
         )?;
         transaction.delete_media_by_id(request).await?;
         transaction.commit().await.map_err(Into::into)
-    }
-
-    #[instrument(skip(self))]
-    async fn get_media_content_for_uri(
-        &self,
-        uri: &MxcUri,
-    ) -> Result<Option<Vec<u8>>, IndexeddbMediaStoreError> {
-        let _timer = timer!("method");
-        self.media_service.get_media_content_for_uri(self, uri).await
     }
 
     #[instrument(skip(self))]
@@ -312,7 +303,7 @@ impl MediaStoreInner for IndexeddbMediaStore {
 
         let transaction =
             self.transaction(&[MediaRetentionPolicy::OBJECT_STORE], TransactionMode::Readwrite)?;
-        transaction.put_item(&policy).await?;
+        transaction.put_item(&policy)?;
         transaction.commit().await.map_err(Into::into)
     }
 
@@ -357,7 +348,7 @@ impl MediaStoreInner for IndexeddbMediaStore {
             && metadata.ignore_policy != ignore_policy
         {
             metadata.ignore_policy = ignore_policy;
-            transaction.put_media_metadata(&metadata).await?;
+            transaction.put_media_metadata(&metadata)?;
             transaction.commit().await?;
         }
         Ok(())
@@ -376,23 +367,6 @@ impl MediaStoreInner for IndexeddbMediaStore {
             TransactionMode::Readwrite,
         )?;
         let media = transaction.access_media_by_id(request, current_time).await?;
-        transaction.commit().await?;
-        Ok(media.map(|m| m.content))
-    }
-
-    #[instrument(skip_all)]
-    async fn get_media_content_for_uri_inner(
-        &self,
-        uri: &MxcUri,
-        current_time: SystemTime,
-    ) -> Result<Option<Vec<u8>>, IndexeddbMediaStoreError> {
-        let _timer = timer!("method");
-
-        let transaction = self.transaction(
-            &[MediaMetadata::OBJECT_STORE, MediaContent::OBJECT_STORE],
-            TransactionMode::Readwrite,
-        )?;
-        let media = transaction.access_media_by_uri(uri, current_time).await?.pop();
         transaction.commit().await?;
         Ok(media.map(|m| m.content))
     }
@@ -463,7 +437,7 @@ impl MediaStoreInner for IndexeddbMediaStore {
             }
         }
 
-        transaction.put_media_cleanup_time(current_time).await?;
+        transaction.put_media_cleanup_time(current_time)?;
         transaction.commit().await.map_err(Into::into)
     }
 

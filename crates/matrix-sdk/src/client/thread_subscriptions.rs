@@ -32,10 +32,7 @@ use ruma::{
     },
     assign,
 };
-use tokio::sync::{
-    Mutex, OwnedMutexGuard,
-    mpsc::{Receiver, Sender, channel},
-};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use tracing::{debug, instrument, trace, warn};
 
 use crate::{Client, Result, client::WeakClient};
@@ -80,20 +77,14 @@ impl GuardedStoreAccess {
     }
 
     /// Saves the tokens in the database.
-    ///
-    /// Returns whether the list of tokens is empty or not.
     #[instrument(skip_all, fields(num_tokens = tokens.len()))]
-    async fn save_catchup_tokens(
-        &self,
-        tokens: Vec<ThreadSubscriptionCatchupToken>,
-    ) -> Result<bool> {
+    async fn save_catchup_tokens(&self, tokens: Vec<ThreadSubscriptionCatchupToken>) -> Result<()> {
         let store = self.client.state_store();
-        let is_empty = if tokens.is_empty() {
+        if tokens.is_empty() {
             store.remove_kv_data(StateStoreDataKey::ThreadSubscriptionsCatchupTokens).await?;
 
             trace!("Marking thread subscriptions as not outdated \\o/");
             self.is_outdated.store(false, atomic::Ordering::SeqCst);
-            true
         } else {
             store
                 .set_kv_data(
@@ -104,9 +95,9 @@ impl GuardedStoreAccess {
 
             trace!("Marking thread subscriptions as outdated.");
             self.is_outdated.store(true, atomic::Ordering::SeqCst);
-            false
-        };
-        Ok(is_empty)
+        }
+
+        Ok(())
     }
 }
 
@@ -121,9 +112,9 @@ pub struct ThreadSubscriptionCatchup {
     /// A weak reference to the parent [`Client`] instance.
     client: WeakClient,
 
-    /// A sender to wake up the catchup task when new catchup tokens are
+    /// A signal to wake up the catchup task when new catchup tokens are
     /// available.
-    ping_sender: Sender<()>,
+    ping: Arc<Notify>,
 
     /// A mutex to ensure there's only one writer on the thread subscriptions
     /// catchup tokens at a time.
@@ -134,14 +125,15 @@ impl ThreadSubscriptionCatchup {
     pub async fn new(client: Client) -> Arc<Self> {
         let is_outdated = Arc::new(AtomicBool::new(true));
         let weak_client = WeakClient::from_client(&client);
-        let (ping_sender, ping_receiver) = channel(8);
+        let ping = Arc::new(Notify::new());
+        let task_ping = Arc::clone(&ping);
         let uniq_mutex = Arc::new(Mutex::new(()));
 
         let this = Arc::new(Self {
             _task: OnceLock::new(),
             is_outdated,
             client: weak_client.clone(),
-            ping_sender,
+            ping,
             uniq_mutex,
         });
 
@@ -155,7 +147,7 @@ impl ThreadSubscriptionCatchup {
                     client
                         .task_monitor()
                         .spawn_infinite_task("client::thread_subscriptions_catchup", async move {
-                            Self::thread_subscriptions_catchup_task(that, ping_receiver).await;
+                            Self::thread_subscriptions_catchup_task(that, task_ping).await;
                         })
                         .abort_on_drop()
                 });
@@ -229,17 +221,21 @@ impl ThreadSubscriptionCatchup {
         let mut tokens = guard.load_catchup_tokens().await?.unwrap_or_default();
 
         if let Some(token) = token {
-            trace!(?token, "Saving catchup token");
-            tokens.push(token);
+            // Gappy syncs on a busy account can cause the same catchup token to be sent
+            // repeatedly. We dedupe the tokens here to prevent duplicate catchup requests.
+            if tokens.contains(&token) {
+                trace!(?token, "Skipping duplicate catchup token");
+            } else {
+                trace!(?token, "Saving catchup token");
+                tokens.push(token);
+
+                guard.save_catchup_tokens(tokens).await?;
+
+                // Wake up the catchup task, in case it's waiting.
+                self.ping.notify_one();
+            }
         } else {
             trace!("No catchup token to save");
-        }
-
-        let is_token_list_empty = guard.save_catchup_tokens(tokens).await?;
-
-        // Wake up the catchup task, in case it's waiting.
-        if !is_token_list_empty {
-            let _ = self.ping_sender.send(()).await;
         }
 
         Ok(())
@@ -261,7 +257,7 @@ impl ThreadSubscriptionCatchup {
     ///
     /// [MSC4308]: https://github.com/matrix-org/matrix-spec-proposals/pull/4308
     #[instrument(skip_all)]
-    async fn thread_subscriptions_catchup_task(this: Arc<Self>, mut ping_receiver: Receiver<()>) {
+    async fn thread_subscriptions_catchup_task(this: Arc<Self>, ping: Arc<Notify>) {
         loop {
             // Load the current catchup token.
             let Some(guard) = this.lock().await else {
@@ -283,14 +279,9 @@ impl ThreadSubscriptionCatchup {
 
                 // Wait for a wake up.
                 trace!("Waiting for an explicit wake up to process future thread subscriptions");
-
-                if let Some(()) = ping_receiver.recv().await {
-                    trace!("Woke up!");
-                    continue;
-                }
-
-                // Channel closed, the client is shutting down.
-                break;
+                ping.notified().await;
+                trace!("Woke up!");
+                continue;
             };
 
             // We do have a tokens. Pop the last value, and use it to catch up!
@@ -450,6 +441,25 @@ mod tests {
 
         // And we are not outdated anymore!
         assert!(tsc.is_outdated().not());
+    }
+
+    #[async_test]
+    async fn test_save_catchup_token_deduplicates() {
+        let client = MockClientBuilder::new(None).build().await;
+
+        let tsc = client.thread_subscription_catchup();
+        let guard = tsc.lock().await.unwrap();
+
+        let token =
+            ThreadSubscriptionCatchupToken { from: "from".to_owned(), to: Some("to".to_owned()) };
+
+        // When the same catchup token is saved twice,
+        tsc.save_catchup_token(&guard, Some(token.clone())).await.unwrap();
+        tsc.save_catchup_token(&guard, Some(token.clone())).await.unwrap();
+
+        // Then it must only appear once in the stored list.
+        let tokens = guard.load_catchup_tokens().await.unwrap();
+        assert_eq!(tokens, Some(vec![token]));
     }
 }
 

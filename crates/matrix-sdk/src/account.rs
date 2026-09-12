@@ -28,8 +28,12 @@ use matrix_sdk_base::{
     store::StateStoreExt,
 };
 use mime::Mime;
+#[cfg(feature = "unstable-msc4426")]
+use ruma::SecondsSinceUnixEpoch;
 #[cfg(feature = "experimental-element-recent-emojis")]
 use ruma::api::client::config::set_global_account_data::v3::Request as UpdateGlobalAccountDataRequest;
+#[cfg(feature = "unstable-msc4426")]
+use ruma::profile::{CallProfileField, StatusProfileField};
 use ruma::{
     ClientSecret, MxcUri, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, SessionId, UInt, UserId,
     api::{
@@ -61,13 +65,13 @@ use ruma::{
         push_rules::PushRulesEventContent,
         room::MediaSource,
     },
-    profile::{ProfileFieldName, ProfileFieldValue},
+    profile::{ProfileFieldName, ProfileFieldValue, UserProfileChanges, UserProfileUpdate},
     push::Ruleset,
     serde::Raw,
     thirdparty::Medium,
 };
 use serde::Deserialize;
-use tracing::error;
+use tracing::{debug, error, warn};
 
 use crate::{Client, Error, Result, config::RequestConfig};
 
@@ -446,6 +450,48 @@ impl Account {
         Ok(response.value)
     }
 
+    /// Set the user's status (MSC4426 `m.status` profile field).
+    ///
+    /// Replaces any existing status. Use [`Self::clear_status`] to remove it.
+    ///
+    /// # Arguments
+    ///
+    /// * `emoji` - the status emoji. The MSC limits this to 32 bytes; not
+    ///   enforced client-side.
+    /// * `text` - the status text. The MSC limits this to 256 bytes; not
+    ///   enforced client-side.
+    #[cfg(feature = "unstable-msc4426")]
+    pub async fn set_status(&self, emoji: String, text: String) -> Result<()> {
+        let value = StatusProfileField::new(text, emoji);
+        self.set_profile_field(ProfileFieldValue::Status(value)).await
+    }
+
+    /// Clear the user's status (deletes the MSC4426 `m.status` profile field).
+    #[cfg(feature = "unstable-msc4426")]
+    pub async fn clear_status(&self) -> Result<()> {
+        self.delete_profile_field(ProfileFieldName::Status).await
+    }
+
+    /// Set the user's call indicator (MSC4426 `m.call` profile field).
+    ///
+    /// # Arguments
+    ///
+    /// * `call_joined_ts` - when the user joined the current call, in seconds
+    ///   since the Unix epoch. `None` if the joined time isn't known.
+    #[cfg(feature = "unstable-msc4426")]
+    pub async fn set_call(&self, call_joined_ts: Option<SecondsSinceUnixEpoch>) -> Result<()> {
+        let mut value = CallProfileField::new();
+        value.call_joined_ts = call_joined_ts;
+        self.set_profile_field(ProfileFieldValue::Call(value)).await
+    }
+
+    /// Clear the user's call indicator (deletes the MSC4426 `m.call` profile
+    /// field).
+    #[cfg(feature = "unstable-msc4426")]
+    pub async fn clear_call(&self) -> Result<()> {
+        self.delete_profile_field(ProfileFieldName::Call).await
+    }
+
     /// Set the given field of our own user's profile.
     ///
     /// [`Client::homeserver_capabilities()`] should be called first to check it
@@ -460,8 +506,12 @@ impl Account {
     /// Returns an error if the request fails.
     pub async fn set_profile_field(&self, value: ProfileFieldValue) -> Result<()> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
-        let request = set_profile_field::v3::Request::new(user_id.to_owned(), value);
+        let request = set_profile_field::v3::Request::new(user_id.to_owned(), value.clone());
         self.client.send(request).await?;
+
+        let mut changes = UserProfileChanges::new();
+        changes.insert_updated_value(value);
+        self.own_profile_updated(changes).await;
 
         Ok(())
     }
@@ -481,10 +531,40 @@ impl Account {
     /// of if the request fails in some other way.
     pub async fn delete_profile_field(&self, field: ProfileFieldName) -> Result<()> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
-        let request = delete_profile_field::v3::Request::new(user_id.to_owned(), field);
+        let request = delete_profile_field::v3::Request::new(user_id.to_owned(), field.clone());
         self.client.send(request).await?;
 
+        let mut changes = UserProfileChanges::new();
+        changes.removed.push(field);
+        self.own_profile_updated(changes).await;
+
         Ok(())
+    }
+
+    /// Apply the given changes to the locally stored copy of our own profile,
+    /// so they are observable before the next sync reflects them.
+    async fn own_profile_updated(&self, changes: UserProfileChanges) {
+        match self.client.is_global_profile_sync_enabled().await {
+            Ok(true) => {}
+
+            Ok(false) => {
+                debug!("Server doesn't support global profile sync: skip the local echo.");
+                return;
+            }
+
+            Err(error) => {
+                warn!(?error, "Unknown support for global profile sync: skipping the local echo.");
+                return;
+            }
+        }
+
+        if let Err(error) =
+            self.client.base_client().own_profile_updated(UserProfileUpdate::Updated(changes)).await
+        {
+            // The homeserver has already accepted the changes at this point, so we
+            // only need to log the failure.
+            warn!(?error, "Failed to update the locally stored copy of our own profile");
+        }
     }
 
     /// Change the password of the account.

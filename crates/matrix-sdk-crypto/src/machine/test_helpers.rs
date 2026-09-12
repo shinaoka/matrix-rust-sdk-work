@@ -39,7 +39,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     Account, CollectStrategy, CrossSigningBootstrapRequests, DecryptionSettings, Device,
-    DeviceData, EncryptionSyncChanges, OlmMachine, OtherUserIdentityData, TrustRequirement,
+    DeviceData, EncryptionSyncChanges, OlmMachine, OlmMachineBuilder, OtherUserIdentityData,
+    TrustRequirement,
     olm::PrivateCrossSigningIdentity,
     store::{CryptoStoreWrapper, MemoryStore, types::Changes},
     types::{
@@ -123,7 +124,9 @@ pub async fn get_machine_pair_using_store(
 ) -> (OlmMachine, OlmMachine, OneTimeKeys) {
     let (bob, otk) = get_prepared_machine_test_helper(bob, use_fallback_key).await;
 
-    let alice = OlmMachine::with_store(alice, alice_device_id, alice_store, None)
+    let alice = OlmMachineBuilder::new(alice, alice_device_id)
+        .with_crypto_store(alice_store)
+        .build()
         .await
         .expect("Failed to create OlmMachine from supplied store");
 
@@ -421,6 +424,8 @@ pub fn create_unsigned_device(device_keys: DeviceKeys) -> Device {
         verification_machine: dummy_verification_machine(),
         own_identity: None,
         device_owner_identity: None,
+        #[cfg(feature = "experimental-x509-identity-verification")]
+        x509_verifier: None,
     }
 }
 
@@ -443,6 +448,8 @@ pub async fn create_signed_device_of_unverified_user(
         verification_machine: dummy_verification_machine(),
         own_identity: None,
         device_owner_identity: Some(public_identity.into()),
+        #[cfg(feature = "experimental-x509-identity-verification")]
+        x509_verifier: None,
     };
     assert!(device.is_cross_signed_by_owner());
     device
@@ -472,6 +479,8 @@ pub async fn create_signed_device_of_verified_user(
         verification_machine: dummy_verification_machine(),
         own_identity: Some(own_identity.to_public_identity().await.unwrap()),
         device_owner_identity: Some(public_identity.into()),
+        #[cfg(feature = "experimental-x509-identity-verification")]
+        x509_verifier: None,
     };
     assert!(device.is_cross_signed_by_owner());
     assert!(device.is_cross_signing_trusted());

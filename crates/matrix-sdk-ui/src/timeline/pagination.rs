@@ -16,15 +16,12 @@ use async_rx::StreamExt as _;
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt as _, pin_mut};
-use matrix_sdk::event_cache::PaginationStatus;
+use matrix_sdk::event_cache::{PaginationStatus, RoomPagination};
 use ruma::EventId;
 use tracing::instrument;
 
 use super::{Error, algorithms::rfind_event_by_id};
-use crate::timeline::{
-    PaginationError::{self, NotSupported},
-    controller::TimelineFocusKind,
-};
+use crate::timeline::{PaginationError::NotSupported, controller::TimelineFocusKind};
 
 /// Outcome of a cache-only backward restore via
 /// [`Timeline::live_restore_from_cache`].
@@ -68,7 +65,7 @@ impl super::Timeline {
     #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
     pub async fn paginate_backwards(&self, mut num_events: u16) -> Result<bool, Error> {
         match self.controller.focus() {
-            TimelineFocusKind::Live { .. } => {
+            TimelineFocusKind::Live { event_cache, .. } => {
                 match self.controller.live_lazy_paginate_backwards(num_events).await {
                     Some(needed_num_events) => {
                         num_events = needed_num_events.try_into().expect(
@@ -86,28 +83,20 @@ impl super::Timeline {
                     }
                 }
 
-                Ok(self.live_paginate_backwards(num_events).await?)
+                Ok(self.live_paginate_backwards(&event_cache.pagination(), num_events).await?)
             }
 
-            TimelineFocusKind::Event { focused_event_id, thread_mode, .. } => Ok(self
-                .event_cache
-                .get_event_focused_cache(focused_event_id.clone(), (*thread_mode).into())
-                .await?
-                .ok_or(PaginationError::MissingCache)?
-                .paginate_backwards(num_events)
-                .await?
-                .hit_end_of_timeline),
+            TimelineFocusKind::Event { event_cache, .. } => {
+                Ok(event_cache.paginate_backwards(num_events).await?.hit_end_of_timeline)
+            }
 
-            TimelineFocusKind::Thread { root_event_id } => Ok(self
-                .event_cache
-                .thread_pagination(root_event_id.to_owned())
-                .await
-                .map_err(PaginationError::EventCache)?
+            TimelineFocusKind::Thread { event_cache, .. } => Ok(event_cache
+                .pagination()
                 .run_backwards_once(num_events)
                 .await
                 .map(|outcome| outcome.reached_start)?),
 
-            TimelineFocusKind::PinnedEvents => Err(Error::PaginationError(NotSupported)),
+            TimelineFocusKind::PinnedEvents { .. } => Err(Error::PaginationError(NotSupported)),
         }
     }
 
@@ -119,16 +108,11 @@ impl super::Timeline {
         match self.controller.focus() {
             TimelineFocusKind::Live { .. } => Ok(true),
 
-            TimelineFocusKind::Event { focused_event_id, thread_mode, .. } => Ok(self
-                .event_cache
-                .get_event_focused_cache(focused_event_id.clone(), (*thread_mode).into())
-                .await?
-                .ok_or(PaginationError::MissingCache)?
-                .paginate_forwards(num_events)
-                .await?
-                .hit_end_of_timeline),
+            TimelineFocusKind::Event { event_cache, .. } => {
+                Ok(event_cache.paginate_forwards(num_events).await?.hit_end_of_timeline)
+            }
 
-            TimelineFocusKind::Thread { .. } | TimelineFocusKind::PinnedEvents => {
+            TimelineFocusKind::Thread { .. } | TimelineFocusKind::PinnedEvents { .. } => {
                 Err(Error::PaginationError(NotSupported))
             }
         }
@@ -140,9 +124,13 @@ impl super::Timeline {
     /// on a specific event.
     ///
     /// Returns whether we hit the start of the timeline.
-    async fn live_paginate_backwards(&self, batch_size: u16) -> Result<bool, Error> {
+    async fn live_paginate_backwards(
+        &self,
+        event_cache_pagination: &RoomPagination,
+        batch_size: u16,
+    ) -> Result<bool, Error> {
         loop {
-            match self.event_cache.pagination().run_backwards_once(batch_size).await {
+            match event_cache_pagination.run_backwards_once(batch_size).await {
                 Ok(outcome) => {
                     if outcome.reached_start {
                         self.controller.insert_timeline_start_if_missing().await;
@@ -203,10 +191,10 @@ impl super::Timeline {
         anchor_event_id: &str,
         max_chunks: u16,
     ) -> Result<RestoreFromCacheOutcome, Error> {
-        match self.controller.focus() {
-            TimelineFocusKind::Live { .. } => {}
+        let event_cache_pagination = match self.controller.focus() {
+            TimelineFocusKind::Live { event_cache, .. } => event_cache.pagination(),
             _ => return Err(Error::PaginationError(NotSupported)),
-        }
+        };
 
         // Parse the anchor event_id once. If it fails (malformed id), treat it
         // as absent so callers fall back to the non-anchor path.
@@ -269,9 +257,7 @@ impl super::Timeline {
         // Pass max_chunks so run_backwards_cache_only enforces the chunk budget
         // regardless of how many events each chunk contains (P2b fix).
         let needs_u16 = needs.try_into().unwrap_or(u16::MAX);
-        let outcome = self
-            .event_cache
-            .pagination()
+        let outcome = event_cache_pagination
             .run_backwards_cache_only(needs_u16, anchor_id, max_chunks)
             .await?;
         total_events_loaded += outcome.events_loaded;
@@ -335,11 +321,11 @@ impl super::Timeline {
     pub async fn live_back_pagination_status(
         &self,
     ) -> Option<(PaginationStatus, impl Stream<Item = PaginationStatus> + use<>)> {
-        if !self.controller.is_live() {
+        let TimelineFocusKind::Live { event_cache, .. } = self.controller.focus() else {
             return None;
-        }
+        };
 
-        let pagination = self.event_cache.pagination();
+        let pagination = event_cache.pagination();
 
         let mut status = pagination.status();
 

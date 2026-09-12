@@ -17,6 +17,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs, missing_debug_implementations)]
 #![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
+#![recursion_limit = "256"]
 
 pub mod backups;
 mod ciphers;
@@ -34,6 +35,7 @@ pub mod store;
 pub mod types;
 mod utilities;
 mod verification;
+pub mod x509;
 
 #[cfg(any(test, feature = "testing"))]
 /// Testing facilities and helpers for crypto tests
@@ -91,7 +93,10 @@ pub use identities::{
     Device, DeviceData, LocalTrust, OtherUserIdentity, OtherUserIdentityData, OwnUserIdentity,
     OwnUserIdentityData, UserDevices, UserIdentity, UserIdentityData,
 };
-pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine};
+pub use machine::{
+    BootstrapCrossSigningError, CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine,
+    OlmMachineBuilder,
+};
 use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecryptInfo};
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
@@ -174,7 +179,7 @@ pub enum RoomEventDecryptionResult {
     UnableToDecrypt(UnableToDecryptInfo),
 }
 
-#[cfg_attr(doc, aquamarine::aquamarine)]
+#[cfg_attr(doc, doc = include_str!("../../../.cargo/mermaid.html"))]
 /// A step by step guide that explains how to include [end-to-end-encryption]
 /// support in a [Matrix] client library.
 ///

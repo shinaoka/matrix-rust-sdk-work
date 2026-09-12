@@ -20,7 +20,7 @@ use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::events::MessageLikeEventType;
 use tracing::error;
 
-use crate::{room::Room, runtime::get_runtime_handle};
+use crate::room::Room;
 
 #[derive(uniffi::Record)]
 pub struct WidgetDriverAndHandle {
@@ -267,6 +267,7 @@ pub fn get_element_call_required_permissions(
         update_delayed_event: true,
         send_delayed_event: true,
         download_files: true,
+        rtc_transports: true,
     }
 }
 
@@ -307,11 +308,11 @@ impl WidgetDriverHandle {
         self.0.recv().await
     }
 
-    //// Send a message from the widget to the widget driver.
+    /// Send a message from the widget to the widget driver.
     ///
     /// Returns `false` if the widget driver is no longer running.
-    pub async fn send(&self, msg: String) -> bool {
-        self.0.send(msg).await
+    pub fn send(&self, msg: String) -> bool {
+        self.0.send(msg)
     }
 }
 
@@ -334,6 +335,9 @@ pub struct WidgetCapabilities {
     pub send_delayed_event: bool,
     /// This allows the widget to download files (avatars)
     pub download_files: bool,
+    /// This allows the widget to discover the RTC transports advertised by the
+    /// homeserver (MSC4515).
+    pub rtc_transports: bool,
 }
 
 impl From<WidgetCapabilities> for matrix_sdk::widget::Capabilities {
@@ -345,6 +349,7 @@ impl From<WidgetCapabilities> for matrix_sdk::widget::Capabilities {
             update_delayed_event: value.update_delayed_event,
             send_delayed_event: value.send_delayed_event,
             download_file: value.download_files,
+            rtc_transports: value.rtc_transports,
         }
     }
 }
@@ -358,6 +363,7 @@ impl From<matrix_sdk::widget::Capabilities> for WidgetCapabilities {
             update_delayed_event: value.update_delayed_event,
             send_delayed_event: value.send_delayed_event,
             download_files: value.download_file,
+            rtc_transports: value.rtc_transports,
         }
     }
 }
@@ -424,8 +430,10 @@ impl From<matrix_sdk::widget::Filter> for WidgetEventFilter {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
 pub trait WidgetCapabilitiesProvider: SendOutsideWasm + SyncOutsideWasm {
-    fn acquire_capabilities(&self, capabilities: WidgetCapabilities) -> WidgetCapabilities;
+    async fn acquire_capabilities(&self, capabilities: WidgetCapabilities) -> WidgetCapabilities;
 }
 
 struct CapabilitiesProviderWrap(Arc<dyn WidgetCapabilitiesProvider>);
@@ -435,15 +443,9 @@ impl matrix_sdk::widget::CapabilitiesProvider for CapabilitiesProviderWrap {
         &self,
         capabilities: matrix_sdk::widget::Capabilities,
     ) -> matrix_sdk::widget::Capabilities {
-        let this = self.0.clone();
-        // This could require a prompt to the user. Ideally the callback
-        // interface would just be async, but that's not supported yet so use
-        // one of tokio's blocking task threads instead.
-        get_runtime_handle()
-            .spawn_blocking(move || this.acquire_capabilities(capabilities.into()).into())
-            .await
-            // propagate panics from the blocking task
-            .unwrap()
+        // This could require a prompt to the user; the callback interface is
+        // async, so just await it.
+        self.0.acquire_capabilities(capabilities.into()).await.into()
     }
 }
 

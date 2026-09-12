@@ -437,7 +437,7 @@ mod tests {
         {
             let mut position_guard = sliding_sync.inner.position.lock().await;
             position_guard.pos = Some(pos.clone());
-            sliding_sync.subscribe_to_rooms(&[restored_room_id], None, false);
+            sliding_sync.set_room_subscriptions(&[restored_room_id], None, false);
 
             // Then, we can correctly cache the sliding sync instance.
             store_sliding_sync_state(&sliding_sync, &position_guard).await?;

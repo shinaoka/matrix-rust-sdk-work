@@ -16,15 +16,12 @@ use std::sync::Arc;
 
 use eyeball_im::VectorDiff;
 use matrix_sdk::{deserialized_responses::TimelineEvent, send_queue::SendHandle};
-#[cfg(test)]
-use ruma::events::receipt::ReceiptEventContent;
 use ruma::{
     MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    events::{AnyMessageLikeEventContent, AnySyncEphemeralRoomEvent},
+    events::{AnyMessageLikeEventContent, receipt::ReceiptEventContent},
     room_version_rules::RoomVersionRules,
-    serde::Raw,
 };
-use tracing::{instrument, trace, warn};
+use tracing::{instrument, trace};
 
 use super::{
     super::{
@@ -34,7 +31,7 @@ use super::{
         event_item::RemoteEventOrigin,
         traits::RoomDataProvider,
     },
-    DateDividerMode, TimelineMetadata, TimelineSettings, TimelineStateTransaction,
+    ActiveCallInfo, DateDividerMode, TimelineMetadata, TimelineSettings, TimelineStateTransaction,
     observable_items::ObservableItems,
 };
 use crate::{timeline::controller::TimelineFocusKind, unable_to_decrypt_hook::UtdHookManager};
@@ -59,6 +56,7 @@ impl<P: RoomDataProvider> TimelineState<P> {
         internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
         is_room_encrypted: bool,
+        active_call: Option<ActiveCallInfo>,
     ) -> Self {
         Self {
             items: ObservableItems::new(),
@@ -68,7 +66,8 @@ impl<P: RoomDataProvider> TimelineState<P> {
                 internal_id_prefix,
                 unable_to_decrypt_hook,
                 is_room_encrypted,
-            ),
+            )
+            .with_active_call_info(active_call),
             focus,
             _phantom: std::marker::PhantomData,
         }
@@ -117,32 +116,19 @@ impl<P: RoomDataProvider> TimelineState<P> {
     }
 
     #[instrument(skip_all)]
-    pub(super) async fn handle_ephemeral_events(
+    pub(super) async fn handle_read_receipt(
         &mut self,
-        events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+        event: ReceiptEventContent,
         room_data_provider: &P,
     ) {
-        if events.is_empty() {
+        if event.is_empty() {
             return;
         }
 
-        let mut txn = self.transaction();
-
         trace!("Handling ephemeral room events");
-        let own_user_id = room_data_provider.own_user_id();
-        for raw_event in events {
-            match raw_event.deserialize() {
-                Ok(AnySyncEphemeralRoomEvent::Receipt(ev)) => {
-                    txn.handle_explicit_read_receipts(ev.content, own_user_id);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    let event_type = raw_event.get_field::<String>("type").ok().flatten();
-                    warn!(event_type, "Failed to deserialize ephemeral event: {e}");
-                }
-            }
-        }
 
+        let mut txn = self.transaction();
+        txn.handle_explicit_read_receipts(event, room_data_provider.own_user_id());
         txn.commit();
     }
 
@@ -168,13 +154,13 @@ impl<P: RoomDataProvider> TimelineState<P> {
 
         // TODO merge with other should_add, one way or another?
         let should_add_new_items = match &txn.focus {
-            TimelineFocusKind::Live { hide_threaded_events } => {
+            TimelineFocusKind::Live { hide_threaded_events, .. } => {
                 thread_root.is_none() || !hide_threaded_events
             }
             TimelineFocusKind::Thread { root_event_id, .. } => {
                 thread_root.as_ref().is_some_and(|r| r == root_event_id)
             }
-            TimelineFocusKind::Event { .. } | TimelineFocusKind::PinnedEvents => {
+            TimelineFocusKind::Event { .. } | TimelineFocusKind::PinnedEvents { .. } => {
                 // Don't add new items to these timelines; aggregations are added independently
                 // of the `should_add_new_items` value.
                 false
@@ -195,7 +181,7 @@ impl<P: RoomDataProvider> TimelineState<P> {
         };
 
         let timeline_action = TimelineAction::from_content(content, in_reply_to, thread_root, None);
-        TimelineEventHandler::new(&mut txn, ctx)
+        TimelineEventHandler::new(&mut txn, &ctx)
             .handle_event(&mut date_divider_adjuster, timeline_action, None)
             .await;
         txn.adjust_date_dividers(date_divider_adjuster);

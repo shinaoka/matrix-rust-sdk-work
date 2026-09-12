@@ -21,8 +21,7 @@ use matrix_sdk_base::{
 use ruma::OwnedEventId;
 
 use super::{
-    RoomEventCacheGenericUpdate, RoomEventCacheStateLockReadGuard,
-    RoomEventCacheStateLockWriteGuard, RoomEventCacheUpdate,
+    RoomEventCacheGenericUpdate, RoomEventCacheUpdate, state::RoomEventCacheState,
     pagination::{
         RoomLiveTailRefreshCancellation, RoomLiveTailRefreshDiagnostics,
         RoomLiveTailRefreshOutcome, RoomLiveTailRefreshResult, RoomPagination,
@@ -33,6 +32,7 @@ use crate::{
     event_cache::{
         EventCacheError, EventsOrigin, Result, TimelineVectorDiffs,
         deduplicator::{DeduplicationOutcome, filter_duplicate_events},
+        states::{StateLockReadGuard, StateLockWriteGuard},
     },
     room::{Messages, MessagesOptions},
 };
@@ -46,12 +46,13 @@ struct LiveTailSnapshotFence {
 }
 
 impl LiveTailSnapshotFence {
-    fn capture(state: &RoomEventCacheStateLockReadGuard<'_>) -> Self {
+    fn capture(state: &StateLockReadGuard<'_, RoomEventCacheState>) -> Self {
         let mut contiguous_suffix_event_ids = Vec::new();
         for chunk in state.room_linked_chunk().rchunks() {
             match chunk.content() {
-                ChunkContent::Items(events) => contiguous_suffix_event_ids
-                    .extend(events.iter().rev().filter_map(|event| event.event_id())),
+                ChunkContent::Items(events) => contiguous_suffix_event_ids.extend(
+                    events.iter().rev().filter_map(|event| event.event_id().map(|id| id.to_owned())),
+                ),
                 ChunkContent::Gap(_) => break,
             }
         }
@@ -63,7 +64,7 @@ impl LiveTailSnapshotFence {
         }
     }
 
-    fn matches(&self, state: &RoomEventCacheStateLockWriteGuard<'_>) -> bool {
+    fn matches(&self, state: &StateLockWriteGuard<'_, RoomEventCacheState>) -> bool {
         self.gap_snapshot_id == state.gap_snapshot_id()
             && self.gap_topology_generation == state.gap_topology_generation()
             && self.newest_event_id == state.newest_event_id()
@@ -201,8 +202,10 @@ impl RoomPagination {
         let returned_events = response.chunk.len();
         let historical_gap_remaining = response.end.is_some();
         let mut response_events = response.chunk;
-        let response_event_ids =
-            response_events.iter().filter_map(|event| event.event_id()).collect::<Vec<_>>();
+        let response_event_ids = response_events
+            .iter()
+            .filter_map(|event| event.event_id().map(|id| id.to_owned()))
+            .collect::<Vec<_>>();
         let (newest_cached_response_index, older_anchor_response_index) =
             live_tail_anchor_indices(&fence.contiguous_suffix_event_ids, &response_event_ids);
         let mut diagnostics = RoomLiveTailRefreshDiagnostics {
