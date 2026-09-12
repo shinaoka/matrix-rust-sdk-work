@@ -227,7 +227,8 @@ async fn test_thread_focus_keeps_unable_to_decrypt_thread_reply() {
     let reply_event_id = event_id!("$thread_reply:example.com");
     let timeline = TestTimelineBuilder::new()
         .focus(TimelineFocus::Thread { root_event_id: root_event_id.clone() })
-        .build();
+        .build()
+        .await;
     let mut stream = timeline.subscribe_events().await;
 
     let root = event_factory.text_msg("thread root").event_id(&root_event_id).sender(&ALICE);

@@ -963,9 +963,9 @@ pub struct SlidingSyncSubscriptionDelta {
     pub retained: BTreeSet<OwnedRoomId>,
 }
 
-impl fmt::Debug for SlidingSyncSubscriptionDelta {
+impl Debug for SlidingSyncSubscriptionDelta {
     /// Identifier-free: the room sets are caller-facing only.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SlidingSyncSubscriptionDelta")
             .field("changed", &self.changed)

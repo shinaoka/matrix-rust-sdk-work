@@ -766,7 +766,7 @@ async fn test_focused_timeline_keeps_threaded_events_when_requested() {
 
     let f = EventFactory::new().room(room_id).sender(user_id);
     let focus_event = f.text_msg("Focus").into_event();
-    let focus_event_id = focus_event.event_id().unwrap().clone();
+    let focus_event_id = focus_event.event_id().unwrap().to_owned();
 
     server
         .mock_room_event_context()

@@ -123,7 +123,8 @@ async fn test_filter_always_false() {
 async fn test_filtered_gap_repair_settles_without_an_observable_projection() {
     let timeline = TestTimelineBuilder::new()
         .settings(TimelineSettings { event_filter: Arc::new(|_, _| false), ..Default::default() })
-        .build();
+        .build()
+        .await;
     let projection =
         GapRepairProjectionId { actor_generation: 9, repair_generation: 11, projection_batch: 1 };
 
@@ -148,7 +149,7 @@ async fn test_filtered_gap_repair_settles_without_an_observable_projection() {
 
 #[async_test]
 async fn test_aggregation_only_gap_repair_emits_a_tagged_observable_barrier() {
-    let timeline = TestTimeline::new();
+    let timeline = TestTimeline::new().await;
     let mut stream = timeline.subscribe().await;
     let message_event_id = timeline.factory.text_msg("message").sender(&ALICE).into_event();
     let event_id = message_event_id.event_id().unwrap().to_owned();
@@ -181,7 +182,7 @@ async fn test_aggregation_only_gap_repair_emits_a_tagged_observable_barrier() {
 
 #[async_test]
 async fn test_gap_repair_barrier_is_visible_through_the_skipping_subscriber() {
-    let timeline = TestTimeline::new();
+    let timeline = TestTimeline::new().await;
     let values = (0..25)
         .map(|index| {
             timeline.factory.text_msg(format!("message {index}")).sender(&ALICE).into_event()

@@ -1921,7 +1921,6 @@ mod tests {
             Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
                 subscriber.recv()
         );
-        assert_matches!(&diffs[0], VectorDiff::Set { index, value });
         let VectorDiff::Set { index, value } = &diffs[0] else {
             panic!("expected Set diff");
         };

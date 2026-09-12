@@ -186,9 +186,9 @@ pub struct RoomSubscriptionReconcile {
     pub retained_rooms: BTreeSet<OwnedRoomId>,
 }
 
-impl std::fmt::Debug for RoomSubscriptionReconcile {
+impl fmt::Debug for RoomSubscriptionReconcile {
     /// Identifier-free: the caller-facing room sets are never serialized.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RoomSubscriptionReconcile")
             .field("generation", &self.generation)
