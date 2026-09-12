@@ -303,6 +303,7 @@ impl RoomEventCacheState {
             self.remember_redaction(&redaction);
         }
 
+        let mut replaced_in_memory = false;
         let targets = self.pending_redactions.keys().cloned().collect::<Vec<_>>();
         for target_id in targets {
             let Some(redaction) = self.pending_redactions.get(&target_id).cloned() else {
@@ -324,6 +325,7 @@ impl RoomEventCacheState {
                     self.room_linked_chunk
                         .replace_event_at(position, target)
                         .expect("should have been a valid position of an item");
+                    replaced_in_memory = true;
                 }
                 EventLocation::Store => {
                     store.save_event(&self.room_id, target).await?;
@@ -332,9 +334,16 @@ impl RoomEventCacheState {
             self.pending_redactions.remove(&target_id);
         }
 
-        let updates = self.room_linked_chunk.store_updates().take();
-        if !updates.is_empty() {
-            store.handle_linked_chunk_updates(LinkedChunkId::Room(&self.room_id), updates).await?;
+        // Only touch the store when this rebuild changed an in-memory event: the
+        // linked chunk can carry updates recorded while it was loaded, and draining
+        // them here would make creating a cache perform an unrelated store write.
+        if replaced_in_memory {
+            let updates = self.room_linked_chunk.store_updates().take();
+            if !updates.is_empty() {
+                store
+                    .handle_linked_chunk_updates(LinkedChunkId::Room(&self.room_id), updates)
+                    .await?;
+            }
         }
 
         Ok(())
