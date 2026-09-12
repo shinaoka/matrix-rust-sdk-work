@@ -88,8 +88,11 @@ impl ReadReceiptSnapshot {
     ///
     /// `Some(receipt)` denotes an addition or update; `None` denotes removal.
     /// Changes compare timestamps and thread scope, not insertion-order slots.
-    /// Shared tree branches are skipped; independently rebuilt snapshots may
-    /// require a full comparison. Neither compatibility map is materialized.
+    /// Changed and removed readers are reported in the earlier snapshot's
+    /// order, followed by readers that only exist in this snapshot. The values
+    /// are compared explicitly instead of using `OrdMap::diff`, whose shared
+    /// subtree skipping can miss a value-only update. Neither compatibility map
+    /// is materialized.
     ///
     /// ```
     /// use matrix_sdk_ui::timeline::ReadReceiptSnapshot;
@@ -106,13 +109,19 @@ impl ReadReceiptSnapshot {
         &'a self,
         previous: &'a Self,
     ) -> impl Iterator<Item = (&'a OwnedUserId, Option<&'a Receipt>)> {
-        previous.by_user.diff(&self.by_user).map(|change| match change {
-            imbl::ordmap::DiffItem::Add(user, entry)
-            | imbl::ordmap::DiffItem::Update { new: (user, entry), .. } => {
-                (user, Some(&entry.receipt))
+        let changed_or_removed = previous.by_user.iter().filter_map(|(user, entry)| {
+            match self.by_user.get(user) {
+                Some(new) if new != entry => Some((user, Some(&new.receipt))),
+                Some(_) => None,
+                None => Some((user, None)),
             }
-            imbl::ordmap::DiffItem::Remove(user, _) => (user, None),
-        })
+        });
+
+        let added = self.by_user.iter().filter_map(|(user, entry)| {
+            (!previous.by_user.contains_key(user)).then_some((user, Some(&entry.receipt)))
+        });
+
+        changed_or_removed.chain(added)
     }
 
     pub(in crate::timeline) fn insert(

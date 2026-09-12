@@ -713,7 +713,7 @@ impl RoomListService {
 
         self.sliding_sync.set_room_subscriptions(
             room_ids,
-            Some(room_subscription_settings()),
+            Some(room_subscription_settings(self.client.user_id())),
             cancel_in_flight_request,
         )
     }
@@ -737,7 +737,7 @@ impl RoomListService {
 
         self.sliding_sync.reset_and_add_room_subscriptions(
             room_ids,
-            Some(room_subscription_settings()),
+            Some(room_subscription_settings(self.client.user_id())),
             cancel_in_flight_request,
         )
     }
@@ -813,7 +813,7 @@ impl RoomListService {
 
         self.sliding_sync.set_room_subscriptions(
             room_ids,
-            Some(room_subscription_settings()),
+            Some(room_subscription_settings(self.client.user_id())),
             cancel_in_flight_request,
         );
 
@@ -1010,17 +1010,23 @@ impl RoomListService {
     }
 }
 
-fn room_subscription_settings() -> http::request::RoomSubscription {
+fn room_subscription_settings(
+    own_user_id: Option<&UserId>,
+) -> http::request::RoomSubscription {
     assign!(http::request::RoomSubscription::default(), {
-        required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
-            (state_event.clone(), (*value).to_owned())
-        })
-        .chain(
-            DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
-                (state_event.clone(), (*value).to_owned())
-            })
-        )
-        .collect(),
+        // Matrix desktop fork patch surface: expand the MSC4186 `$ME` member
+        // placeholder to the authenticated user's exact state key, because some
+        // servers advertise MSC4186 without expanding `$ME` themselves.
+        required_state: required_state_for_user(DEFAULT_REQUIRED_STATE, own_user_id)
+            .into_iter()
+            .chain(
+                DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE
+                    .iter()
+                    .map(|(state_event, value)| {
+                        (state_event.clone(), (*value).to_owned())
+                    }),
+            )
+            .collect(),
         timeline_limit: UInt::from(DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT),
     })
 }
@@ -2015,6 +2021,7 @@ mod tests {
                 ["m.space.parent", "*"],
                 ["m.space.child", "*"],
                 ["org.matrix.msc3672.beacon_info", "*"],
+                ["org.matrix.msc1763.retention", ""],
             ])
         );
 

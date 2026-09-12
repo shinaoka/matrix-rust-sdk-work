@@ -222,6 +222,32 @@ impl RoomEventCache {
         self.inner.latest_sync_observation.read().await.clone()
     }
 
+    /// Clear all the storage for this [`RoomEventCache`], notifying observers.
+    ///
+    /// Matrix desktop fork patch surface: used by the persisted gap-repair
+    /// integration tests; not part of upstream matrix-sdk.
+    #[cfg(feature = "testing")]
+    pub async fn clear(&self) -> Result<()> {
+        let updates_as_vector_diffs = self
+            .inner
+            .state
+            .write()
+            .await?
+            .reload(super::states::ReloadPreprocessing::ForgetAll)
+            .await?;
+
+        // Notify observers about the update.
+        self.inner.update_sender.send(
+            RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                diffs: updates_as_vector_diffs,
+                origin: EventsOrigin::Cache,
+            }),
+            Some(RoomEventCacheGenericUpdate { room_id: self.inner.room_id.clone() }),
+        );
+
+        Ok(())
+    }
+
     /// Inspect all persisted timeline gaps without exposing pagination tokens
     /// or linked-chunk identifiers.
     ///

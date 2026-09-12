@@ -172,13 +172,47 @@ enum ToDeviceTokenFormat {
     Legacy,
 }
 
+/// Whether a token came from the classic `/sync` endpoint.
+///
+/// Classic `/sync` to-device tokens look like `s<stream>_<...>_<...>` and live
+/// in a different token space than Sliding Sync tokens, so they must never be
+/// sent as a Sliding Sync `to_device.since`.
+///
+/// Matrix desktop fork patch surface: a client that previously ran the classic
+/// `/sync` loop (Koushi before issue #412) may still have such a token in its
+/// crypto store. Any other token is opaque and is passed through unchanged,
+/// because token formats are an implementation detail of the server.
+fn is_classic_sync_token(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix('s') else {
+        return false;
+    };
+
+    let mut segments = rest.split('_');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    if first.is_empty() || !first.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+
+    let mut segments_after_first = 0;
+    for segment in segments {
+        if segment.is_empty() || !segment.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        segments_after_first += 1;
+    }
+
+    segments_after_first > 0
+}
+
 fn classify_to_device_token(token: Option<String>) -> (Option<String>, ToDeviceTokenFormat) {
     match token {
         None => (None, ToDeviceTokenFormat::Absent),
-        Some(token) if !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit()) => {
-            (Some(token), ToDeviceTokenFormat::Sliding)
+        Some(token) if token.is_empty() || is_classic_sync_token(&token) => {
+            (None, ToDeviceTokenFormat::Legacy)
         }
-        Some(_) => (None, ToDeviceTokenFormat::Legacy),
+        Some(token) => (Some(token), ToDeviceTokenFormat::Sliding),
     }
 }
 
@@ -270,12 +304,18 @@ mod tests {
         use super::{ToDeviceTokenFormat, classify_to_device_token};
 
         assert_eq!(classify_to_device_token(None), (None, ToDeviceTokenFormat::Absent));
-        assert_eq!(
-            classify_to_device_token(Some("42".to_owned())),
-            (Some("42".to_owned()), ToDeviceTokenFormat::Sliding)
-        );
 
-        for legacy in ["s123_4_5", "", "１２"] {
+        // Numeric Sliding Sync tokens (Synapse) and opaque tokens from any other
+        // server are passed through unchanged.
+        for sliding in ["42", "nb0", "abc-def"] {
+            assert_eq!(
+                classify_to_device_token(Some(sliding.to_owned())),
+                (Some(sliding.to_owned()), ToDeviceTokenFormat::Sliding)
+            );
+        }
+
+        // Classic `/sync` tokens and an empty token are never sent to Sliding Sync.
+        for legacy in ["s123_4_5", "s1_2", ""] {
             assert_eq!(
                 classify_to_device_token(Some(legacy.to_owned())),
                 (None, ToDeviceTokenFormat::Legacy)

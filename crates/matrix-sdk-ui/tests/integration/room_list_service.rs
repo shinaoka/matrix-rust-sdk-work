@@ -2761,7 +2761,7 @@ async fn test_remove_and_reset_room_subscriptions() -> Result<(), Error> {
                         ["m.room.name", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
-                        ["m.room.member", "$ME"],
+                        ["m.room.member", "@example:localhost"],
                         ["m.room.topic", ""],
                         ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
@@ -2787,7 +2787,7 @@ async fn test_remove_and_reset_room_subscriptions() -> Result<(), Error> {
                         ["m.room.name", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
-                        ["m.room.member", "$ME"],
+                        ["m.room.member", "@example:localhost"],
                         ["m.room.topic", ""],
                         ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
@@ -2844,7 +2844,7 @@ async fn test_remove_and_reset_room_subscriptions() -> Result<(), Error> {
                         ["m.room.name", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
-                        ["m.room.member", "$ME"],
+                        ["m.room.member", "@example:localhost"],
                         ["m.room.topic", ""],
                         ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
@@ -2870,7 +2870,7 @@ async fn test_remove_and_reset_room_subscriptions() -> Result<(), Error> {
                         ["m.room.name", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
-                        ["m.room.member", "$ME"],
+                        ["m.room.member", "@example:localhost"],
                         ["m.room.topic", ""],
                         ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
@@ -2894,7 +2894,7 @@ async fn test_remove_and_reset_room_subscriptions() -> Result<(), Error> {
                         ["m.room.name", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
-                        ["m.room.member", "$ME"],
+                        ["m.room.member", "@example:localhost"],
                         ["m.room.topic", ""],
                         ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
@@ -3794,7 +3794,6 @@ async fn test_reconcile_readd_marks_the_room_missing_again() -> Result<(), Error
     };
 
     let _ = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await;
-    #[cfg(feature = "testing")]
     client.get_room(room_a).unwrap().mark_members_synced();
     let _ = room_list.reconcile_room_subscriptions_with_generation(&[]).await;
     assert!(room_list.active_room_subscriptions().is_empty());
