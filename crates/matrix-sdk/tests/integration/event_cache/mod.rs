@@ -2875,12 +2875,13 @@ async fn test_inspect_and_repair_specific_persisted_timeline_gap() {
 
     let outcome = room_event_cache
         .pagination()
-        .repair_timeline_gap(
+        .repair_timeline_gap_with_projection(
             &older_gap,
             RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 4 },
+        RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
         )
         .await
-        .unwrap();
+        .unwrap().outcome;
     assert_eq!(outcome, RoomTimelineGapRepairOutcome::BoundariesJoined { events: 1 });
 
     let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
@@ -2888,12 +2889,13 @@ async fn test_inspect_and_repair_specific_persisted_timeline_gap() {
     assert_eq!(
         room_event_cache
             .pagination()
-            .repair_timeline_gap(
+            .repair_timeline_gap_with_projection(
                 &older_gap,
                 RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 4 },
+            RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
             )
             .await
-            .unwrap(),
+            .unwrap().outcome,
         RoomTimelineGapRepairOutcome::Stale
     );
 }
@@ -2971,12 +2973,13 @@ async fn test_repair_timeline_gap_reports_progress_with_a_new_sdk_token() {
     assert_eq!(
         room_event_cache
             .pagination()
-            .repair_timeline_gap(
+            .repair_timeline_gap_with_projection(
                 &gap,
                 RoomTimelineGapRepairBudget { event_limit: 16, cached_chunk_limit: 4 },
+            RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
             )
             .await
-            .unwrap(),
+            .unwrap().outcome,
         RoomTimelineGapRepairOutcome::Progress { events: 1 }
     );
     let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
@@ -3025,12 +3028,13 @@ async fn test_repair_timeline_gap_reports_start_reached_when_continuity_is_prove
     assert_eq!(
         room_event_cache
             .pagination()
-            .repair_timeline_gap(
+            .repair_timeline_gap_with_projection(
                 &gap,
                 RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 4 },
+            RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
             )
             .await
-            .unwrap(),
+            .unwrap().outcome,
         RoomTimelineGapRepairOutcome::StartReached { events: 1 }
     );
     let after = room_event_cache.inspect_timeline_gaps().await.unwrap();
@@ -3071,9 +3075,10 @@ async fn test_repair_timeline_gap_returns_stale_before_a_concurrent_request_erro
     let pagination = room_event_cache.pagination();
     let repair = spawn(async move {
         pagination
-            .repair_timeline_gap(
+            .repair_timeline_gap_with_projection(
                 &gap,
                 RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
             )
             .await
     });
@@ -3102,7 +3107,7 @@ async fn test_repair_timeline_gap_returns_stale_before_a_concurrent_request_erro
         .await;
     assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
 
-    assert_eq!(repair.await.unwrap().unwrap(), RoomTimelineGapRepairOutcome::Stale);
+    assert_eq!(repair.await.unwrap().unwrap().outcome, RoomTimelineGapRepairOutcome::Stale);
 }
 
 #[async_test]
@@ -3144,9 +3149,10 @@ async fn test_repair_timeline_gap_accepts_unrelated_live_events_during_request()
     let pagination = room_event_cache.pagination();
     let repair = spawn(async move {
         pagination
-            .repair_timeline_gap(
+            .repair_timeline_gap_with_projection(
                 &gap,
                 RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
             )
             .await
     });
@@ -3174,7 +3180,7 @@ async fn test_repair_timeline_gap_accepts_unrelated_live_events_during_request()
     assert_let_timeout!(Ok(RoomEventCacheUpdate::UpdateTimelineEvents(_)) = room_updates.recv());
 
     assert_eq!(
-        repair.await.unwrap().unwrap(),
+        repair.await.unwrap().unwrap().outcome,
         RoomTimelineGapRepairOutcome::StartReached { events: 1 }
     );
 }
@@ -3216,12 +3222,13 @@ async fn test_repair_timeline_gap_rejects_a_handle_from_another_room() {
     assert_eq!(
         second_cache
             .pagination()
-            .repair_timeline_gap(
+            .repair_timeline_gap_with_projection(
                 &foreign_gap,
                 RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
             )
             .await
-            .unwrap(),
+            .unwrap().outcome,
         RoomTimelineGapRepairOutcome::Stale
     );
 }
@@ -3277,9 +3284,10 @@ async fn test_late_ordinary_pagination_coalesces_ahead_of_queued_gap_repair() {
     let targeted_pagination = room_event_cache.pagination();
     let targeted = spawn(async move {
         targeted_pagination
-            .repair_timeline_gap(
+            .repair_timeline_gap_with_projection(
                 &gap,
                 RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
             )
             .await
     });
@@ -3292,7 +3300,7 @@ async fn test_late_ordinary_pagination_coalesces_ahead_of_queued_gap_repair() {
     let late_outcome = late.await.unwrap().unwrap();
     assert_eq!(first_outcome.events.len(), 1);
     assert_eq!(late_outcome.events.len(), 1);
-    assert_eq!(targeted.await.unwrap().unwrap(), RoomTimelineGapRepairOutcome::Stale);
+    assert_eq!(targeted.await.unwrap().unwrap().outcome, RoomTimelineGapRepairOutcome::Stale);
 }
 
 #[async_test]
@@ -3356,12 +3364,13 @@ async fn test_cancelled_ordinary_caller_keeps_targeted_repair_serialized() {
 
     let targeted_pagination = room_event_cache.pagination();
     let targeted = targeted_pagination
-        .repair_timeline_gap(
+        .repair_timeline_gap_with_projection(
             &gap,
             RoomTimelineGapRepairBudget { event_limit: 7, cached_chunk_limit: 2 },
+        RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
         )
         .await
-        .unwrap();
+        .unwrap().outcome;
     assert_eq!(targeted, RoomTimelineGapRepairOutcome::Stale);
 }
 
@@ -3402,9 +3411,10 @@ async fn test_cancelled_targeted_repair_finishes_persistence_and_broadcast() {
     let pagination = room_event_cache.pagination();
     let repair = spawn(async move {
         pagination
-            .repair_timeline_gap(
+            .repair_timeline_gap_with_projection(
                 &gap,
                 RoomTimelineGapRepairBudget { event_limit: 8, cached_chunk_limit: 2 },
+            RoomTimelineGapProjectionId { actor_generation: 1, repair_generation: 1 },
             )
             .await
     });

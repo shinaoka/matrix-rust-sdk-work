@@ -766,18 +766,6 @@ impl RoomListService {
         }
     }
 
-    /// Replace room subscriptions and return their process-local generation.
-    ///
-    /// Implemented as a thin wrapper over the atomic differential
-    /// reconciliation, so an identical desired set is a true no-op (issue
-    /// #518).
-    pub async fn subscribe_to_rooms_with_generation(
-        &self,
-        room_ids: &[&RoomId],
-    ) -> RoomSubscriptionGeneration {
-        self.reconcile_room_subscriptions_with_generation(room_ids).await.generation
-    }
-
     /// Atomically reconcile the room-subscription set from the current set to
     /// the desired set, diffing by room ID.
     ///
@@ -1207,7 +1195,7 @@ mod tests {
             sync.next().await.expect("initial room-list sync result")?;
         }
 
-        let generation = room_list_service.subscribe_to_rooms_with_generation(&[room_id]).await;
+        let generation = room_list_service.reconcile_room_subscriptions_with_generation(&[room_id]).await.generation;
 
         {
             let _update_guard = server

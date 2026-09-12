@@ -344,7 +344,7 @@ async fn test_room_subscription_checkpoint_tracks_the_response_generation_and_ga
         },
     };
 
-    let generation = room_list.subscribe_to_rooms_with_generation(&[room_id]).await;
+    let generation = room_list.reconcile_room_subscriptions_with_generation(&[room_id]).await.generation;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -398,7 +398,7 @@ async fn test_room_subscription_checkpoint_does_not_reuse_the_baseline_observati
         },
     };
 
-    let generation = room_list.subscribe_to_rooms_with_generation(&[room_id]).await;
+    let generation = room_list.reconcile_room_subscriptions_with_generation(&[room_id]).await.generation;
     let checkpoints = room_list.room_subscription_checkpoints();
 
     sync_then_assert_request_and_fake_response! {
@@ -437,7 +437,7 @@ async fn test_delayed_subscription_response_cannot_repopulate_a_replaced_generat
         },
     };
 
-    let old_generation = room_list.subscribe_to_rooms_with_generation(&[old_room_id]).await;
+    let old_generation = room_list.reconcile_room_subscriptions_with_generation(&[old_room_id]).await.generation;
 
     let delayed_old_response = async {
         sync_then_assert_request_and_fake_response! {
@@ -462,7 +462,7 @@ async fn test_delayed_subscription_response_cannot_repopulate_a_replaced_generat
     };
     let replace_subscription = async {
         sleep(Duration::from_millis(500)).await;
-        room_list.subscribe_to_rooms_with_generation(&[new_room_id]).await
+        room_list.reconcile_room_subscriptions_with_generation(&[new_room_id]).await.generation
     };
 
     let (_, new_generation) = tokio::join!(delayed_old_response, replace_subscription);
@@ -3643,7 +3643,7 @@ async fn test_reconcile_identical_set_is_a_true_noop() -> Result<(), Error> {
         },
     };
 
-    let generation = room_list.subscribe_to_rooms_with_generation(&[room_a]).await;
+    let generation = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await.generation;
     let checkpoints_before = room_list.room_subscription_checkpoints().get().clone();
     let members_synced_before = client.get_room(room_a).unwrap().are_members_synced();
 
@@ -3691,7 +3691,7 @@ async fn test_reconcile_adds_only_new_rooms_and_retains_intersection() -> Result
         },
     };
 
-    let generation_a = room_list.subscribe_to_rooms_with_generation(&[room_a]).await;
+    let generation_a = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await.generation;
     // Simulate both rooms completing a member fetch so the reconciliation's
     // invalidation is observable (member completeness is otherwise false for
     // both, making the assertions vacuous).
