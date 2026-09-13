@@ -15,7 +15,10 @@
 use std::{
     collections::HashMap,
     iter::empty,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use eyeball::SharedObservable;
@@ -92,7 +95,7 @@ pub struct RoomEventCacheState {
 
     /// Latest persisted redaction for each target whose redacted event has not
     /// yet been seen in this room cache.
-    pending_redactions: HashMap<OwnedEventId, Event>,
+    pending_redactions: Arc<Mutex<HashMap<OwnedEventId, Event>>>,
 
     /// Monotonic generation for persisted gap-topology mutations.
     gap_topology_generation: u64,
@@ -149,6 +152,7 @@ impl RoomEventCacheState {
         store_guard: EventCacheStoreLockGuard,
         pagination_status: SharedObservable<SharedPaginationStatus>,
         back_pagination_queue: Option<BackPaginationQueue>,
+        pending_redactions: Arc<Mutex<HashMap<OwnedEventId, Event>>>,
     ) -> Result<Self, EventCacheError> {
         let linked_chunk_id = LinkedChunkId::Room(&room_id);
 
@@ -209,7 +213,7 @@ impl RoomEventCacheState {
             waited_for_initial_prev_token: false,
             subscribers_handle: Default::default(),
             back_pagination_queue,
-            pending_redactions: HashMap::new(),
+            pending_redactions,
             gap_topology_generation: 0,
             gap_snapshot_id: NEXT_GAP_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed),
         };
@@ -254,21 +258,39 @@ impl RoomEventCacheState {
     /// known redaction when several target the same event.
     fn remember_redaction(&mut self, event: &Event) -> Option<OwnedEventId> {
         let target = self.redaction_target(event)?;
-        let replace = self
-            .pending_redactions
+        let mut pending = self.pending_redactions.lock().unwrap();
+        let replace = pending
             .get(&target)
             .is_none_or(|current| Self::compare_redactions(event, current).is_gt());
         if replace {
-            self.pending_redactions.insert(target.clone(), event.clone());
+            pending.insert(target.clone(), event.clone());
         }
         Some(target)
+    }
+
+    /// Redact events whose target has a pending redaction, before they are
+    /// inserted into a chunk: the chunk item, the queued store updates and the
+    /// store copy then all carry the redacted form. See `CachesInternals`.
+    pub(super) fn redact_pending_events(&mut self, events: &mut [Event]) {
+        let Ok(pending) = self.pending_redactions.lock() else {
+            return;
+        };
+        for event in events.iter_mut() {
+            let Some(event_id) = event.event_id().map(ToOwned::to_owned) else {
+                continue;
+            };
+            let Some(redaction) = pending.get(&event_id) else {
+                continue;
+            };
+            let _ = Self::apply_redaction_to_event(event, redaction, &self.room_version_rules);
+        }
     }
 
     fn event_is_redacted(event: &Event) -> bool {
         event.raw().deserialize().is_ok_and(|event| event.is_redacted())
     }
 
-    fn apply_redaction_to_event(
+    pub(in super::super) fn apply_redaction_to_event(
         target: &mut Event,
         redaction: &Event,
         rules: &RoomVersionRules,
@@ -295,7 +317,7 @@ impl RoomEventCacheState {
         &mut self,
         store: &EventCacheStoreLockGuard,
     ) -> Result<(), EventCacheError> {
-        self.pending_redactions.clear();
+        self.pending_redactions.lock().unwrap().clear();
 
         for redaction in
             store.get_room_events(&self.room_id, Some("m.room.redaction"), None).await?
@@ -304,9 +326,16 @@ impl RoomEventCacheState {
         }
 
         let mut replaced_in_memory = false;
-        let targets = self.pending_redactions.keys().cloned().collect::<Vec<_>>();
+        let targets = self
+            .pending_redactions
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         for target_id in targets {
-            let Some(redaction) = self.pending_redactions.get(&target_id).cloned() else {
+            let redaction = self.pending_redactions.lock().unwrap().get(&target_id).cloned();
+            let Some(redaction) = redaction else {
                 continue;
             };
             let Some((location, mut target)) =
@@ -316,7 +345,6 @@ impl RoomEventCacheState {
             };
 
             if !Self::apply_redaction_to_event(&mut target, &redaction, &self.room_version_rules) {
-                self.pending_redactions.remove(&target_id);
                 continue;
             }
 
@@ -331,7 +359,6 @@ impl RoomEventCacheState {
                     store.save_event(&self.room_id, target).await?;
                 }
             }
-            self.pending_redactions.remove(&target_id);
         }
 
         // Only touch the store when this rebuild changed an in-memory event: the
@@ -667,7 +694,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         let Some(event_id) = event.event_id().map(|id| id.to_owned()) else {
             return Ok(());
         };
-        let Some(redaction) = self.state.pending_redactions.get(&event_id).cloned() else {
+        let Some(redaction) = self.state.pending_redactions.lock().unwrap().get(&event_id).cloned()
+        else {
             return Ok(());
         };
 
@@ -676,7 +704,6 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             &redaction,
             &self.state.room_version_rules,
         ) {
-            self.state.pending_redactions.remove(&event_id);
             return Ok(());
         }
 
@@ -685,7 +712,6 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         };
 
         self.replace_event_at(location, event.clone()).await?;
-        self.state.pending_redactions.remove(&event_id);
         Ok(())
     }
 
@@ -832,6 +858,9 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         // events, because we are pushing all _new_ `events` at the back.
         self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids).await?;
 
+        let mut events = events;
+        self.redact_pending_events(&mut events);
+
         self.state.room_linked_chunk.push_live_events(
             prev_batch_token.map(|prev_token| Gap { token: prev_token }),
             &events,
@@ -902,9 +931,9 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         // Replay any redaction that arrived before its target, now that the
         // target is known to this cache.
         for event in &events {
-            let pending = event
-                .event_id()
-                .is_some_and(|event_id| self.state.pending_redactions.contains_key(event_id));
+            let pending = event.event_id().is_some_and(|event_id| {
+                self.state.pending_redactions.lock().unwrap().contains_key(event_id)
+            });
             if pending {
                 let mut event = event.clone();
                 self.apply_pending_redaction_to_event(&mut event).await?;
