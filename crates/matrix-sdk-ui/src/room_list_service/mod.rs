@@ -1075,7 +1075,7 @@ mod tests {
     use wiremock::ResponseTemplate;
 
     use super::{
-        ALL_ROOMS_LIST_NAME, Error, RoomListRangeLoadingState, RoomListService,
+        ALL_ROOMS_LIST_NAME, Error, RoomListService,
         RoomSubscriptionCheckpoint, RoomSubscriptionGeneration, RoomSubscriptionState, State,
         filters::new_filter_non_left, required_state_for_user,
     };
@@ -1287,11 +1287,10 @@ mod tests {
         let client = server.client_builder().build().await;
         let room_list_service = RoomListService::new(client).await?;
         let all_rooms = room_list_service.all_rooms().await?;
-        let mut range_state = all_rooms.range_loading_state();
         let committed = room_list_service.committed_all_rooms_response();
 
-        assert_eq!(range_state.next().await, Some(RoomListRangeLoadingState::PartiallyLoaded));
         assert!(!committed.get().range_fully_loaded());
+        assert_eq!(all_rooms.current_entries_snapshot().range_fully_loaded(), None);
 
         let sync = room_list_service.sync();
         pin_mut!(sync);
@@ -1310,17 +1309,9 @@ mod tests {
             sync.next().await.expect("room-list sync result")?;
             tokio::task::yield_now().await;
 
-            while let Some(Some(state)) = range_state.next().now_or_never() {
-                assert_eq!(state, RoomListRangeLoadingState::PartiallyLoaded);
-            }
             assert!(!committed.get().range_fully_loaded());
+            assert_eq!(all_rooms.current_entries_snapshot().range_fully_loaded(), Some(false));
         }
-
-        let mut current_range_state = all_rooms.range_loading_state();
-        assert_eq!(
-            current_range_state.next().await,
-            Some(RoomListRangeLoadingState::PartiallyLoaded)
-        );
 
         let _mock_guard = server
             .mock_sliding_sync()
@@ -1334,10 +1325,7 @@ mod tests {
 
         sync.next().await.expect("final room-list sync result")?;
         assert!(committed.get().range_fully_loaded());
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), range_state.next()).await?,
-            Some(RoomListRangeLoadingState::FullyLoaded)
-        );
+        assert_eq!(all_rooms.current_entries_snapshot().range_fully_loaded(), Some(true));
 
         let requests = server.received_requests().await.expect("captured requests");
         let ranges = requests
@@ -1417,8 +1405,8 @@ mod tests {
         let room_list_service = RoomListService::new(client).await?;
         let all_rooms = room_list_service.all_rooms().await?;
         let mut committed = room_list_service.committed_all_rooms_response();
-        let mut range_state = all_rooms.range_loading_state();
-        assert_eq!(range_state.next().await, Some(RoomListRangeLoadingState::PartiallyLoaded));
+        assert!(!committed.get().range_fully_loaded());
+        assert_eq!(all_rooms.current_entries_snapshot().range_fully_loaded(), None);
 
         let sync = room_list_service.sync();
         pin_mut!(sync);
@@ -1457,16 +1445,7 @@ mod tests {
         assert_eq!(final_body["lists"]["all_rooms"]["ranges"], serde_json::json!([[0, 0]]));
 
         assert!(committed.get().range_fully_loaded());
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match range_state.next().await {
-                    Some(RoomListRangeLoadingState::FullyLoaded) => break,
-                    Some(RoomListRangeLoadingState::PartiallyLoaded) => continue,
-                    None => panic!("room range loading-state stream ended"),
-                }
-            }
-        })
-        .await?;
+        assert_eq!(all_rooms.current_entries_snapshot().range_fully_loaded(), Some(true));
 
         let (entries, controller) = all_rooms.entries_with_dynamic_adapters(usize::MAX);
         pin_mut!(entries);
