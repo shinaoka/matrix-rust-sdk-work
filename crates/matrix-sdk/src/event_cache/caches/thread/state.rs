@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::empty;
+use std::{
+    collections::HashMap,
+    iter::empty,
+    sync::{Arc, Mutex},
+};
 
 use eyeball::{AsyncLock, ObservableWriteGuard, SharedObservable};
 use eyeball_im::VectorDiff;
@@ -62,6 +66,7 @@ use super::{
     ThreadEventCacheUpdateSender,
 };
 use crate::room::WeakRoom;
+use super::super::room::RoomEventCacheState;
 
 pub struct ThreadEventCacheState {
     /// The room owning this thread.
@@ -106,6 +111,11 @@ pub struct ThreadEventCacheState {
 
     /// A handle for subscribers.
     subscribers_handle: SubscribersHandle,
+
+    /// Redactions that arrived in the room before their target was known, shared
+    /// with the room cache. A target delivered into this thread later must be
+    /// redacted before it reaches the thread chunk or the store.
+    pending_redactions: Arc<Mutex<HashMap<OwnedEventId, Event>>>,
 }
 
 impl ThreadEventCacheState {
@@ -129,6 +139,7 @@ impl ThreadEventCacheState {
         store_guard: EventCacheStoreLockGuard,
         update_sender: ThreadEventCacheUpdateSender,
         linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
+        pending_redactions: Arc<Mutex<HashMap<OwnedEventId, Event>>>,
     ) -> Result<Self> {
         let linked_chunk_id = LinkedChunkId::Thread(&room_id, &thread_id);
 
@@ -194,6 +205,7 @@ impl ThreadEventCacheState {
             linked_chunk_update_sender,
             waited_for_initial_prev_token: false,
             subscribers_handle: SubscribersHandle::default(),
+            pending_redactions,
         })
     }
 
@@ -504,6 +516,9 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         // existing events, because we are pushing all _new_ `events` at the back.
         self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids).await?;
 
+        let mut events = events;
+        self.redact_pending_events(&mut events);
+
         self.state.thread_linked_chunk.push_live_events(
             prev_batch_token.as_ref().map(|prev_token| Gap { token: prev_token.clone() }),
             &events,
@@ -606,6 +621,28 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
     /// to-be-redacted event in the chunk, and replace it by the
     /// redacted form.
     #[instrument(skip_all)]
+    /// Redact events whose target has a pending redaction, before they are
+    /// inserted into this thread's chunk; the room cache shares the registry, so a
+    /// redaction delivered to the room timeline also covers this thread's copy.
+    pub(super) fn redact_pending_events(&mut self, events: &mut [Event]) {
+        let Ok(pending) = self.pending_redactions.lock() else {
+            return;
+        };
+        for event in events.iter_mut() {
+            let Some(event_id) = event.event_id().map(ToOwned::to_owned) else {
+                continue;
+            };
+            let Some(redaction) = pending.get(&event_id) else {
+                continue;
+            };
+            let _ = RoomEventCacheState::apply_redaction_to_event(
+                event,
+                redaction,
+                &self.room_version_rules,
+            );
+        }
+    }
+
     async fn maybe_apply_new_redaction(&mut self, event: &Event) -> Result<()> {
         let Some(event_id) =
             extract_redaction_target(event.raw(), &self.room_version_rules.redaction)

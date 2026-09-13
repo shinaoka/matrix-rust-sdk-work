@@ -18,7 +18,7 @@ pub mod pagination;
 mod state;
 mod updates;
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::{Arc, Mutex}};
 
 use eyeball::AsyncLock;
 use matrix_sdk_base::{
@@ -104,6 +104,7 @@ impl ThreadEventCache {
         auto_shrink_sender: mpsc::Sender<AutoShrinkMessage>,
         generic_update_sender: Sender<RoomEventCacheGenericUpdate>,
         linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
+        pending_redactions: Arc<Mutex<HashMap<OwnedEventId, Event>>>,
     ) -> Result<Self> {
         let update_sender = ThreadEventCacheUpdateSender::new(generic_update_sender.clone());
 
@@ -120,6 +121,7 @@ impl ThreadEventCache {
                         store_guard,
                         update_sender.clone(),
                         linked_chunk_update_sender,
+                        pending_redactions,
                     )
                 },
             )

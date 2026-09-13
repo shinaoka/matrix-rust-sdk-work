@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, ops::Not, sync::Arc};
+use std::{
+    collections::HashMap,
+    ops::Not,
+    sync::{Arc, Mutex},
+};
 
 use eyeball::SharedObservable;
 use eyeball_im::VectorDiff;
@@ -79,6 +83,12 @@ struct CachesInternals {
     auto_shrink_sender: mpsc::Sender<AutoShrinkMessage>,
     linked_chunk_update_sender: Sender<room::RoomEventCacheLinkedChunkUpdate>,
     room_version_rules: RoomVersionRules,
+    /// Redactions that arrived in this room before their target was known, shared
+    /// by the room cache and every per-thread cache of that room.
+    ///
+    /// A target delivered later must be redacted before it reaches any chunk or
+    /// the store, whichever cache writes that copy.
+    pending_redactions: Arc<Mutex<HashMap<OwnedEventId, Event>>>,
 }
 
 impl Caches {
@@ -115,6 +125,9 @@ impl Caches {
         let own_user_id =
             client.user_id().expect("the user must be logged in, at this point").to_owned();
 
+        let pending_redactions: Arc<Mutex<HashMap<OwnedEventId, Event>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         let room_state = state
             .try_insert_once_with(
                 states::selectors::RoomStateSelector::new(room_id.to_owned()),
@@ -130,6 +143,7 @@ impl Caches {
                         store_guard,
                         pagination_status.clone(),
                         back_pagination_queue,
+                        pending_redactions.clone(),
                     )
                 },
             )
@@ -161,6 +175,7 @@ impl Caches {
             pinned_events: OnceCell::new(),
             event_focused: Arc::new(RwLock::new(HashMap::new())),
             internals: CachesInternals {
+                pending_redactions,
                 state: state.clone(),
                 auto_shrink_sender,
                 linked_chunk_update_sender,
@@ -212,6 +227,7 @@ impl Caches {
                         self.internals.auto_shrink_sender.clone(),
                         room.update_sender().generic_update_sender().clone(),
                         self.internals.linked_chunk_update_sender.clone(),
+                        self.internals.pending_redactions.clone(),
                     )
                     .await?;
 
