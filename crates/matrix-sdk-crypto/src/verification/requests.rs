@@ -1624,6 +1624,7 @@ impl RequestState<Transitioned> {
             && content.from_device() == self.state.other_device_data.device_id()
             && content.flow_id() == self.flow_id.as_str()
         {
+            super::protection_counters::note_suppressed_sas_start_replay();
             return Ok(None);
         }
 
@@ -1911,7 +1912,16 @@ mod tests {
         assert_matches!(bob_sas.state(), SasState::Accepted { .. });
 
         let mut request_changes = Box::pin(bob_request.changes());
+        let suppressed_before = crate::verification::incoming_verification_request_protection_counters()
+            .suppressed_sas_start_replays;
         bob_request.receive_start(alice_id(), &start_content).await.unwrap();
+        let suppressed_after = crate::verification::incoming_verification_request_protection_counters()
+            .suppressed_sas_start_replays;
+        assert_eq!(
+            suppressed_after,
+            suppressed_before + 1,
+            "the protection must count the replayed SAS start it rejected"
+        );
 
         assert!(request_changes.next().now_or_never().is_none());
         assert_let!(

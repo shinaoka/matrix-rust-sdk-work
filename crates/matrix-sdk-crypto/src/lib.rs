@@ -121,9 +121,13 @@ pub use store::{
 };
 pub use verification::IncomingVerificationRequestDelivery;
 pub use verification::{
-    AcceptSettings, AcceptedProtocols, CancelInfo, Emoji, EmojiShortAuthString, Sas, SasState,
-    Verification, VerificationRequest, VerificationRequestState, format_emojis,
+    AcceptSettings, AcceptedProtocols, CancelInfo, Emoji, EmojiShortAuthString,
+    IncomingVerificationRequestProtectionCounters, Sas, SasState, Verification,
+    VerificationRequest, VerificationRequestState, format_emojis,
+    incoming_verification_request_protection_counters,
 };
+#[cfg(feature = "testing")]
+pub use verification::reset_incoming_verification_request_protection_counters;
 #[cfg(feature = "qrcode")]
 pub use verification::{QrVerification, QrVerificationState, ScanError};
 #[doc(no_inline)]

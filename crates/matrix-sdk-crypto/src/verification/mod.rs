@@ -15,6 +15,7 @@
 mod cache;
 mod event_enums;
 mod machine;
+mod protection_counters;
 #[cfg(feature = "qrcode")]
 mod qrcode;
 mod requests;
@@ -27,6 +28,12 @@ use event_enums::OutgoingContent;
 pub use machine::IncomingVerificationRequestDelivery;
 pub(crate) use machine::VerificationEventResult;
 pub use machine::VerificationMachine;
+pub use protection_counters::{
+    IncomingVerificationRequestProtectionCounters,
+    incoming_verification_request_protection_counters,
+};
+#[cfg(feature = "testing")]
+pub use protection_counters::reset_incoming_verification_request_protection_counters;
 #[cfg(feature = "qrcode")]
 pub use qrcode::{QrVerification, QrVerificationState, ScanError};
 pub use requests::{VerificationRequest, VerificationRequestState};
