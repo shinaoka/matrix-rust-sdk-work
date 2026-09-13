@@ -280,4 +280,46 @@ mod tests {
         assert!(original.as_index_map().values().all(|receipt| receipt.ts.is_none()
             && receipt.thread == ruma::events::receipt::ReceiptThread::Unthreaded));
     }
+
+    #[test]
+    fn large_receipt_set_reports_only_changed_readers() {
+        use ruma::{MilliSecondsSinceUnixEpoch, UserId};
+
+        fn ts_for(seconds: u64) -> MilliSecondsSinceUnixEpoch {
+            MilliSecondsSinceUnixEpoch::from_system_time(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            )
+            .unwrap()
+        }
+
+        // A read receipt set as large as the biggest rooms allow: the explicit value
+        // comparison in `changes_since` must still report exactly the readers whose
+        // receipt changed, was added or was removed, and nothing else. It scans the
+        // previous set, so this also protects the incremental-notification contract
+        // from a cheaper-but-wrong diff.
+        let users: Vec<OwnedUserId> = (0..10_000)
+            .map(|i| UserId::parse(format!("@u{i}:example.org")).unwrap().into())
+            .collect();
+        let before: ReadReceiptSnapshot =
+            users.iter().cloned().map(|user| (user, Receipt::default())).collect();
+
+        let mut after = before.clone();
+        after.insert(users[123].clone(), Receipt::new(ts_for(1)));
+        after.swap_remove(&users[456]);
+        let added = UserId::parse("@newcomer:example.org").unwrap().to_owned();
+        after.insert(added.clone(), Receipt::new(ts_for(2)));
+
+        // Documented order: changed and removed readers in the earlier snapshot's
+        // order, then readers that only exist in this snapshot.
+        let changed: Vec<(&OwnedUserId, Option<&Receipt>)> =
+            after.changes_since(&before).collect();
+
+        assert_eq!(changed.len(), 3, "only the changed, removed and added readers");
+        assert_eq!(changed[0].0, &users[123]);
+        assert_eq!(changed[0].1.unwrap().ts, Some(ts_for(1)));
+        assert_eq!(changed[1].0, &users[456]);
+        assert!(changed[1].1.is_none());
+        assert_eq!(changed[2].0, &added);
+        assert_eq!(changed[2].1.unwrap().ts, Some(ts_for(2)));
+    }
 }
