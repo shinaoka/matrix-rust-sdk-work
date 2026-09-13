@@ -50,8 +50,6 @@ pub struct RoomList {
     sliding_sync_list: SlidingSyncList,
     loading_state: SharedObservable<RoomListLoadingState>,
     _loading_state_task: BackgroundTaskHandle,
-    range_loading_state: SharedObservable<RoomListRangeLoadingState>,
-    _range_loading_state_task: BackgroundTaskHandle,
     all_rooms_observed_ids: AllRoomsObservedIdsObservable,
 }
 
@@ -139,13 +137,6 @@ impl RoomList {
                 },
                 None => RoomListLoadingState::NotLoaded,
             });
-        let range_loading_state = SharedObservable::new(RoomListRangeLoadingState::from_states(
-            &sliding_sync_list.state(),
-            &room_list_service_state.get(),
-        ));
-        let range_sliding_sync_list = sliding_sync_list.clone();
-        let mut range_room_list_service_state = room_list_service_state.clone();
-
         Ok(Self {
             client: client.clone(),
             sliding_sync_list: sliding_sync_list.clone(),
@@ -183,38 +174,6 @@ impl RoomList {
                     }
                 })
                 .abort_on_drop(),
-            range_loading_state: range_loading_state.clone(),
-            _range_loading_state_task: client
-                .task_monitor()
-                .spawn_infinite_task("room_list::range_loading_state_task", async move {
-                    let (mut current_list_state, range_loading_state_stream) =
-                        range_sliding_sync_list.state_stream();
-                    let mut current_service_state = range_room_list_service_state.get();
-                    range_loading_state.set(RoomListRangeLoadingState::from_states(
-                        &current_list_state,
-                        &current_service_state,
-                    ));
-                    pin_mut!(range_loading_state_stream);
-
-                    loop {
-                        select! {
-                            state = range_loading_state_stream.next() => {
-                                let Some(state) = state else { break };
-                                current_list_state = state;
-                            }
-                            state = range_room_list_service_state.next() => {
-                                let Some(state) = state else { break };
-                                current_service_state = state;
-                            }
-                        }
-
-                        range_loading_state.set(RoomListRangeLoadingState::from_states(
-                            &current_list_state,
-                            &current_service_state,
-                        ));
-                    }
-                })
-                .abort_on_drop(),
             all_rooms_observed_ids,
         })
     }
@@ -226,13 +185,6 @@ impl RoomList {
     /// See [`RoomListLoadingState`].
     pub fn loading_state(&self) -> Subscriber<RoomListLoadingState> {
         self.loading_state.subscribe_reset()
-    }
-
-    /// Get a subscriber to the coarse loading state of the underlying room range.
-    ///
-    /// This method sends the current range loading state as the first update.
-    pub fn range_loading_state(&self) -> Subscriber<RoomListRangeLoadingState> {
-        self.range_loading_state.subscribe_reset()
     }
 
     /// Read the current `all_rooms` entries without waiting for stream delivery.
@@ -336,7 +288,7 @@ impl RoomList {
 
 /// The coarse loading state of the room range backing a [`RoomList`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RoomListRangeLoadingState {
+pub(super) enum RoomListRangeLoadingState {
     /// The complete room range has not been loaded yet.
     PartiallyLoaded,
 

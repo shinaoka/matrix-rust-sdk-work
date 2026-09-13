@@ -21,7 +21,6 @@ mod client;
 mod error;
 mod list;
 
-use std::fmt;
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::Debug,

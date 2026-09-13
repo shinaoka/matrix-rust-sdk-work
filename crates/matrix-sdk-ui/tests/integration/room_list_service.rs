@@ -3814,7 +3814,7 @@ async fn test_reconcile_readd_marks_the_room_missing_again() -> Result<(), Error
 
 #[async_test]
 async fn test_reconcile_recovers_after_session_expiry_and_reports_readd() -> Result<(), Error> {
-    let (client, server, room_list) = new_room_list_service().await?;
+    let (_client, server, room_list) = new_room_list_service().await?;
     let sync = room_list.sync();
     pin_mut!(sync);
     let room_a = room_id!("!a:bar.org");
