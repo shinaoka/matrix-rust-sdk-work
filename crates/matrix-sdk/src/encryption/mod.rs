@@ -135,6 +135,7 @@ pub use matrix_sdk_base::crypto::{
     RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
     RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMemberReloadDiagnostic,
     RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision, RoomKeyReceiveCounters,
+    IncomingVerificationRequestProtectionCounters,
     RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
     RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
     RoomKeyRotationDiagnostic, RoomKeyRotationReason, SessionCreationError, SignatureError,
@@ -1014,6 +1015,23 @@ impl Encryption {
             .await
             .as_ref()
             .map(|machine| machine.room_key_receive_counters())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the private-data-free activation counters for the
+    /// incoming-verification-request protections.
+    ///
+    /// The counters are process-wide and contain counts only, so they can show
+    /// whether the protections against rare conditions (unknown sender devices,
+    /// repeated SAS start events, released deliveries) are still exercised.
+    pub async fn incoming_verification_request_protection_counters(
+        &self,
+    ) -> IncomingVerificationRequestProtectionCounters {
+        self.client
+            .olm_machine()
+            .await
+            .as_ref()
+            .map(|machine| machine.incoming_verification_request_protection_counters())
             .unwrap_or_default()
     }
 

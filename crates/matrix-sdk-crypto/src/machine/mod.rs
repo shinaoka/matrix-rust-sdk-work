@@ -1527,6 +1527,18 @@ impl OlmMachine {
         self.inner.room_key_diagnostics.receive_counters()
     }
 
+    /// Snapshot the private-data-free activation counters for the
+    /// incoming-verification-request protections.
+    ///
+    /// The counters are process-wide and contain counts only, so they can show
+    /// whether the protections against rare conditions (unknown sender devices,
+    /// repeated SAS start events, released deliveries) are still exercised.
+    pub fn incoming_verification_request_protection_counters(
+        &self,
+    ) -> crate::verification::IncomingVerificationRequestProtectionCounters {
+        crate::verification::incoming_verification_request_protection_counters()
+    }
+
     /// Get to-device requests to share a room key with users in a room.
     ///
     /// # Arguments

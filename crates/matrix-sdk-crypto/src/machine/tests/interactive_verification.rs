@@ -313,8 +313,16 @@ async fn test_unknown_sender_verification_request_is_recovered_after_key_query()
     let event = request_to_event(alice.user_id(), &request);
     let mut recovered_requests = bob.subscribe_to_incoming_verification_requests();
 
+    let deferred_before =
+        crate::incoming_verification_request_protection_counters().unknown_sender_deferred;
     bob.handle_verification_event(&event).await;
     bob.handle_verification_event(&event).await;
+    let deferred_after =
+        crate::incoming_verification_request_protection_counters().unknown_sender_deferred;
+    assert!(
+        deferred_after > deferred_before,
+        "an unknown-sender request must be counted as deferred, not dropped"
+    );
     assert!(
         bob.get_verification_request(alice.user_id(), outgoing_request.flow_id().as_str())
             .is_none(),
@@ -1313,7 +1321,15 @@ async fn test_polled_recovery_without_application_commit_returns_to_later_owner(
 
     let uncommitted = first_owner.next().await.expect("the first owner must acquire the delivery");
     assert_eq!(uncommitted.flow_id(), outgoing_request.flow_id());
+    let released_before =
+        crate::incoming_verification_request_protection_counters().released_deliveries;
     drop(uncommitted);
+    let released_after =
+        crate::incoming_verification_request_protection_counters().released_deliveries;
+    assert!(
+        released_after > released_before,
+        "releasing an uncommitted delivery must be counted as an activation"
+    );
     drop(first_owner);
 
     let mut later_owner = bob.subscribe_to_incoming_verification_requests();

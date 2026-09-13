@@ -289,6 +289,7 @@ impl PendingToDeviceKeyQueryResponseClaim {
                         token,
                         observed_generation: pending.committed_update_generation,
                     };
+                    super::protection_counters::note_key_query_replay();
                     replay_needed = true;
                 } else {
                     pending.state =
@@ -511,6 +512,7 @@ impl Drop for IncomingVerificationRequestDelivery {
         {
             publication.state = IncomingVerificationRequestPublicationState::Unclaimed;
         }
+        super::protection_counters::note_released_delivery();
         drop(owner);
         notify_watch(&self.publication_changed);
     }
@@ -1379,6 +1381,7 @@ impl VerificationMachine {
             return None;
         };
         let query_needed = self.retain_pending_to_device_request(event);
+        super::protection_counters::note_unknown_sender_deferred();
         Some(VerificationEventResult::UnknownSenderQueued {
             sender: event.sender.clone(),
             query_needed,
