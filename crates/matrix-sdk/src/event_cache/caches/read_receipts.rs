@@ -470,9 +470,11 @@ where
 
     let mut receipt = None;
 
-    for (event, event_id) in linked_chunk.revents().filter_map(|(_pos, event)| {
-        event_filter.filter(event).then_some((event, event.event_id()?))
-    }) {
+    // Explicit unthreaded receipts may point at thread replies. Keep their
+    // chronological boundary even though replies do not count as room unreads.
+    for (event, event_id) in
+        linked_chunk.revents().filter_map(|(_pos, event)| Some((event, event.event_id()?)))
+    {
         if receipt.is_none() {
             // Try to see if the latest active receipt is still the most recent receipt.
             if latest_active == Some(event_id) {
@@ -482,7 +484,7 @@ where
             }
             // Try to find an implicit read receipt (i.e. an event sent by the current
             // user).
-            else if event.sender().as_deref() == Some(user_id) {
+            else if event_filter.filter(event) && event.sender().as_deref() == Some(user_id) {
                 trace!(implicit = %event_id, "found an implicit receipt; stopping search");
                 receipt = Some(event_id.to_owned());
             }
@@ -600,9 +602,12 @@ pub(crate) async fn compute_unread_counts<T>(
         read_receipts.find_and_process_events(
             &event_id,
             user_id,
-            linked_chunk
-                .events()
-                .filter_map(|(_pos, event)| event_filter.filter(event).then_some(event)),
+            linked_chunk.events().filter_map(|(_pos, event)| {
+                // The boundary itself must reach find_and_process_events so it
+                // can reset the counts, even if it is excluded from counting.
+                (event.event_id() == Some(event_id.as_ref()) || event_filter.filter(event))
+                    .then_some(event)
+            }),
         );
 
         debug!(?read_receipts, "after finding a better receipt");
@@ -1131,6 +1136,111 @@ mod tests {
         assert_eq!(receipts.num_unread, 1);
         assert_eq!(receipts.num_mentions, 0);
         assert_eq!(receipts.num_notifications, 0);
+    }
+
+    #[tokio::test]
+    async fn unthreaded_receipt_on_thread_reply_preserves_room_read_boundary() {
+        let room_id = room_id!("!room:example.org");
+        let own = user_id!("@reader:example.org");
+        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let mut already_read = f.text_msg("already read").event_id(event_id!("$root")).into_event();
+        already_read.set_push_actions(vec![
+            Action::Notify,
+            Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)),
+        ]);
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.push_events(vec![
+            already_read,
+            f.text_msg("reply")
+                .event_id(event_id!("$reply"))
+                .in_thread(event_id!("$root"), event_id!("$root"))
+                .into_event(),
+        ]);
+        let state_store = MemoryStore::new();
+        let event_filter = RoomReadReceiptEventFilter {
+            room_id,
+            with_threading_support: true,
+            state_store: &state_store,
+        };
+        let mut receipts = ReadReceipts::default();
+        receipts.latest_active = Some(matrix_sdk_base::read_receipts::LatestReadReceipt {
+            event_id: owned_event_id!("$reply"),
+        });
+        super::compute_unread_counts(own, None, &linked_chunk, &event_filter, &mut receipts, None)
+            .await;
+        assert_eq!(
+            receipts.num_unread, 0,
+            "an explicit room receipt can use a reply as its chronological boundary"
+        );
+        assert_eq!(receipts.num_notifications, 0);
+        assert_eq!(receipts.num_mentions, 0);
+        // A subsequent main message counts; another thread reply does not.
+        linked_chunk.push_events(vec![
+            f.text_msg("new main").event_id(event_id!("$main-new")).into_event(),
+            f.text_msg("new reply")
+                .event_id(event_id!("$reply-new"))
+                .in_thread(event_id!("$root"), event_id!("$reply"))
+                .into_event(),
+        ]);
+        super::compute_unread_counts(own, None, &linked_chunk, &event_filter, &mut receipts, None)
+            .await;
+        assert_eq!(receipts.num_unread, 1);
+    }
+
+    #[tokio::test]
+    async fn unthreaded_reply_receipt_is_matched_from_sync_and_store() {
+        use matrix_sdk_base::{StateChanges, store::StateStore};
+        let room_id = room_id!("!room:example.org");
+        let own = user_id!("@reader:example.org");
+        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.push_events(vec![
+            f.text_msg("old").event_id(event_id!("$root")).into_event(),
+            f.text_msg("read reply")
+                .event_id(event_id!("$reply"))
+                .in_thread(event_id!("$root"), event_id!("$root"))
+                .into_event(),
+            f.text_msg("new").event_id(event_id!("$new")).into_event(),
+            f.text_msg("own reply")
+                .sender(own)
+                .event_id(event_id!("$own-reply"))
+                .in_thread(event_id!("$root"), event_id!("$reply"))
+                .into_event(),
+        ]);
+        let receipt_event: ruma::events::receipt::ReceiptEventContent =
+            serde_json::from_value(serde_json::json!({
+                "$reply": {"m.read": {"@reader:example.org": {"ts": 10}}}
+            }))
+            .unwrap();
+        let state_store = MemoryStore::new();
+        let filter = RoomReadReceiptEventFilter {
+            room_id,
+            with_threading_support: true,
+            state_store: &state_store,
+        };
+        let mut receipts = ReadReceipts::default();
+        super::compute_unread_counts(
+            own,
+            Some(&receipt_event),
+            &linked_chunk,
+            &filter,
+            &mut receipts,
+            None,
+        )
+        .await;
+        assert_eq!(receipts.num_unread, 1);
+        assert_eq!(receipts.latest_active.as_ref().unwrap().event_id, event_id!("$reply"));
+        assert!(receipts.pending.is_empty());
+        let mut changes = StateChanges::default();
+        changes.receipts.insert(room_id.to_owned(), receipt_event);
+        state_store.save_changes(&changes).await.unwrap();
+        let mut restored = ReadReceipts::default();
+        super::compute_unread_counts(own, None, &linked_chunk, &filter, &mut restored, None).await;
+        assert_eq!(
+            restored.num_unread, 1,
+            "an own thread reply must not implicitly read the later main message"
+        );
+        assert_eq!(restored.latest_active.as_ref().unwrap().event_id, event_id!("$reply"));
     }
 
     #[test]
