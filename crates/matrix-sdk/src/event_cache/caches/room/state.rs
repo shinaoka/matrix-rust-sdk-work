@@ -969,7 +969,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         let mut read_receipts = prev_read_receipts.clone();
 
         let client = room.client();
-        let event_filter = RoomReadReceiptEventFilter::new(&self.state, client.state_store());
+        let event_filter =
+            RoomReadReceiptEventFilter::new(&self.state, client.state_store(), &self.store).await?;
 
         compute_unread_counts(
             &self.state.own_user_id,
