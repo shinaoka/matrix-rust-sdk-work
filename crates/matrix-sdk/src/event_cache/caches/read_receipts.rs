@@ -101,10 +101,11 @@
 
 use std::{
     collections::HashSet,
-    ops::{ControlFlow, Deref, DerefMut, Not},
+    ops::{ControlFlow, Deref, DerefMut},
 };
 
 use matrix_sdk_base::{
+    event_cache::store::EventCacheStoreLockGuard,
     read_receipts::{LatestReadReceipt, ReadReceipts},
     serde_helpers::extract_relation,
     store::DynStateStore,
@@ -297,19 +298,63 @@ pub struct RoomReadReceiptEventFilter<'cache> {
 
     /// The state store to access stored receipt events.
     state_store: &'cache DynStateStore,
+
+    /// Direct thread replies, including relation targets restored from storage.
+    thread_reply_ids: HashSet<OwnedEventId>,
 }
 
 impl<'cache> RoomReadReceiptEventFilter<'cache> {
-    /// Construct a new [`ReadReceiptsForRoom`].
-    pub fn new(
+    /// Construct a room filter using the same relation ownership as thread routing.
+    pub async fn new(
         room_event_cache_state: &'cache super::room::RoomEventCacheState,
         state_store: &'cache DynStateStore,
-    ) -> Self {
-        Self {
-            room_id: &room_event_cache_state.room_id,
-            with_threading_support: room_event_cache_state.enabled_thread_support,
+        event_store: &EventCacheStoreLockGuard,
+    ) -> Result<Self, crate::event_cache::EventCacheError> {
+        Self::from_events(
+            &room_event_cache_state.room_id,
+            room_event_cache_state.enabled_thread_support,
+            room_event_cache_state.room_linked_chunk(),
             state_store,
+            event_store,
+        )
+        .await
+    }
+
+    async fn from_events(
+        room_id: &'cache RoomId,
+        with_threading_support: bool,
+        events: &EventLinkedChunk,
+        state_store: &'cache DynStateStore,
+        event_store: &EventCacheStoreLockGuard,
+    ) -> Result<Self, crate::event_cache::EventCacheError> {
+        let mut thread_reply_ids = HashSet::new();
+        if with_threading_support {
+            let mut loaded_ids = HashSet::new();
+            let mut related_ids = HashSet::new();
+            for (_, event) in events.events() {
+                if let Some(id) = event.event_id() {
+                    loaded_ids.insert(id.to_owned());
+                    if extract_thread_root(event.raw()).is_some() {
+                        thread_reply_ids.insert(id.to_owned());
+                    }
+                }
+                if let Some((relation, target)) = extract_relation(event.raw())
+                    && relation != RelationType::Thread
+                {
+                    related_ids.insert(target);
+                }
+            }
+            // A reply can have left the in-memory window while its edit remains.
+            // Resolve each missing target once, without loading network history.
+            for target in related_ids.difference(&loaded_ids) {
+                if let Some(event) = event_store.find_event(room_id, target).await?
+                    && extract_thread_root(event.raw()).is_some()
+                {
+                    thread_reply_ids.insert(target.clone());
+                }
+            }
         }
+        Ok(Self { room_id, with_threading_support, state_store, thread_reply_ids })
     }
 }
 
@@ -321,7 +366,16 @@ impl<'cache> EventFilter for RoomReadReceiptEventFilter<'cache> {
     fn filter(&self, event: &TimelineEvent) -> bool {
         // This type is built from a `RoomEventCacheState`. The room event cache
         // contains all events, including in-thread events. We need to filter them!
-        (self.with_threading_support && extract_thread_root(event.raw()).is_some()).not()
+        if !self.with_threading_support {
+            return true;
+        }
+        if extract_thread_root(event.raw()).is_some() {
+            return false;
+        }
+        // Edits/reactions to replies belong to their thread too. Unknown targets
+        // stay in the room; an unresolved relation is not proof of thread scope.
+        !extract_relation(event.raw())
+            .is_some_and(|(_, target)| self.thread_reply_ids.contains(&target))
     }
 
     fn receipt_thread_matches(&self, receipt_thread: &ReceiptThread) -> bool {
@@ -470,9 +524,11 @@ where
 
     let mut receipt = None;
 
-    for (event, event_id) in linked_chunk.revents().filter_map(|(_pos, event)| {
-        event_filter.filter(event).then_some((event, event.event_id()?))
-    }) {
+    // Explicit unthreaded receipts may point at thread replies. Keep their
+    // chronological boundary even though replies do not count as room unreads.
+    for (event, event_id) in
+        linked_chunk.revents().filter_map(|(_pos, event)| Some((event, event.event_id()?)))
+    {
         if receipt.is_none() {
             // Try to see if the latest active receipt is still the most recent receipt.
             if latest_active == Some(event_id) {
@@ -482,7 +538,7 @@ where
             }
             // Try to find an implicit read receipt (i.e. an event sent by the current
             // user).
-            else if event.sender().as_deref() == Some(user_id) {
+            else if event_filter.filter(event) && event.sender().as_deref() == Some(user_id) {
                 trace!(implicit = %event_id, "found an implicit receipt; stopping search");
                 receipt = Some(event_id.to_owned());
             }
@@ -600,9 +656,12 @@ pub(crate) async fn compute_unread_counts<T>(
         read_receipts.find_and_process_events(
             &event_id,
             user_id,
-            linked_chunk
-                .events()
-                .filter_map(|(_pos, event)| event_filter.filter(event).then_some(event)),
+            linked_chunk.events().filter_map(|(_pos, event)| {
+                // The boundary itself must reach find_and_process_events so it
+                // can reset the counts, even if it is excluded from counting.
+                (event.event_id() == Some(event_id.as_ref()) || event_filter.filter(event))
+                    .then_some(event)
+            }),
         );
 
         debug!(?read_receipts, "after finding a better receipt");
@@ -1095,6 +1154,7 @@ mod tests {
             room_id,
             with_threading_support: true,
             state_store: &state_store,
+            thread_reply_ids: Default::default(),
         };
 
         // Threaded messages from myself or other users shouldn't change the
@@ -1133,6 +1193,262 @@ mod tests {
         assert_eq!(receipts.num_notifications, 0);
     }
 
+    #[tokio::test]
+    async fn thread_edit_does_not_leave_room_notification_after_thread_is_read() {
+        let room_id = room_id!("!room:example.org");
+        let own = user_id!("@reader:example.org");
+        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let root = f.text_msg("root").event_id(event_id!("$root")).into_event();
+        let reply = f
+            .text_msg("reply")
+            .event_id(event_id!("$reply"))
+            .in_thread(event_id!("$root"), event_id!("$root"))
+            .into_event();
+        let mut edit = f
+            .text_msg("* mention")
+            .event_id(event_id!("$edit"))
+            .edit(event_id!("$reply"), MessageType::text_plain("mention").into())
+            .into_event();
+        edit.set_push_actions(vec![
+            Action::Notify,
+            Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)),
+        ]);
+        let state_store = MemoryStore::new();
+        let event_store = matrix_sdk_base::event_cache::store::EventCacheStoreLock::new(
+            matrix_sdk_base::event_cache::store::MemoryStore::new(),
+            matrix_sdk_common::cross_process_lock::CrossProcessLockConfig::SingleProcess,
+        );
+        let store_lock = event_store.lock().await.unwrap();
+        let store_guard = store_lock.as_clean().unwrap();
+        for stored_reply in [false, true] {
+            let mut linked_chunk = EventLinkedChunk::new();
+            linked_chunk.push_events(vec![root.clone()]);
+            if stored_reply {
+                store_guard.save_event(room_id, reply.clone()).await.unwrap();
+            } else {
+                linked_chunk.push_events(vec![reply.clone()]);
+            }
+            linked_chunk.push_events(vec![edit.clone()]);
+            let filter = RoomReadReceiptEventFilter::from_events(
+                room_id,
+                true,
+                &linked_chunk,
+                &state_store,
+                store_guard,
+            )
+            .await
+            .unwrap();
+            let mut receipts = ReadReceipts::default();
+            receipts.latest_active = Some(matrix_sdk_base::read_receipts::LatestReadReceipt {
+                event_id: owned_event_id!("$root"),
+            });
+            super::compute_unread_counts(own, None, &linked_chunk, &filter, &mut receipts, None)
+                .await;
+            assert_eq!(receipts.num_unread, 0);
+            assert_eq!(
+                receipts.num_notifications, 0,
+                "a thread edit belongs to the thread, not the room"
+            );
+            assert_eq!(receipts.num_mentions, 0);
+        }
+        // The edit still notifies in its own thread until that thread is read.
+        let mut thread_events = EventLinkedChunk::new();
+        thread_events.push_events(vec![reply, edit]);
+        let filter = super::ThreadReadReceiptEventFilter {
+            room_id,
+            thread_id: event_id!("$root"),
+            state_store: &state_store,
+        };
+        let mut receipts = ReadReceipts::default();
+        receipts.latest_active = Some(matrix_sdk_base::read_receipts::LatestReadReceipt {
+            event_id: owned_event_id!("$reply"),
+        });
+        super::compute_unread_counts(own, None, &thread_events, &filter, &mut receipts, None).await;
+        assert_eq!((receipts.num_notifications, receipts.num_mentions), (1, 1));
+        receipts.latest_active.as_mut().unwrap().event_id = owned_event_id!("$edit");
+        super::compute_unread_counts(own, None, &thread_events, &filter, &mut receipts, None).await;
+        assert_eq!((receipts.num_notifications, receipts.num_mentions), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn related_thread_filter_preserves_main_notifications_and_explicit_receipts() {
+        let room_id = room_id!("!room:example.org");
+        let own = user_id!("@reader:example.org");
+        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let state_store = MemoryStore::new();
+        let event_store = matrix_sdk_base::event_cache::store::EventCacheStoreLock::new(
+            matrix_sdk_base::event_cache::store::MemoryStore::new(),
+            matrix_sdk_common::cross_process_lock::CrossProcessLockConfig::SingleProcess,
+        );
+        let store_lock = event_store.lock().await.unwrap();
+        let store_guard = store_lock.as_clean().unwrap();
+        for (target, threading, own_edit, expected_unread, expected_notifications) in [
+            ("$reply", true, false, 1, 0),
+            ("$reply", true, true, 1, 0),
+            ("$root", true, false, 1, 1),
+            ("$unknown", true, false, 1, 1),
+            ("$reply", false, false, 2, 1),
+        ] {
+            let mut edit = f
+                .text_msg("* mention")
+                .event_id(event_id!("$edit"))
+                .sender(if own_edit { own } else { *ALICE })
+                .edit(
+                    &ruma::EventId::parse(target).unwrap(),
+                    MessageType::text_plain("mention").into(),
+                )
+                .into_event();
+            edit.set_push_actions(vec![
+                Action::Notify,
+                Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)),
+            ]);
+            let mut events = EventLinkedChunk::new();
+            events.push_events(vec![
+                f.text_msg("root").event_id(event_id!("$root")).into_event(),
+                f.text_msg("reply")
+                    .event_id(event_id!("$reply"))
+                    .in_thread(event_id!("$root"), event_id!("$root"))
+                    .into_event(),
+                f.text_msg("later main").event_id(event_id!("$main")).into_event(),
+                edit,
+            ]);
+            let filter = RoomReadReceiptEventFilter::from_events(
+                room_id,
+                threading,
+                &events,
+                &state_store,
+                store_guard,
+            )
+            .await
+            .unwrap();
+            let mut receipts = ReadReceipts::default();
+            receipts.latest_active = Some(matrix_sdk_base::read_receipts::LatestReadReceipt {
+                event_id: owned_event_id!("$root"),
+            });
+            super::compute_unread_counts(own, None, &events, &filter, &mut receipts, None).await;
+            assert_eq!(
+                receipts.num_unread, expected_unread,
+                "target={target}, threading={threading}, own={own_edit}"
+            );
+            assert_eq!(receipts.num_notifications, expected_notifications);
+            assert_eq!(receipts.num_mentions, expected_notifications);
+            // An explicit unthreaded receipt may still use the excluded edit as a boundary.
+            receipts.latest_active.as_mut().unwrap().event_id = owned_event_id!("$edit");
+            super::compute_unread_counts(own, None, &events, &filter, &mut receipts, None).await;
+            assert_eq!(
+                (receipts.num_unread, receipts.num_notifications, receipts.num_mentions),
+                (0, 0, 0)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unthreaded_receipt_on_thread_reply_preserves_room_read_boundary() {
+        let room_id = room_id!("!room:example.org");
+        let own = user_id!("@reader:example.org");
+        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let mut already_read = f.text_msg("already read").event_id(event_id!("$root")).into_event();
+        already_read.set_push_actions(vec![
+            Action::Notify,
+            Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)),
+        ]);
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.push_events(vec![
+            already_read,
+            f.text_msg("reply")
+                .event_id(event_id!("$reply"))
+                .in_thread(event_id!("$root"), event_id!("$root"))
+                .into_event(),
+        ]);
+        let state_store = MemoryStore::new();
+        let event_filter = RoomReadReceiptEventFilter {
+            room_id,
+            with_threading_support: true,
+            state_store: &state_store,
+            thread_reply_ids: Default::default(),
+        };
+        let mut receipts = ReadReceipts::default();
+        receipts.latest_active = Some(matrix_sdk_base::read_receipts::LatestReadReceipt {
+            event_id: owned_event_id!("$reply"),
+        });
+        super::compute_unread_counts(own, None, &linked_chunk, &event_filter, &mut receipts, None)
+            .await;
+        assert_eq!(
+            receipts.num_unread, 0,
+            "an explicit room receipt can use a reply as its chronological boundary"
+        );
+        assert_eq!(receipts.num_notifications, 0);
+        assert_eq!(receipts.num_mentions, 0);
+        // A subsequent main message counts; another thread reply does not.
+        linked_chunk.push_events(vec![
+            f.text_msg("new main").event_id(event_id!("$main-new")).into_event(),
+            f.text_msg("new reply")
+                .event_id(event_id!("$reply-new"))
+                .in_thread(event_id!("$root"), event_id!("$reply"))
+                .into_event(),
+        ]);
+        super::compute_unread_counts(own, None, &linked_chunk, &event_filter, &mut receipts, None)
+            .await;
+        assert_eq!(receipts.num_unread, 1);
+    }
+
+    #[tokio::test]
+    async fn unthreaded_reply_receipt_is_matched_from_sync_and_store() {
+        use matrix_sdk_base::{StateChanges, store::StateStore};
+        let room_id = room_id!("!room:example.org");
+        let own = user_id!("@reader:example.org");
+        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.push_events(vec![
+            f.text_msg("old").event_id(event_id!("$root")).into_event(),
+            f.text_msg("read reply")
+                .event_id(event_id!("$reply"))
+                .in_thread(event_id!("$root"), event_id!("$root"))
+                .into_event(),
+            f.text_msg("new").event_id(event_id!("$new")).into_event(),
+            f.text_msg("own reply")
+                .sender(own)
+                .event_id(event_id!("$own-reply"))
+                .in_thread(event_id!("$root"), event_id!("$reply"))
+                .into_event(),
+        ]);
+        let receipt_event: ruma::events::receipt::ReceiptEventContent =
+            serde_json::from_value(serde_json::json!({
+                "$reply": {"m.read": {"@reader:example.org": {"ts": 10}}}
+            }))
+            .unwrap();
+        let state_store = MemoryStore::new();
+        let filter = RoomReadReceiptEventFilter {
+            room_id,
+            with_threading_support: true,
+            state_store: &state_store,
+            thread_reply_ids: Default::default(),
+        };
+        let mut receipts = ReadReceipts::default();
+        super::compute_unread_counts(
+            own,
+            Some(&receipt_event),
+            &linked_chunk,
+            &filter,
+            &mut receipts,
+            None,
+        )
+        .await;
+        assert_eq!(receipts.num_unread, 1);
+        assert_eq!(receipts.latest_active.as_ref().unwrap().event_id, event_id!("$reply"));
+        assert!(receipts.pending.is_empty());
+        let mut changes = StateChanges::default();
+        changes.receipts.insert(room_id.to_owned(), receipt_event);
+        state_store.save_changes(&changes).await.unwrap();
+        let mut restored = ReadReceipts::default();
+        super::compute_unread_counts(own, None, &linked_chunk, &filter, &mut restored, None).await;
+        assert_eq!(
+            restored.num_unread, 1,
+            "an own thread reply must not implicitly read the later main message"
+        );
+        assert_eq!(restored.latest_active.as_ref().unwrap().event_id, event_id!("$reply"));
+    }
+
     #[test]
     fn test_select_best_receipt_noop() {
         let room_id = room_id!("!roomid:example.org");
@@ -1153,6 +1469,7 @@ mod tests {
             room_id,
             with_threading_support: false,
             state_store: &state_store,
+            thread_reply_ids: Default::default(),
         };
 
         // When there are no pending receipts,
@@ -1203,6 +1520,7 @@ mod tests {
             room_id,
             with_threading_support: false,
             state_store: &state_store,
+            thread_reply_ids: Default::default(),
         };
 
         // Then there's a new best receipt, which is the implicit one.
@@ -1246,6 +1564,7 @@ mod tests {
             room_id,
             with_threading_support: false,
             state_store: &state_store,
+            thread_reply_ids: Default::default(),
         };
 
         // Then the best receipt is still $2.
@@ -1294,6 +1613,7 @@ mod tests {
             room_id,
             with_threading_support: false,
             state_store: &state_store,
+            thread_reply_ids: Default::default(),
         };
 
         // Then there's a new best receipt, which is the explicit one from the event
@@ -1342,6 +1662,7 @@ mod tests {
             room_id,
             with_threading_support: false,
             state_store: &state_store,
+            thread_reply_ids: Default::default(),
         };
 
         // Then there's no new best receipts.
@@ -1389,6 +1710,7 @@ mod tests {
             room_id,
             with_threading_support: false,
             state_store: &state_store,
+            thread_reply_ids: Default::default(),
         };
 
         // Then there's a new best receipt, which is the matched pending receipt.
@@ -1443,6 +1765,7 @@ mod tests {
             room_id,
             with_threading_support: false,
             state_store: &state_store,
+            thread_reply_ids: Default::default(),
         };
 
         // Then there's a new best receipt, which is the most advanced in the linked

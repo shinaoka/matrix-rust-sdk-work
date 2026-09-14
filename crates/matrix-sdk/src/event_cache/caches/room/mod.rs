@@ -30,6 +30,7 @@ use eyeball::SharedObservable;
 use matrix_sdk_base::{
     deserialized_responses::{AmbiguityChange, ThreadSummary},
     event_cache::Event,
+    linked_chunk::ChunkContent,
     sync::Timeline,
 };
 use ruma::{
@@ -191,7 +192,28 @@ impl RoomEventCache {
     /// subscriber. Creating, and especially dropping, a [`Subscriber`] isn't
     /// free, as it triggers side-effects.
     pub async fn subscribe(&self) -> Result<(Vec<Event>, Subscriber<RoomEventCacheUpdate>)> {
-        let state = self.inner.state.read().await?;
+        let mut state = self.inner.state.write().await?;
+        // RoomInfo can retain counts computed by an older filter across startup.
+        // Reconcile only a complete loaded suffix: missing history must not turn
+        // persisted notifications into a falsely empty room.
+        let can_recount = self.inner.weak_room.get().is_some_and(|room| {
+            let receipts = room.read_receipts();
+            let Some(active) = receipts.latest_active.as_ref() else { return false };
+            for chunk in state.room_linked_chunk().rchunks() {
+                match chunk.content() {
+                    ChunkContent::Gap(_) => return false,
+                    ChunkContent::Items(events) => {
+                        if events.iter().any(|event| event.event_id() == Some(&active.event_id)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        });
+        if can_recount {
+            state.update_read_receipts(None).await?;
+        }
         let events =
             state.room_linked_chunk().events().map(|(_position, item)| item.clone()).collect();
 
@@ -937,6 +959,114 @@ mod timed_tests {
         RoomEventCacheUpdate,
     };
     use crate::{assert_let_timeout, test_utils::client::MockClientBuilder};
+
+    #[async_test]
+    async fn test_subscribe_recounts_cached_thread_edit_notifications() {
+        use matrix_sdk_base::{RoomInfoNotableUpdateReasons, read_receipts::LatestReadReceipt};
+        use ruma::{
+            events::room::message::MessageType,
+            push::{Action, HighlightTweakValue, Tweak},
+        };
+
+        let room_id = room_id!("!cached:example.org");
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| {
+                builder.with_threading_support(crate::ThreadingSupport::Enabled {
+                    with_subscriptions: false,
+                })
+            })
+            .build()
+            .await;
+        client.event_cache().subscribe().unwrap();
+        client
+            .base_client()
+            .get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let f = EventFactory::new().room(room_id).sender(*BOB);
+        let root = event_id!("$root");
+        let reply = event_id!("$reply");
+        let mut edit = f
+            .text_msg("* mention")
+            .event_id(event_id!("$edit"))
+            .edit(reply, MessageType::text_plain("mention").into())
+            .into_event();
+        edit.set_push_actions(vec![
+            Action::Notify,
+            Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)),
+        ]);
+        cache
+            .handle_joined_room_update(
+                Timeline {
+                    limited: false,
+                    prev_batch: None,
+                    events: vec![
+                        f.text_msg("root").event_id(root).into_event(),
+                        f.text_msg("reply")
+                            .event_id(reply)
+                            .in_thread(root, root)
+                            .into_event(),
+                        edit,
+                    ],
+                },
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // A previously persisted count must be reconciled without another sync.
+        // Missing boundaries and gaps cannot prove that notifications were read.
+        for (boundary, add_main, add_gap, expected) in [
+            (root, false, false, 0),
+            (root, false, false, 0), // repeated subscription is idempotent
+            (event_id!("$outside-cache"), false, false, 7),
+            (root, true, false, 1),
+            (root, false, true, 7),
+        ] {
+            if add_main || add_gap {
+                let mut state = cache.inner.state.write().await.unwrap();
+                if add_gap {
+                    state.room_linked_chunk_mut().push_gap(Gap {
+                        token: "missing".into(),
+                    });
+                }
+                if add_main {
+                    let mut main = f
+                        .text_msg("unread main")
+                        .event_id(event_id!("$main"))
+                        .into_event();
+                    main.set_push_actions(vec![
+                        Action::Notify,
+                        Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)),
+                    ]);
+                    state.room_linked_chunk_mut().push_events(vec![main]);
+                }
+            }
+            room.update_and_save_room_info(|mut info| {
+                let mut receipts = info.read_receipts().clone();
+                receipts.latest_active = Some(LatestReadReceipt {
+                    event_id: boundary.to_owned(),
+                });
+                receipts.num_unread = 0;
+                receipts.num_notifications = 7;
+                receipts.num_mentions = 7;
+                info.set_read_receipts(receipts);
+                (info, RoomInfoNotableUpdateReasons::READ_RECEIPT)
+            })
+            .await
+            .unwrap();
+            let (_events, _subscriber) = cache.subscribe().await.unwrap();
+            let receipts = room.read_receipts();
+            assert_eq!(receipts.num_notifications, expected);
+            assert_eq!(receipts.num_mentions, expected);
+            assert_eq!(receipts.latest_active.as_ref().unwrap().event_id, boundary);
+            let (_events, _second_subscriber) = cache.subscribe().await.unwrap();
+            assert_eq!(room.read_receipts(), receipts);
+        }
+    }
 
     #[async_test]
     async fn test_write_to_storage() {

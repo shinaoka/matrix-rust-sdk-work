@@ -223,6 +223,11 @@ impl RoomEventCacheState {
         Ok(state)
     }
 
+    /// Return a reference to subscribers handle.
+    pub fn subscribers_handle(&self) -> &SubscribersHandle {
+        &self.subscribers_handle
+    }
+
     /// Return a read-only reference to the underlying room linked chunk.
     pub fn room_linked_chunk(&self) -> &EventLinkedChunk {
         &self.room_linked_chunk
@@ -391,11 +396,6 @@ impl<'a> StateLockReadGuard<'a, RoomEventCacheState> {
     /// Return the newest event identity in the loaded room timeline.
     pub(super) fn newest_event_id(&self) -> Option<OwnedEventId> {
         self.state.room_linked_chunk.revents().find_map(|(_, event)| event.event_id().map(|id| id.to_owned()))
-    }
-
-    /// Return a reference to subscribers handle.
-    pub fn subscribers_handle(&self) -> &SubscribersHandle {
-        &self.state.subscribers_handle
     }
 
     /// See documentation of [`find_event`].
@@ -969,7 +969,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         let mut read_receipts = prev_read_receipts.clone();
 
         let client = room.client();
-        let event_filter = RoomReadReceiptEventFilter::new(&self.state, client.state_store());
+        let event_filter =
+            RoomReadReceiptEventFilter::new(&self.state, client.state_store(), &self.store).await?;
 
         compute_unread_counts(
             &self.state.own_user_id,
