@@ -905,9 +905,7 @@ mod tests {
     fn redacted_event_does_not_retain_notification_counts() {
         let own = user_id!("@alice:example.org");
         let other = user_id!("@bob:example.org");
-        let f = EventFactory::new()
-            .room(room_id!("!room:example.org"))
-            .sender(other);
+        let f = EventFactory::new().room(room_id!("!room:example.org")).sender(other);
         let target_id = event_id!("$target:example.org");
         let mut target = f.text_msg("message").event_id(target_id).into_event();
         target.set_push_actions(vec![
@@ -916,42 +914,25 @@ mod tests {
         ]);
         let mut before = ReadReceipts::default();
         before.process_event(&target, own);
-        assert_eq!(
-            (
-                before.num_unread,
-                before.num_notifications,
-                before.num_mentions
-            ),
-            (1, 1, 1)
-        );
+        assert_eq!((before.num_unread, before.num_notifications, before.num_mentions), (1, 1, 1));
         let redaction = f.redaction(target_id).into_event();
-        assert!(
-            super::super::room::RoomEventCacheState::apply_redaction_to_event(
-                &mut target,
-                &redaction,
-                &ruma::RoomVersionId::V10.rules().unwrap()
-            )
-        );
+        assert!(super::super::room::RoomEventCacheState::apply_redaction_to_event(
+            &mut target,
+            &redaction,
+            &ruma::RoomVersionId::V10.rules().unwrap()
+        ));
         // Redaction removes the notification, not the ability to anchor a receipt.
-        let mut later = f
-            .text_msg("later unread")
-            .event_id(event_id!("$later:example.org"))
-            .into_event();
+        let mut later =
+            f.text_msg("later unread").event_id(event_id!("$later:example.org")).into_event();
         later.set_push_actions(vec![Action::Notify]);
-        let boundary = f
-            .text_msg("boundary")
-            .event_id(event_id!("$boundary:example.org"))
-            .into_event();
+        let boundary =
+            f.text_msg("boundary").event_id(event_id!("$boundary:example.org")).into_event();
         let events = [boundary, target.clone(), later];
         for marker in [event_id!("$boundary:example.org"), target_id] {
             let mut receipts = ReadReceipts::default();
             assert!(receipts.find_and_process_events(marker, own, events.iter()));
             assert_eq!(
-                (
-                    receipts.num_unread,
-                    receipts.num_notifications,
-                    receipts.num_mentions
-                ),
+                (receipts.num_unread, receipts.num_notifications, receipts.num_mentions),
                 (1, 1, 0)
             );
         }
@@ -963,11 +944,7 @@ mod tests {
             let mut receipts = ReadReceipts::default();
             receipts.process_event(&target, own);
             assert_eq!(
-                (
-                    receipts.num_unread,
-                    receipts.num_notifications,
-                    receipts.num_mentions
-                ),
+                (receipts.num_unread, receipts.num_notifications, receipts.num_mentions),
                 (0, 0, 0)
             );
         }
