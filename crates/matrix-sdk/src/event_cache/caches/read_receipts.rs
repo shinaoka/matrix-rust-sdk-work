@@ -204,6 +204,11 @@ impl ReadReceiptsExt for ReadReceipts {
     /// Returns whether a new event triggered a new unread/notification/mention.
     #[inline(always)]
     fn process_event(&mut self, event: &TimelineEvent, user_id: &UserId) {
+        // Cached push actions can predate a redaction. Do not resurrect their
+        // notification/mention counts when recounting a restored timeline.
+        if is_redacted(event.raw()) {
+            return;
+        }
         if marks_as_unread(event.raw(), user_id) {
             self.num_unread += 1;
         }
@@ -737,21 +742,19 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
         return false;
     }
 
-    // Filter out redacted events.
+    !is_redacted(event)
+}
+
+fn is_redacted(event: &Raw<AnySyncTimelineEvent>) -> bool {
     #[derive(serde::Deserialize)]
     struct UnsignedContent {
         redacted_because: Option<Raw<AnySyncTimelineEvent>>,
     }
 
-    // Filter out redactions.
-    if let Ok(Some(UnsignedContent { redacted_because: Some(_redaction) })) =
-        event.get_field::<UnsignedContent>("unsigned")
-    {
-        tracing::trace!("not interesting because redacted");
-        return false;
-    }
-
-    true
+    matches!(
+        event.get_field::<UnsignedContent>("unsigned"),
+        Ok(Some(UnsignedContent { redacted_because: Some(_) }))
+    )
 }
 
 /// A type representing `Option<ReceiptEventContent>`.
@@ -896,6 +899,78 @@ mod tests {
             .into_raw_sync();
 
         assert!(marks_as_unread(&ev, user_id).not());
+    }
+
+    #[test]
+    fn redacted_event_does_not_retain_notification_counts() {
+        let own = user_id!("@alice:example.org");
+        let other = user_id!("@bob:example.org");
+        let f = EventFactory::new()
+            .room(room_id!("!room:example.org"))
+            .sender(other);
+        let target_id = event_id!("$target:example.org");
+        let mut target = f.text_msg("message").event_id(target_id).into_event();
+        target.set_push_actions(vec![
+            Action::Notify,
+            Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)),
+        ]);
+        let mut before = ReadReceipts::default();
+        before.process_event(&target, own);
+        assert_eq!(
+            (
+                before.num_unread,
+                before.num_notifications,
+                before.num_mentions
+            ),
+            (1, 1, 1)
+        );
+        let redaction = f.redaction(target_id).into_event();
+        assert!(
+            super::super::room::RoomEventCacheState::apply_redaction_to_event(
+                &mut target,
+                &redaction,
+                &ruma::RoomVersionId::V10.rules().unwrap()
+            )
+        );
+        // Redaction removes the notification, not the ability to anchor a receipt.
+        let mut later = f
+            .text_msg("later unread")
+            .event_id(event_id!("$later:example.org"))
+            .into_event();
+        later.set_push_actions(vec![Action::Notify]);
+        let boundary = f
+            .text_msg("boundary")
+            .event_id(event_id!("$boundary:example.org"))
+            .into_event();
+        let events = [boundary, target.clone(), later];
+        for marker in [event_id!("$boundary:example.org"), target_id] {
+            let mut receipts = ReadReceipts::default();
+            assert!(receipts.find_and_process_events(marker, own, events.iter()));
+            assert_eq!(
+                (
+                    receipts.num_unread,
+                    receipts.num_notifications,
+                    receipts.num_mentions
+                ),
+                (1, 1, 0)
+            );
+        }
+        // Also cover a cache entry restored with push actions from before deletion.
+        for target in [
+            target.clone(),
+            serde_json::from_value(serde_json::to_value(&target).unwrap()).unwrap(),
+        ] {
+            let mut receipts = ReadReceipts::default();
+            receipts.process_event(&target, own);
+            assert_eq!(
+                (
+                    receipts.num_unread,
+                    receipts.num_notifications,
+                    receipts.num_mentions
+                ),
+                (0, 0, 0)
+            );
+        }
     }
 
     #[test]
