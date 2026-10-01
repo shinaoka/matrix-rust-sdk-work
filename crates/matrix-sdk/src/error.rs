@@ -360,6 +360,10 @@ pub enum Error {
     #[error("a concurrent request failed; see logs for details")]
     ConcurrentRequestFailed,
 
+    /// The homeserver reported that a remote user's device-key query failed.
+    #[error("the user's homeserver failed a device-key query")]
+    UserKeyQueryFailure,
+
     /// An other error was raised.
     ///
     /// This might happen because encryption was enabled on the base-crate

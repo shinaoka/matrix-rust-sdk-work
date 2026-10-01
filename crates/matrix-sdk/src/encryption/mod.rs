@@ -1381,7 +1381,9 @@ impl Encryption {
     ///
     /// Returns a [`UserIdentity`] if one is found. Returns an error if there
     /// was an issue with the crypto store or with the request to the
-    /// homeserver.
+    /// homeserver. If the queried user's server is listed under the response's
+    /// `failures`, this returns an error rather than a possibly stale cached
+    /// identity.
     ///
     /// This will always return `None` if the client hasn't been logged in.
     ///
@@ -1415,7 +1417,10 @@ impl Encryption {
         let Some(olm) = olm else { return Ok(None) };
 
         let (request_id, request) = olm.query_keys_for_users(iter::once(user_id));
-        self.client.keys_query(&request_id, request.device_keys).await?;
+        let response = self.client.keys_query(&request_id, request.device_keys).await?;
+        if response.failures.contains_key(user_id.server_name().as_str()) {
+            return Err(Error::UserKeyQueryFailure);
+        }
 
         let identity = olm.get_identity(user_id, None).await?;
         Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
