@@ -3918,6 +3918,7 @@ dependencies = [
  "tracing",
  "unicode-casefold",
  "unicode-normalization",
+ "unicode-segmentation",
  "zeroize",
 ]
 

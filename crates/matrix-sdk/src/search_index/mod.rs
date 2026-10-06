@@ -306,24 +306,31 @@ async fn get_most_recent_edit(
         return None;
     };
 
-    // Only index valid replacements (matching sender, type, etc.); otherwise
-    // anyone could rewrite another user's indexed message. Fall back to the
-    // original event when there is no valid edit.
-    let latest = related
-        .iter()
-        .rev()
-        .find(|edit| {
-            check_validity_of_replacement_events(
-                original_ev.raw(),
-                original_ev.encryption_info().map(|info| &**info),
-                edit.raw(),
-                edit.encryption_info().map(|info| &**info),
-            )
-            .is_ok()
-        })
-        .unwrap_or(&original_ev);
+    // Only consider valid replacements (matching sender, type, etc.) from newest
+    // to oldest, and require each to deserialize into visible content, so a
+    // malformed newer edit cannot hide an earlier valid version. Fall back to
+    // the original event when no valid edit remains.
+    for edit in related.iter().rev() {
+        if check_validity_of_replacement_events(
+            original_ev.raw(),
+            original_ev.encryption_info().map(|info| &**info),
+            edit.raw(),
+            edit.encryption_info().map(|info| &**info),
+        )
+        .is_err()
+        {
+            continue;
+        }
 
-    match latest.raw().deserialize() {
+        if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(latest))) =
+            edit.raw().deserialize()
+            && let Some(latest) = latest.as_original()
+        {
+            return Some(latest.clone());
+        }
+    }
+
+    match original_ev.raw().deserialize() {
         Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(latest))) => {
             latest.as_original().cloned()
         }
@@ -336,7 +343,7 @@ async fn get_most_recent_edit(
 /// Produced by [`resolve_cached_message`] from the persistent event cache only
 /// (no network), with edits and redactions already resolved, so search
 /// verification never reads stale pre-edit text.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ResolvedMessage {
     /// The original (root) event id this message's display identity uses.
     pub event_id: OwnedEventId,
@@ -349,6 +356,19 @@ pub struct ResolvedMessage {
     pub timestamp_millis: Option<u64>,
     /// Visible searchable text, extracted exactly as the index extracts it.
     pub body: String,
+}
+
+impl std::fmt::Debug for ResolvedMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedMessage")
+            .field("event_id", &"EventId(..)")
+            .field("current_event_id", &"EventId(..)")
+            .field("sender", &"UserId(..)")
+            .field("timestamp_millis", &self.timestamp_millis)
+            .field("body", &"MessageBody(..)")
+            .finish()
+    }
 }
 
 /// Resolve a message to its current visible content, reading only the local
@@ -377,6 +397,13 @@ pub(crate) async fn resolve_cached_message(
             _ => None,
         })
         .unwrap_or_else(|| event_id.to_owned());
+
+    // Reject a redacted root even when the caller supplied one of its edit ids:
+    // a surviving edit must not resurrect a message whose original was redacted.
+    let root = cache.find_event(&original_id).await.ok().flatten()?;
+    if timeline_event_is_redacted(&root) {
+        return None;
+    }
 
     let resolved = get_most_recent_edit(cache, &original_id).await?;
 
@@ -1055,6 +1082,47 @@ mod tests {
         let resolved =
             room.resolve_cached_message(event_id!("$missing")).await.expect("cache lookup");
         assert!(resolved.is_none(), "unknown events must not resolve: {resolved:?}");
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_resolve_cached_message_rejects_redacted_root_through_edit_id() {
+        let room_id = room_id!("!room_id:localhost");
+        let original_id = event_id!("$redact_original");
+        let edit_id = event_id!("$redact_edit");
+        let redaction_id = event_id!("$redact_event");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let f = EventFactory::new().room(room_id).sender(user_id!("@user_id:localhost"));
+
+        let original = f.text_msg("Original message").event_id(original_id);
+        let edit = f
+            .text_msg("* Edited message")
+            .edit(original_id, RoomMessageEventContentWithoutRelation::text_plain("Edited message"))
+            .event_id(edit_id);
+        let redaction = f.redaction(original_id).event_id(redaction_id);
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_event(original)
+                    .add_timeline_event(edit)
+                    .add_timeline_event(redaction),
+            )
+            .await;
+
+        // Resolving the original is rejected, and a surviving edit id must not
+        // resurrect the redacted message.
+        assert!(room.resolve_cached_message(original_id).await.unwrap().is_none());
+        assert!(
+            room.resolve_cached_message(edit_id).await.unwrap().is_none(),
+            "a surviving edit must not resurrect a redacted original"
+        );
     }
 
     #[cfg(feature = "experimental-search")]

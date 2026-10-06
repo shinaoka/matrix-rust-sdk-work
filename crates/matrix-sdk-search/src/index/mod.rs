@@ -259,34 +259,6 @@ impl RoomIndex {
         self.collect_event_ids(&searcher, results)
     }
 
-    /// Search the index with the query treated as literal text.
-    ///
-    /// Unlike [`RoomIndex::search`], the query is not parsed for operators or
-    /// field syntax: it is tokenized with the configured body tokenizer and
-    /// every produced token is required to be present. That is a superset of
-    /// substring matches, so the caller still verifies exactness.
-    ///
-    /// Returns [`IndexError::EmptyMessage`] when the tokenizer produces no
-    /// tokens (for example a query shorter than the configured minimum ngram);
-    /// callers must fall back to a bounded secondary path rather than silently
-    /// dropping the query.
-    #[cfg(test)]
-    pub(crate) fn search_literal(
-        &self,
-        query: &str,
-        max_number_of_results: usize,
-        pagination_offset: Option<usize>,
-    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
-        let query = self.literal_query(query)?;
-        let searcher = self.reader()?.searcher();
-        let offset = pagination_offset.unwrap_or(0);
-        let results = searcher.search(
-            &query,
-            &TopDocs::with_limit(max_number_of_results).and_offset(offset).order_by_score(),
-        )?;
-        self.collect_event_ids(&searcher, results)
-    }
-
     /// Page literal search results newest-first.
     ///
     /// Returns at most `limit` matches strictly older than `cursor`. Pass the
@@ -380,13 +352,14 @@ impl RoomIndex {
     }
 
     fn events_to_be_removed(&self, event_id: &EventId) -> Result<Vec<OwnedEventId>, IndexError> {
+        // Match by primary key too: an edit document is keyed by the edit event
+        // id with the original event id as its deletion key, so removing the
+        // redacted edit by its own id must still find it.
+        let primary = self.schema.get_field_name(self.schema.primary_key());
+        let deletion = self.schema.get_field_name(self.schema.deletion_key());
         Ok(self
             .search(
-                format!(
-                    "{}:\"{event_id}\"",
-                    self.schema.get_field_name(self.schema.deletion_key())
-                )
-                .as_str(),
+                format!("{primary}:\"{event_id}\" OR {deletion}:\"{event_id}\"").as_str(),
                 10000,
                 None,
             )?
@@ -842,13 +815,11 @@ mod tests {
         index_message(&mut index, event)?;
 
         // `report:2026` is not a field query: it is literal message text.
-        let result = index.search_literal("report:2026", 10, None).expect("literal search failed");
-        let result: HashSet<_> = result.iter().map(|(_, id)| id).collect();
+        let result =
+            index.search_literal_page("report:2026", 10, None).expect("literal search failed");
+        let result: Vec<String> = result.iter().map(|cursor| cursor.event_id.to_string()).collect();
 
-        let true_value = [event_id.to_owned()];
-        let true_value: HashSet<_> = true_value.iter().collect();
-
-        assert_eq!(result, true_value, "literal search result not correct: {result:?}");
+        assert_eq!(result, vec![event_id.to_string()], "literal search result not correct");
 
         Ok(())
     }
@@ -870,13 +841,11 @@ mod tests {
 
         index_message(&mut index, event)?;
 
-        let result = index.search_literal("アンケート", 10, None).expect("literal search failed");
-        let result: HashSet<_> = result.iter().map(|(_, id)| id).collect();
+        let result =
+            index.search_literal_page("アンケート", 10, None).expect("literal search failed");
+        let result: Vec<String> = result.iter().map(|cursor| cursor.event_id.to_string()).collect();
 
-        let true_value = [event_id.to_owned()];
-        let true_value: HashSet<_> = true_value.iter().collect();
-
-        assert_eq!(result, true_value, "literal search result not correct: {result:?}");
+        assert_eq!(result, vec![event_id.to_string()], "literal search result not correct");
 
         Ok(())
     }
@@ -1041,6 +1010,23 @@ mod tests {
 
         let page = index.search_literal_page("xカ", 10, None).expect("raw substring query");
         assert_eq!(page.len(), 1, "raw substring must match across normalization: {page:?}");
+    }
+
+    /// Normalization is applied per grapheme, matching the desktop verifier: a
+    /// compatibility jamo sequence is not composed across grapheme boundaries.
+    #[test]
+    fn test_literal_search_matches_per_grapheme_normalization() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        add_indexable(&mut index, "$jamo:localhost", 1_000, "あ\u{3131}\u{314F}");
+
+        let page = index
+            .search_literal_page("あ\u{1100}", 10, None)
+            .expect("per-grapheme normalized query");
+        assert_eq!(page.len(), 1, "per-grapheme normalization must match: {page:?}");
     }
 
     #[test]

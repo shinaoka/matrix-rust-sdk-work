@@ -20,19 +20,23 @@
 
 use unicode_casefold::{Locale, UnicodeCaseFold, Variant};
 use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Normalize searchable text: NFKC, full case folding, and dash unification.
 ///
-/// This matches the desktop client's verifier so an indexed normalized body and
-/// a normalized query compare consistently.
+/// Normalization is applied per grapheme, exactly like the desktop client's
+/// verifier, so a multi-grapheme sequence is never composed across a grapheme
+/// boundary (which would make the indexed text and the verified text disagree).
 pub(crate) fn normalize_search_text(value: &str) -> String {
-    value
-        .nfkc()
-        .case_fold_with(Variant::Full, Locale::NonTurkic)
-        .map(|ch| match ch {
-            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
-            | '\u{2212}' | '\u{fe58}' | '\u{ff0d}' => '-',
-            other => other,
-        })
-        .collect()
+    let mut normalized = String::with_capacity(value.len());
+    for grapheme in value.graphemes(true) {
+        for ch in grapheme.nfkc().case_fold_with(Variant::Full, Locale::NonTurkic) {
+            normalized.push(match ch {
+                '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+                | '\u{2212}' | '\u{fe58}' | '\u{ff0d}' => '-',
+                other => other,
+            });
+        }
+    }
+    normalized
 }

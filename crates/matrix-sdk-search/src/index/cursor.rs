@@ -24,7 +24,7 @@ use std::collections::BinaryHeap;
 
 use ruma::{EventId, OwnedEventId};
 use tantivy::{
-    DateTime, DocAddress, Score, SegmentOrdinal, TantivyError,
+    DateTime, Score, TantivyError,
     collector::{Collector, SegmentCollector},
     columnar::StrColumn,
     fastfield::Column,
@@ -46,7 +46,6 @@ pub struct SearchCursor {
 pub(crate) struct Candidate {
     pub(crate) timestamp_millis: i64,
     pub(crate) event_id: String,
-    pub(crate) doc_address: DocAddress,
 }
 
 /// Collects the newest `limit` matches strictly older than `cursor`.
@@ -61,7 +60,7 @@ impl Collector for CursorTopCollector {
 
     fn for_segment(
         &self,
-        segment_local_id: SegmentOrdinal,
+        _segment_local_id: u32,
         segment: &tantivy::SegmentReader,
     ) -> tantivy::Result<Self::Child> {
         let date_col = segment.fast_fields().date("date")?;
@@ -74,7 +73,6 @@ impl Collector for CursorTopCollector {
         Ok(CursorSegmentCollector {
             limit: self.limit,
             cursor: self.cursor.clone(),
-            segment_ord: segment_local_id,
             date_col,
             event_id_col,
             heap: BinaryHeap::new(),
@@ -97,7 +95,6 @@ impl Collector for CursorTopCollector {
 pub(crate) struct CursorSegmentCollector {
     limit: usize,
     cursor: Option<SearchCursor>,
-    segment_ord: SegmentOrdinal,
     date_col: Column<DateTime>,
     event_id_col: StrColumn,
     heap: BinaryHeap<std::cmp::Reverse<Candidate>>,
@@ -127,11 +124,7 @@ impl SegmentCollector for CursorSegmentCollector {
             return;
         }
 
-        let candidate = Candidate {
-            timestamp_millis,
-            event_id: self.scratch.clone(),
-            doc_address: DocAddress::new(self.segment_ord, doc),
-        };
+        let candidate = Candidate { timestamp_millis, event_id: self.scratch.clone() };
 
         if self.heap.len() < self.limit {
             self.heap.push(std::cmp::Reverse(candidate));
@@ -144,15 +137,13 @@ impl SegmentCollector for CursorSegmentCollector {
     }
 
     fn harvest(self) -> Self::Fruit {
-        let mut candidates: Vec<Candidate> =
-            self.heap.into_iter().map(|std::cmp::Reverse(candidate)| candidate).collect();
-        candidates.sort_by(|a, b| b.cmp(a));
-        candidates
+        // Ordering is established once in `CursorTopCollector::merge_fruits`.
+        self.heap.into_iter().map(|std::cmp::Reverse(candidate)| candidate).collect()
     }
 }
 
-/// Parse a collected event id, keeping candidates in `(timestamp, event_id)`
-/// order and dropping malformed ids like the offset-based path does.
+/// Parse a collected event id, dropping malformed ids like the offset-based
+/// path does.
 pub(crate) fn candidate_cursor(candidate: &Candidate) -> Option<SearchCursor> {
     match EventId::parse(&candidate.event_id) {
         Ok(event_id) => {
