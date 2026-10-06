@@ -30,7 +30,7 @@ use matrix_sdk_search::{
     },
 };
 use ruma::{
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, RoomId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
     events::{
         AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         poll::{
@@ -331,6 +331,90 @@ async fn get_most_recent_edit(
     }
 }
 
+/// The most recent visible content for a cached message.
+///
+/// Produced by [`resolve_cached_message`] from the persistent event cache only
+/// (no network), with edits and redactions already resolved, so search
+/// verification never reads stale pre-edit text.
+#[derive(Clone, Debug)]
+pub struct ResolvedMessage {
+    /// The original (root) event id this message's display identity uses.
+    pub event_id: OwnedEventId,
+    /// The event id whose content is current; an edit id when the message has
+    /// been edited.
+    pub current_event_id: OwnedEventId,
+    /// The sender of the message, from the resolved content.
+    pub sender: OwnedUserId,
+    /// Origin server timestamp of the resolved content, in milliseconds.
+    pub timestamp_millis: Option<u64>,
+    /// Visible searchable text, extracted exactly as the index extracts it.
+    pub body: String,
+}
+
+/// Resolve a message to its current visible content, reading only the local
+/// event cache. Returns `None` when the event is missing or redacted.
+pub(crate) async fn resolve_cached_message(
+    cache: &RoomEventCache,
+    event_id: &EventId,
+) -> Option<ResolvedMessage> {
+    let cached = cache.find_event(event_id).await.ok().flatten()?;
+    if timeline_event_is_redacted(&cached) {
+        return None;
+    }
+
+    let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(message))) =
+        cached.raw().deserialize()
+    else {
+        return None;
+    };
+
+    // A candidate id may be an edit event; resolve from the original message so
+    // the newest valid edit wins either way.
+    let original_id = message
+        .as_original()
+        .and_then(|original| match &original.content.relates_to {
+            Some(Relation::Replacement(replacement)) => Some(replacement.event_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| event_id.to_owned());
+
+    let resolved = get_most_recent_edit(cache, &original_id).await?;
+
+    let body = room_message_body(visible_msgtype(&resolved))?;
+
+    Some(ResolvedMessage {
+        event_id: original_id,
+        current_event_id: resolved.event_id.clone(),
+        sender: resolved.sender.clone(),
+        timestamp_millis: Some(resolved.origin_server_ts.get().into()),
+        body,
+    })
+}
+
+/// Whether a cached timeline event carries a redaction.
+fn timeline_event_is_redacted(event: &TimelineEvent) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Unsigned {
+        redacted_because: Option<serde_json::Value>,
+    }
+
+    match event.raw().get_field::<Unsigned>("unsigned") {
+        Ok(Some(unsigned)) => unsigned.redacted_because.is_some(),
+        Ok(None) => false,
+        // A malformed unsigned block cannot be trusted; fail closed.
+        Err(_) => true,
+    }
+}
+
+/// The message type carrying the currently visible content: the replacement's
+/// `m.new_content` for an edit, otherwise the event's own content.
+fn visible_msgtype(event: &OriginalSyncRoomMessageEvent) -> &MessageType {
+    match &event.content.relates_to {
+        Some(Relation::Replacement(replacement)) => &replacement.new_content.msgtype,
+        _ => &event.content.msgtype,
+    }
+}
+
 /// Indexable text for a media message: its filename plus any caption.
 fn media_body(filename: &str, caption: Option<&str>) -> String {
     match caption {
@@ -362,7 +446,7 @@ fn indexable_from_room_message(
     event: &OriginalSyncRoomMessageEvent,
     timestamp: Option<MilliSecondsSinceUnixEpoch>,
 ) -> Option<IndexableEvent> {
-    let body = room_message_body(&event.content.msgtype)?;
+    let body = room_message_body(visible_msgtype(event))?;
     let original_event_id = match &event.content.relates_to {
         Some(Relation::Replacement(replacement)) => replacement.event_id.clone(),
         _ => event.event_id.clone(),
@@ -903,6 +987,74 @@ mod tests {
             "Search should return latest edit, got {:?}",
             results[0].1
         );
+    }
+
+    /// Resolving a candidate id returns the newest valid edit's content, and
+    /// resolving the edit id itself returns the same original identity.
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_resolve_cached_message_returns_latest_edit_content() {
+        let room_id = room_id!("!room_id:localhost");
+        let original_id = event_id!("$resolve_original");
+        let edit_id = event_id!("$resolve_edit");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let f = EventFactory::new().room(room_id).sender(user_id!("@user_id:localhost"));
+
+        let original = f.text_msg("This is a message").event_id(original_id);
+        let edit = f
+            .text_msg("* An edited message")
+            .edit(
+                original_id,
+                RoomMessageEventContentWithoutRelation::text_plain("An edited message"),
+            )
+            .event_id(edit_id);
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_event(original)
+                    .add_timeline_event(edit),
+            )
+            .await;
+
+        let resolved = room
+            .resolve_cached_message(original_id)
+            .await
+            .expect("cache lookup")
+            .expect("message should resolve");
+        assert_eq!(resolved.body, "An edited message");
+        assert_eq!(resolved.current_event_id, edit_id.to_owned());
+        assert_eq!(resolved.event_id, original_id.to_owned());
+
+        let resolved_from_edit = room
+            .resolve_cached_message(edit_id)
+            .await
+            .expect("cache lookup")
+            .expect("edit should resolve to the message");
+        assert_eq!(resolved_from_edit.body, "An edited message");
+        assert_eq!(resolved_from_edit.event_id, original_id.to_owned());
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_resolve_cached_message_returns_none_for_unknown_event() {
+        let room_id = room_id!("!room_id:localhost");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        let resolved =
+            room.resolve_cached_message(event_id!("$missing")).await.expect("cache lookup");
+        assert!(resolved.is_none(), "unknown events must not resolve: {resolved:?}");
     }
 
     #[cfg(feature = "experimental-search")]

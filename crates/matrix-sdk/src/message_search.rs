@@ -85,11 +85,10 @@ use std::{collections::HashSet, pin::Pin};
 use async_stream::try_stream;
 use futures_util::{Stream, StreamExt as _};
 use matrix_sdk_base::{RoomStateFilter, deserialized_responses::TimelineEvent};
-use matrix_sdk_search::error::IndexError;
 #[cfg(doc)]
 use matrix_sdk_search::index::RoomIndex;
-use matrix_sdk_search::index::SearchCursor;
-use ruma::{OwnedEventId, OwnedRoomId};
+use matrix_sdk_search::{error::IndexError, index::SearchCursor};
+use ruma::{EventId, OwnedEventId, OwnedRoomId};
 
 use crate::{Client, Room};
 
@@ -166,6 +165,21 @@ impl Room {
                 yield page;
             }
         }
+    }
+
+    /// Resolve a message to its current visible content, reading only the local
+    /// event cache (no network).
+    ///
+    /// Edits and redactions are resolved, so callers never verify stale
+    /// pre-edit text. Returns `None` when the event is not cached or has been
+    /// redacted.
+    pub async fn resolve_cached_message(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<crate::search_index::ResolvedMessage>, crate::Error> {
+        let (cache, _drop_handles) = self.event_cache().await?;
+
+        Ok(crate::search_index::resolve_cached_message(&cache, event_id).await)
     }
 }
 
