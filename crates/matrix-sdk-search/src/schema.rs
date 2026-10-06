@@ -81,7 +81,6 @@ impl RoomMessageSchema {
         Self::new_with_config(&SearchIndexConfig::default())
     }
 
-    #[cfg(test)]
     pub(crate) fn body_field(&self) -> Field {
         self.body_field
     }

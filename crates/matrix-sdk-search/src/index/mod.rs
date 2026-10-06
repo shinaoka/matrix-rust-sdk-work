@@ -25,9 +25,12 @@ use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt,
 };
 use tantivy::{
-    Index, IndexReader, ReloadPolicy, TantivyDocument, collector::TopDocs,
-    directory::error::OpenDirectoryError, query::QueryParser, schema::Value,
-    tokenizer::NgramTokenizer,
+    Index, IndexReader, ReloadPolicy, TantivyDocument,
+    collector::TopDocs,
+    directory::error::OpenDirectoryError,
+    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    schema::{IndexRecordOption, Term, Value},
+    tokenizer::{NgramTokenizer, TokenStream},
 };
 use tracing::{debug, error, warn};
 
@@ -126,6 +129,9 @@ pub struct RoomIndex {
     index: Index,
     schema: RoomMessageSchema,
     query_parser: QueryParser,
+    /// Name of the registered tokenizer for the searchable body field, used to
+    /// tokenize literal queries the same way the body was indexed.
+    body_tokenizer_name: String,
     room_id: OwnedRoomId,
     /// Events added but not yet committed, mapping each document's primary key
     /// (event id) to its deletion key (original event id). The deletion key is
@@ -162,6 +168,7 @@ impl RoomIndex {
             index,
             schema,
             query_parser,
+            body_tokenizer_name: config.body_tokenizer_name(),
             room_id: room_id.to_owned(),
             uncommitted_adds: HashMap::new(),
             uncommitted_removes: HashSet::new(),
@@ -241,9 +248,68 @@ impl RoomIndex {
             &query,
             &TopDocs::with_limit(max_number_of_results).and_offset(offset).order_by_score(),
         )?;
+        self.collect_event_ids(&searcher, results)
+    }
+
+    /// Search the index with the query treated as literal text.
+    ///
+    /// Unlike [`RoomIndex::search`], the query is not parsed for operators or
+    /// field syntax: it is tokenized with the configured body tokenizer and
+    /// every produced token is required to be present. That is a superset of
+    /// substring matches, so the caller still verifies exactness.
+    ///
+    /// Returns [`IndexError::EmptyMessage`] when the tokenizer produces no
+    /// tokens (for example a query shorter than the configured minimum ngram);
+    /// callers must fall back to a bounded secondary path rather than silently
+    /// dropping the query.
+    pub(crate) fn search_literal(
+        &self,
+        query: &str,
+        max_number_of_results: usize,
+        pagination_offset: Option<usize>,
+    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
+        let query = self.literal_query(query)?;
+        let searcher = self.reader()?.searcher();
+        let offset = pagination_offset.unwrap_or(0);
+        let results = searcher.search(
+            &query,
+            &TopDocs::with_limit(max_number_of_results).and_offset(offset).order_by_score(),
+        )?;
+        self.collect_event_ids(&searcher, results)
+    }
+
+    /// Build a literal query: every token the configured body tokenizer emits
+    /// for `query` must be present. Operators and field syntax are inert.
+    fn literal_query(&self, query: &str) -> Result<Box<dyn Query>, IndexError> {
+        let mut tokenizer = self
+            .index
+            .tokenizers()
+            .get(&self.body_tokenizer_name)
+            .ok_or(IndexError::EmptyMessage)?;
+        let mut stream = tokenizer.token_stream(query);
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        while let Some(token) = stream.next() {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.schema.body_field(), &token.text),
+                    IndexRecordOption::WithFreqs,
+                )),
+            ));
+        }
+        if clauses.is_empty() {
+            return Err(IndexError::EmptyMessage);
+        }
+        Ok(Box::new(BooleanQuery::new(clauses)))
+    }
+
+    fn collect_event_ids(
+        &self,
+        searcher: &tantivy::Searcher,
+        results: Vec<(f32, tantivy::DocAddress)>,
+    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
         let mut ret: Vec<(f32, OwnedEventId)> = Vec::new();
         let pk = self.schema.primary_key();
-
         for (score, doc_address) in results {
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
             match retrieved_doc.get_first(pk).and_then(|maybe_value| maybe_value.as_str()) {
@@ -254,7 +320,6 @@ impl RoomIndex {
                 _ => error!("unexpected value type while searching documents"),
             }
         }
-
         Ok(ret)
     }
 
@@ -697,6 +762,87 @@ mod tests {
         let true_value: HashSet<_> = true_value.iter().collect();
 
         assert_eq!(result, true_value, "search result not correct: {result:?}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_literal_search_ignores_query_parser_field_syntax() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        let event_id = event_id!("$literal:localhost");
+        let event = EventFactory::new()
+            .text_msg("see report:2026.pdf now")
+            .event_id(event_id)
+            .room(room_id)
+            .sender(user_id!("@user_id:localhost"))
+            .into_any_sync_message_like_event();
+
+        index_message(&mut index, event)?;
+
+        // `report:2026` is not a field query: it is literal message text.
+        let result = index.search_literal("report:2026", 10, None).expect("literal search failed");
+        let result: HashSet<_> = result.iter().map(|(_, id)| id).collect();
+
+        let true_value = [event_id.to_owned()];
+        let true_value: HashSet<_> = true_value.iter().collect();
+
+        assert_eq!(result, true_value, "literal search result not correct: {result:?}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_literal_search_matches_japanese_substring() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        let event_id = event_id!("$literal_japanese:localhost");
+        let event = EventFactory::new()
+            .text_msg("再アンケートです。来週確認します。")
+            .event_id(event_id)
+            .room(room_id)
+            .sender(user_id!("@user_id:localhost"))
+            .into_any_sync_message_like_event();
+
+        index_message(&mut index, event)?;
+
+        let result = index.search_literal("アンケート", 10, None).expect("literal search failed");
+        let result: HashSet<_> = result.iter().map(|(_, id)| id).collect();
+
+        let true_value = [event_id.to_owned()];
+        let true_value: HashSet<_> = true_value.iter().collect();
+
+        assert_eq!(result, true_value, "literal search result not correct: {result:?}");
+
+        Ok(())
+    }
+
+    /// A query shorter than the configured minimum ngram produces no tokens;
+    /// the caller gets a typed error so it can fall back instead of silently
+    /// dropping the query.
+    #[test]
+    fn test_literal_search_reports_queries_without_tokens() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        let event = EventFactory::new()
+            .text_msg("hello world")
+            .event_id(event_id!("$short:localhost"))
+            .room(room_id)
+            .sender(user_id!("@user_id:localhost"))
+            .into_any_sync_message_like_event();
+
+        index_message(&mut index, event)?;
+
+        assert!(matches!(index.search_literal("a", 10, None), Err(IndexError::EmptyMessage)));
 
         Ok(())
     }
