@@ -33,6 +33,8 @@ ruma = { workspace = true , features = [
     "unstable-msc1767"
 ] }
 serde = { workspace = true, features = ["derive"] }
+unicode-casefold = "0.2"
+unicode-normalization.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

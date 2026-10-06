@@ -21,9 +21,10 @@ use tantivy::{
 };
 
 use crate::{
-    config::{SearchIndexConfig, SearchTokenizer},
+    config::SearchIndexConfig,
     error::{IndexError, IndexSchemaError},
     index::IndexableEvent,
+    normalize::normalize_search_text,
 };
 
 pub(crate) trait MatrixSearchIndexSchema {
@@ -44,6 +45,9 @@ pub(crate) struct RoomMessageSchema {
     /// Used by edits to refer to the event they edited (deletion key).
     original_event_id_field: Field,
     body_field: Field,
+    /// NFKC + case-folded body text, indexed with single-character grams so a
+    /// query that normalizes to one scalar still has a token to match.
+    body_normalized_field: Field,
     date_field: Field,
     sender_field: Field,
     default_search_fields: Vec<Field>,
@@ -54,7 +58,12 @@ impl RoomMessageSchema {
         let mut schema = Schema::builder();
         let event_id_field = schema.add_text_field("event_id", STORED | STRING | FAST);
         let original_event_id_field = schema.add_text_field("original_event_id", STRING);
-        let body_field = schema.add_text_field("body", body_text_options(config));
+        let body_field =
+            schema.add_text_field("body", body_text_options(&config.body_tokenizer_name()));
+        let body_normalized_field = schema.add_text_field(
+            "body_normalized",
+            body_text_options(&config.body_normalized_tokenizer_name()),
+        );
 
         let date_options =
             DateOptions::from(INDEXED).set_fast().set_precision(DateTimePrecision::Milliseconds);
@@ -71,6 +80,7 @@ impl RoomMessageSchema {
             event_id_field,
             original_event_id_field,
             body_field,
+            body_normalized_field,
             date_field,
             sender_field,
             default_search_fields,
@@ -84,6 +94,10 @@ impl RoomMessageSchema {
 
     pub(crate) fn body_field(&self) -> Field {
         self.body_field
+    }
+
+    pub(crate) fn body_normalized_field(&self) -> Field {
+        self.body_normalized_field
     }
 }
 
@@ -115,6 +129,7 @@ impl MatrixSearchIndexSchema for RoomMessageSchema {
         let Self {
             event_id_field,
             body_field,
+            body_normalized_field,
             date_field,
             sender_field,
             original_event_id_field,
@@ -125,8 +140,11 @@ impl MatrixSearchIndexSchema for RoomMessageSchema {
 
         let IndexableEvent { event_id, body, timestamp, sender, original_event_id } = event;
 
+        let normalized_body = normalize_search_text(&body);
+
         document.add_text(*event_id_field, event_id);
         document.add_text(*body_field, body);
+        document.add_text(*body_normalized_field, normalized_body);
         document.add_date(
             *date_field,
             DateTime::from_timestamp_millis(
@@ -145,20 +163,14 @@ impl MatrixSearchIndexSchema for RoomMessageSchema {
     }
 }
 
-fn body_text_options(config: &SearchIndexConfig) -> TextOptions {
-    match &config.tokenizer {
-        SearchTokenizer::Default => TEXT,
-        SearchTokenizer::Ngram(_) => {
-            let tokenizer_name = config.body_tokenizer_name();
-            let indexing_options = TEXT
-                .get_indexing_options()
-                .expect("TEXT should have indexing options")
-                .clone()
-                .set_tokenizer(&tokenizer_name);
+fn body_text_options(tokenizer_name: &str) -> TextOptions {
+    let indexing_options = TEXT
+        .get_indexing_options()
+        .expect("TEXT should have indexing options")
+        .clone()
+        .set_tokenizer(tokenizer_name);
 
-            TEXT.set_indexing_options(indexing_options)
-        }
-    }
+    TEXT.set_indexing_options(indexing_options)
 }
 
 impl TryFrom<Schema> for RoomMessageSchema {
@@ -168,6 +180,7 @@ impl TryFrom<Schema> for RoomMessageSchema {
         let event_id_field = schema.get_field("event_id")?;
         let original_event_id_field = schema.get_field("original_event_id")?;
         let body_field = schema.get_field("body")?;
+        let body_normalized_field = schema.get_field("body_normalized")?;
         let date_field = schema.get_field("date")?;
         let sender_field = schema.get_field("sender")?;
 
@@ -178,6 +191,7 @@ impl TryFrom<Schema> for RoomMessageSchema {
             event_id_field,
             original_event_id_field,
             body_field,
+            body_normalized_field,
             date_field,
             sender_field,
             default_search_fields,

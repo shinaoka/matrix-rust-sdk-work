@@ -9,6 +9,7 @@ pub(crate) const TANTIVY_INDEX_MEMORY_BUDGET: usize = 50_000_000;
 /// A module for search index configuration.
 pub mod config;
 mod encrypted;
+mod normalize;
 mod schema;
 mod writer;
 

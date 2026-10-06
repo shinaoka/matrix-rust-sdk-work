@@ -39,10 +39,28 @@ impl SearchIndexConfig {
         self.tokenizer.name()
     }
 
+    /// Tokenizer name for the normalized body field.
+    ///
+    /// Normalized text always indexes single-character grams, so a query whose
+    /// normalization collapses to one scalar (for example a combining-mark
+    /// sequence folding to a precomposed character) still has a token to match.
+    pub(crate) fn body_normalized_tokenizer_name(&self) -> String {
+        match &self.tokenizer {
+            SearchTokenizer::Ngram(config) => format!("matrix_ngram_1_{}", config.max_gram()),
+            SearchTokenizer::Default => "default".to_owned(),
+        }
+    }
+
     pub(crate) fn ngram_tokenizer(&self) -> Option<(String, usize, usize)> {
         self.tokenizer
             .ngram_config()
             .map(|config| (self.body_tokenizer_name(), config.min_gram(), config.max_gram()))
+    }
+
+    pub(crate) fn ngram_normalized_tokenizer(&self) -> Option<(String, usize, usize)> {
+        self.tokenizer
+            .ngram_config()
+            .map(|config| (self.body_normalized_tokenizer_name(), 1, config.max_gram()))
     }
 }
 

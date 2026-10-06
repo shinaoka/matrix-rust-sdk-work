@@ -32,7 +32,7 @@ use tantivy::{
     collector::TopDocs,
     directory::error::OpenDirectoryError,
     query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
-    schema::{IndexRecordOption, Term, Value},
+    schema::{Field, IndexRecordOption, Term, Value},
     tokenizer::{NgramTokenizer, TokenStream},
 };
 use tracing::{debug, error, warn};
@@ -41,6 +41,7 @@ use crate::{
     OpStamp, TANTIVY_INDEX_MEMORY_BUDGET,
     config::SearchIndexConfig,
     error::IndexError,
+    normalize::normalize_search_text,
     schema::{MatrixSearchIndexSchema, RoomMessageSchema},
     writer::SearchIndexWriter,
 };
@@ -135,6 +136,9 @@ pub struct RoomIndex {
     /// Name of the registered tokenizer for the searchable body field, used to
     /// tokenize literal queries the same way the body was indexed.
     body_tokenizer_name: String,
+    /// Tokenizer for the normalized body field, always including single
+    /// character grams.
+    body_normalized_tokenizer_name: String,
     room_id: OwnedRoomId,
     /// Events added but not yet committed, mapping each document's primary key
     /// (event id) to its deletion key (original event id). The deletion key is
@@ -172,6 +176,7 @@ impl RoomIndex {
             schema,
             query_parser,
             body_tokenizer_name: config.body_tokenizer_name(),
+            body_normalized_tokenizer_name: config.body_normalized_tokenizer_name(),
             room_id: room_id.to_owned(),
             uncommitted_adds: HashMap::new(),
             uncommitted_removes: HashSet::new(),
@@ -305,27 +310,53 @@ impl RoomIndex {
 
     /// Build a literal query: every token the configured body tokenizer emits
     /// for `query` must be present. Operators and field syntax are inert.
+    ///
+    /// The query matches both the raw body and the normalized body, so that
+    /// normalization-equivalent text (NFKC, case folding, dash unification) is
+    /// a candidate even when the raw bytes differ.
     fn literal_query(&self, query: &str) -> Result<Box<dyn Query>, IndexError> {
-        let mut tokenizer = self
-            .index
-            .tokenizers()
-            .get(&self.body_tokenizer_name)
-            .ok_or(IndexError::EmptyMessage)?;
+        let raw = self.token_clauses(&self.body_tokenizer_name, self.schema.body_field(), query)?;
+        let normalized = self.token_clauses(
+            &self.body_normalized_tokenizer_name,
+            self.schema.body_normalized_field(),
+            &normalize_search_text(query),
+        )?;
+
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        if let Some(raw) = raw {
+            clauses.push((Occur::Should, raw));
+        }
+        if let Some(normalized) = normalized {
+            clauses.push((Occur::Should, normalized));
+        }
+        if clauses.is_empty() {
+            return Err(IndexError::EmptyMessage);
+        }
+        Ok(Box::new(BooleanQuery::new(clauses)))
+    }
+
+    /// Tokenize `query` with `tokenizer_name` and require every token to be
+    /// present in `field`, or `None` when the tokenizer yields no tokens.
+    fn token_clauses(
+        &self,
+        tokenizer_name: &str,
+        field: Field,
+        query: &str,
+    ) -> Result<Option<Box<dyn Query>>, IndexError> {
+        let mut tokenizer =
+            self.index.tokenizers().get(tokenizer_name).ok_or(IndexError::EmptyMessage)?;
         let mut stream = tokenizer.token_stream(query);
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         while let Some(token) = stream.next() {
             clauses.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
-                    Term::from_field_text(self.schema.body_field(), &token.text),
+                    Term::from_field_text(field, &token.text),
                     IndexRecordOption::WithFreqs,
                 )),
             ));
         }
-        if clauses.is_empty() {
-            return Err(IndexError::EmptyMessage);
-        }
-        Ok(Box::new(BooleanQuery::new(clauses)))
+        if clauses.is_empty() { Ok(None) } else { Ok(Some(Box::new(BooleanQuery::new(clauses)))) }
     }
 
     fn collect_event_ids(
@@ -536,7 +567,9 @@ impl RoomIndex {
 }
 
 fn register_tokenizers(index: &Index, config: &SearchIndexConfig) {
-    if let Some((tokenizer_name, min_gram, max_gram)) = config.ngram_tokenizer() {
+    for (tokenizer_name, min_gram, max_gram) in
+        [config.ngram_tokenizer(), config.ngram_normalized_tokenizer()].into_iter().flatten()
+    {
         let Ok(tokenizer) = NgramTokenizer::all_ngrams(min_gram, max_gram) else {
             unreachable!(
                 "NgramConfig only stores bounds where min_gram > 0 and min_gram <= max_gram"
@@ -848,11 +881,10 @@ mod tests {
         Ok(())
     }
 
-    /// A query shorter than the configured minimum ngram produces no tokens;
-    /// the caller gets a typed error so it can fall back instead of silently
-    /// dropping the query.
+    /// A query that produces no tokens at all gets a typed error so the caller
+    /// can fall back instead of silently dropping the query.
     #[test]
-    fn test_literal_search_reports_queries_without_tokens() -> Result<(), Box<dyn Error>> {
+    fn test_literal_search_reports_tokenless_queries() -> Result<(), Box<dyn Error>> {
         let room_id = room_id!("!room_id:localhost");
         let mut index = RoomIndexBuilder::new_in_memory(room_id)
             .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
@@ -867,7 +899,7 @@ mod tests {
 
         index_message(&mut index, event)?;
 
-        assert!(matches!(index.search_literal("a", 10, None), Err(IndexError::EmptyMessage)));
+        assert!(matches!(index.search_literal_page("", 10, None), Err(IndexError::EmptyMessage)));
 
         Ok(())
     }
@@ -957,6 +989,58 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), 3, "every tied match must be returned once: {seen:?}");
         assert_eq!(seen, vec!["$event_c:localhost", "$event_b:localhost", "$event_a:localhost"]);
+    }
+
+    /// A query whose normalization collapses to one scalar still matches a
+    /// precomposed body through the normalized field.
+    #[test]
+    fn test_literal_search_matches_normalized_combining_mark_query() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        add_indexable(&mut index, "$precomposed:localhost", 1_000, "ガ");
+
+        let page = index
+            .search_literal_page("カ\u{3099}", 10, None)
+            .expect("normalized query must not be empty");
+        assert_eq!(page.len(), 1, "combining-mark query must match a precomposed body: {page:?}");
+    }
+
+    /// Case folding and compatibility forms are enumerated through the
+    /// normalized field.
+    #[test]
+    fn test_literal_search_matches_case_and_width_normalized() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        add_indexable(&mut index, "$upper:localhost", 1_000, "HÉLLO WÖRLD");
+        add_indexable(&mut index, "$width:localhost", 2_000, "ABC");
+
+        let case_page =
+            index.search_literal_page("héllo wörld", 10, None).expect("case-folded query");
+        assert_eq!(case_page.len(), 1, "case folding must match: {case_page:?}");
+
+        let width_page = index.search_literal_page("ＡＢＣ", 10, None).expect("full-width query");
+        assert_eq!(width_page.len(), 1, "compatibility width must match: {width_page:?}");
+    }
+
+    /// A raw substring that spans a combining mark is still found through the
+    /// raw field even though normalization would rewrite the body.
+    #[test]
+    fn test_literal_search_matches_raw_substring_across_combining_mark() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        add_indexable(&mut index, "$raw:localhost", 1_000, "xカ\u{3099} now");
+
+        let page = index.search_literal_page("xカ", 10, None).expect("raw substring query");
+        assert_eq!(page.len(), 1, "raw substring must match across normalization: {page:?}");
     }
 
     #[test]
