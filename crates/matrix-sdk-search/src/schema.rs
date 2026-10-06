@@ -15,7 +15,8 @@
 use tantivy::{
     DateTime, TantivyDocument,
     schema::{
-        DateOptions, DateTimePrecision, Field, INDEXED, STORED, STRING, Schema, TEXT, TextOptions,
+        DateOptions, DateTimePrecision, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT,
+        TextOptions,
     },
 };
 
@@ -51,12 +52,12 @@ pub(crate) struct RoomMessageSchema {
 impl RoomMessageSchema {
     pub(crate) fn new_with_config(config: &SearchIndexConfig) -> Self {
         let mut schema = Schema::builder();
-        let event_id_field = schema.add_text_field("event_id", STORED | STRING);
+        let event_id_field = schema.add_text_field("event_id", STORED | STRING | FAST);
         let original_event_id_field = schema.add_text_field("original_event_id", STRING);
         let body_field = schema.add_text_field("body", body_text_options(config));
 
         let date_options =
-            DateOptions::from(INDEXED).set_fast().set_precision(DateTimePrecision::Seconds);
+            DateOptions::from(INDEXED).set_fast().set_precision(DateTimePrecision::Milliseconds);
 
         let date_field = schema.add_date_field("date", date_options);
         let sender_field = schema.add_text_field("sender", STRING);

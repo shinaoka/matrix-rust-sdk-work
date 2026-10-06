@@ -25,7 +25,9 @@ use matrix_sdk_base::{
 use matrix_sdk_search::{
     config::SearchIndexConfig,
     error::IndexError,
-    index::{IndexableEvent, RoomIndex, RoomIndexOperation, builder::RoomIndexBuilder},
+    index::{
+        IndexableEvent, RoomIndex, RoomIndexOperation, SearchCursor, builder::RoomIndexBuilder,
+    },
 };
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, RoomId,
@@ -222,6 +224,29 @@ impl SearchIndexGuard<'_> {
         let index = self.index_map.get_mut(room_id).expect("index should exist");
 
         index.search(query, max_number_of_results, pagination_offset)
+    }
+
+    /// Page a [`Room`]'s index with `query` treated as literal text, newest
+    /// first.
+    ///
+    /// Returns at most `max_number_of_results` matches strictly older than
+    /// `cursor`. Unlike [`SearchIndexGuard::search`], no offset is used, so
+    /// memory stays bounded by the page size regardless of history depth.
+    pub(crate) fn search_literal_page(
+        &mut self,
+        query: &str,
+        max_number_of_results: usize,
+        cursor: Option<SearchCursor>,
+        room_id: &RoomId,
+    ) -> Result<Vec<SearchCursor>, IndexError> {
+        if !self.index_map.contains_key(room_id) {
+            let index = self.create_index(room_id)?;
+            self.index_map.insert(room_id.to_owned(), index);
+        }
+
+        let index = self.index_map.get_mut(room_id).expect("index should exist");
+
+        index.search_literal_page(query, max_number_of_results, cursor)
     }
 
     /// Given a [`TimelineEvent`] this function will derive a
@@ -559,8 +584,8 @@ mod tests {
     use ruma::{
         event_id,
         events::{
-            AnySyncMessageLikeEvent, room::message::MessageType,
-            room::message::RoomMessageEventContentWithoutRelation,
+            AnySyncMessageLikeEvent,
+            room::message::{MessageType, RoomMessageEventContentWithoutRelation},
         },
         room_id, user_id,
     };

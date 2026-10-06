@@ -14,12 +14,15 @@
 
 /// A module for building a [`RoomIndex`]
 pub mod builder;
+mod cursor;
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
 };
 
+pub use cursor::SearchCursor;
+use cursor::{CursorTopCollector, candidate_cursor};
 use once_cell::sync::OnceCell;
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt,
@@ -262,6 +265,7 @@ impl RoomIndex {
     /// tokens (for example a query shorter than the configured minimum ngram);
     /// callers must fall back to a bounded secondary path rather than silently
     /// dropping the query.
+    #[cfg(test)]
     pub(crate) fn search_literal(
         &self,
         query: &str,
@@ -276,6 +280,27 @@ impl RoomIndex {
             &TopDocs::with_limit(max_number_of_results).and_offset(offset).order_by_score(),
         )?;
         self.collect_event_ids(&searcher, results)
+    }
+
+    /// Page literal search results newest-first.
+    ///
+    /// Returns at most `limit` matches strictly older than `cursor`. Pass the
+    /// last returned cursor to fetch the next page, or `None` for the newest
+    /// page. Unlike [`RoomIndex::search`], no offset is used, so memory stays
+    /// bounded by `limit` regardless of history depth.
+    pub fn search_literal_page(
+        &self,
+        query: &str,
+        limit: usize,
+        cursor: Option<SearchCursor>,
+    ) -> Result<Vec<SearchCursor>, IndexError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query = self.literal_query(query)?;
+        let searcher = self.reader()?.searcher();
+        let candidates = searcher.search(&query, &CursorTopCollector { limit, cursor })?;
+        Ok(candidates.iter().filter_map(candidate_cursor).collect())
     }
 
     /// Build a literal query: every token the configured body tokenizer emits
@@ -845,6 +870,93 @@ mod tests {
         assert!(matches!(index.search_literal("a", 10, None), Err(IndexError::EmptyMessage)));
 
         Ok(())
+    }
+
+    fn add_indexable(index: &mut RoomIndex, id: &str, timestamp: u64, body: &str) {
+        let event_id = EventId::parse(id).expect("valid event id").to_owned();
+        index
+            .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                event_id.clone(),
+                event_id,
+                user_id!("@user_id:localhost").to_owned(),
+                Some(MilliSecondsSinceUnixEpoch(UInt::new_saturating(timestamp))),
+                body.to_owned(),
+            )))
+            .expect("failed to add event");
+    }
+
+    #[test]
+    fn test_literal_page_is_newest_first_and_pages_exactly() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        for timestamp in 1_000..1_005u64 {
+            add_indexable(
+                &mut index,
+                &format!("$event_{timestamp}:localhost"),
+                timestamp,
+                "hello world",
+            );
+        }
+
+        let first = index.search_literal_page("hello", 2, None).expect("first page");
+        assert_eq!(
+            first.iter().map(|cursor| cursor.timestamp_millis).collect::<Vec<_>>(),
+            vec![1_004, 1_003],
+            "first page must be newest first"
+        );
+
+        let second =
+            index.search_literal_page("hello", 2, first.last().cloned()).expect("second page");
+        assert_eq!(
+            second.iter().map(|cursor| cursor.timestamp_millis).collect::<Vec<_>>(),
+            vec![1_002, 1_001]
+        );
+
+        let third =
+            index.search_literal_page("hello", 2, second.last().cloned()).expect("third page");
+        assert_eq!(
+            third.iter().map(|cursor| cursor.timestamp_millis).collect::<Vec<_>>(),
+            vec![1_000]
+        );
+
+        let exhausted =
+            index.search_literal_page("hello", 2, third.last().cloned()).expect("exhausted page");
+        assert!(exhausted.is_empty(), "paging must terminate: {exhausted:?}");
+    }
+
+    /// Ties on the timestamp are paged exactly by the event-id tiebreak: no
+    /// duplicates and no skipped matches.
+    #[test]
+    fn test_literal_page_breaks_same_timestamp_ties() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        for name in ["a", "b", "c"] {
+            add_indexable(&mut index, &format!("$event_{name}:localhost"), 1_000, "hello world");
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = index.search_literal_page("hello", 2, cursor.clone()).expect("page");
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().cloned();
+            seen.extend(page.into_iter().map(|cursor| cursor.event_id.to_string()));
+            assert!(seen.len() <= 3, "paging must not repeat or exceed the match set: {seen:?}");
+        }
+
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "every tied match must be returned once: {seen:?}");
+        assert_eq!(seen, vec!["$event_c:localhost", "$event_b:localhost", "$event_a:localhost"]);
     }
 
     #[test]

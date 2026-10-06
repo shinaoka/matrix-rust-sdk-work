@@ -88,6 +88,7 @@ use matrix_sdk_base::{RoomStateFilter, deserialized_responses::TimelineEvent};
 use matrix_sdk_search::error::IndexError;
 #[cfg(doc)]
 use matrix_sdk_search::index::RoomIndex;
+use matrix_sdk_search::index::SearchCursor;
 use ruma::{OwnedEventId, OwnedRoomId};
 
 use crate::{Client, Room};
@@ -127,6 +128,44 @@ impl Room {
     ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
         let mut search_index_guard = self.client.search_index().lock().await;
         search_index_guard.search(query, max_number_of_results, pagination_offset, self.room_id())
+    }
+
+    /// Page this room's index for literal `query` text, newest first.
+    ///
+    /// Returns at most `max_number_of_results` matches strictly older than
+    /// `cursor`; pass the last returned cursor to continue, or `None` to start
+    /// at the newest match. Unlike [`Room::search`], no offset is used, so
+    /// memory stays bounded by the page size.
+    pub async fn search_literal_page(
+        &self,
+        query: &str,
+        max_number_of_results: usize,
+        cursor: Option<SearchCursor>,
+    ) -> Result<Vec<SearchCursor>, IndexError> {
+        let mut search_index_guard = self.client.search_index().lock().await;
+        search_index_guard.search_literal_page(query, max_number_of_results, cursor, self.room_id())
+    }
+
+    /// Search this room with literal `query` text, yielding pages of cursors
+    /// newest first. See [`Room::search_literal_page`].
+    pub fn search_messages_literal(
+        &self,
+        query: String,
+    ) -> impl Stream<Item = Result<Vec<SearchCursor>, IndexError>> + use<> {
+        let room = self.clone();
+
+        try_stream! {
+            let mut cursor = None;
+            loop {
+                let page =
+                    room.search_literal_page(&query, SEARCH_RESULTS_PAGE_SIZE, cursor.clone()).await?;
+                if page.is_empty() {
+                    break;
+                }
+                cursor = page.last().cloned();
+                yield page;
+            }
+        }
     }
 }
 
