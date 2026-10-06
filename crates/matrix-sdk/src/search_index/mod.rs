@@ -343,6 +343,9 @@ async fn get_most_recent_edit(
 /// Produced by [`resolve_cached_message`] from the persistent event cache only
 /// (no network), with edits and redactions already resolved, so search
 /// verification never reads stale pre-edit text.
+///
+/// Only room messages resolve. Stickers and poll starts are also indexed but
+/// return `None` here, matching what the desktop client previously verified.
 #[derive(Clone)]
 pub struct ResolvedMessage {
     /// The original (root) event id this message's display identity uses.
@@ -373,6 +376,11 @@ impl std::fmt::Debug for ResolvedMessage {
 
 /// Resolve a message to its current visible content, reading only the local
 /// event cache. Returns `None` when the event is missing or redacted.
+///
+/// Redacting the latest edit removes the edited document; it does not fall back
+/// to an earlier edit version, because the cached redacted edit no longer
+/// carries its relation. Clients that need that fallback must re-derive it from
+/// their own durable relations.
 pub(crate) async fn resolve_cached_message(
     cache: &RoomEventCache,
     event_id: &EventId,

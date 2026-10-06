@@ -261,6 +261,11 @@ impl RoomIndex {
 
     /// Page literal search results newest-first.
     ///
+    /// Results are the union of raw and normalization-equivalent candidates. A
+    /// tokenless raw branch is only reported as [`IndexError::EmptyMessage`]
+    /// when the normalized branch is also empty, so callers that need raw
+    /// coverage for a very short query must enforce their own minimum length.
+    ///
     /// Returns at most `limit` matches strictly older than `cursor`. Pass the
     /// last returned cursor to fetch the next page, or `None` for the newest
     /// page. Unlike [`RoomIndex::search`], no offset is used, so memory stays
