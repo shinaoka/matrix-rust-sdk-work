@@ -357,8 +357,14 @@ pub struct ResolvedMessage {
     pub sender: OwnedUserId,
     /// Origin server timestamp of the resolved content, in milliseconds.
     pub timestamp_millis: Option<u64>,
-    /// Visible searchable text, extracted exactly as the index extracts it.
-    pub body: String,
+    /// Visible message text: the body of a text-like message, or the caption of
+    /// a media message.
+    pub body: Option<String>,
+    /// Filename of a media message.
+    ///
+    /// The index stores the filename as searchable text too, but resolution
+    /// reports it separately so a filename match keeps its own match field.
+    pub attachment_filename: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedMessage {
@@ -369,7 +375,11 @@ impl std::fmt::Debug for ResolvedMessage {
             .field("current_event_id", &"EventId(..)")
             .field("sender", &"UserId(..)")
             .field("timestamp_millis", &self.timestamp_millis)
-            .field("body", &"MessageBody(..)")
+            .field("body", &self.body.as_ref().map(|_| "MessageBody(..)"))
+            .field(
+                "attachment_filename",
+                &self.attachment_filename.as_ref().map(|_| "AttachmentFilename(..)"),
+            )
             .finish()
     }
 }
@@ -415,7 +425,10 @@ pub(crate) async fn resolve_cached_message(
 
     let resolved = get_most_recent_edit(cache, &original_id).await?;
 
-    let body = room_message_body(visible_msgtype(&resolved))?;
+    let (body, attachment_filename) = resolved_text(visible_msgtype(&resolved));
+    if body.is_none() && attachment_filename.is_none() {
+        return None;
+    }
 
     Some(ResolvedMessage {
         event_id: original_id,
@@ -423,6 +436,7 @@ pub(crate) async fn resolve_cached_message(
         sender: resolved.sender.clone(),
         timestamp_millis: Some(resolved.origin_server_ts.get().into()),
         body,
+        attachment_filename,
     })
 }
 
@@ -472,6 +486,29 @@ fn room_message_body(msgtype: &MessageType) -> Option<String> {
         MessageType::Audio(content) => Some(media_body(content.filename(), content.caption())),
         MessageType::File(content) => Some(media_body(content.filename(), content.caption())),
         _ => None,
+    }
+}
+
+/// Split the visible content of a room message into text and, for media
+/// messages, the filename.
+///
+/// The index stores the union of both, so a match may come from either; the
+/// resolved reader keeps them apart so callers can report which field matched.
+fn resolved_text(msgtype: &MessageType) -> (Option<String>, Option<String>) {
+    match msgtype {
+        MessageType::Image(content) => {
+            (content.caption().map(ToOwned::to_owned), Some(content.filename().to_owned()))
+        }
+        MessageType::Video(content) => {
+            (content.caption().map(ToOwned::to_owned), Some(content.filename().to_owned()))
+        }
+        MessageType::Audio(content) => {
+            (content.caption().map(ToOwned::to_owned), Some(content.filename().to_owned()))
+        }
+        MessageType::File(content) => {
+            (content.caption().map(ToOwned::to_owned), Some(content.filename().to_owned()))
+        }
+        _ => (room_message_body(msgtype), None),
     }
 }
 
@@ -1063,7 +1100,8 @@ mod tests {
             .await
             .expect("cache lookup")
             .expect("message should resolve");
-        assert_eq!(resolved.body, "An edited message");
+        assert_eq!(resolved.body.as_deref(), Some("An edited message"));
+        assert_eq!(resolved.attachment_filename, None);
         assert_eq!(resolved.current_event_id, edit_id.to_owned());
         assert_eq!(resolved.event_id, original_id.to_owned());
 
@@ -1072,8 +1110,46 @@ mod tests {
             .await
             .expect("cache lookup")
             .expect("edit should resolve to the message");
-        assert_eq!(resolved_from_edit.body, "An edited message");
+        assert_eq!(resolved_from_edit.body.as_deref(), Some("An edited message"));
         assert_eq!(resolved_from_edit.event_id, original_id.to_owned());
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_resolve_cached_message_splits_media_caption_and_filename() {
+        use ruma::owned_mxc_uri;
+
+        let room_id = room_id!("!media_room:localhost");
+        let image_id = event_id!("$media_image");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let f = EventFactory::new().room(room_id).sender(user_id!("@user_id:localhost"));
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    f.image("holiday_beach.jpg".to_owned(), owned_mxc_uri!("mxc://localhost/1"))
+                        .caption(Some("sunset over the ocean".to_owned()), None)
+                        .event_id(image_id),
+                ),
+            )
+            .await;
+
+        let resolved = room
+            .resolve_cached_message(image_id)
+            .await
+            .expect("cache lookup")
+            .expect("media message should resolve");
+
+        // A caption match and a filename match report different fields, so the
+        // index text is split back apart on resolution.
+        assert_eq!(resolved.body.as_deref(), Some("sunset over the ocean"));
+        assert_eq!(resolved.attachment_filename.as_deref(), Some("holiday_beach.jpg"));
     }
 
     #[cfg(feature = "experimental-search")]
