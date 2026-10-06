@@ -20,7 +20,7 @@
 //! are strictly older than a caller cursor. Ordering is by `(date, event_id)`,
 //! so paging stays exact and bounded even when many events share a timestamp.
 
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::collections::BinaryHeap;
 
 use ruma::{EventId, OwnedEventId};
 use tantivy::{
@@ -42,23 +42,11 @@ pub struct SearchCursor {
 
 /// A collected candidate, ordered by recency: larger timestamp first, then
 /// larger event id, so a `Reverse` min-heap keeps the newest `limit`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct Candidate {
     pub(crate) timestamp_millis: i64,
     pub(crate) event_id: String,
     pub(crate) doc_address: DocAddress,
-}
-
-impl Ord for Candidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.timestamp_millis, &self.event_id).cmp(&(other.timestamp_millis, &other.event_id))
-    }
-}
-
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 /// Collects the newest `limit` matches strictly older than `cursor`.
@@ -167,10 +155,9 @@ impl SegmentCollector for CursorSegmentCollector {
 /// order and dropping malformed ids like the offset-based path does.
 pub(crate) fn candidate_cursor(candidate: &Candidate) -> Option<SearchCursor> {
     match EventId::parse(&candidate.event_id) {
-        Ok(event_id) => Some(SearchCursor {
-            timestamp_millis: candidate.timestamp_millis,
-            event_id: event_id.to_owned(),
-        }),
+        Ok(event_id) => {
+            Some(SearchCursor { timestamp_millis: candidate.timestamp_millis, event_id })
+        }
         Err(err) => {
             tracing::error!("error while parsing event_id from search result: {err:?}");
             None
