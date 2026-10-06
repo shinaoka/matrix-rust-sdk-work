@@ -340,8 +340,8 @@ async fn get_most_recent_edit(
 
 /// The most recent visible content for a cached message.
 ///
-/// Produced by [`resolve_cached_message`] from the persistent event cache only
-/// (no network), with edits and redactions already resolved, so search
+/// Produced by the cache-only resolver from the persistent event cache (no
+/// network), with edits and redactions already resolved, so search
 /// verification never reads stale pre-edit text.
 ///
 /// Only room messages resolve. Stickers and poll starts are also indexed but
