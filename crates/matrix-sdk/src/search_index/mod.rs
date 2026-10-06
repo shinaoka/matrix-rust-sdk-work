@@ -344,8 +344,9 @@ async fn get_most_recent_edit(
 /// network), with edits and redactions already resolved, so search
 /// verification never reads stale pre-edit text.
 ///
-/// Only room messages resolve. Stickers and poll starts are also indexed but
-/// return `None` here, matching what the desktop client previously verified.
+/// Only room messages and stickers resolve. Polls are indexed but stay excluded:
+/// their visible content can be replaced or ended, and resolving the initial
+/// question would surface text the poll no longer shows.
 #[derive(Clone)]
 pub struct ResolvedMessage {
     /// The original (root) event id this message's display identity uses.
@@ -400,9 +401,30 @@ pub(crate) async fn resolve_cached_message(
         return None;
     }
 
-    let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(message))) =
-        cached.raw().deserialize()
-    else {
+    let Ok(AnySyncTimelineEvent::MessageLike(event)) = cached.raw().deserialize() else {
+        return None;
+    };
+
+    // A sticker's descriptive text is indexed, so it must resolve too; otherwise
+    // the candidate is dropped and a previously findable sticker disappears.
+    if let AnySyncMessageLikeEvent::Sticker(sticker) = event {
+        let original = sticker.as_original()?;
+        let body = original.content.body.clone();
+        return Some(ResolvedMessage {
+            event_id: original.event_id.clone(),
+            current_event_id: original.event_id.clone(),
+            sender: original.sender.clone(),
+            timestamp_millis: Some(original.origin_server_ts.get().into()),
+            body: Some(body.clone()),
+            // A sticker carries one piece of text: the index writes it as the
+            // searchable content and the crawler exposes it as both caption and
+            // filename, so resolution reports it the same way and the caller's
+            // content policy governs it identically.
+            attachment_filename: Some(body),
+        });
+    }
+
+    let AnySyncMessageLikeEvent::RoomMessage(message) = event else {
         return None;
     };
 
@@ -1112,6 +1134,50 @@ mod tests {
             .expect("edit should resolve to the message");
         assert_eq!(resolved_from_edit.body.as_deref(), Some("An edited message"));
         assert_eq!(resolved_from_edit.event_id, original_id.to_owned());
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_resolve_cached_message_returns_a_sticker_description() {
+        use ruma::{events::room::ImageInfo, owned_mxc_uri};
+
+        let room_id = room_id!("!sticker_room:localhost");
+        let sticker_id = event_id!("$resolve_sticker");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let f = EventFactory::new().room(room_id).sender(user_id!("@user_id:localhost"));
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    f.sticker(
+                        "a waving cat",
+                        ImageInfo::new(),
+                        owned_mxc_uri!("mxc://localhost/1"),
+                    )
+                    .event_id(sticker_id),
+                ),
+            )
+            .await;
+
+        // Stickers are indexed, so they must resolve: a candidate that resolves
+        // to `None` is dropped and a previously findable sticker disappears.
+        let resolved = room
+            .resolve_cached_message(sticker_id)
+            .await
+            .expect("cache lookup")
+            .expect("sticker should resolve");
+        assert_eq!(resolved.event_id, sticker_id.to_owned());
+        assert_eq!(resolved.current_event_id, sticker_id.to_owned());
+        assert_eq!(resolved.body.as_deref(), Some("a waving cat"));
+        // One piece of text: reported as both the caption and the filename, the
+        // way the crawler and the index expose it.
+        assert_eq!(resolved.attachment_filename.as_deref(), Some("a waving cat"));
     }
 
     #[cfg(feature = "experimental-search")]
