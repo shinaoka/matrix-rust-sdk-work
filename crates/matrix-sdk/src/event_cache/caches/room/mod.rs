@@ -18,7 +18,7 @@ mod state;
 mod updates;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt,
     sync::{
         Arc,
@@ -290,6 +290,34 @@ impl RoomEventCache {
         P: FnMut(&Event) -> Option<O>,
     {
         Ok(self.inner.state.read().await?.rfind_map_event_in_memory_by(predicate))
+    }
+
+    /// Return explicitly redacted IDs from one consistent cache observation.
+    ///
+    /// This also covers redactions received before their targets, even when the
+    /// target only exists in a focused timeline or a bundled edit. Missing
+    /// events are not evidence of redaction. No network request is made.
+    ///
+    /// Matrix desktop fork patch surface: not part of upstream matrix-sdk.
+    ///
+    /// # Errors
+    /// Returns cache/storage errors when the guarded lookup fails, or
+    /// `InvalidCachedEvent` if a cached event cannot be decoded. Neither error
+    /// should be treated as proof that an event was redacted.
+    pub async fn redacted_event_ids(&self, event_ids: &[OwnedEventId]) -> Result<HashSet<OwnedEventId>> {
+        let state = self.inner.state.read().await?;
+        let mut redacted = state.pending_redactions_for(event_ids);
+        for event_id in event_ids {
+            if redacted.contains(event_id) { continue; }
+            if let Some((_, event)) = state.find_event(event_id).await? {
+                let event = event.raw().deserialize()
+                    .map_err(|_| super::super::EventCacheError::InvalidCachedEvent)?;
+                if event.is_redacted() {
+                    redacted.insert(event_id.clone());
+                }
+            }
+        }
+        Ok(redacted)
     }
 
     /// Try to find an event by ID in this room.
@@ -646,6 +674,67 @@ mod tests {
     };
 
     use crate::test_utils::logged_in_client;
+
+    #[async_test]
+    async fn test_live_redaction_before_target_is_remembered_without_reopening() {
+        let room_id = room_id!("!redaction:example.invalid");
+        let target = event_id!("$missing-edit");
+        let factory = EventFactory::new().room(room_id).sender(user_id!("@member:example.invalid"));
+        let client = logged_in_client(None).await;
+        client.event_cache().subscribe().unwrap();
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        {
+            let mut state = cache.inner.state.write().await.unwrap();
+            state.handle_sync(super::Timeline {
+                limited: false, prev_batch: None,
+                events: vec![factory.redaction(target).event_id(event_id!("$redaction")).into_event()],
+            }, &super::MaybeReceiptEventContent::none()).await.unwrap();
+        }
+        assert!(cache.find_event(target).await.unwrap().is_none());
+        // A suspended guard remains cancellable and is not redaction evidence.
+        let write_guard = cache.inner.state.write().await.unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), cache.redacted_event_ids(&[target.to_owned()])).await.is_err());
+        drop(write_guard);
+        assert!(cache.redacted_event_ids(&[target.to_owned(), event_id!("$unknown").to_owned()]).await.unwrap().contains(target));
+        assert!(!cache.redacted_event_ids(&[event_id!("$unknown").to_owned()]).await.unwrap().contains(event_id!("$unknown")));
+        {
+            let mut state = cache.inner.state.write().await.unwrap();
+            state.handle_sync(super::Timeline {
+                limited: false, prev_batch: None,
+                events: vec![factory.text_msg("synthetic replay").event_id(target).into_event()],
+            }, &super::MaybeReceiptEventContent::none()).await.unwrap();
+        }
+        assert!(cache.find_event(target).await.unwrap().unwrap().raw().deserialize().unwrap().is_redacted());
+    }
+
+    #[async_test]
+    async fn test_redaction_proof_reconstructs_from_storage_without_the_target() {
+        let store = std::sync::Arc::new(matrix_sdk_base::event_cache::store::MemoryStore::new());
+        let room_id = room_id!("!redaction:example.invalid");
+        let target = event_id!("$missing-edit");
+        let factory = EventFactory::new().room(room_id).sender(user_id!("@member:example.invalid"));
+        for reopening in [false, true] {
+            let client = crate::test_utils::test_client_builder(None)
+                .store_config(matrix_sdk_base::store::StoreConfig::new(matrix_sdk_base::cross_process_lock::CrossProcessLockConfig::SingleProcess).event_cache_store(store.clone()))
+                .build().await.unwrap();
+            crate::test_utils::set_client_session(&client).await;
+            client.event_cache().subscribe().unwrap();
+            client.base_client().get_or_create_room(room_id, RoomState::Joined);
+            let room = client.get_room(room_id).unwrap();
+            let (cache, _handles) = room.event_cache().await.unwrap();
+            if !reopening {
+                let mut state = cache.inner.state.write().await.unwrap();
+                state.handle_sync(super::Timeline {
+                    limited: false, prev_batch: None,
+                    events: vec![factory.redaction(target).event_id(event_id!("$redaction")).into_event()],
+                }, &super::MaybeReceiptEventContent::none()).await.unwrap();
+            }
+            assert!(cache.find_event(target).await.unwrap().is_none());
+            assert!(cache.redacted_event_ids(&[target.to_owned()]).await.unwrap().contains(target));
+        }
+    }
 
     #[async_test]
     async fn test_find_event_by_id_with_edit_relation() {

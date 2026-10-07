@@ -233,6 +233,11 @@ impl RoomEventCacheState {
         &self.room_linked_chunk
     }
 
+    pub(super) fn pending_redactions_for(&self, event_ids: &[OwnedEventId]) -> std::collections::HashSet<OwnedEventId> {
+        let pending = self.pending_redactions.lock().unwrap();
+        event_ids.iter().filter(|id| pending.contains_key(*id)).cloned().collect()
+    }
+
     fn redaction_target(&self, event: &Event) -> Option<OwnedEventId> {
         let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(
             redaction,
@@ -1061,6 +1066,10 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             trace!("missing target event id from the redaction event");
             return Ok(());
         };
+
+        // Keep the committed redaction even when its target is not loaded yet.
+        // The same map is rebuilt from encrypted storage when the cache opens.
+        self.remember_redaction(event);
 
         // Replace the redacted event by a redacted form, if we knew about it.
         let Some((location, mut target_event)) = self.find_event(&target_event_id).await? else {
