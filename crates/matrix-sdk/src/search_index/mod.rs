@@ -48,7 +48,7 @@ use ruma::{
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, warn};
 
-use crate::event_cache::RoomEventCache;
+use crate::event_cache::{EventCacheError, RoomEventCache};
 
 type Password = String;
 
@@ -296,14 +296,14 @@ impl SearchIndexGuard<'_> {
 async fn get_most_recent_edit(
     cache: &RoomEventCache,
     original: &EventId,
-) -> Option<OriginalSyncRoomMessageEvent> {
+) -> Result<Option<OriginalSyncRoomMessageEvent>, EventCacheError> {
     use ruma::events::{AnySyncTimelineEvent, relation::RelationType};
 
-    let Ok(Some((original_ev, related))) =
-        cache.find_event_with_relations(original, Some(vec![RelationType::Replacement])).await
+    let Some((original_ev, related)) =
+        cache.find_event_with_relations(original, Some(vec![RelationType::Replacement])).await?
     else {
         debug!("Couldn't find relations for {}", original);
-        return None;
+        return Ok(None);
     };
 
     // Only consider valid replacements (matching sender, type, etc.) from newest
@@ -326,16 +326,16 @@ async fn get_most_recent_edit(
             edit.raw().deserialize()
             && let Some(latest) = latest.as_original()
         {
-            return Some(latest.clone());
+            return Ok(Some(latest.clone()));
         }
     }
 
-    match original_ev.raw().deserialize() {
+    Ok(match original_ev.raw().deserialize() {
         Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(latest))) => {
             latest.as_original().cloned()
         }
         _ => None,
-    }
+    })
 }
 
 /// The most recent visible content for a cached message.
@@ -344,9 +344,9 @@ async fn get_most_recent_edit(
 /// network), with edits and redactions already resolved, so search
 /// verification never reads stale pre-edit text.
 ///
-/// Only room messages and stickers resolve. Polls are indexed but stay excluded:
-/// their visible content can be replaced or ended, and resolving the initial
-/// question would surface text the poll no longer shows.
+/// Only room messages and stickers resolve. Polls are indexed but stay
+/// excluded: their visible content can be replaced or ended, and resolving the
+/// initial question would surface text the poll no longer shows.
 #[derive(Clone)]
 pub struct ResolvedMessage {
     /// The original (root) event id this message's display identity uses.
@@ -395,22 +395,26 @@ impl std::fmt::Debug for ResolvedMessage {
 pub(crate) async fn resolve_cached_message(
     cache: &RoomEventCache,
     event_id: &EventId,
-) -> Option<ResolvedMessage> {
-    let cached = cache.find_event(event_id).await.ok().flatten()?;
+) -> Result<Option<ResolvedMessage>, EventCacheError> {
+    let Some(cached) = cache.find_event(event_id).await? else {
+        return Ok(None);
+    };
     if timeline_event_is_redacted(&cached) {
-        return None;
+        return Ok(None);
     }
 
     let Ok(AnySyncTimelineEvent::MessageLike(event)) = cached.raw().deserialize() else {
-        return None;
+        return Ok(None);
     };
 
     // A sticker's descriptive text is indexed, so it must resolve too; otherwise
     // the candidate is dropped and a previously findable sticker disappears.
     if let AnySyncMessageLikeEvent::Sticker(sticker) = event {
-        let original = sticker.as_original()?;
+        let Some(original) = sticker.as_original() else {
+            return Ok(None);
+        };
         let body = original.content.body.clone();
-        return Some(ResolvedMessage {
+        return Ok(Some(ResolvedMessage {
             event_id: original.event_id.clone(),
             current_event_id: original.event_id.clone(),
             sender: original.sender.clone(),
@@ -421,11 +425,11 @@ pub(crate) async fn resolve_cached_message(
             // filename, so resolution reports it the same way and the caller's
             // content policy governs it identically.
             attachment_filename: Some(body),
-        });
+        }));
     }
 
     let AnySyncMessageLikeEvent::RoomMessage(message) = event else {
-        return None;
+        return Ok(None);
     };
 
     // A candidate id may be an edit event; resolve from the original message so
@@ -440,26 +444,30 @@ pub(crate) async fn resolve_cached_message(
 
     // Reject a redacted root even when the caller supplied one of its edit ids:
     // a surviving edit must not resurrect a message whose original was redacted.
-    let root = cache.find_event(&original_id).await.ok().flatten()?;
+    let Some(root) = cache.find_event(&original_id).await? else {
+        return Ok(None);
+    };
     if timeline_event_is_redacted(&root) {
-        return None;
+        return Ok(None);
     }
 
-    let resolved = get_most_recent_edit(cache, &original_id).await?;
+    let Some(resolved) = get_most_recent_edit(cache, &original_id).await? else {
+        return Ok(None);
+    };
 
     let (body, attachment_filename) = resolved_text(visible_msgtype(&resolved));
     if body.is_none() && attachment_filename.is_none() {
-        return None;
+        return Ok(None);
     }
 
-    Some(ResolvedMessage {
+    Ok(Some(ResolvedMessage {
         event_id: original_id,
         current_event_id: resolved.event_id.clone(),
         sender: resolved.sender.clone(),
         timestamp_millis: Some(resolved.origin_server_ts.get().into()),
         body,
         attachment_filename,
-    })
+    }))
 }
 
 /// Whether a cached timeline event carries a redaction.
@@ -564,7 +572,9 @@ async fn handle_possible_edit(
     cache: &RoomEventCache,
 ) -> Option<RoomIndexOperation> {
     if let Some(Relation::Replacement(replacement_data)) = &event.content.relates_to {
-        if let Some(recent) = get_most_recent_edit(cache, &replacement_data.event_id).await {
+        if let Some(recent) =
+            get_most_recent_edit(cache, &replacement_data.event_id).await.ok().flatten()
+        {
             return Some(
                 indexable_from_room_message(&recent, timestamp).map_or(
                     RoomIndexOperation::Noop,
@@ -593,6 +603,8 @@ async fn handle_room_message(
             &event.event_id,
         )
         .await
+        .ok()
+        .flatten()
         .and_then(|recent| {
             indexable_from_room_message(&recent, timestamp).map(RoomIndexOperation::Add)
         }));
@@ -1081,6 +1093,52 @@ mod tests {
             "Search should return latest edit, got {:?}",
             results[0].1
         );
+    }
+
+    #[cfg(all(feature = "experimental-search", feature = "sqlite"))]
+    #[async_test]
+    async fn test_cached_resolution_propagates_relations_storage_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = MatrixMockServer::new().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| {
+                builder.sqlite_store(directory.path(), Some("synthetic-store-passphrase"))
+            })
+            .build()
+            .await;
+        client.event_cache().subscribe().unwrap();
+        let room_id = room_id!("!relations:localhost");
+        let root = event_id!("$root:localhost");
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let f = EventFactory::new().room(room_id).sender(user_id!("@member:localhost"));
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_event(f.text_msg("synthetic original").event_id(root)),
+            )
+            .await;
+        assert!(room.resolve_cached_message(root).await.unwrap().is_some());
+        // Keep the lease alive so the loaded root and its redaction proof remain
+        // readable while the encrypted backend's relations read fails.
+        let _store_guard = client.event_cache_store().lock().await.unwrap();
+        client.event_cache_store().close().await.unwrap();
+        assert!(cache.find_event(root).await.unwrap().is_some());
+        assert!(cache.redacted_event_ids(&[root.to_owned()]).await.unwrap().is_empty());
+        assert!(
+            cache
+                .find_event_with_relations(
+                    root,
+                    Some(vec![ruma::events::relation::RelationType::Replacement])
+                )
+                .await
+                .is_err()
+        );
+        assert!(room.resolve_cached_message(root).await.is_err());
+        client.event_cache_store().reopen().await.unwrap();
+        assert!(room.resolve_cached_message(root).await.unwrap().is_some());
     }
 
     /// Resolving a candidate id returns the newest valid edit's content, and

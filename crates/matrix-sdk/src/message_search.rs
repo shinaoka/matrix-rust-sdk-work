@@ -145,28 +145,6 @@ impl Room {
         search_index_guard.search_literal_page(query, max_number_of_results, cursor, self.room_id())
     }
 
-    /// Search this room with literal `query` text, yielding pages of cursors
-    /// newest first. See [`Room::search_literal_page`].
-    pub fn search_messages_literal(
-        &self,
-        query: String,
-    ) -> impl Stream<Item = Result<Vec<SearchCursor>, IndexError>> + use<> {
-        let room = self.clone();
-
-        try_stream! {
-            let mut cursor = None;
-            loop {
-                let page =
-                    room.search_literal_page(&query, SEARCH_RESULTS_PAGE_SIZE, cursor.clone()).await?;
-                if page.is_empty() {
-                    break;
-                }
-                cursor = page.last().cloned();
-                yield page;
-            }
-        }
-    }
-
     /// Resolve a message to its current visible content, reading only the local
     /// event cache (no network).
     ///
@@ -179,7 +157,7 @@ impl Room {
     ) -> Result<Option<crate::search_index::ResolvedMessage>, crate::Error> {
         let (cache, _drop_handles) = self.event_cache().await?;
 
-        Ok(crate::search_index::resolve_cached_message(&cache, event_id).await)
+        Ok(crate::search_index::resolve_cached_message(&cache, event_id).await?)
     }
 }
 

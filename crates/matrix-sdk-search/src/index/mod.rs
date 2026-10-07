@@ -395,7 +395,7 @@ impl RoomIndex {
 
         writer.remove(&event_id);
 
-        // Committed documents matching the deletion key.
+        // Committed documents matching either identity.
         for event in events.into_iter() {
             self.uncommitted_adds.remove(&event);
             self.uncommitted_removes.insert(event);
@@ -408,7 +408,9 @@ impl RoomIndex {
         let uncommitted: Vec<_> = self
             .uncommitted_adds
             .iter()
-            .filter(|(_, deletion_key)| **deletion_key == event_id)
+            .filter(|(primary_key, deletion_key)| {
+                **primary_key == event_id || **deletion_key == event_id
+            })
             .map(|(primary_key, _)| primary_key.clone())
             .collect();
         for event in uncommitted {
@@ -634,6 +636,44 @@ mod tests {
         new: OriginalSyncRoomMessageEvent,
     ) -> Result<(), IndexError> {
         index.execute(RoomIndexOperation::Edit(event_id.to_owned(), to_indexable(&new)))
+    }
+
+    #[test]
+    fn test_remove_edit_by_primary_key_after_commit_and_in_same_batch() {
+        for same_batch in [false, true] {
+            let mut index = RoomIndexBuilder::new_in_memory(room_id!("!room:localhost")).build();
+            let root = event_id!("$root:localhost");
+            let edit = event_id!("$edit:localhost");
+            index
+                .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                    root.to_owned(),
+                    root.to_owned(),
+                    user_id!("@user:localhost").to_owned(),
+                    None,
+                    "original".to_owned(),
+                )))
+                .unwrap();
+            let replacement = RoomIndexOperation::Edit(
+                root.to_owned(),
+                IndexableEvent::new(
+                    edit.to_owned(),
+                    root.to_owned(),
+                    user_id!("@user:localhost").to_owned(),
+                    None,
+                    "replacementunique".to_owned(),
+                ),
+            );
+            let remove = RoomIndexOperation::Remove(edit.to_owned());
+            if same_batch {
+                index.bulk_execute(vec![replacement, remove]).unwrap();
+            } else {
+                index.execute(replacement).unwrap();
+                assert_eq!(index.search("replacementunique", 10, None).unwrap().len(), 1);
+                index.execute(remove).unwrap();
+            }
+            assert!(index.search("replacementunique", 10, None).unwrap().is_empty());
+            assert!(!index.contains(edit));
+        }
     }
 
     #[test]

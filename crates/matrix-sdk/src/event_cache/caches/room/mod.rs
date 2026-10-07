@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod pagination;
 mod live_tail;
+pub mod pagination;
 mod state;
 mod updates;
 
@@ -304,13 +304,20 @@ impl RoomEventCache {
     /// Returns cache/storage errors when the guarded lookup fails, or
     /// `InvalidCachedEvent` if a cached event cannot be decoded. Neither error
     /// should be treated as proof that an event was redacted.
-    pub async fn redacted_event_ids(&self, event_ids: &[OwnedEventId]) -> Result<HashSet<OwnedEventId>> {
+    pub async fn redacted_event_ids(
+        &self,
+        event_ids: &[OwnedEventId],
+    ) -> Result<HashSet<OwnedEventId>> {
         let state = self.inner.state.read().await?;
         let mut redacted = state.pending_redactions_for(event_ids);
         for event_id in event_ids {
-            if redacted.contains(event_id) { continue; }
+            if redacted.contains(event_id) {
+                continue;
+            }
             if let Some((_, event)) = state.find_event(event_id).await? {
-                let event = event.raw().deserialize()
+                let event = event
+                    .raw()
+                    .deserialize()
                     .map_err(|_| super::super::EventCacheError::InvalidCachedEvent)?;
                 if event.is_redacted() {
                     redacted.insert(event_id.clone());
@@ -325,16 +332,7 @@ impl RoomEventCache {
     /// It starts by looking into loaded events before looking inside the
     /// storage.
     pub async fn find_event(&self, event_id: &EventId) -> Result<Option<Event>> {
-        Ok(self
-            .inner
-            .state
-            .read()
-            .await?
-            .find_event(event_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|(_loc, event)| event))
+        Ok(self.inner.state.read().await?.find_event(event_id).await?.map(|(_loc, event)| event))
     }
 
     /// Try to find an event by ID in this room, along with its related events.
@@ -354,15 +352,7 @@ impl RoomEventCache {
         filter: Option<Vec<RelationType>>,
     ) -> Result<Option<(Event, Vec<Event>)>> {
         // Search in all loaded or stored events.
-        Ok(self
-            .inner
-            .state
-            .read()
-            .await?
-            .find_event_with_relations(event_id, filter)
-            .await
-            .ok()
-            .flatten())
+        Ok(self.inner.state.read().await?.find_event_with_relations(event_id, filter).await?)
     }
 
     /// Try to find the related events for an event by ID in this room.
@@ -687,26 +677,76 @@ mod tests {
         let (cache, _handles) = room.event_cache().await.unwrap();
         {
             let mut state = cache.inner.state.write().await.unwrap();
-            state.handle_sync(super::Timeline {
-                limited: false, prev_batch: None,
-                events: vec![factory.redaction(target).event_id(event_id!("$redaction")).into_event()],
-            }, &super::MaybeReceiptEventContent::none()).await.unwrap();
+            state
+                .handle_sync(
+                    super::Timeline {
+                        limited: false,
+                        prev_batch: None,
+                        events: vec![
+                            factory
+                                .redaction(target)
+                                .event_id(event_id!("$redaction"))
+                                .into_event(),
+                        ],
+                    },
+                    &super::MaybeReceiptEventContent::none(),
+                )
+                .await
+                .unwrap();
         }
         assert!(cache.find_event(target).await.unwrap().is_none());
         // A suspended guard remains cancellable and is not redaction evidence.
         let write_guard = cache.inner.state.write().await.unwrap();
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), cache.redacted_event_ids(&[target.to_owned()])).await.is_err());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                cache.redacted_event_ids(&[target.to_owned()])
+            )
+            .await
+            .is_err()
+        );
         drop(write_guard);
-        assert!(cache.redacted_event_ids(&[target.to_owned(), event_id!("$unknown").to_owned()]).await.unwrap().contains(target));
-        assert!(!cache.redacted_event_ids(&[event_id!("$unknown").to_owned()]).await.unwrap().contains(event_id!("$unknown")));
+        assert!(
+            cache
+                .redacted_event_ids(&[target.to_owned(), event_id!("$unknown").to_owned()])
+                .await
+                .unwrap()
+                .contains(target)
+        );
+        assert!(
+            !cache
+                .redacted_event_ids(&[event_id!("$unknown").to_owned()])
+                .await
+                .unwrap()
+                .contains(event_id!("$unknown"))
+        );
         {
             let mut state = cache.inner.state.write().await.unwrap();
-            state.handle_sync(super::Timeline {
-                limited: false, prev_batch: None,
-                events: vec![factory.text_msg("synthetic replay").event_id(target).into_event()],
-            }, &super::MaybeReceiptEventContent::none()).await.unwrap();
+            state
+                .handle_sync(
+                    super::Timeline {
+                        limited: false,
+                        prev_batch: None,
+                        events: vec![
+                            factory.text_msg("synthetic replay").event_id(target).into_event(),
+                        ],
+                    },
+                    &super::MaybeReceiptEventContent::none(),
+                )
+                .await
+                .unwrap();
         }
-        assert!(cache.find_event(target).await.unwrap().unwrap().raw().deserialize().unwrap().is_redacted());
+        assert!(
+            cache
+                .find_event(target)
+                .await
+                .unwrap()
+                .unwrap()
+                .raw()
+                .deserialize()
+                .unwrap()
+                .is_redacted()
+        );
     }
 
     #[async_test]
@@ -717,8 +757,15 @@ mod tests {
         let factory = EventFactory::new().room(room_id).sender(user_id!("@member:example.invalid"));
         for reopening in [false, true] {
             let client = crate::test_utils::test_client_builder(None)
-                .store_config(matrix_sdk_base::store::StoreConfig::new(matrix_sdk_base::cross_process_lock::CrossProcessLockConfig::SingleProcess).event_cache_store(store.clone()))
-                .build().await.unwrap();
+                .store_config(
+                    matrix_sdk_base::store::StoreConfig::new(
+                        matrix_sdk_base::cross_process_lock::CrossProcessLockConfig::SingleProcess,
+                    )
+                    .event_cache_store(store.clone()),
+                )
+                .build()
+                .await
+                .unwrap();
             crate::test_utils::set_client_session(&client).await;
             client.event_cache().subscribe().unwrap();
             client.base_client().get_or_create_room(room_id, RoomState::Joined);
@@ -726,10 +773,22 @@ mod tests {
             let (cache, _handles) = room.event_cache().await.unwrap();
             if !reopening {
                 let mut state = cache.inner.state.write().await.unwrap();
-                state.handle_sync(super::Timeline {
-                    limited: false, prev_batch: None,
-                    events: vec![factory.redaction(target).event_id(event_id!("$redaction")).into_event()],
-                }, &super::MaybeReceiptEventContent::none()).await.unwrap();
+                state
+                    .handle_sync(
+                        super::Timeline {
+                            limited: false,
+                            prev_batch: None,
+                            events: vec![
+                                factory
+                                    .redaction(target)
+                                    .event_id(event_id!("$redaction"))
+                                    .into_event(),
+                            ],
+                        },
+                        &super::MaybeReceiptEventContent::none(),
+                    )
+                    .await
+                    .unwrap();
             }
             assert!(cache.find_event(target).await.unwrap().is_none());
             assert!(cache.redacted_event_ids(&[target.to_owned()]).await.unwrap().contains(target));
@@ -1067,9 +1126,7 @@ mod timed_tests {
             .build()
             .await;
         client.event_cache().subscribe().unwrap();
-        client
-            .base_client()
-            .get_or_create_room(room_id, RoomState::Joined);
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
         let room = client.get_room(room_id).unwrap();
         let (cache, _handles) = room.event_cache().await.unwrap();
         let f = EventFactory::new().room(room_id).sender(*BOB);
@@ -1091,10 +1148,7 @@ mod timed_tests {
                     prev_batch: None,
                     events: vec![
                         f.text_msg("root").event_id(root).into_event(),
-                        f.text_msg("reply")
-                            .event_id(reply)
-                            .in_thread(root, root)
-                            .into_event(),
+                        f.text_msg("reply").event_id(reply).in_thread(root, root).into_event(),
                         edit,
                     ],
                 },
@@ -1118,15 +1172,11 @@ mod timed_tests {
             if add_main || add_gap {
                 let mut state = cache.inner.state.write().await.unwrap();
                 if add_gap {
-                    state.room_linked_chunk_mut().push_gap(Gap {
-                        token: "missing".into(),
-                    });
+                    state.room_linked_chunk_mut().push_gap(Gap { token: "missing".into() });
                 }
                 if add_main {
-                    let mut main = f
-                        .text_msg("unread main")
-                        .event_id(event_id!("$main"))
-                        .into_event();
+                    let mut main =
+                        f.text_msg("unread main").event_id(event_id!("$main")).into_event();
                     main.set_push_actions(vec![
                         Action::Notify,
                         Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)),
@@ -1136,9 +1186,7 @@ mod timed_tests {
             }
             room.update_and_save_room_info(|mut info| {
                 let mut receipts = info.read_receipts().clone();
-                receipts.latest_active = Some(LatestReadReceipt {
-                    event_id: boundary.to_owned(),
-                });
+                receipts.latest_active = Some(LatestReadReceipt { event_id: boundary.to_owned() });
                 receipts.num_unread = 0;
                 receipts.num_notifications = 7;
                 receipts.num_mentions = 7;
