@@ -288,9 +288,9 @@ impl Caches {
                         key.clone(),
                         &self.internals.state,
                         self.internals.linked_chunk_update_sender.clone(),
+                        number_of_initial_events,
                     )
                     .await?;
-                    cache.start_from(number_of_initial_events, thread_mode).await?;
 
                     event_focused_caches.insert(key.clone(), cache);
 
