@@ -128,11 +128,12 @@ impl Caches {
         let pending_redactions: Arc<Mutex<HashMap<OwnedEventId, Event>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        let mut timeline_is_not_empty = None;
         let room_state = state
             .try_insert_once_with(
                 states::selectors::RoomStateSelector::new(room_id.to_owned()),
-                |store_guard| {
-                    room::RoomEventCacheState::new(
+                |store_guard| async {
+                    let cache_state = room::RoomEventCacheState::new(
                         own_user_id.clone(),
                         room_id.to_owned(),
                         weak_room.clone(),
@@ -145,12 +146,25 @@ impl Caches {
                         back_pagination_queue,
                         pending_redactions.clone(),
                     )
+                    .await?;
+
+                    // Probe the freshly constructed state here rather than re-acquiring
+                    // the state lock afterwards. `try_insert_once_with` registers the room
+                    // state before it returns, and the enclosing `Caches` is only published
+                    // by the caller once this function has returned, so an await between
+                    // registration and publication is a point at which an aborted caller
+                    // could strand a registered room state without its `Caches` handle and
+                    // make every later construction for this room fail with
+                    // `CacheStateAlreadyExists`.
+                    timeline_is_not_empty =
+                        Some(cache_state.room_linked_chunk().revents().next().is_some());
+
+                    Ok(cache_state)
                 },
             )
             .await?;
 
-        let timeline_is_not_empty =
-            room_state.read().await?.room_linked_chunk().revents().next().is_some();
+        let timeline_is_not_empty = timeline_is_not_empty.unwrap_or(false);
 
         let room_event_cache = room::RoomEventCache::new(
             room_id.to_owned(),
