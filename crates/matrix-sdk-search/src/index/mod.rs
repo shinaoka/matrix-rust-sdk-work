@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 /// A module for building a [`RoomIndex`]
 pub mod builder;
@@ -475,7 +478,9 @@ impl RoomIndex {
                     | OpenDirectoryError::NotADirectory(_) => return Err(err),
                 },
                 // Bubble
-                IndexError::QueryParserError(_) => return Err(err),
+                IndexError::QueryParserError(_) | IndexError::EventPreparationFailed => {
+                    return Err(err);
+                }
                 // Ignore
                 IndexError::CannotIndexRedactedMessage
                 | IndexError::EmptyMessage

@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 use std::{borrow::Cow, sync::Arc};
 
@@ -739,7 +742,6 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 kind: edit_kind,
                 edit_json: self.ctx.flow.raw_event().cloned(),
                 encryption_info,
-                bundled_item_owner: None,
             }),
         );
 
@@ -1070,7 +1072,6 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             &self.ctx.flow.timeline_item_id(),
             &self.ctx.sender,
             &mut cowed,
-            self.items,
             &self.meta.room_version_rules,
         ) {
             warn!("discarding aggregations: {err}");

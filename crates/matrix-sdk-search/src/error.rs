@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 use tantivy::{
     directory::error::OpenDirectoryError as TantivyOpenDirectoryError,
@@ -52,6 +55,10 @@ pub enum IndexError {
     /// Indexing Empty Message Error
     #[error("Cannot index empty message")]
     EmptyMessage,
+
+    /// Cached event preparation failed; no batch operations were committed.
+    #[error("Cached event preparation failed")]
+    EventPreparationFailed,
 
     /// IO error
     #[error(transparent)]

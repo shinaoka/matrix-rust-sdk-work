@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 mod live_tail;
 pub mod pagination;
@@ -1288,7 +1291,7 @@ mod timed_tests {
     }
 
     #[async_test]
-    async fn test_write_to_storage_strips_bundled_relations() {
+    async fn test_write_to_storage_keeps_the_replacement_candidate() {
         let room_id = room_id!("!galette:saucisse.bzh");
         let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
 
@@ -1360,7 +1363,8 @@ mod timed_tests {
             assert!(original.unsigned.relations.replace.is_some());
         }
 
-        // The one in storage does not.
+        // The one in storage keeps the replacement candidate, so a bundle-only edit
+        // survives reconstruction; other bundled summaries are dropped.
         let linked_chunk = from_all_chunks::<3, _, _>(
             event_cache_store.load_all_chunks(LinkedChunkId::Room(room_id)).await.unwrap(),
         )
@@ -1378,7 +1382,7 @@ mod timed_tests {
 
             let original = msg.as_original().unwrap();
             assert_eq!(original.content.body(), "hey yo");
-            assert!(original.unsigned.relations.replace.is_none());
+            assert!(original.unsigned.relations.replace.is_some());
         });
 
         // That's all, folks!

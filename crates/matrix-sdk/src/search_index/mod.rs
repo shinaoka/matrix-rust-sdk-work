@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 //! The search index is an abstraction layer in the matrix-sdk for the
 //! matrix-sdk-search crate. It provides a [`SearchIndex`] which wraps
@@ -263,7 +266,7 @@ impl SearchIndexGuard<'_> {
         redaction_rules: &RedactionRules,
     ) -> Result<(), IndexError> {
         if let Some(index_operation) =
-            parse_timeline_event(room_cache, event, redaction_rules).await
+            parse_timeline_event(room_cache, event, redaction_rules).await?
         {
             self.execute(index_operation, room_id)
         } else {
@@ -285,7 +288,8 @@ impl SearchIndexGuard<'_> {
     {
         let futures = events.map(|ev| parse_timeline_event(room_cache, ev, redaction_rules));
 
-        let operations: Vec<_> = join_all(futures).await.into_iter().flatten().collect();
+        let prepared = join_all(futures).await.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let operations = prepared.into_iter().flatten().collect();
 
         self.bulk_execute(operations, room_id)
     }
@@ -299,18 +303,36 @@ async fn get_most_recent_edit(
 ) -> Result<Option<OriginalSyncRoomMessageEvent>, EventCacheError> {
     use ruma::events::{AnySyncTimelineEvent, relation::RelationType};
 
-    let Some((original_ev, related)) =
+    let Some((stored_original, mut related)) =
         cache.find_event_with_relations(original, Some(vec![RelationType::Replacement])).await?
     else {
         debug!("Couldn't find relations for {}", original);
         return Ok(None);
     };
 
-    // Only consider valid replacements (matching sender, type, etc.) from newest
-    // to oldest, and require each to deserialize into visible content, so a
-    // malformed newer edit cannot hide an earlier valid version. Fall back to
-    // the original event when no valid edit remains.
-    for edit in related.iter().rev() {
+    // Invariant: what search verification reads must equal what the timeline
+    // renders. The UI renders the bundled replacement, so a bundle-only edit must
+    // be a candidate here too; otherwise the index and the read disagree.
+    //
+    // Prefer the loaded root's latest envelope over a possibly older stored
+    // candidate.
+    let original_ev = cache.find_event(original).await?.unwrap_or(stored_original);
+    if let Some(bundle) = original_ev.bundled_replacement()
+        && !bundle.kind.is_utd()
+        && let Some(id) = bundle.event_id()
+        && !cache.redacted_event_ids(&[id.to_owned()]).await?.contains(id)
+    {
+        related.push(*bundle);
+    }
+
+    // Cache relations are ordered by linked-chunk position, not edit time.
+    // Choose the greatest raw timestamp and event ID among visible valid edits;
+    // a malformed or invalid newer edit must not hide an earlier valid version.
+    let mut latest_valid: Option<OriginalSyncRoomMessageEvent> = None;
+    for edit in &related {
+        if edit.kind.is_utd() {
+            continue;
+        }
         if check_validity_of_replacement_events(
             original_ev.raw(),
             original_ev.encryption_info().map(|info| &**info),
@@ -325,9 +347,16 @@ async fn get_most_recent_edit(
         if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(latest))) =
             edit.raw().deserialize()
             && let Some(latest) = latest.as_original()
+            && latest_valid.as_ref().is_none_or(|current| {
+                (latest.origin_server_ts, &latest.event_id)
+                    > (current.origin_server_ts, &current.event_id)
+            })
         {
-            return Ok(Some(latest.clone()));
+            latest_valid = Some(latest.clone());
         }
+    }
+    if latest_valid.is_some() {
+        return Ok(latest_valid);
     }
 
     Ok(match original_ev.raw().deserialize() {
@@ -547,6 +576,7 @@ fn resolved_text(msgtype: &MessageType) -> (Option<String>, Option<String>) {
 fn indexable_from_room_message(
     event: &OriginalSyncRoomMessageEvent,
     timestamp: Option<MilliSecondsSinceUnixEpoch>,
+    addressable_event_id: OwnedEventId,
 ) -> Option<IndexableEvent> {
     let body = room_message_body(visible_msgtype(event))?;
     let original_event_id = match &event.content.relates_to {
@@ -555,12 +585,35 @@ fn indexable_from_room_message(
     };
 
     Some(IndexableEvent::new(
-        event.event_id.clone(),
+        addressable_event_id,
         original_event_id,
         event.sender.clone(),
         timestamp,
         body,
     ))
+}
+
+/// Keep an edit-primary document only when that cache entry can route
+/// resolution to its root. A missing/UTD/redacted/malformed child needs the
+/// addressable root.
+async fn addressable_message_id(
+    event: &OriginalSyncRoomMessageEvent,
+    cache: &RoomEventCache,
+) -> Result<OwnedEventId, IndexError> {
+    let Some(Relation::Replacement(replacement)) = &event.content.relates_to else {
+        return Ok(event.event_id.clone());
+    };
+    if let Some(cached) =
+        cache.find_event(&event.event_id).await.map_err(|_| IndexError::EventPreparationFailed)?
+        && !cached.kind.is_utd()
+        && let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(cached))) =
+            cached.raw().deserialize()
+        && let Some(cached) = cached.as_original()
+        && matches!(&cached.content.relates_to, Some(Relation::Replacement(target)) if target.event_id == replacement.event_id)
+    {
+        return Ok(event.event_id.clone());
+    }
+    Ok(replacement.event_id.clone())
 }
 
 /// If the given [`OriginalSyncRoomMessageEvent`] is an edit we make an
@@ -570,46 +623,46 @@ async fn handle_possible_edit(
     event: &OriginalSyncRoomMessageEvent,
     timestamp: Option<MilliSecondsSinceUnixEpoch>,
     cache: &RoomEventCache,
-) -> Option<RoomIndexOperation> {
+) -> Result<Option<RoomIndexOperation>, IndexError> {
     if let Some(Relation::Replacement(replacement_data)) = &event.content.relates_to {
-        if let Some(recent) =
-            get_most_recent_edit(cache, &replacement_data.event_id).await.ok().flatten()
-        {
-            return Some(
-                indexable_from_room_message(&recent, timestamp).map_or(
-                    RoomIndexOperation::Noop,
-                    |indexable| {
-                        RoomIndexOperation::Edit(replacement_data.event_id.clone(), indexable)
-                    },
-                ),
-            );
+        let recent = get_most_recent_edit(cache, &replacement_data.event_id)
+            .await
+            .map_err(|_| IndexError::EventPreparationFailed)?;
+        let operation = if let Some(recent) = recent {
+            let id = addressable_message_id(&recent, cache).await?;
+            indexable_from_room_message(&recent, timestamp, id)
+                .map_or(RoomIndexOperation::Noop, |indexable| {
+                    RoomIndexOperation::Edit(replacement_data.event_id.clone(), indexable)
+                })
         } else {
-            return Some(RoomIndexOperation::Noop);
-        }
+            RoomIndexOperation::Noop
+        };
+        return Ok(Some(operation));
     }
-    None
+    Ok(None)
 }
 
-/// Return a [`RoomIndexOperation::Edit`] or [`RoomIndexOperation::Add`]
-/// depending on the message.
+/// Refresh the canonical root's document with the currently visible message.
 async fn handle_room_message(
     event: SyncRoomMessageEvent,
     timestamp: Option<MilliSecondsSinceUnixEpoch>,
     cache: &RoomEventCache,
-) -> Option<RoomIndexOperation> {
-    if let Some(event) = event.as_original() {
-        return handle_possible_edit(event, timestamp, cache).await.or(get_most_recent_edit(
-            cache,
-            &event.event_id,
-        )
-        .await
-        .ok()
-        .flatten()
-        .and_then(|recent| {
-            indexable_from_room_message(&recent, timestamp).map(RoomIndexOperation::Add)
-        }));
+) -> Result<Option<RoomIndexOperation>, IndexError> {
+    let Some(event) = event.as_original() else {
+        return Ok(None);
+    };
+    if let Some(operation) = handle_possible_edit(event, timestamp, cache).await? {
+        return Ok(Some(operation));
     }
-    None
+    let recent = get_most_recent_edit(cache, &event.event_id)
+        .await
+        .map_err(|_| IndexError::EventPreparationFailed)?;
+    let Some(recent) = recent else {
+        return Ok(None);
+    };
+    let id = addressable_message_id(&recent, cache).await?;
+    Ok(indexable_from_room_message(&recent, timestamp, id)
+        .map(|indexable| RoomIndexOperation::Edit(event.event_id.clone(), indexable)))
 }
 
 /// Return a [`RoomIndexOperation`] removing a redacted event from the index, or
@@ -619,24 +672,27 @@ async fn handle_room_redaction(
     timestamp: Option<MilliSecondsSinceUnixEpoch>,
     cache: &RoomEventCache,
     rules: &RedactionRules,
-) -> Option<RoomIndexOperation> {
-    let redacted_event_id = event.redacts(rules)?;
+) -> Result<Option<RoomIndexOperation>, IndexError> {
+    let Some(redacted_event_id) = event.redacts(rules) else {
+        return Ok(None);
+    };
 
     // If the redacted event was a room message edit, re-add the most recent
     // remaining version instead of just removing it.
-    if let Ok(Some(redacted_event)) = cache.find_event(redacted_event_id).await
+    if let Some(redacted_event) =
+        cache.find_event(redacted_event_id).await.map_err(|_| IndexError::EventPreparationFailed)?
         && let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             redacted_event,
         ))) = redacted_event.raw().deserialize()
         && let Some(redacted_event) = redacted_event.as_original()
-        && let Some(operation) = handle_possible_edit(redacted_event, timestamp, cache).await
+        && let Some(operation) = handle_possible_edit(redacted_event, timestamp, cache).await?
     {
-        return Some(operation);
+        return Ok(Some(operation));
     }
 
     // Otherwise remove the redacted event from the index. This covers plain
     // messages, stickers and polls.
-    Some(RoomIndexOperation::Remove(redacted_event_id.to_owned()))
+    Ok(Some(RoomIndexOperation::Remove(redacted_event_id.to_owned())))
 }
 
 /// Return a [`RoomIndexOperation::Add`] indexing a sticker's descriptive text.
@@ -727,23 +783,23 @@ async fn parse_timeline_event(
     cache: &RoomEventCache,
     event: TimelineEvent,
     redaction_rules: &RedactionRules,
-) -> Option<RoomIndexOperation> {
+) -> Result<Option<RoomIndexOperation>, IndexError> {
     use ruma::events::AnySyncTimelineEvent;
 
     if event.kind.is_utd() {
-        return None;
+        return Ok(None);
     }
 
     let timestamp = event.timestamp();
 
-    match event.raw().deserialize() {
+    Ok(match event.raw().deserialize() {
         Ok(event) => match event {
             AnySyncTimelineEvent::MessageLike(event) => match event {
                 AnySyncMessageLikeEvent::RoomMessage(event) => {
-                    handle_room_message(event, timestamp, cache).await
+                    return handle_room_message(event, timestamp, cache).await;
                 }
                 AnySyncMessageLikeEvent::RoomRedaction(event) => {
-                    handle_room_redaction(event, timestamp, cache, redaction_rules).await
+                    return handle_room_redaction(event, timestamp, cache, redaction_rules).await;
                 }
                 AnySyncMessageLikeEvent::Sticker(event) => handle_sticker(event, timestamp),
                 AnySyncMessageLikeEvent::PollStart(event) => handle_poll_start(event, timestamp),
@@ -759,7 +815,7 @@ async fn parse_timeline_event(
             warn!("failed to parse event: {e:?}");
             None
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1137,8 +1193,46 @@ mod tests {
                 .is_err()
         );
         assert!(room.resolve_cached_message(root).await.is_err());
+        let index =
+            SearchIndex::new(Arc::new(Mutex::new(HashMap::new())), SearchIndexStoreKind::InMemory);
+        let mut index = index.lock().await;
+        let rules = room.clone_info().room_version_rules_or_default().redaction;
+        let message = f.text_msg("synthetic original").event_id(root).into_event();
+        assert!(
+            index.handle_timeline_event(message.clone(), &cache, room_id, &rules).await.is_err(),
+            "single acknowledged preparation must not silently succeed"
+        );
+        let sticker = f
+            .sticker(
+                "batchneedle",
+                Default::default(),
+                ruma::owned_mxc_uri!("mxc://example.invalid/sticker"),
+            )
+            .event_id(event_id!("$batch-sticker:localhost"))
+            .into_event();
+        assert!(
+            index
+                .bulk_handle_timeline_event(
+                    vec![sticker.clone(), message.clone()].into_iter(),
+                    &cache,
+                    room_id,
+                    &rules
+                )
+                .await
+                .is_err(),
+            "one failed preparation must fail the whole acknowledgement"
+        );
+        assert!(
+            index.search("batchneedle", 10, None, room_id).unwrap().is_empty(),
+            "no partial batch commit"
+        );
         client.event_cache_store().reopen().await.unwrap();
         assert!(room.resolve_cached_message(root).await.unwrap().is_some());
+        index
+            .bulk_handle_timeline_event(vec![sticker, message].into_iter(), &cache, room_id, &rules)
+            .await
+            .unwrap();
+        assert_eq!(index.search("batchneedle", 10, None, room_id).unwrap().len(), 1);
     }
 
     /// Resolving a candidate id returns the newest valid edit's content, and
@@ -1195,6 +1289,385 @@ mod tests {
     }
 
     #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_cached_replacement_order_is_not_linked_chunk_order() {
+        for (newer_ts, older_ts) in
+            [(200_u64, 100_u64), (100, 100), (4_100_000_000_000, 4_000_000_000_000)]
+        {
+            let room_id = room_id!("!edit_order:localhost");
+            let root = event_id!("$order-root");
+            let newer = event_id!("$order-z");
+            let older = event_id!("$order-a");
+            let server = MatrixMockServer::new().await;
+            let client = server.client_builder().build().await;
+            client.event_cache().subscribe().unwrap();
+            let room = server.sync_joined_room(&client, room_id).await;
+            let f = EventFactory::new().room(room_id).sender(user_id!("@member:localhost"));
+            server
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(room_id)
+                        .add_timeline_event(f.text_msg("original").server_ts(50_u64).event_id(root))
+                        .add_timeline_event(
+                            f.text_msg("* newer").server_ts(newer_ts).event_id(newer).edit(
+                                root,
+                                RoomMessageEventContentWithoutRelation::text_plain("newer"),
+                            ),
+                        )
+                        .add_timeline_event(
+                            f.text_msg("* older").server_ts(older_ts).event_id(older).edit(
+                                root,
+                                RoomMessageEventContentWithoutRelation::text_plain("older"),
+                            ),
+                        ),
+                )
+                .await;
+            let resolved = room.resolve_cached_message(root).await.unwrap().unwrap();
+            assert_eq!(resolved.body.as_deref(), Some("newer"));
+            assert_eq!(resolved.current_event_id, newer);
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[async_test]
+    async fn test_bundled_only_index_candidate_is_addressable_and_replaces_the_root() {
+        let room_id = room_id!("!bundle_index:localhost");
+        let root = event_id!("$bundle-index-root");
+        let edit = event_id!("$bundle-index-edit");
+        let directory = tempfile::tempdir().unwrap();
+        let server = MatrixMockServer::new().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| {
+                builder.sqlite_store(directory.path(), Some("synthetic-store-passphrase"))
+            })
+            .build()
+            .await;
+        client.event_cache().subscribe().unwrap();
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let sender = user_id!("@member:localhost");
+        let f = EventFactory::new().room(room_id).sender(sender);
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    f.text_msg("originalneedle")
+                        .server_ts(50_u64)
+                        .event_id(root)
+                        .with_bundled_edit(
+                            f.text_msg("* currentneedle").server_ts(100_u64).event_id(edit).edit(
+                                root,
+                                RoomMessageEventContentWithoutRelation::text_plain("currentneedle"),
+                            ),
+                        ),
+                ),
+            )
+            .await;
+        assert!(cache.find_event(edit).await.unwrap().is_none());
+        let index =
+            SearchIndex::new(Arc::new(Mutex::new(HashMap::new())), SearchIndexStoreKind::InMemory);
+        let mut index = index.lock().await;
+        // Existing primary-root document from before the bundled replacement.
+        index
+            .execute(
+                RoomIndexOperation::Add(IndexableEvent::new(
+                    root.to_owned(),
+                    root.to_owned(),
+                    sender.to_owned(),
+                    None,
+                    "originalneedle".to_owned(),
+                )),
+                room_id,
+            )
+            .unwrap();
+        assert_eq!(
+            index.search_literal_page("originalneedle", 10, None, room_id).unwrap().len(),
+            1
+        );
+        index
+            .handle_timeline_event(
+                cache.find_event(root).await.unwrap().unwrap(),
+                &cache,
+                room_id,
+                &room.clone_info().room_version_rules_or_default().redaction,
+            )
+            .await
+            .unwrap();
+        let candidates = index.search_literal_page("currentneedle", 10, None, room_id).unwrap();
+        assert_eq!(candidates.len(), 1, "acknowledged indexing must publish the current literal");
+        assert_eq!(candidates[0].event_id, root);
+        let resolved = room.resolve_cached_message(&candidates[0].event_id).await.unwrap().unwrap();
+        assert_eq!(resolved.body.as_deref(), Some("currentneedle"));
+        assert_eq!(resolved.current_event_id, edit);
+        assert!(index.search_literal_page("originalneedle", 10, None, room_id).unwrap().is_empty());
+        // This lookup bypasses the loaded memory root, as reconstruction does.
+        let (stored, _) = cache
+            .find_event_with_relations(
+                root,
+                Some(vec![ruma::events::relation::RelationType::Replacement]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let restored: matrix_sdk_base::deserialized_responses::TimelineEvent =
+            serde_json::from_value(serde_json::to_value(stored).unwrap()).unwrap();
+        let child = restored
+            .bundled_replacement()
+            .expect("ordinary sync persistence must retain the sole current replacement candidate");
+        assert_eq!(child.event_id(), Some(edit));
+    }
+
+    #[async_test]
+    async fn test_duplicate_root_bundle_refreshes_current_content() {
+        let room_id = room_id!("!duplicate_bundle:localhost");
+        let root = event_id!("$duplicate-bundle-root");
+        let edit = event_id!("$duplicate-bundle-edit");
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+        let room = server.sync_joined_room(&client, room_id).await;
+        let f = EventFactory::new().room(room_id).sender(user_id!("@member:localhost"));
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    f.text_msg("originalneedle").server_ts(50_u64).event_id(root),
+                ),
+            )
+            .await;
+        assert_eq!(
+            room.resolve_cached_message(root).await.unwrap().unwrap().body.as_deref(),
+            Some("originalneedle")
+        );
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    f.text_msg("originalneedle")
+                        .server_ts(50_u64)
+                        .event_id(root)
+                        .with_bundled_edit(
+                            f.text_msg("* currentneedle").server_ts(100_u64).event_id(edit).edit(
+                                root,
+                                RoomMessageEventContentWithoutRelation::text_plain("currentneedle"),
+                            ),
+                        ),
+                ),
+            )
+            .await;
+        assert_eq!(
+            room.resolve_cached_message(root).await.unwrap().unwrap().body.as_deref(),
+            Some("currentneedle"),
+            "duplicate identity must not discard new replacement evidence"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[async_test]
+    async fn test_decoded_bundle_with_cached_utd_child_uses_addressable_root_in_both_preparations()
+    {
+        use std::collections::BTreeMap;
+
+        use matrix_sdk_base::deserialized_responses::{
+            AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, TimelineEvent, UnableToDecryptInfo,
+            UnableToDecryptReason, UnsignedDecryptionResult, UnsignedEventLocation,
+            VerificationState,
+        };
+
+        for prepare_edit in [false, true] {
+            let room_id = room_id!("!bundle_utd:localhost");
+            let root = event_id!("$bundle-utd-root");
+            let edit = event_id!("$bundle-utd-edit");
+            let sender = user_id!("@member:localhost");
+            let directory = tempfile::tempdir().unwrap();
+            let server = MatrixMockServer::new().await;
+            let client = server
+                .client_builder()
+                .on_builder(|builder| {
+                    builder.sqlite_store(directory.path(), Some("synthetic-store-passphrase"))
+                })
+                .build()
+                .await;
+            client.event_cache().subscribe().unwrap();
+            let room = server.sync_joined_room(&client, room_id).await;
+            let (cache, _handles) = room.event_cache().await.unwrap();
+            let f = EventFactory::new().room(room_id).sender(sender);
+            let info = |session: &str| {
+                Arc::new(EncryptionInfo {
+                    sender: sender.to_owned(),
+                    sender_device: None,
+                    forwarder: None,
+                    algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                        curve25519_key: format!("synthetic-{session}"),
+                        sender_claimed_keys: BTreeMap::new(),
+                        session_id: Some(session.to_owned()),
+                    },
+                    verification_state: VerificationState::Verified,
+                })
+            };
+            let root_info = info("root-session");
+            let child_info = info("child-session");
+            let cached_root = TimelineEvent::from_decrypted(
+                DecryptedRoomEvent {
+                    event: f
+                        .text_msg("originalneedle")
+                        .server_ts(50_u64)
+                        .event_id(root)
+                        .with_bundled_edit(
+                            f.text_msg("* currentneedle").server_ts(100_u64).event_id(edit).edit(
+                                root,
+                                RoomMessageEventContentWithoutRelation::text_plain("currentneedle"),
+                            ),
+                        )
+                        .into_raw(),
+                    encryption_info: root_info,
+                    unsigned_encryption_info: Some(BTreeMap::from([(
+                        UnsignedEventLocation::RelationsReplace,
+                        UnsignedDecryptionResult::Decrypted(child_info.clone()),
+                    )])),
+                },
+                None,
+            );
+            let embedded = *cached_root.bundled_replacement().unwrap();
+            assert!(Arc::ptr_eq(embedded.encryption_info().unwrap(), &child_info));
+            let ciphertext = ruma::serde::Raw::from_json_string(
+                serde_json::json!({
+                    "type": "m.room.encrypted", "event_id": edit, "room_id": room_id,
+                    "sender": sender, "origin_server_ts": 100,
+                    "content": {"algorithm":"m.megolm.v1.aes-sha2", "ciphertext":"synthetic",
+                        "device_id":"TEST", "sender_key":"synthetic", "session_id":"child-session"},
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let utd = TimelineEvent::from_utd(
+                ciphertext,
+                UnableToDecryptInfo {
+                    session_id: Some("child-session".to_owned()),
+                    reason: UnableToDecryptReason::Unknown,
+                },
+            );
+            let store = match client.event_cache_store().lock().await.unwrap() {
+                matrix_sdk_base::event_cache::store::EventCacheStoreLockState::Clean(store)
+                | matrix_sdk_base::event_cache::store::EventCacheStoreLockState::Dirty(store) => {
+                    store
+                }
+            };
+            store.save_event(room_id, cached_root.clone()).await.unwrap();
+            store.save_event(room_id, utd).await.unwrap();
+            drop(store);
+            assert!(
+                cache.events().await.unwrap().is_empty(),
+                "root must be read from storage, not a loaded timeline"
+            );
+            client.event_cache_store().close().await.unwrap();
+            client.event_cache_store().reopen().await.unwrap();
+            let restored = cache.find_event(root).await.unwrap().unwrap();
+            let restored_child = restored.bundled_replacement().unwrap();
+            assert!(matches!(
+                &restored_child.encryption_info().unwrap().algorithm_info,
+                AlgorithmInfo::MegolmV1AesSha2 { session_id, .. } if session_id.as_deref() == Some("child-session")
+            ));
+            assert!(cache.find_event(edit).await.unwrap().unwrap().kind.is_utd());
+            assert!(room.resolve_cached_message(edit).await.unwrap().is_none());
+            let index = SearchIndex::new(
+                Arc::new(Mutex::new(HashMap::new())),
+                SearchIndexStoreKind::InMemory,
+            );
+            let mut index = index.lock().await;
+            index
+                .handle_timeline_event(
+                    if prepare_edit { *restored_child } else { restored },
+                    &cache,
+                    room_id,
+                    &room.clone_info().room_version_rules_or_default().redaction,
+                )
+                .await
+                .unwrap();
+            let candidates = index.search_literal_page("currentneedle", 10, None, room_id).unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].event_id, root);
+            let resolved =
+                room.resolve_cached_message(&candidates[0].event_id).await.unwrap().unwrap();
+            assert_eq!(resolved.body.as_deref(), Some("currentneedle"));
+            assert_eq!(resolved.current_event_id, edit);
+        }
+    }
+
+    #[async_test]
+    async fn test_absent_bundled_child_requires_positive_redaction_to_be_excluded() {
+        let room_id = room_id!("!bundle_redaction:localhost");
+        let root = event_id!("$bundle-redaction-root");
+        let edit = event_id!("$bundle-redaction-edit");
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+        let room = server.sync_joined_room(&client, room_id).await;
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let f = EventFactory::new().room(room_id).sender(user_id!("@member:localhost"));
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    f.text_msg("originalneedle").event_id(root).with_bundled_edit(
+                        f.text_msg("* currentneedle").event_id(edit).edit(
+                            root,
+                            RoomMessageEventContentWithoutRelation::text_plain("currentneedle"),
+                        ),
+                    ),
+                ),
+            )
+            .await;
+        assert!(cache.find_event(edit).await.unwrap().is_none());
+        assert_eq!(
+            room.resolve_cached_message(root).await.unwrap().unwrap().body.as_deref(),
+            Some("currentneedle")
+        );
+        let index =
+            SearchIndex::new(Arc::new(Mutex::new(HashMap::new())), SearchIndexStoreKind::InMemory);
+        let mut index = index.lock().await;
+        let rules = room.clone_info().room_version_rules_or_default().redaction;
+        index
+            .handle_timeline_event(
+                cache.find_event(root).await.unwrap().unwrap(),
+                &cache,
+                room_id,
+                &rules,
+            )
+            .await
+            .unwrap();
+        assert_eq!(index.search_literal_page("currentneedle", 10, None, room_id).unwrap().len(), 1);
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    f.redaction(edit).event_id(event_id!("$bundle-child-redaction")),
+                ),
+            )
+            .await;
+        assert!(cache.redacted_event_ids(&[edit.to_owned()]).await.unwrap().contains(edit));
+        assert_eq!(
+            room.resolve_cached_message(root).await.unwrap().unwrap().body.as_deref(),
+            Some("originalneedle")
+        );
+        index
+            .handle_timeline_event(
+                cache.find_event(root).await.unwrap().unwrap(),
+                &cache,
+                room_id,
+                &rules,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            index.search_literal_page("originalneedle", 10, None, room_id).unwrap().len(),
+            1,
+            "acknowledged refresh must replace a root-keyed edit with surviving content"
+        );
+        assert!(index.search_literal_page("currentneedle", 10, None, room_id).unwrap().is_empty());
+    }
+
     #[async_test]
     async fn test_resolve_cached_message_returns_a_sticker_description() {
         use ruma::{events::room::ImageInfo, owned_mxc_uri};
@@ -1354,7 +1827,8 @@ mod tests {
         let redaction = event_factory.redaction(redacted_id).event_id(redaction_id).into_event();
         let redaction_rules = room.clone_info().room_version_rules_or_default().redaction;
 
-        let operation = parse_timeline_event(&room_cache, redaction, &redaction_rules).await;
+        let operation =
+            parse_timeline_event(&room_cache, redaction, &redaction_rules).await.unwrap();
 
         match operation {
             Some(RoomIndexOperation::Remove(event_id)) => assert_eq!(event_id, redacted_id),
@@ -1401,7 +1875,8 @@ mod tests {
         let redaction = event_factory.redaction(edit_id).event_id(redaction_id).into_event();
         let redaction_rules = room.clone_info().room_version_rules_or_default().redaction;
 
-        let operation = parse_timeline_event(&room_cache, redaction, &redaction_rules).await;
+        let operation =
+            parse_timeline_event(&room_cache, redaction, &redaction_rules).await.unwrap();
 
         match operation {
             Some(RoomIndexOperation::Edit(event_id, latest_edit)) => {

@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 use std::{collections::BTreeMap, fmt, ops::Not, sync::Arc};
 
@@ -618,8 +621,12 @@ impl TimelineEvent {
 
         let (thread_summary, latest_thread_event) = extract_bundled_thread_summary(raw);
 
-        let bundled_latest_thread_event =
-            Self::from_bundled_latest_event(&kind, latest_thread_event, max_timestamp);
+        let bundled_latest_thread_event = Self::from_bundled_event(
+            &kind,
+            latest_thread_event,
+            max_timestamp,
+            UnsignedEventLocation::RelationsThreadLatestEvent,
+        );
 
         let timestamp = extract_timestamp(raw, max_timestamp);
 
@@ -687,22 +694,36 @@ impl TimelineEvent {
         }
     }
 
-    /// Try to create a new [`TimelineEvent`] for the bundled latest thread
-    /// event, if available, and if we have enough information about the
-    /// encryption status for it.
-    fn from_bundled_latest_event(
+    /// Extract the bundled replacement, preserving its own encryption or UTD
+    /// information. This does not validate its content or replacement relation.
+    pub fn bundled_replacement(&self) -> Option<Box<Self>> {
+        let unsigned: Raw<serde_json::Value> = self.raw().get_field("unsigned").ok()??;
+        let relations: Raw<serde_json::Value> = unsigned.get_field("m.relations").ok()??;
+        let replacement = relations.get_field("m.replace").ok()??;
+        Self::from_bundled_event(
+            &self.kind,
+            Some(replacement),
+            MilliSecondsSinceUnixEpoch::now(),
+            UnsignedEventLocation::RelationsReplace,
+        )
+    }
+
+    /// Construct a bundled event with the encryption information for its
+    /// location.
+    fn from_bundled_event(
         kind: &TimelineEventKind,
         latest_event: Option<Raw<AnySyncMessageLikeEvent>>,
         max_timestamp: MilliSecondsSinceUnixEpoch,
+        location: UnsignedEventLocation,
     ) -> Option<Box<Self>> {
         let latest_event = latest_event?;
 
         match kind {
             TimelineEventKind::Decrypted(decrypted) => {
-                if let Some(unsigned_decryption_result) =
-                    decrypted.unsigned_encryption_info.as_ref().and_then(|unsigned_map| {
-                        unsigned_map.get(&UnsignedEventLocation::RelationsThreadLatestEvent)
-                    })
+                if let Some(unsigned_decryption_result) = decrypted
+                    .unsigned_encryption_info
+                    .as_ref()
+                    .and_then(|unsigned_map| unsigned_map.get(&location))
                 {
                     match unsigned_decryption_result {
                         UnsignedDecryptionResult::Decrypted(encryption_info) => {
@@ -2200,10 +2221,11 @@ mod tests {
                 reason: UnableToDecryptReason::Unknown,
             },
         };
-        let result = TimelineEvent::from_bundled_latest_event(
+        let result = TimelineEvent::from_bundled_event(
             &kind,
             Some(value.cast_unchecked()),
             MilliSecondsSinceUnixEpoch::now(),
+            UnsignedEventLocation::RelationsThreadLatestEvent,
         )
         .expect("Could not get bundled latest event");
 

@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 //! An aggregation manager for the timeline.
 //!
@@ -50,7 +53,7 @@ use ruma::{
     room_version_rules::RoomVersionRules,
     serde::Raw,
 };
-use tracing::{error, info, trace, warn};
+use tracing::{info, trace, warn};
 
 use super::{ObservableItemsTransaction, rfind_event_by_item_id};
 use crate::timeline::{
@@ -84,10 +87,6 @@ pub(in crate::timeline) struct PendingEdit {
 
     /// The encryption info for this edit.
     pub encryption_info: Option<Arc<EncryptionInfo>>,
-
-    /// If provided, this is the identifier of a remote event item that included
-    /// this bundled edit.
-    pub bundled_item_owner: Option<OwnedEventId>,
 }
 
 /// Which kind of aggregation (related event) is this?
@@ -647,7 +646,7 @@ impl Aggregations {
                 ApplyAggregationResult::Edit => {
                     // This edit has been removed; try to find another that still applies.
                     if let Some(aggregations) = self.related_events.get(found) {
-                        if resolve_edits(aggregations, items, &mut cowed) {
+                        if resolve_edits(aggregations, &mut cowed) {
                             items.replace(
                                 item_pos,
                                 TimelineItem::new(cowed.into_owned(), item.internal_id.to_owned()),
@@ -685,7 +684,6 @@ impl Aggregations {
         item_id: &TimelineEventItemId,
         sender: &OwnedUserId,
         event: &mut Cow<'_, EventTimelineItem>,
-        items: &mut ObservableItemsTransaction<'_>,
         rules: &RoomVersionRules,
     ) -> Result<(), AggregationError> {
         // If a beacon-stop arrived before this live start item, it was stashed
@@ -719,7 +717,7 @@ impl Aggregations {
         }
 
         if has_edits {
-            resolve_edits(aggregations, items, event);
+            resolve_edits(aggregations, event);
         }
 
         Ok(())
@@ -816,123 +814,77 @@ impl Aggregations {
 /// found.
 ///
 /// Returns true if an edit was found and applied, false otherwise.
-fn resolve_edits(
-    aggregations: &[Aggregation],
-    items: &ObservableItemsTransaction<'_>,
-    event: &mut Cow<'_, EventTimelineItem>,
-) -> bool {
-    // A tuple of the best edit, if we have found one and a boolean indicating if
-    // the edit is coming from a local echo. If it's from a local echo, we can't
-    // validate it as we don't have a raw JSON, but this isn't that important as
-    // we're sure we won't send ourselves invalid edits.
-    let mut best_edit: Option<(PendingEdit, bool)> = None;
-    let mut best_edit_pos = None;
+fn resolve_edits(aggregations: &[Aggregation], event: &mut Cow<'_, EventTimelineItem>) -> bool {
+    // Invariant: what search verification reads must equal what the timeline
+    // renders. Select the same greatest raw `(origin_server_ts, event_id)` among
+    // validated edits that the cache resolver uses, so the rendered body and the
+    // indexed/verified body cannot disagree for this selection. Two known
+    // exceptions, both inherited from upstream, are documented in
+    // docs/upstream/matrix-rust-sdk-feedback.md: the item keeps the edited content
+    // when the last edit is redacted, and the item's encryption proof is the
+    // applied edit's rather than the original root's.
+    //
+    // The selected edit is therefore already validated before it is applied.
+    let mut best_edit: Option<PendingEdit> = None;
+    let mut best_edit_key = None;
 
     for a in aggregations {
         if let AggregationKind::Edit(pending_edit) = &a.kind {
             match &a.own_id {
                 TimelineEventItemId::TransactionId(_) => {
                     // A local echo is always the most recent edit: use this one.
-                    best_edit = Some((pending_edit.clone(), true));
+                    // It has no raw JSON to validate, but we are sure we won't
+                    // send ourselves an invalid edit.
+                    best_edit = Some(pending_edit.clone());
                     break;
                 }
 
                 TimelineEventItemId::EventId(event_id) => {
-                    if let Some(best_edit_pos) = &mut best_edit_pos {
-                        // Find the position of the timeline owning the edit: either the bundled
-                        // item owner if this was a bundled edit, or the edit event itself.
-                        let pos = items.position_by_event_id(
-                            pending_edit.bundled_item_owner.as_ref().unwrap_or(event_id),
-                        );
-
-                        if let Some(pos) = pos {
-                            // If the edit is more recent (higher index) than the previous best
-                            // edit we knew about, use this one.
-                            if pos > *best_edit_pos {
-                                best_edit = Some((pending_edit.clone(), false));
-                                *best_edit_pos = pos;
-                                trace!(?best_edit_pos, edit_id = ?a.own_id, "found better edit");
-                            }
-                        } else {
-                            trace!(edit_id = ?a.own_id, "couldn't find timeline meta for edit event");
-
-                            // The edit event isn't in the timeline, so it might be a bundled
-                            // edit. In this case, record it as the best edit if and only if
-                            // there wasn't any other.
-                            if best_edit.is_none() {
-                                best_edit = Some((pending_edit.clone(), false));
-                                trace!(?best_edit_pos, edit_id = ?a.own_id, "found bundled edit");
-                            }
-                        }
-                    } else {
-                        // There wasn't any best edit yet, so record this one as being it, with
-                        // its position.
-                        best_edit = Some((pending_edit.clone(), false));
-                        best_edit_pos = items.position_by_event_id(event_id);
-                        trace!(?best_edit_pos, edit_id = ?a.own_id, "first best edit");
+                    let (Some(original_json), Some(edit_json)) =
+                        (event.original_json(), pending_edit.edit_json.as_ref())
+                    else {
+                        continue;
+                    };
+                    if check_validity_of_replacement_events(
+                        original_json,
+                        event.encryption_info(),
+                        edit_json,
+                        pending_edit.encryption_info.as_deref(),
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    let key = (
+                        edit_json
+                            .get_field::<MilliSecondsSinceUnixEpoch>("origin_server_ts")
+                            .ok()
+                            .flatten(),
+                        event_id,
+                    );
+                    if best_edit_key.as_ref().is_none_or(|current| key > *current) {
+                        best_edit = Some(pending_edit.clone());
+                        best_edit_key = Some(key);
                     }
                 }
             }
         }
     }
 
-    if let Some((edit, is_local_echo)) = best_edit {
-        edit_item(event, edit, is_local_echo)
-    } else {
-        false
-    }
+    if let Some(edit) = best_edit { edit_item(event, edit) } else { false }
 }
 
 /// Apply the selected edit to the given EventTimelineItem.
 ///
 /// Returns true if the edit was applied, false otherwise (because the edit and
 /// original timeline item types didn't match, for instance).
-fn edit_item(
-    item: &mut Cow<'_, EventTimelineItem>,
-    edit: PendingEdit,
-    is_local_echo: bool,
-) -> bool {
-    // We can receive edits from a local echo, i.e. the edit wasn't yet received
-    // from the homeserver.
-    //
-    // Before we send an edit we check that the event is allowed to be edited and
-    // that the replacement content is allowed.
-    //
-    // We don't have yet a full JSON of the event, so we can't do the validation
-    // here.
-    if !is_local_echo {
-        let Some(original_json) = item.original_json() else {
-            error!("The original event does not have the JSON field set.");
-            return false;
-        };
-
-        let Some(edit_json) = &edit.edit_json else {
-            error!(
-                "The replacement event of a remotely received edit does not have the JSON field set."
-            );
-            return false;
-        };
-
-        match check_validity_of_replacement_events(
-            original_json,
-            item.encryption_info(),
-            edit_json,
-            edit.encryption_info.as_deref(),
-        ) {
-            Ok(content) => content,
-            Err(e) => {
-                warn!("Event wasn't replaced due to the replacement event being invalid: {e}");
-                return false;
-            }
-        }
-    }
-
+fn edit_item(item: &mut Cow<'_, EventTimelineItem>, edit: PendingEdit) -> bool {
     let TimelineItemContent::MsgLike(content) = item.content() else {
         info!("Edit of message event applies to {:?}, discarding", item.content().debug_string());
         return false;
     };
 
-    let PendingEdit { kind: edit_kind, edit_json, encryption_info, bundled_item_owner: _ } = edit;
+    let PendingEdit { kind: edit_kind, edit_json, encryption_info } = edit;
 
     match (edit_kind, content) {
         (
@@ -1016,7 +968,7 @@ pub(crate) fn find_item_and_apply_aggregation(
         }
         ApplyAggregationResult::Edit => {
             if let Some(aggregations) = aggregations.related_events.get(target)
-                && resolve_edits(aggregations, items, &mut cowed)
+                && resolve_edits(aggregations, &mut cowed)
             {
                 let new_event_item = cowed.into_owned();
                 let new_item =
@@ -1042,8 +994,8 @@ enum ApplyAggregationResult {
     /// The passed `Cow<EventTimelineItem>` has been cloned and updated.
     UpdatedItem,
 
-    /// An edit must be included in the edit set and resolved later, using the
-    /// relative position of the edits.
+    /// An edit must be included in the edit set and resolved later, choosing
+    /// the latest valid timestamp and then the greatest event ID.
     Edit,
 
     /// The item hasn't been modified after applying the aggregation, because it
