@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 
 /// Configuration for a Matrix search index.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchIndexConfig {
     /// The tokenizer to use for message body text.
     #[serde(default)]
@@ -64,16 +64,11 @@ impl SearchIndexConfig {
     }
 }
 
-impl Default for SearchIndexConfig {
-    fn default() -> Self {
-        Self { tokenizer: SearchTokenizer::default() }
-    }
-}
-
 /// Tokenizer configuration for Matrix search indexes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchTokenizer {
     /// Use Tantivy's default text tokenizer.
+    #[default]
     Default,
     /// Use a Tantivy ngram tokenizer over message body text.
     Ngram(NgramConfig),
@@ -101,12 +96,6 @@ impl SearchTokenizer {
             Self::Default => None,
             Self::Ngram(config) => Some(config),
         }
-    }
-}
-
-impl Default for SearchTokenizer {
-    fn default() -> Self {
-        Self::Default
     }
 }
 

@@ -355,7 +355,7 @@ impl RoomEventCache {
         filter: Option<Vec<RelationType>>,
     ) -> Result<Option<(Event, Vec<Event>)>> {
         // Search in all loaded or stored events.
-        Ok(self.inner.state.read().await?.find_event_with_relations(event_id, filter).await?)
+        self.inner.state.read().await?.find_event_with_relations(event_id, filter).await
     }
 
     /// Try to find the related events for an event by ID in this room.

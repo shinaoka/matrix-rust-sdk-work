@@ -924,7 +924,7 @@ mod tests {
     }
 
     fn add_indexable(index: &mut RoomIndex, id: &str, timestamp: u64, body: &str) {
-        let event_id = EventId::parse(id).expect("valid event id").to_owned();
+        let event_id = EventId::parse(id).expect("valid event id");
         index
             .execute(RoomIndexOperation::Add(IndexableEvent::new(
                 event_id.clone(),
