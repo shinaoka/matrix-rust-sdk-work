@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
+use futures_util::StreamExt;
 use matrix_sdk_base::{
     RoomMemberships,
     crypto::{CryptoStoreError, UserIdentity as CryptoUserIdentity, types::MasterPubkey},
 };
 use ruma::{
     OwnedUserId, UserId,
-    events::{key::verification::VerificationMethod, room::message::RoomMessageEventContent},
+    events::{
+        key::verification::VerificationMethod,
+        room::{member::SyncRoomMemberEvent, message::RoomMessageEventContent},
+    },
 };
 
 use super::{
@@ -152,7 +156,8 @@ impl UserIdentity {
     ///   over to-device messaging.
     /// * Someone else's identity - The event will be sent to a DM room we share
     ///   with the user, if we don't share a DM with the user, one will be
-    ///   created.
+    ///   created. The request is sent after the user has joined the room. If
+    ///   they do not join within one minute, the request fails with a timeout.
     ///
     /// The default methods that are supported are:
     ///
@@ -252,6 +257,32 @@ impl UserIdentity {
         self.request_verification_impl(Some(methods)).await
     }
 
+    async fn wait_for_room_member_to_join(
+        &self,
+        room: &crate::Room,
+        user_id: &UserId,
+    ) -> crate::Result<()> {
+        const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+        let observer = self.client.observe_room_events::<SyncRoomMemberEvent, ()>(room.room_id());
+        let mut updates = observer.subscribe();
+        let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+
+        loop {
+            let members =
+                tokio::time::timeout_at(deadline, room.members_no_sync(RoomMemberships::JOIN))
+                    .await
+                    .map_err(|_| crate::Error::Timeout)??;
+            if members.iter().any(|member| member.user_id() == user_id) {
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, updates.next())
+                .await
+                .map_err(|_| crate::Error::Timeout)?
+                .ok_or(crate::Error::Timeout)?;
+        }
+    }
+
     async fn request_verification_impl(
         &self,
         methods: Option<Vec<VerificationMethod>>,
@@ -289,6 +320,7 @@ impl UserIdentity {
                     self.client.create_dm(i.user_id()).await?
                 };
 
+                self.wait_for_room_member_to_join(&room, i.user_id()).await?;
                 let result = room.send(RoomMessageEventContent::new(content)).await?;
 
                 let verification =

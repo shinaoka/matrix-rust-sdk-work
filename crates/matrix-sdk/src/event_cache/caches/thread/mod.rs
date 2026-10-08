@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 //! Threads-related data structures.
 
@@ -521,7 +524,7 @@ mod timed_tests {
     }
 
     #[async_test]
-    async fn test_write_to_storage_strips_bundled_relations() {
+    async fn test_write_to_storage_keeps_the_replacement_candidate() {
         let sender = user_id!("@mnt_io:matrix.org");
         let room_id = room_id!("!r0");
         let thread_root = event_id!("$t0_ev0");
@@ -584,7 +587,8 @@ mod timed_tests {
             assert!(msg.as_original().unwrap().unsigned.relations.replace.is_some());
         }
 
-        // The one in storage does not.
+        // The one in storage keeps the replacement candidate, so a bundle-only edit
+        // survives reconstruction; other bundled summaries are dropped.
         let linked_chunk = from_all_chunks::<3, _, _>(
             event_cache_store
                 .load_all_chunks(LinkedChunkId::Thread(room_id, thread_root))
@@ -604,7 +608,7 @@ mod timed_tests {
             assert_eq!(event.event_id(), thread_event_id_0);
 
             assert_let!(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(msg)) = event);
-            assert!(msg.as_original().unwrap().unsigned.relations.replace.is_none());
+            assert!(msg.as_original().unwrap().unsigned.relations.replace.is_some());
         });
 
         // That's all, folks!

@@ -37,8 +37,11 @@ impl SearchIndexWriter {
     }
 
     pub(crate) fn remove(&self, event_id: &EventId) {
-        self.inner
-            .delete_term(Term::from_field_text(self.schema.deletion_key(), event_id.as_str()));
+        // An edited document has its edit ID as primary key and its root ID as
+        // deletion key. Either kind of redaction must delete the actual terms.
+        for field in [self.schema.primary_key(), self.schema.deletion_key()] {
+            self.inner.delete_term(Term::from_field_text(field, event_id.as_str()));
+        }
     }
 
     pub(crate) fn commit(&mut self) -> Result<OpStamp, TantivyError> {

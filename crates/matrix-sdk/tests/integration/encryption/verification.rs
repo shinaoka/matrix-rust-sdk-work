@@ -330,3 +330,30 @@ async fn test_request_user_identity() {
     assert_matches!(encryption.request_user_identity(bob_id).await, Ok(Some(_)));
     assert_matches!(encryption.get_user_identity(bob_id).await, Ok(Some(_)));
 }
+
+#[async_test]
+async fn test_request_user_identity_reports_key_query_failure() {
+    let (client, server) = logged_in_client_with_server().await;
+    let bob_id = user_id!("@bob:example.org");
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/r0/keys/query"))
+        .and(body_json(json!({ "device_keys": { bob_id: []}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "failures": {
+                "example.org": {
+                    "errcode": "M_UNAVAILABLE",
+                    "error": "synthetic failure"
+                }
+            },
+            "device_keys": {}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    assert_matches!(
+        client.encryption().request_user_identity(bob_id).await,
+        Err(matrix_sdk::Error::UserKeyQueryFailure)
+    );
+}

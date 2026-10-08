@@ -168,8 +168,18 @@ pub async fn update_any_room(
     )
     .await?;
 
-    let notification_count = room_response.unread_notifications.clone().into();
-    room_info.update_notification_count(notification_count);
+    // MSC4186 serialises `unread_notifications` flattened with `default`, so the
+    // pair carries only the counts the server actually sent: `is_empty()` means
+    // "no count update for this room", not "this room has none". Keep the counts
+    // already known for the room in that case — replacing them with zero drops a
+    // room's unread badge on the next sync.
+    let notification_count = if room_response.unread_notifications.is_empty() {
+        room_info.notification_counts
+    } else {
+        let counts = room_response.unread_notifications.clone().into();
+        room_info.update_notification_count(counts);
+        counts
+    };
 
     let ambiguity_changes = ambiguity_cache.changes.remove(room_id).unwrap_or_default();
     let avatar_changes = avatar_cache.remove_changes(room_id);

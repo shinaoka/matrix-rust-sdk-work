@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -421,7 +424,6 @@ impl TimelineMetadata {
                                 )),
                                 edit_json,
                                 encryption_info: ctx.bundled_edit_encryption_info,
-                                bundled_item_owner: Some(ctx.event_id.to_owned()),
                             }),
                         );
                         self.aggregations.add(
@@ -459,7 +461,6 @@ impl TimelineMetadata {
                                 )),
                                 edit_json,
                                 encryption_info: ctx.bundled_edit_encryption_info,
-                                bundled_item_owner: Some(ctx.event_id.to_owned()),
                             }),
                         );
                         self.aggregations.add(

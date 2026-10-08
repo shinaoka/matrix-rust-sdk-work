@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 use std::{
     collections::HashMap,
@@ -33,7 +36,9 @@ use matrix_sdk_base::{
     serde_helpers::extract_redaction_target,
     sync::Timeline,
 };
-use matrix_sdk_common::{executor::spawn, serde_helpers::extract_timestamp};
+use matrix_sdk_common::{
+    check_validity_of_replacement_events, executor::spawn, serde_helpers::extract_timestamp,
+};
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId,
     events::{
@@ -231,6 +236,11 @@ impl RoomEventCacheState {
     /// Return a read-only reference to the underlying room linked chunk.
     pub fn room_linked_chunk(&self) -> &EventLinkedChunk {
         &self.room_linked_chunk
+    }
+
+    pub(super) fn pending_redactions_for(&self, event_ids: &[OwnedEventId]) -> std::collections::HashSet<OwnedEventId> {
+        let pending = self.pending_redactions.lock().unwrap();
+        event_ids.iter().filter(|id| pending.contains_key(*id)).cloned().collect()
     }
 
     fn redaction_target(&self, event: &Event) -> Option<OwnedEventId> {
@@ -637,6 +647,149 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         }
     }
 
+    /// Decide what a same-ID re-delivery may change, and drop what it may not.
+    ///
+    /// An event we cannot decrypt, a replacement we can no longer use, or an
+    /// older or invalid replacement is *unknown or worse*, not proof that what
+    /// we already decoded is wrong, so none of them may erase it. A
+    /// re-delivered redacted envelope is the opposite: authoritative
+    /// redaction evidence, and it is never discarded as a downgrade. A
+    /// redacted copy is never revived by an unredacted re-delivery.
+    ///
+    /// The dropped event is also removed from the duplicate sets, otherwise the
+    /// removal step would delete the cached copy without re-inserting anything.
+    async fn merge_duplicate_evidence(
+        &mut self,
+        events: &mut Vec<Event>,
+        in_memory_duplicates: &mut Vec<(OwnedEventId, Position)>,
+        in_store_duplicates: &mut Vec<(OwnedEventId, Position)>,
+    ) -> Result<(), EventCacheError> {
+        let mut dropped = Vec::new();
+
+        for event in events.iter() {
+            let Some(event_id) = event.event_id() else {
+                continue;
+            };
+
+            let Some((_, cached)) = self.find_event(event_id).await? else {
+                continue;
+            };
+
+            let incoming_redacted = is_positively_redacted_event(event);
+            let cached_redacted = self.is_positively_redacted(event_id, &cached);
+
+            let drop = if incoming_redacted {
+                // Authoritative redaction evidence is always admitted.
+                false
+            } else if cached_redacted {
+                // A redacted copy must not be revived by an unredacted re-delivery.
+                true
+            } else {
+                (!carries_usable_content(event) && carries_usable_content(&cached))
+                    || loses_replacement_evidence(&cached, event)
+            };
+
+            if drop {
+                dropped.push(event_id.to_owned());
+            }
+        }
+
+        if dropped.is_empty() {
+            return Ok(());
+        }
+
+        let is_dropped = |event_id: &EventId| dropped.iter().any(|id| id == event_id);
+        events.retain(|event| event.event_id().is_none_or(|id| !is_dropped(id)));
+        in_memory_duplicates.retain(|(id, _)| !is_dropped(id));
+        in_store_duplicates.retain(|(id, _)| !is_dropped(id));
+
+        Ok(())
+    }
+
+    /// Apply, in place, the duplicates that do carry new evidence: a
+    /// re-delivered redacted envelope, or a strictly newer valid bundled
+    /// replacement.
+    ///
+    /// Invariant: what search verification reads must equal what the timeline
+    /// renders. Discarding the newer envelope would let the cached root and the
+    /// rendered timeline disagree after a duplicate sync.
+    ///
+    /// Returns the linked-chunk diffs for the refreshed events.
+    async fn refresh_bundled_replacements(
+        &mut self,
+        events: &[Event],
+        in_store_duplicates: &[(OwnedEventId, Position)],
+    ) -> Result<Vec<VectorDiff<Event>>, EventCacheError> {
+        let mut refreshed = false;
+
+        for event in events {
+            let Some(event_id) = event.event_id() else {
+                continue;
+            };
+
+            let Some((location, cached)) = self.find_event(event_id).await? else {
+                continue;
+            };
+
+            let cached_redacted = self.is_positively_redacted(event_id, &cached);
+            let apply = if is_positively_redacted_event(event) {
+                !cached_redacted
+            } else if cached_redacted {
+                false
+            } else if let Some(incoming_replacement) = usable_replacement(event) {
+                // Only a strictly newer, valid replacement is new evidence; the
+                // drop pass already rejected older or invalid ones.
+                let cached_key = usable_replacement(&cached)
+                    .and_then(|replacement| replacement_key(&replacement));
+                replacement_key(&incoming_replacement) > cached_key
+                    && replacement_valid(&cached, &incoming_replacement)
+            } else {
+                false
+            };
+
+            if !apply {
+                continue;
+            }
+
+            // The refresh must go through the sanitizing, index-notifying update
+            // path, so a store-only root cannot acquire new visible text without
+            // the index subscriber seeing it and without the relation narrowing.
+            match location {
+                EventLocation::Memory(_) => {
+                    self.replace_event_at(location, event.clone()).await?;
+                }
+                EventLocation::Store => {
+                    let Some(position) = in_store_duplicates
+                        .iter()
+                        .find(|(id, _)| id == event_id)
+                        .map(|(_, position)| *position)
+                    else {
+                        continue;
+                    };
+
+                    self.apply_store_only_updates(vec![Update::ReplaceItem {
+                        at: position,
+                        item: event.clone(),
+                    }])
+                    .await?;
+                }
+            }
+            refreshed = true;
+        }
+
+        Ok(if refreshed { self.room_linked_chunk.updates_as_vector_diffs() } else { Vec::new() })
+    }
+
+    /// Whether we hold positive proof that the cached event was redacted:
+    /// either the committed redaction marker, or a pending redaction for it.
+    fn is_positively_redacted(&self, event_id: &EventId, cached: &Event) -> bool {
+        if !self.pending_redactions_for(&[event_id.to_owned()]).is_empty() {
+            return true;
+        }
+
+        cached.raw().deserialize().map(|event| event.is_redacted()).unwrap_or(false)
+    }
+
     /// Remove events by their position, in `EventLinkedChunk` and in
     /// `EventCacheStore`.
     ///
@@ -800,9 +953,9 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         let mut prev_batch_token = timeline.prev_batch.take();
 
         let DeduplicationOutcome {
-            all_events: events,
-            in_memory_duplicated_event_ids,
-            in_store_duplicated_event_ids,
+            all_events: mut events,
+            mut in_memory_duplicated_event_ids,
+            mut in_store_duplicated_event_ids,
             non_empty_all_duplicates: all_duplicates,
         } = filter_duplicate_events(
             &self.state.own_user_id,
@@ -831,17 +984,31 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             prev_batch_token = None;
         }
 
+        // A re-delivery that cannot be decrypted must not replace cached decrypted
+        // content: unknown is not proof that what we already decoded is wrong.
+        self.merge_duplicate_evidence(
+            &mut events,
+            &mut in_memory_duplicated_event_ids,
+            &mut in_store_duplicated_event_ids,
+        )
+        .await?;
+
         if all_duplicates {
             // No new events and no gap (per the previous check), thus no need to change the
             // room state. We're done!
             //
+            // That said, a duplicate can still carry a newer bundled replacement, so
+            // refresh it in place before returning instead of discarding the evidence.
+            let refreshed =
+                self.refresh_bundled_replacements(&events, &in_store_duplicated_event_ids).await?;
+
             // We might have a new read receipt, though! If that's the case, handle it for
             // unread counts tracking.
             //
             // Post-process the ephemeral events.
             self.post_process_upserted_events(empty(), read_receipt_event.as_ref()).await?;
 
-            return Ok((false, Vec::new(), None));
+            return Ok((false, refreshed, None));
         }
 
         let has_new_gap = prev_batch_token.is_some();
@@ -858,7 +1025,6 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         // events, because we are pushing all _new_ `events` at the back.
         self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids).await?;
 
-        let mut events = events;
         self.redact_pending_events(&mut events);
 
         self.state.room_linked_chunk.push_live_events(
@@ -1062,6 +1228,10 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             return Ok(());
         };
 
+        // Keep the committed redaction even when its target is not loaded yet.
+        // The same map is rebuilt from encrypted storage when the cache opens.
+        self.remember_redaction(event);
+
         // Replace the redacted event by a redacted form, if we knew about it.
         let Some((location, mut target_event)) = self.find_event(&target_event_id).await? else {
             trace!("redacted event is missing from the linked chunk");
@@ -1155,13 +1325,417 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     }
 }
 
+/// Whether the event, or its bundled replacement, holds content we can actually
+/// decode. An undecryptable event alone is unknown, not evidence against a
+/// copy we already decoded.
+fn carries_usable_content(event: &Event) -> bool {
+    !event.kind.is_utd() || usable_replacement(event).is_some()
+}
+
+/// Whether the event itself carries positive proof that it was redacted.
+fn is_positively_redacted_event(event: &Event) -> bool {
+    event.raw().deserialize().map(|event| event.is_redacted()).unwrap_or(false)
+}
+
+/// The event's bundled replacement, when it is present, decodable, and decodes
+/// into the room-message replacement the resolver can actually apply.
+fn usable_replacement(event: &Event) -> Option<Box<Event>> {
+    let bundled = event.bundled_replacement()?;
+    if bundled.kind.is_utd() {
+        return None;
+    }
+
+    matches!(
+        bundled.raw().deserialize(),
+        Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(message)))
+            if message.as_original().is_some()
+    )
+    .then_some(bundled)
+}
+
+/// Whether the incoming event would lose, or downgrade, replacement evidence
+/// the cached copy still holds.
+fn loses_replacement_evidence(cached: &Event, incoming: &Event) -> bool {
+    let Some(cached_replacement) = usable_replacement(cached) else {
+        return false;
+    };
+
+    let Some(incoming_replacement) = usable_replacement(incoming) else {
+        return true;
+    };
+
+    replacement_key(&incoming_replacement) <= replacement_key(&cached_replacement)
+        || !replacement_valid(cached, &incoming_replacement)
+}
+
+/// Whether a replacement is valid against the root we hold.
+fn replacement_valid(cached: &Event, replacement: &Event) -> bool {
+    check_validity_of_replacement_events(
+        cached.raw(),
+        cached.encryption_info().map(|info| &**info),
+        replacement.raw(),
+        replacement.encryption_info().map(|info| &**info),
+    )
+    .is_ok()
+}
+
+/// The raw `(timestamp, event id)` of a bundled replacement, when it has one.
+/// `None` sorts before any replacement, so a first aggregate counts as newer.
+fn replacement_key(replacement: &Event) -> Option<(u64, OwnedEventId)> {
+    let timestamp = replacement.raw().get_field::<u64>("origin_server_ts").ok().flatten()?;
+    Some((timestamp, replacement.event_id()?.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use matrix_sdk_base::RoomState;
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
-    use ruma::{event_id, room_id, user_id};
+    use ruma::{
+        event_id,
+        events::room::message::{
+            RedactedRoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+        },
+        room_id, user_id,
+    };
 
-    use crate::test_utils::logged_in_client;
+    use super::{is_positively_redacted_event, replacement_key, usable_replacement};
+    use crate::{event_cache::caches::room::RoomEventCache, test_utils::logged_in_client};
+
+    #[async_test]
+    async fn test_utd_redelivery_does_not_erase_decoded_content() {
+        use matrix_sdk_base::{
+            deserialized_responses::{TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason},
+            sync::Timeline,
+        };
+
+        use super::super::super::read_receipts::MaybeReceiptEventContent;
+
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!galette:saucisse.bzh");
+        client.event_cache().subscribe().unwrap();
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+        let event_id = event_id!("$decoded");
+
+        let mut state = room_event_cache.inner.state.write().await.unwrap();
+        state.save_events([f.text_msg("knownneedle").event_id(event_id).into()]).await.unwrap();
+
+        let utd = TimelineEvent::from_utd(
+            ruma::serde::Raw::from_json_string(
+                serde_json::json!({
+                    "type": "m.room.encrypted", "event_id": event_id, "room_id": room_id,
+                    "sender": "@ben:saucisse.bzh", "origin_server_ts": 100,
+                    "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "synthetic",
+                        "device_id": "TEST", "sender_key": "synthetic", "session_id": "s"},
+                })
+                .to_string(),
+            )
+            .unwrap(),
+            UnableToDecryptInfo {
+                session_id: Some("s".to_owned()),
+                reason: UnableToDecryptReason::Unknown,
+            },
+        );
+
+        state
+            .handle_sync(
+                Timeline { limited: false, prev_batch: None, events: vec![utd] },
+                &MaybeReceiptEventContent::none(),
+            )
+            .await
+            .unwrap();
+
+        let (_, cached) = state.find_event(event_id).await.unwrap().unwrap();
+        assert!(
+            !cached.kind.is_utd(),
+            "an undecryptable re-delivery must not erase decoded content"
+        );
+    }
+
+    /// A root carrying a bundled replacement, as the server aggregates it.
+    fn root_with_bundle(
+        f: &EventFactory,
+        root: &ruma::EventId,
+        edit: &ruma::EventId,
+        edit_ts: u64,
+    ) -> matrix_sdk_base::event_cache::Event {
+        f.text_msg("originalneedle")
+            .event_id(root)
+            .with_bundled_edit(
+                f.text_msg("* currentneedle").server_ts(edit_ts).event_id(edit).edit(
+                    root,
+                    RoomMessageEventContentWithoutRelation::text_plain("currentneedle"),
+                ),
+            )
+            .into_event()
+    }
+
+    /// Sync one batch into the room cache and return the resulting replacement
+    /// key.
+    async fn sync_and_read_bundle(
+        cache: &RoomEventCache,
+        events: Vec<matrix_sdk_base::event_cache::Event>,
+        root: &ruma::EventId,
+    ) -> Option<(u64, String)> {
+        sync_batch(cache, events).await;
+        let cached = cached_event(cache, root).await;
+        let replacement = usable_replacement(&cached)?;
+        let (timestamp, event_id) = replacement_key(&replacement)?;
+        Some((timestamp, event_id.to_string()))
+    }
+
+    /// Sync one batch into the room cache through the production ingestion
+    /// path.
+    async fn sync_batch(cache: &RoomEventCache, events: Vec<matrix_sdk_base::event_cache::Event>) {
+        use matrix_sdk_base::sync::Timeline;
+
+        use super::super::super::read_receipts::MaybeReceiptEventContent;
+
+        cache
+            .inner
+            .state
+            .write()
+            .await
+            .unwrap()
+            .handle_sync(
+                Timeline { limited: false, prev_batch: None, events },
+                &MaybeReceiptEventContent::none(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Read a cached event through the same lookup the resolver uses.
+    async fn cached_event(
+        cache: &RoomEventCache,
+        event_id: &ruma::EventId,
+    ) -> matrix_sdk_base::event_cache::Event {
+        cache.inner.state.read().await.unwrap().find_event(event_id).await.unwrap().unwrap().1
+    }
+
+    /// A malformed bundled replacement: valid relation, undecodable content.
+    fn malformed_bundle(
+        room_id: &ruma::RoomId,
+        sender: &ruma::UserId,
+        root: &ruma::EventId,
+    ) -> ruma::serde::Raw<ruma::events::AnySyncTimelineEvent> {
+        ruma::serde::Raw::from_json_string(
+            serde_json::json!({
+                "type": "m.room.message", "event_id": "$malformed-bundle-edit",
+                "room_id": room_id, "sender": sender, "origin_server_ts": 200,
+                "content": {"msgtype": "m.text", "body": 42,
+                    "m.relates_to": {"rel_type": "m.replace", "event_id": root}},
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[async_test]
+    async fn test_redacted_root_is_not_revived_by_a_bundled_redelivery() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!redacted-bundle:saucisse.bzh");
+        client.event_cache().subscribe().unwrap();
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+        let root = event_id!("$redacted-bundle-root");
+        let edit = event_id!("$redacted-bundle-edit");
+
+        let plain = f.text_msg("originalneedle").event_id(root).into_event();
+        assert!(sync_and_read_bundle(&cache, vec![plain], root).await.is_none());
+
+        // A redaction whose target we already know is pending until the target is
+        // revisited; it is positive proof, so the re-delivery must not revive it.
+        cache
+            .inner
+            .state
+            .write()
+            .await
+            .unwrap()
+            .pending_redactions
+            .lock()
+            .unwrap()
+            .insert(root.to_owned(), f.text_msg("ignored").into_event());
+
+        let revived = root_with_bundle(&f, root, edit, 100);
+        assert!(
+            sync_and_read_bundle(&cache, vec![revived], root).await.is_none(),
+            "a redacted root must not be revived by an unredacted re-delivery"
+        );
+    }
+
+    #[async_test]
+    async fn test_mixed_batch_keeps_the_cached_bundled_replacement() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!mixed-bundle:saucisse.bzh");
+        client.event_cache().subscribe().unwrap();
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+        let root = event_id!("$mixed-bundle-root");
+        let edit = event_id!("$mixed-bundle-edit");
+
+        let with_bundle = root_with_bundle(&f, root, edit, 100);
+        assert_eq!(
+            sync_and_read_bundle(&cache, vec![with_bundle], root).await,
+            Some((100, edit.to_string()))
+        );
+
+        // The duplicate root loses its aggregate while a genuinely new event is
+        // appended in the same batch; the cached replacement must survive.
+        let bundleless = f.text_msg("originalneedle").event_id(root).into_event();
+        let fresh = f.text_msg("unrelated").event_id(event_id!("$mixed-bundle-new")).into_event();
+        assert_eq!(
+            sync_and_read_bundle(&cache, vec![bundleless, fresh], root).await,
+            Some((100, edit.to_string())),
+            "a bundleless duplicate must not erase the cached replacement"
+        );
+    }
+
+    #[async_test]
+    async fn test_invalid_newer_bundle_does_not_erase_the_cached_replacement() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!invalid-bundle:saucisse.bzh");
+        client.event_cache().subscribe().unwrap();
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+        let root = event_id!("$invalid-bundle-root");
+        let edit = event_id!("$invalid-bundle-edit");
+
+        let with_bundle = root_with_bundle(&f, root, edit, 100);
+        assert_eq!(
+            sync_and_read_bundle(&cache, vec![with_bundle], root).await,
+            Some((100, edit.to_string()))
+        );
+
+        // A newer replacement from another sender is invalid, so it must not
+        // displace the valid one we already hold.
+        let other = EventFactory::new().room(room_id).sender(user_id!("@mallory:saucisse.bzh"));
+        let invalid = f
+            .text_msg("originalneedle")
+            .event_id(root)
+            .with_bundled_edit(
+                other
+                    .text_msg("* evil")
+                    .server_ts(200)
+                    .event_id(event_id!("$invalid-bundle-new"))
+                    .edit(root, RoomMessageEventContentWithoutRelation::text_plain("evil")),
+            )
+            .into_event();
+        assert_eq!(
+            sync_and_read_bundle(&cache, vec![invalid], root).await,
+            Some((100, edit.to_string())),
+            "an invalid newer replacement must not displace a valid cached one"
+        );
+    }
+
+    #[async_test]
+    async fn test_redacted_redelivery_is_applied_instead_of_dropped() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!redacted-redelivery:saucisse.bzh");
+        client.event_cache().subscribe().unwrap();
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let sender = user_id!("@ben:saucisse.bzh");
+        let f = EventFactory::new().room(room_id).sender(sender);
+        let root = event_id!("$redacted-redelivery-root");
+        let edit = event_id!("$redacted-redelivery-edit");
+
+        let with_bundle = root_with_bundle(&f, root, edit, 100);
+        assert_eq!(
+            sync_and_read_bundle(&cache, vec![with_bundle], root).await,
+            Some((100, edit.to_string()))
+        );
+
+        // The server re-sends the root already redacted. That envelope is the only
+        // redaction evidence this cache has, so it must be applied, not dropped as
+        // a downgrade of the bundled replacement.
+        let redacted =
+            f.redacted(sender, RedactedRoomMessageEventContent::new()).event_id(root).into_event();
+        sync_batch(&cache, vec![redacted]).await;
+
+        let cached = cached_event(&cache, root).await;
+        assert!(
+            is_positively_redacted_event(&cached),
+            "a re-delivered redacted envelope must be applied"
+        );
+        // `resolve_cached_message` only exists with `experimental-search`, so the
+        // end-to-end assertion is gated while the cache-level one always runs.
+        #[cfg(feature = "experimental-search")]
+        assert!(room.resolve_cached_message(root).await.unwrap().is_none());
+    }
+
+    #[async_test]
+    async fn test_mixed_batch_keeps_the_newer_cached_bundle() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!mixed-older-bundle:saucisse.bzh");
+        client.event_cache().subscribe().unwrap();
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+        let root = event_id!("$mixed-older-root");
+        let newer = event_id!("$mixed-older-newer");
+        let older = event_id!("$mixed-older-older");
+
+        assert_eq!(
+            sync_and_read_bundle(&cache, vec![root_with_bundle(&f, root, newer, 200)], root).await,
+            Some((200, newer.to_string()))
+        );
+
+        // A mixed batch carries the duplicate root with an older aggregate; the
+        // batch is not all-duplicates, so it must still not downgrade the cache.
+        let fresh = f.text_msg("unrelated").event_id(event_id!("$mixed-older-new")).into_event();
+        assert_eq!(
+            sync_and_read_bundle(&cache, vec![root_with_bundle(&f, root, older, 100), fresh], root)
+                .await,
+            Some((200, newer.to_string())),
+            "a mixed batch must not replace a newer cached aggregate with an older one"
+        );
+    }
+
+    #[async_test]
+    async fn test_mixed_batch_keeps_the_cached_bundle_over_a_malformed_one() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!mixed-malformed:saucisse.bzh");
+        client.event_cache().subscribe().unwrap();
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (cache, _handles) = room.event_cache().await.unwrap();
+        let sender = user_id!("@ben:saucisse.bzh");
+        let f = EventFactory::new().room(room_id).sender(sender);
+        let root = event_id!("$mixed-malformed-root");
+        let edit = event_id!("$mixed-malformed-edit");
+
+        assert_eq!(
+            sync_and_read_bundle(&cache, vec![root_with_bundle(&f, root, edit, 100)], root).await,
+            Some((100, edit.to_string()))
+        );
+
+        // The newer aggregate does not decode into replacement content, so it is not
+        // evidence the cache can use.
+        let malformed = f
+            .text_msg("originalneedle")
+            .event_id(root)
+            .with_bundled_edit(malformed_bundle(room_id, sender, root))
+            .into_event();
+        let fresh =
+            f.text_msg("unrelated").event_id(event_id!("$mixed-malformed-new")).into_event();
+        assert_eq!(
+            sync_and_read_bundle(&cache, vec![malformed, fresh], root).await,
+            Some((100, edit.to_string())),
+            "an undecodable newer aggregate must not displace a usable one"
+        );
+    }
 
     #[async_test]
     async fn test_save_event() {

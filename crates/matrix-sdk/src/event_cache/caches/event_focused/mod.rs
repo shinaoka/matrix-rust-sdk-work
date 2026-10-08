@@ -574,18 +574,22 @@ pub struct EventFocusedCache {
 }
 
 impl EventFocusedCache {
-    /// Create a new empty event-focused cache.
+    /// Create an initialized event-focused cache before publishing its state.
     pub(super) async fn new(
         room: WeakRoom,
         key: EventFocusedCacheKey,
         state: &StateLock,
         linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
+        number_of_initial_events: u16,
     ) -> Result<Self> {
+        let thread_mode = key.thread_mode;
         let cache_state = state
             .try_insert_once_with(
                 EventFocusedStateSelector::new(room.room_id().to_owned(), key.clone()),
-                |_store_guard| async {
-                    Ok(EventFocusedCacheState {
+                |store_guard| async {
+                    // Keep the existing cross-process store lock through initialization.
+                    let _store_guard = store_guard;
+                    let mut cache = EventFocusedCacheState {
                         room,
                         focused_event_id: key.focused_event_id,
                         pagination_mode: EventFocusedPaginationMode::Room {
@@ -598,7 +602,11 @@ impl EventFocusedCache {
                         }, // dummy value
                         update_sender: Sender::new(32),
                         linked_chunk_update_sender,
-                    })
+                    };
+                    // Register only after initialization succeeds. Dropping or failing
+                    // the context request must not strand a state without a cache handle.
+                    cache.start_from(number_of_initial_events, thread_mode).await?;
+                    Ok(cache)
                 },
             )
             .await?;
@@ -634,16 +642,6 @@ impl EventFocusedCache {
     /// possible).
     pub async fn hit_timeline_end(&self) -> Result<bool> {
         Ok(self.inner.read().await?.last_chunk_as_gap().is_none())
-    }
-
-    /// Start the event-focused timeline from the focused event, fetching
-    /// context events and detecting thread membership.
-    pub(super) async fn start_from(
-        &self,
-        num_context_events: u16,
-        thread_mode: EventFocusThreadMode,
-    ) -> Result<StartFromResult> {
-        self.inner.write().await?.start_from(num_context_events, thread_mode).await
     }
 
     /// Paginate backwards in this event-focused timeline, be it room or thread
