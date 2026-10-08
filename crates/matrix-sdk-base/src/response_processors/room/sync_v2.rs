@@ -126,8 +126,16 @@ pub async fn update_joined_room(
 
     updated_members_in_room.insert(room_id.to_owned(), new_user_ids);
 
-    let notification_count = joined_room.unread_notifications.into();
-    room_info.update_notification_count(notification_count);
+    // An empty `unread_notifications` pair means the server sent no count update
+    // for this room, not that the room has none: keep the counts already known
+    // instead of zeroing them (see the msc4186 path).
+    let notification_count = if joined_room.unread_notifications.is_empty() {
+        room_info.notification_counts
+    } else {
+        let counts = joined_room.unread_notifications.into();
+        room_info.update_notification_count(counts);
+        counts
+    };
 
     context.state_changes.add_room(room_info);
 

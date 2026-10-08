@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -280,6 +283,171 @@ async fn test_relations_edit_overrides_pending_edit_msg() {
     assert!(date_divider.is_date_divider());
 
     assert_pending!(stream);
+}
+
+#[async_test]
+async fn test_newer_valid_edit_is_not_superseded_by_an_older_bundled_edit() {
+    for (newer_ts, older_ts) in [(200_u64, 100_u64), (4_100_000_000_000, 4_000_000_000_000)] {
+        let timeline = TestTimeline::new().await;
+        let f = &timeline.factory;
+        let original_id = event_id!("$ordering-root");
+        let newer_id = event_id!("$ordering-newer");
+        timeline
+            .handle_live_event(
+                f.text_msg("* newer")
+                    .sender(*ALICE)
+                    .server_ts(newer_ts)
+                    .edit(original_id, MessageType::text_plain("newer").into())
+                    .event_id(newer_id),
+            )
+            .await;
+        timeline
+            .handle_live_event(
+                f.text_msg("original")
+                    .sender(*ALICE)
+                    .server_ts(50_u64)
+                    .event_id(original_id)
+                    .with_bundled_edit(
+                        f.text_msg("* older")
+                            .sender(*ALICE)
+                            .server_ts(older_ts)
+                            .edit(original_id, MessageType::text_plain("older").into())
+                            .event_id(event_id!("$ordering-older")),
+                    ),
+            )
+            .await;
+        let items = timeline.controller.items().await;
+        let root = items
+            .iter()
+            .filter_map(|item| item.as_event())
+            .find(|item| item.event_id() == Some(original_id))
+            .unwrap();
+        assert_eq!(
+            root.content().as_message().unwrap().body(),
+            "newer",
+            "Matrix replacement ordering uses origin_server_ts, not arrival position"
+        );
+        assert_eq!(root.latest_edit_json().unwrap().deserialize().unwrap().event_id(), newer_id);
+    }
+}
+
+#[async_test]
+async fn test_equal_timestamp_edits_choose_greatest_event_id_in_either_arrival_order() {
+    for reverse in [false, true] {
+        let timeline = TestTimeline::new().await;
+        let f = &timeline.factory;
+        let root_id = event_id!("$tie-root");
+        let greater_id = event_id!("$tie-z");
+        let lesser_id = event_id!("$tie-a");
+        let ids = if reverse { [lesser_id, greater_id] } else { [greater_id, lesser_id] };
+        for id in ids {
+            timeline
+                .handle_live_event(
+                    f.text_msg("* edited")
+                        .sender(*ALICE)
+                        .server_ts(100_u64)
+                        .event_id(id)
+                        .edit(root_id, MessageType::text_plain(id.as_str()).into()),
+                )
+                .await;
+        }
+        timeline
+            .handle_live_event(
+                f.text_msg("original").sender(*ALICE).server_ts(50_u64).event_id(root_id),
+            )
+            .await;
+        let items = timeline.controller.items().await;
+        let root = items
+            .iter()
+            .filter_map(|item| item.as_event())
+            .find(|item| item.event_id() == Some(root_id))
+            .unwrap();
+        assert_eq!(root.content().as_message().unwrap().body(), greater_id.as_str());
+        assert_eq!(root.latest_edit_json().unwrap().deserialize().unwrap().event_id(), greater_id);
+    }
+}
+
+#[async_test]
+async fn test_invalid_newest_pending_edit_cannot_mask_a_valid_edit() {
+    for invalid_kind in ["sender", "type", "plain"] {
+        let timeline = TestTimeline::new().await;
+        let f = &timeline.factory;
+        let root_id = event_id!("$validity-root");
+        let valid_id = event_id!("$validity-valid");
+        let invalid_id = event_id!("$validity-invalid");
+        let room = room_id!("!validity:example.org");
+        let encryption_info = Arc::new(EncryptionInfo {
+            sender: (*ALICE).into(),
+            sender_device: None,
+            forwarder: None,
+            algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key: "test-key".to_owned(),
+                sender_claimed_keys: BTreeMap::new(),
+                session_id: Some("test-session".to_owned()),
+            },
+            verification_state: VerificationState::Verified,
+        });
+        let valid = f
+            .text_msg("* valid")
+            .sender(*ALICE)
+            .server_ts(100_u64)
+            .event_id(valid_id)
+            .edit(root_id, MessageType::text_plain("valid").into())
+            .room(room)
+            .into_raw();
+        let original = f
+            .text_msg("original")
+            .sender(*ALICE)
+            .server_ts(50_u64)
+            .event_id(root_id)
+            .room(room)
+            .into_raw();
+        let wrap = |raw: ruma::serde::Raw<ruma::events::AnyTimelineEvent>| {
+            if invalid_kind == "plain" {
+                TimelineEvent::from_decrypted(
+                    DecryptedRoomEvent {
+                        event: raw,
+                        encryption_info: encryption_info.clone(),
+                        unsigned_encryption_info: None,
+                    },
+                    None,
+                )
+            } else {
+                TimelineEvent::from_plaintext(raw.cast())
+            }
+        };
+        timeline.handle_live_event(wrap(valid)).await;
+        let invalid: ruma::serde::Raw<ruma::events::AnyTimelineEvent> = if invalid_kind == "type" {
+            f.poll_edit(root_id, "Invalid poll", vec!["Answer"])
+                .sender(*ALICE)
+                .server_ts(200_u64)
+                .event_id(invalid_id)
+                .room(room)
+                .into_raw()
+        } else {
+            f.text_msg("* invalid")
+                .sender(if invalid_kind == "sender" { *BOB } else { *ALICE })
+                .server_ts(200_u64)
+                .event_id(invalid_id)
+                .edit(root_id, MessageType::text_plain("invalid").into())
+                .room(room)
+                .into_raw()
+        };
+        timeline.handle_live_event(TimelineEvent::from_plaintext(invalid.cast())).await;
+        timeline.handle_live_event(wrap(original)).await;
+        let items = timeline.controller.items().await;
+        let root = items
+            .iter()
+            .filter_map(|item| item.as_event())
+            .find(|item| item.event_id() == Some(root_id))
+            .unwrap();
+        assert_eq!(root.content().as_message().unwrap().body(), "valid", "{invalid_kind}");
+        assert_eq!(
+            root.latest_edit_json().unwrap().deserialize().unwrap().event_id(),
+            valid_id,
+            "{invalid_kind}"
+        );
+    }
 }
 
 #[async_test]

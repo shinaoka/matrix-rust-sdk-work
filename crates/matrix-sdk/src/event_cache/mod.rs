@@ -186,6 +186,10 @@ pub enum EventCacheError {
     #[error("Unable to load any of the pinned events.")]
     UnableToLoadPinnedEvents,
 
+    /// A cached event cannot be decoded to establish its redaction state.
+    #[error("invalid cached event")]
+    InvalidCachedEvent,
+
     /// An error happened when reading the metadata of a linked chunk, upon
     /// reload.
     #[error("the linked chunk metadata is invalid: {details}")]

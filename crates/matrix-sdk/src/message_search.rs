@@ -85,10 +85,10 @@ use std::{collections::HashSet, pin::Pin};
 use async_stream::try_stream;
 use futures_util::{Stream, StreamExt as _};
 use matrix_sdk_base::{RoomStateFilter, deserialized_responses::TimelineEvent};
-use matrix_sdk_search::error::IndexError;
 #[cfg(doc)]
 use matrix_sdk_search::index::RoomIndex;
-use ruma::{OwnedEventId, OwnedRoomId};
+use matrix_sdk_search::{error::IndexError, index::SearchCursor};
+use ruma::{EventId, OwnedEventId, OwnedRoomId};
 
 use crate::{Client, Room};
 
@@ -127,6 +127,37 @@ impl Room {
     ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
         let mut search_index_guard = self.client.search_index().lock().await;
         search_index_guard.search(query, max_number_of_results, pagination_offset, self.room_id())
+    }
+
+    /// Page this room's index for literal `query` text, newest first.
+    ///
+    /// Returns at most `max_number_of_results` matches strictly older than
+    /// `cursor`; pass the last returned cursor to continue, or `None` to start
+    /// at the newest match. Unlike [`Room::search`], no offset is used, so
+    /// memory stays bounded by the page size.
+    pub async fn search_literal_page(
+        &self,
+        query: &str,
+        max_number_of_results: usize,
+        cursor: Option<SearchCursor>,
+    ) -> Result<Vec<SearchCursor>, IndexError> {
+        let mut search_index_guard = self.client.search_index().lock().await;
+        search_index_guard.search_literal_page(query, max_number_of_results, cursor, self.room_id())
+    }
+
+    /// Resolve a message to its current visible content, reading only the local
+    /// event cache (no network).
+    ///
+    /// Edits and redactions are resolved, so callers never verify stale
+    /// pre-edit text. Returns `None` when the event is not cached or has been
+    /// redacted.
+    pub async fn resolve_cached_message(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<crate::search_index::ResolvedMessage>, crate::Error> {
+        let (cache, _drop_handles) = self.event_cache().await?;
+
+        Ok(crate::search_index::resolve_cached_message(&cache, event_id).await?)
     }
 }
 

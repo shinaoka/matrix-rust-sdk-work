@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 
 /// Configuration for a Matrix search index.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchIndexConfig {
     /// The tokenizer to use for message body text.
     #[serde(default)]
@@ -39,23 +39,36 @@ impl SearchIndexConfig {
         self.tokenizer.name()
     }
 
+    /// Tokenizer name for the normalized body field.
+    ///
+    /// Normalized text always indexes single-character grams, so a query whose
+    /// normalization collapses to one scalar (for example a combining-mark
+    /// sequence folding to a precomposed character) still has a token to match.
+    pub(crate) fn body_normalized_tokenizer_name(&self) -> String {
+        match &self.tokenizer {
+            SearchTokenizer::Ngram(config) => format!("matrix_ngram_1_{}", config.max_gram()),
+            SearchTokenizer::Default => "default".to_owned(),
+        }
+    }
+
     pub(crate) fn ngram_tokenizer(&self) -> Option<(String, usize, usize)> {
         self.tokenizer
             .ngram_config()
             .map(|config| (self.body_tokenizer_name(), config.min_gram(), config.max_gram()))
     }
-}
 
-impl Default for SearchIndexConfig {
-    fn default() -> Self {
-        Self { tokenizer: SearchTokenizer::default() }
+    pub(crate) fn ngram_normalized_tokenizer(&self) -> Option<(String, usize, usize)> {
+        self.tokenizer
+            .ngram_config()
+            .map(|config| (self.body_normalized_tokenizer_name(), 1, config.max_gram()))
     }
 }
 
 /// Tokenizer configuration for Matrix search indexes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchTokenizer {
     /// Use Tantivy's default text tokenizer.
+    #[default]
     Default,
     /// Use a Tantivy ngram tokenizer over message body text.
     Ngram(NgramConfig),
@@ -83,12 +96,6 @@ impl SearchTokenizer {
             Self::Default => None,
             Self::Ngram(config) => Some(config),
         }
-    }
-}
-
-impl Default for SearchTokenizer {
-    fn default() -> Self {
-        Self::Default
     }
 }
 

@@ -11,11 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 use std::collections::{HashMap, HashSet};
 
 use matrix_sdk_base::{
-    deserialized_responses::TimelineEventKind,
+    deserialized_responses::{TimelineEventKind, UnsignedEventLocation},
     event_cache::{Event, Gap, store::EventCacheStoreLockGuard},
     executor::spawn,
     linked_chunk::{ChunkMetadata, LinkedChunkId, OwnedLinkedChunkId, Update},
@@ -170,18 +173,12 @@ pub(super) async fn send_updates_to_store(
         return Ok(());
     }
 
-    // Strip relations from updates which insert or replace items.
-    //
-    // The reason we're doing this, is that consumers of the event cache might look
-    // into bundled relations, and assume they're up to date. If we were to keep
-    // the relations in the events, when storing them, then it could be that
-    // they become outdated (as soon as a new relation comes over sync), so we'd
-    // need to update the bundled relations in this case, which would
-    // have a non-negligible cost, as we'd need to look up related events for each
-    // forwarded to a listener.
-    //
-    // As a result, we choose to strip bundled relations from events when we forward
-    // them to the store, and consumers have to explicitly ask for relations.
+    // Invariant: what search verification reads must equal what the timeline
+    // renders. Drop mutable bundled relation summaries, but retain the replacement
+    // event and its own encryption metadata, otherwise a bundle-only edit has no
+    // surviving content after reconstruction and the index/read disagree.
+    // It is a candidate, not proof of the latest edit: consumers must validate and
+    // compare it with ordinary related events.
     for update in updates.iter_mut() {
         match update {
             Update::PushItems { items, .. } => strip_relations_from_events(items),
@@ -226,22 +223,25 @@ pub(super) async fn send_updates_to_store(
     Ok(())
 }
 
-/// Strips the bundled relations from a collection of events.
+/// Strip bundled summaries, retaining replacement candidates.
 fn strip_relations_from_events(items: &mut [Event]) {
     for ev in items.iter_mut() {
         strip_relations_from_event(ev);
     }
 }
 
-/// Strips the bundled relations from an event, if they were present.
+/// Strip bundled summaries and their metadata, retaining the replacement pair.
 fn strip_relations_from_event(ev: &mut Event) {
     match &mut ev.kind {
         TimelineEventKind::Decrypted(decrypted) => {
-            // Remove all information about encryption info for
-            // the bundled events.
-            decrypted.unsigned_encryption_info = None;
+            if let Some(metadata) = &mut decrypted.unsigned_encryption_info {
+                metadata.retain(|location, _| *location == UnsignedEventLocation::RelationsReplace);
+                if metadata.is_empty() {
+                    decrypted.unsigned_encryption_info = None;
+                }
+            }
 
-            // Remove the `unsigned`/`m.relations` field, if needs be.
+            // Retain only the replacement candidate in the raw envelope.
             strip_relations_if_present(&mut decrypted.event);
         }
 
@@ -252,20 +252,23 @@ fn strip_relations_from_event(ev: &mut Event) {
     }
 }
 
-/// Removes the bundled relations from an event, if they were present.
-///
-/// Only replaces the present if it contained bundled relations.
+/// Remove bundled summaries, retaining only the replacement candidate.
 fn strip_relations_if_present<T>(event: &mut Raw<T>) {
-    // We're going to get rid of the `unsigned`/`m.relations` field, if it's
-    // present.
     // Use a closure that returns an option so we can quickly short-circuit.
     let mut closure = || -> Option<()> {
         let mut val: serde_json::Value = event.deserialize_as().ok()?;
         let unsigned = val.get_mut("unsigned")?;
         let unsigned_obj = unsigned.as_object_mut()?;
-        if unsigned_obj.remove("m.relations").is_some() {
-            *event = Raw::new(&val).ok()?.cast_unchecked();
+        let relations = unsigned_obj.get_mut("m.relations")?;
+        if let Some(relations) = relations.as_object_mut() {
+            relations.retain(|key, _| key == "m.replace");
+            if relations.is_empty() {
+                unsigned_obj.remove("m.relations");
+            }
+        } else {
+            unsigned_obj.remove("m.relations");
         }
+        *event = Raw::new(&val).ok()?.cast_unchecked();
         None
     };
     let _ = closure();
@@ -410,4 +413,88 @@ pub async fn find_event_relations(
     let related = related.into_iter().map(|(event, _pos)| event).collect();
 
     Ok(related)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use matrix_sdk_base::deserialized_responses::{
+        AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, TimelineEvent, UnableToDecryptInfo,
+        UnableToDecryptReason, UnsignedDecryptionResult, VerificationState,
+    };
+
+    use super::*;
+
+    #[test]
+    fn persistence_keeps_only_replacement_envelope_and_its_own_metadata() {
+        let value = serde_json::json!({
+            "type":"m.room.message", "event_id":"$root", "room_id":"!room:localhost",
+            "sender":"@member:localhost", "origin_server_ts":50,
+            "content":{"msgtype":"m.text", "body":"original"},
+            "unsigned":{"age":5, "m.relations":{
+                "m.replace":{"type":"m.room.encrypted", "event_id":"$edit",
+                    "sender":"@member:localhost", "origin_server_ts":100,
+                    "content":{"algorithm":"m.megolm.v1.aes-sha2", "ciphertext":"synthetic",
+                        "session_id":"child", "sender_key":"synthetic", "device_id":"TEST"}},
+                "m.thread":{"count":2}, "m.annotation":{"chunk":[]}
+            }}
+        });
+        let raw = Raw::new(&value).unwrap();
+        let mut plaintext = TimelineEvent::from_plaintext(raw.clone().cast_unchecked());
+        strip_relations_from_event(&mut plaintext);
+        let persisted: serde_json::Value = plaintext.raw().deserialize_as().unwrap();
+        assert_eq!(persisted["unsigned"]["age"], 5);
+        assert_eq!(persisted["unsigned"]["m.relations"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            persisted["unsigned"]["m.relations"]["m.replace"],
+            value["unsigned"]["m.relations"]["m.replace"]
+        );
+        for keep_child in [false, true] {
+            let info = || {
+                UnsignedDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
+                    session_id: Some("child".to_owned()),
+                    reason: UnableToDecryptReason::Unknown,
+                })
+            };
+            let mut metadata =
+                BTreeMap::from([(UnsignedEventLocation::RelationsThreadLatestEvent, info())]);
+            if keep_child {
+                metadata.insert(UnsignedEventLocation::RelationsReplace, info());
+            }
+            // Synthetic proof metadata, not a key-exchange/decryption fixture.
+            let mut event = TimelineEvent::from_decrypted(
+                DecryptedRoomEvent {
+                    event: raw.clone().cast_unchecked(),
+                    encryption_info: Arc::new(EncryptionInfo {
+                        sender: ruma::user_id!("@member:localhost").to_owned(),
+                        sender_device: None,
+                        forwarder: None,
+                        verification_state: VerificationState::Verified,
+                        algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                            curve25519_key: "synthetic".to_owned(),
+                            sender_claimed_keys: BTreeMap::new(),
+                            session_id: Some("root".to_owned()),
+                        },
+                    }),
+                    unsigned_encryption_info: Some(metadata),
+                },
+                None,
+            );
+            strip_relations_from_event(&mut event);
+            let metadata = event.kind.unsigned_encryption_map();
+            assert_eq!(metadata.is_some(), keep_child);
+            if let Some(metadata) = metadata {
+                assert_eq!(metadata.len(), 1);
+                assert!(metadata.contains_key(&UnsignedEventLocation::RelationsReplace));
+            }
+            assert!(event.bundled_replacement().unwrap().kind.is_utd());
+        }
+        let mut thread_only =
+            Raw::new(&serde_json::json!({"unsigned":{"m.relations":{"m.thread":{"count":2}}}}))
+                .unwrap();
+        strip_relations_if_present(&mut thread_only);
+        let stripped: serde_json::Value = thread_only.deserialize_as().unwrap();
+        assert!(stripped["unsigned"].get("m.relations").is_none());
+    }
 }

@@ -11,23 +11,32 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 /// A module for building a [`RoomIndex`]
 pub mod builder;
+mod cursor;
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
 };
 
+pub use cursor::SearchCursor;
+use cursor::{CursorTopCollector, candidate_cursor};
 use once_cell::sync::OnceCell;
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt,
 };
 use tantivy::{
-    Index, IndexReader, ReloadPolicy, TantivyDocument, collector::TopDocs,
-    directory::error::OpenDirectoryError, query::QueryParser, schema::Value,
-    tokenizer::NgramTokenizer,
+    Index, IndexReader, ReloadPolicy, TantivyDocument,
+    collector::TopDocs,
+    directory::error::OpenDirectoryError,
+    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    schema::{Field, IndexRecordOption, Term, Value},
+    tokenizer::{NgramTokenizer, TokenStream},
 };
 use tracing::{debug, error, warn};
 
@@ -35,6 +44,7 @@ use crate::{
     OpStamp, TANTIVY_INDEX_MEMORY_BUDGET,
     config::SearchIndexConfig,
     error::IndexError,
+    normalize::normalize_search_text,
     schema::{MatrixSearchIndexSchema, RoomMessageSchema},
     writer::SearchIndexWriter,
 };
@@ -126,6 +136,12 @@ pub struct RoomIndex {
     index: Index,
     schema: RoomMessageSchema,
     query_parser: QueryParser,
+    /// Name of the registered tokenizer for the searchable body field, used to
+    /// tokenize literal queries the same way the body was indexed.
+    body_tokenizer_name: String,
+    /// Tokenizer for the normalized body field, always including single
+    /// character grams.
+    body_normalized_tokenizer_name: String,
     room_id: OwnedRoomId,
     /// Events added but not yet committed, mapping each document's primary key
     /// (event id) to its deletion key (original event id). The deletion key is
@@ -162,6 +178,8 @@ impl RoomIndex {
             index,
             schema,
             query_parser,
+            body_tokenizer_name: config.body_tokenizer_name(),
+            body_normalized_tokenizer_name: config.body_normalized_tokenizer_name(),
             room_id: room_id.to_owned(),
             uncommitted_adds: HashMap::new(),
             uncommitted_removes: HashSet::new(),
@@ -241,9 +259,93 @@ impl RoomIndex {
             &query,
             &TopDocs::with_limit(max_number_of_results).and_offset(offset).order_by_score(),
         )?;
+        self.collect_event_ids(&searcher, results)
+    }
+
+    /// Page literal search results newest-first.
+    ///
+    /// Results are the union of raw and normalization-equivalent candidates. A
+    /// tokenless raw branch is only reported as [`IndexError::EmptyMessage`]
+    /// when the normalized branch is also empty, so callers that need raw
+    /// coverage for a very short query must enforce their own minimum length.
+    ///
+    /// Returns at most `limit` matches strictly older than `cursor`. Pass the
+    /// last returned cursor to fetch the next page, or `None` for the newest
+    /// page. Unlike [`RoomIndex::search`], no offset is used, so memory stays
+    /// bounded by `limit` regardless of history depth.
+    pub fn search_literal_page(
+        &self,
+        query: &str,
+        limit: usize,
+        cursor: Option<SearchCursor>,
+    ) -> Result<Vec<SearchCursor>, IndexError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query = self.literal_query(query)?;
+        let searcher = self.reader()?.searcher();
+        let candidates = searcher.search(&query, &CursorTopCollector { limit, cursor })?;
+        Ok(candidates.iter().filter_map(candidate_cursor).collect())
+    }
+
+    /// Build a literal query: every token the configured body tokenizer emits
+    /// for `query` must be present. Operators and field syntax are inert.
+    ///
+    /// The query matches both the raw body and the normalized body, so that
+    /// normalization-equivalent text (NFKC, case folding, dash unification) is
+    /// a candidate even when the raw bytes differ.
+    fn literal_query(&self, query: &str) -> Result<Box<dyn Query>, IndexError> {
+        let raw = self.token_clauses(&self.body_tokenizer_name, self.schema.body_field(), query)?;
+        let normalized = self.token_clauses(
+            &self.body_normalized_tokenizer_name,
+            self.schema.body_normalized_field(),
+            &normalize_search_text(query),
+        )?;
+
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        if let Some(raw) = raw {
+            clauses.push((Occur::Should, raw));
+        }
+        if let Some(normalized) = normalized {
+            clauses.push((Occur::Should, normalized));
+        }
+        if clauses.is_empty() {
+            return Err(IndexError::EmptyMessage);
+        }
+        Ok(Box::new(BooleanQuery::new(clauses)))
+    }
+
+    /// Tokenize `query` with `tokenizer_name` and require every token to be
+    /// present in `field`, or `None` when the tokenizer yields no tokens.
+    fn token_clauses(
+        &self,
+        tokenizer_name: &str,
+        field: Field,
+        query: &str,
+    ) -> Result<Option<Box<dyn Query>>, IndexError> {
+        let mut tokenizer =
+            self.index.tokenizers().get(tokenizer_name).ok_or(IndexError::EmptyMessage)?;
+        let mut stream = tokenizer.token_stream(query);
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        while let Some(token) = stream.next() {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(field, &token.text),
+                    IndexRecordOption::WithFreqs,
+                )),
+            ));
+        }
+        if clauses.is_empty() { Ok(None) } else { Ok(Some(Box::new(BooleanQuery::new(clauses)))) }
+    }
+
+    fn collect_event_ids(
+        &self,
+        searcher: &tantivy::Searcher,
+        results: Vec<(f32, tantivy::DocAddress)>,
+    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
         let mut ret: Vec<(f32, OwnedEventId)> = Vec::new();
         let pk = self.schema.primary_key();
-
         for (score, doc_address) in results {
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
             match retrieved_doc.get_first(pk).and_then(|maybe_value| maybe_value.as_str()) {
@@ -254,18 +356,18 @@ impl RoomIndex {
                 _ => error!("unexpected value type while searching documents"),
             }
         }
-
         Ok(ret)
     }
 
     fn events_to_be_removed(&self, event_id: &EventId) -> Result<Vec<OwnedEventId>, IndexError> {
+        // Match by primary key too: an edit document is keyed by the edit event
+        // id with the original event id as its deletion key, so removing the
+        // redacted edit by its own id must still find it.
+        let primary = self.schema.get_field_name(self.schema.primary_key());
+        let deletion = self.schema.get_field_name(self.schema.deletion_key());
         Ok(self
             .search(
-                format!(
-                    "{}:\"{event_id}\"",
-                    self.schema.get_field_name(self.schema.deletion_key())
-                )
-                .as_str(),
+                format!("{primary}:\"{event_id}\" OR {deletion}:\"{event_id}\"").as_str(),
                 10000,
                 None,
             )?
@@ -296,7 +398,7 @@ impl RoomIndex {
 
         writer.remove(&event_id);
 
-        // Committed documents matching the deletion key.
+        // Committed documents matching either identity.
         for event in events.into_iter() {
             self.uncommitted_adds.remove(&event);
             self.uncommitted_removes.insert(event);
@@ -309,7 +411,9 @@ impl RoomIndex {
         let uncommitted: Vec<_> = self
             .uncommitted_adds
             .iter()
-            .filter(|(_, deletion_key)| **deletion_key == event_id)
+            .filter(|(primary_key, deletion_key)| {
+                **primary_key == event_id || **deletion_key == event_id
+            })
             .map(|(primary_key, _)| primary_key.clone())
             .collect();
         for event in uncommitted {
@@ -374,7 +478,9 @@ impl RoomIndex {
                     | OpenDirectoryError::NotADirectory(_) => return Err(err),
                 },
                 // Bubble
-                IndexError::QueryParserError(_) => return Err(err),
+                IndexError::QueryParserError(_) | IndexError::EventPreparationFailed => {
+                    return Err(err);
+                }
                 // Ignore
                 IndexError::CannotIndexRedactedMessage
                 | IndexError::EmptyMessage
@@ -446,7 +552,9 @@ impl RoomIndex {
 }
 
 fn register_tokenizers(index: &Index, config: &SearchIndexConfig) {
-    if let Some((tokenizer_name, min_gram, max_gram)) = config.ngram_tokenizer() {
+    for (tokenizer_name, min_gram, max_gram) in
+        [config.ngram_tokenizer(), config.ngram_normalized_tokenizer()].into_iter().flatten()
+    {
         let Ok(tokenizer) = NgramTokenizer::all_ngrams(min_gram, max_gram) else {
             unreachable!(
                 "NgramConfig only stores bounds where min_gram > 0 and min_gram <= max_gram"
@@ -533,6 +641,44 @@ mod tests {
         new: OriginalSyncRoomMessageEvent,
     ) -> Result<(), IndexError> {
         index.execute(RoomIndexOperation::Edit(event_id.to_owned(), to_indexable(&new)))
+    }
+
+    #[test]
+    fn test_remove_edit_by_primary_key_after_commit_and_in_same_batch() {
+        for same_batch in [false, true] {
+            let mut index = RoomIndexBuilder::new_in_memory(room_id!("!room:localhost")).build();
+            let root = event_id!("$root:localhost");
+            let edit = event_id!("$edit:localhost");
+            index
+                .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                    root.to_owned(),
+                    root.to_owned(),
+                    user_id!("@user:localhost").to_owned(),
+                    None,
+                    "original".to_owned(),
+                )))
+                .unwrap();
+            let replacement = RoomIndexOperation::Edit(
+                root.to_owned(),
+                IndexableEvent::new(
+                    edit.to_owned(),
+                    root.to_owned(),
+                    user_id!("@user:localhost").to_owned(),
+                    None,
+                    "replacementunique".to_owned(),
+                ),
+            );
+            let remove = RoomIndexOperation::Remove(edit.to_owned());
+            if same_batch {
+                index.bulk_execute(vec![replacement, remove]).unwrap();
+            } else {
+                index.execute(replacement).unwrap();
+                assert_eq!(index.search("replacementunique", 10, None).unwrap().len(), 1);
+                index.execute(remove).unwrap();
+            }
+            assert!(index.search("replacementunique", 10, None).unwrap().is_empty());
+            assert!(!index.contains(edit));
+        }
     }
 
     #[test]
@@ -699,6 +845,238 @@ mod tests {
         assert_eq!(result, true_value, "search result not correct: {result:?}");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_literal_search_ignores_query_parser_field_syntax() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        let event_id = event_id!("$literal:localhost");
+        let event = EventFactory::new()
+            .text_msg("see report:2026.pdf now")
+            .event_id(event_id)
+            .room(room_id)
+            .sender(user_id!("@user_id:localhost"))
+            .into_any_sync_message_like_event();
+
+        index_message(&mut index, event)?;
+
+        // `report:2026` is not a field query: it is literal message text.
+        let result =
+            index.search_literal_page("report:2026", 10, None).expect("literal search failed");
+        let result: Vec<String> = result.iter().map(|cursor| cursor.event_id.to_string()).collect();
+
+        assert_eq!(result, vec![event_id.to_string()], "literal search result not correct");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_literal_search_matches_japanese_substring() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        let event_id = event_id!("$literal_japanese:localhost");
+        let event = EventFactory::new()
+            .text_msg("再アンケートです。来週確認します。")
+            .event_id(event_id)
+            .room(room_id)
+            .sender(user_id!("@user_id:localhost"))
+            .into_any_sync_message_like_event();
+
+        index_message(&mut index, event)?;
+
+        let result =
+            index.search_literal_page("アンケート", 10, None).expect("literal search failed");
+        let result: Vec<String> = result.iter().map(|cursor| cursor.event_id.to_string()).collect();
+
+        assert_eq!(result, vec![event_id.to_string()], "literal search result not correct");
+
+        Ok(())
+    }
+
+    /// A query that produces no tokens at all gets a typed error so the caller
+    /// can fall back instead of silently dropping the query.
+    #[test]
+    fn test_literal_search_reports_tokenless_queries() -> Result<(), Box<dyn Error>> {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        let event = EventFactory::new()
+            .text_msg("hello world")
+            .event_id(event_id!("$short:localhost"))
+            .room(room_id)
+            .sender(user_id!("@user_id:localhost"))
+            .into_any_sync_message_like_event();
+
+        index_message(&mut index, event)?;
+
+        assert!(matches!(index.search_literal_page("", 10, None), Err(IndexError::EmptyMessage)));
+
+        Ok(())
+    }
+
+    fn add_indexable(index: &mut RoomIndex, id: &str, timestamp: u64, body: &str) {
+        let event_id = EventId::parse(id).expect("valid event id");
+        index
+            .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                event_id.clone(),
+                event_id,
+                user_id!("@user_id:localhost").to_owned(),
+                Some(MilliSecondsSinceUnixEpoch(UInt::new_saturating(timestamp))),
+                body.to_owned(),
+            )))
+            .expect("failed to add event");
+    }
+
+    #[test]
+    fn test_literal_page_is_newest_first_and_pages_exactly() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        for timestamp in 1_000..1_005u64 {
+            add_indexable(
+                &mut index,
+                &format!("$event_{timestamp}:localhost"),
+                timestamp,
+                "hello world",
+            );
+        }
+
+        let first = index.search_literal_page("hello", 2, None).expect("first page");
+        assert_eq!(
+            first.iter().map(|cursor| cursor.timestamp_millis).collect::<Vec<_>>(),
+            vec![1_004, 1_003],
+            "first page must be newest first"
+        );
+
+        let second =
+            index.search_literal_page("hello", 2, first.last().cloned()).expect("second page");
+        assert_eq!(
+            second.iter().map(|cursor| cursor.timestamp_millis).collect::<Vec<_>>(),
+            vec![1_002, 1_001]
+        );
+
+        let third =
+            index.search_literal_page("hello", 2, second.last().cloned()).expect("third page");
+        assert_eq!(
+            third.iter().map(|cursor| cursor.timestamp_millis).collect::<Vec<_>>(),
+            vec![1_000]
+        );
+
+        let exhausted =
+            index.search_literal_page("hello", 2, third.last().cloned()).expect("exhausted page");
+        assert!(exhausted.is_empty(), "paging must terminate: {exhausted:?}");
+    }
+
+    /// Ties on the timestamp are paged exactly by the event-id tiebreak: no
+    /// duplicates and no skipped matches.
+    #[test]
+    fn test_literal_page_breaks_same_timestamp_ties() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        for name in ["a", "b", "c"] {
+            add_indexable(&mut index, &format!("$event_{name}:localhost"), 1_000, "hello world");
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = index.search_literal_page("hello", 2, cursor.clone()).expect("page");
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().cloned();
+            seen.extend(page.into_iter().map(|cursor| cursor.event_id.to_string()));
+            assert!(seen.len() <= 3, "paging must not repeat or exceed the match set: {seen:?}");
+        }
+
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "every tied match must be returned once: {seen:?}");
+        assert_eq!(seen, vec!["$event_c:localhost", "$event_b:localhost", "$event_a:localhost"]);
+    }
+
+    /// A query whose normalization collapses to one scalar still matches a
+    /// precomposed body through the normalized field.
+    #[test]
+    fn test_literal_search_matches_normalized_combining_mark_query() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        add_indexable(&mut index, "$precomposed:localhost", 1_000, "ガ");
+
+        let page = index
+            .search_literal_page("カ\u{3099}", 10, None)
+            .expect("normalized query must not be empty");
+        assert_eq!(page.len(), 1, "combining-mark query must match a precomposed body: {page:?}");
+    }
+
+    /// Case folding and compatibility forms are enumerated through the
+    /// normalized field.
+    #[test]
+    fn test_literal_search_matches_case_and_width_normalized() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        add_indexable(&mut index, "$upper:localhost", 1_000, "HÉLLO WÖRLD");
+        add_indexable(&mut index, "$width:localhost", 2_000, "ABC");
+
+        let case_page =
+            index.search_literal_page("héllo wörld", 10, None).expect("case-folded query");
+        assert_eq!(case_page.len(), 1, "case folding must match: {case_page:?}");
+
+        let width_page = index.search_literal_page("ＡＢＣ", 10, None).expect("full-width query");
+        assert_eq!(width_page.len(), 1, "compatibility width must match: {width_page:?}");
+    }
+
+    /// A raw substring that spans a combining mark is still found through the
+    /// raw field even though normalization would rewrite the body.
+    #[test]
+    fn test_literal_search_matches_raw_substring_across_combining_mark() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        add_indexable(&mut index, "$raw:localhost", 1_000, "xカ\u{3099} now");
+
+        let page = index.search_literal_page("xカ", 10, None).expect("raw substring query");
+        assert_eq!(page.len(), 1, "raw substring must match across normalization: {page:?}");
+    }
+
+    /// Normalization is applied per grapheme, matching the desktop verifier: a
+    /// compatibility jamo sequence is not composed across grapheme boundaries.
+    #[test]
+    fn test_literal_search_matches_per_grapheme_normalization() {
+        let room_id = room_id!("!room_id:localhost");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id)
+            .config(SearchIndexConfig::ngram(2, 4).expect("ngram bounds should be valid"))
+            .build();
+
+        add_indexable(&mut index, "$jamo:localhost", 1_000, "あ\u{3131}\u{314F}");
+
+        let page = index
+            .search_literal_page("あ\u{1100}", 10, None)
+            .expect("per-grapheme normalized query");
+        assert_eq!(page.len(), 1, "per-grapheme normalization must match: {page:?}");
     }
 
     #[test]

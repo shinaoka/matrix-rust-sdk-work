@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for the Koushi desktop fork (cache-only search verification); see
+// docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 use std::time::Duration;
 
@@ -1020,7 +1023,7 @@ async fn test_pending_edit_from_backpagination() {
 }
 
 #[async_test]
-async fn test_pending_edit_from_backpagination_doesnt_override_pending_edit_from_sync() {
+async fn test_older_backpaginated_edit_doesnt_override_newer_pending_sync_edit() {
     let mut h = PendingEditHelper::new().await;
     let f = EventFactory::new();
 
@@ -1033,6 +1036,7 @@ async fn test_pending_edit_from_backpagination_doesnt_override_pending_edit_from
                 f.text_msg("* hello")
                     .sender(&ALICE)
                     .event_id(edit_event_id)
+                    .server_ts(200_u64)
                     .edit(original_event_id, RoomMessageEventContent::text_plain("[edit]").into()),
             )
             .set_timeline_prev_batch("prev-batch-token".to_owned())
@@ -1050,6 +1054,7 @@ async fn test_pending_edit_from_backpagination_doesnt_override_pending_edit_from
                 .sender(&ALICE)
                 .event_id(edit_event_id2)
                 .room(&h.room_id)
+                .server_ts(100_u64)
                 .edit(original_event_id, RoomMessageEventContent::text_plain("aloha").into())
                 .into(),
         ],
