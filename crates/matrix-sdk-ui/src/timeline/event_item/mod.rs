@@ -885,7 +885,7 @@ pub struct ReactionInfo {
     /// received from the server, and `None` for a local echo that has no event
     /// ID yet.
     ///
-    /// Koushi fork patch surface: upstream 0.19.0 replaced `ReactionStatus`
+    /// Matrix desktop fork patch surface: upstream 0.19.0 replaced `ReactionStatus`
     /// with `send_state` and stopped carrying the reaction's event ID, which the
     /// Koushi timeline projection needs to address a redaction of the user's own
     /// reaction. Purely additive; no upstream behaviour changes. Upstream

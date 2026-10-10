@@ -348,7 +348,7 @@ impl Aggregation {
 
                 let previous_reaction = reactions.get(key).and_then(|by_user| by_user.get(sender));
 
-                // Koushi fork patch surface: keep the reaction's own event ID
+                // Matrix desktop fork patch surface: keep the reaction's own event ID
                 // on the item so consumers can redact their own reaction.
                 let event_id = match &self.own_id {
                     TimelineEventItemId::EventId(event_id) => Some(event_id.clone()),
