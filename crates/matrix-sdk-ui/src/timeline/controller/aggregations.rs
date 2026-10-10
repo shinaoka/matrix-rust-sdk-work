@@ -348,10 +348,20 @@ impl Aggregation {
 
                 let previous_reaction = reactions.get(key).and_then(|by_user| by_user.get(sender));
 
-                // Same reaction, same origin: already applied.
+                // Koushi fork patch surface: keep the reaction's own event ID
+                // on the item so consumers can redact their own reaction.
+                let event_id = match &self.own_id {
+                    TimelineEventItemId::EventId(event_id) => Some(event_id.clone()),
+                    TimelineEventItemId::TransactionId(_) => None,
+                };
+
+                // Same reaction, same origin: already applied. The event ID is
+                // part of the identity so a server echo replaces the local echo
+                // even when timestamp and send state are unchanged.
                 let is_same = previous_reaction.is_some_and(|prev| {
                     prev.timestamp == *timestamp
                         && same_send_state_kind(prev.send_state.as_ref(), self.send_state.as_ref())
+                        && prev.event_id == event_id
                 });
 
                 if is_same {
@@ -365,7 +375,11 @@ impl Aggregation {
 
                     reactions.entry(key.clone()).or_default().insert(
                         sender.clone(),
-                        ReactionInfo { timestamp: *timestamp, send_state: self.send_state.clone() },
+                        ReactionInfo {
+                            timestamp: *timestamp,
+                            send_state: self.send_state.clone(),
+                            event_id,
+                        },
                     );
 
                     ApplyAggregationResult::UpdatedItem

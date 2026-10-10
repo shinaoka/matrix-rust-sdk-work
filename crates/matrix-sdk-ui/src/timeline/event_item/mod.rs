@@ -881,6 +881,16 @@ pub struct ReactionInfo {
     /// Send state of the reaction when it's one of our own local echoes;
     /// `None` when it came from the server.
     pub send_state: Option<EventSendState>,
+    /// The reaction event's own ID once it is known: always set for a reaction
+    /// received from the server, and `None` for a local echo that has no event
+    /// ID yet.
+    ///
+    /// Koushi fork patch surface: upstream 0.19.0 replaced `ReactionStatus`
+    /// with `send_state` and stopped carrying the reaction's event ID, which the
+    /// Koushi timeline projection needs to address a redaction of the user's own
+    /// reaction. Purely additive; no upstream behaviour changes. Upstream
+    /// intent: offer this as an additive accessor.
+    pub event_id: Option<OwnedEventId>,
 }
 
 /// Reactions grouped by key first, then by sender.
