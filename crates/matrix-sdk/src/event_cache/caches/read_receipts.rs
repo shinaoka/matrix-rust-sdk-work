@@ -1592,7 +1592,7 @@ mod tests {
             new_receipt_event,
             active_receipt,
         );
-        assert_eq!(receipt.unwrap(), event_id!("$2"));
+        assert_eq!(receipt.unwrap(), "$2");
         // And there are no pending receipts.
         assert!(pending_receipts.is_empty());
     }
@@ -1636,7 +1636,7 @@ mod tests {
             new_receipt_event,
             active_receipt,
         );
-        assert_eq!(receipt.unwrap(), event_id!("$2"));
+        assert_eq!(receipt.unwrap(), "$2");
         // And there are no pending receipts.
         assert!(pending_receipts.is_empty());
     }
@@ -1685,7 +1685,7 @@ mod tests {
             new_receipt_event.as_ref(),
             active_receipt,
         );
-        assert_eq!(receipt.unwrap(), event_id!("$2"));
+        assert_eq!(receipt.unwrap(), "$2");
         // And there are no pending receipts.
         assert!(pending_receipts.is_empty());
     }
@@ -1738,7 +1738,7 @@ mod tests {
         assert!(receipt.is_none());
         // And there's a new pending receipt for $4.
         assert_eq!(pending_receipts.len(), 1);
-        assert_eq!(pending_receipts.get(0).unwrap(), event_id!("$4"));
+        assert_eq!(pending_receipts.get(0).unwrap(), "$4");
     }
 
     #[test]
@@ -1782,7 +1782,7 @@ mod tests {
             new_receipt_event.as_ref(),
             active_receipt,
         );
-        assert_eq!(receipt.unwrap(), event_id!("$2"));
+        assert_eq!(receipt.unwrap(), "$2");
         // And there are no more pending receipts.
         assert!(pending_receipts.is_empty());
     }
@@ -1838,7 +1838,7 @@ mod tests {
             new_receipt_event.as_ref(),
             active_receipt,
         );
-        assert_eq!(receipt.unwrap(), event_id!("$4"));
+        assert_eq!(receipt.unwrap(), "$4");
 
         // Receipt 6 is still pending, and there's a new pending receipt for 7 too. ($2
         // has been cleaned because it has been seen).

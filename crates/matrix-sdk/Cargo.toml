@@ -7,7 +7,8 @@ license = "Apache-2.0"
 name = "matrix-sdk"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 rust-version.workspace = true
-version = "0.18.0"
+version = "0.19.1"
+include = [".cargo/mermaid.html", "**/*.rs", "**/*.md"]
 
 [package.metadata.docs.rs]
 features = ["docsrs"]
@@ -107,12 +108,12 @@ async-stream.workspace = true
 async-trait.workspace = true
 axum = { version = "0.8.9", optional = true }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
-bytesize = { version = "2.4.2", default-features = false, features = ["std"] }
+bytesize = { version = "2.7.0", default-features = false, features = ["std"] }
 cfg-if.workspace = true
 event-listener = "5.4.2"
 eyeball.workspace = true
 eyeball-im.workspace = true
-eyre = { version = "0.6.12", optional = true }
+eyre = { version = "0.6.14", optional = true }
 futures-core.workspace = true
 futures-util = { workspace = true, features = ["async-await-macro"] }
 hex = "0.4.3"
@@ -195,7 +196,7 @@ tokio-test = "0.4.5"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-ctor = "1.0.12"
+ctor.workspace = true
 proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 wiremock.workspace = true

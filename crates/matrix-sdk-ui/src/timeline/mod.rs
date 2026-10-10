@@ -98,7 +98,7 @@ pub use self::{
         EventItemOrigin, EventSendState, EventTimelineItem, GapRepairProjectionId,
         InReplyToDetails, LiveLocationState, MediaUploadProgress, MemberProfileChange,
         MembershipChange, Message, MsgLikeContent, MsgLikeKind, OtherMessageLike, OtherState,
-        PollResult, PollState, Profile, ReactionInfo, ReactionStatus, ReactionsByKeyBySender,
+        PollResult, PollState, Profile, ReactionInfo, ReactionsByKeyBySender,
         ReadReceiptSnapshot, RoomMembershipChange, RoomPinnedEventsChange, Sticker, ThreadSummary,
         TimelineDetails, TimelineEventItemId, TimelineEventShieldState,
         TimelineEventShieldStateCode, TimelineItemContent,
