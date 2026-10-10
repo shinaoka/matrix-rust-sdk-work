@@ -204,9 +204,13 @@ impl ReadReceiptsExt for ReadReceipts {
     /// Returns whether a new event triggered a new unread/notification/mention.
     #[inline(always)]
     fn process_event(&mut self, event: &TimelineEvent, user_id: &UserId) {
-        // Cached push actions can predate a redaction. Do not resurrect their
-        // notification/mention counts when recounting a restored timeline.
-        if is_redacted(event.raw()) {
+        // Cached push actions can predate a redaction. Neither the deleted
+        // event nor its redaction is a remaining notification. Keep both in
+        // the linked chunk so they can still anchor a read receipt.
+        if is_redacted(event.raw())
+            || event.raw().get_field::<MessageLikeEventType>("type").ok().flatten()
+                == Some(MessageLikeEventType::RoomRedaction)
+        {
             return;
         }
         if marks_as_unread(event.raw(), user_id) {
@@ -798,6 +802,10 @@ impl FromIterator<(OwnedEventId, Receipts)> for MaybeReceiptEventContent {
         Self(if iterator.peek().is_some() { Some(iterator.collect()) } else { None })
     }
 }
+
+#[cfg(test)]
+#[path = "read_receipts/redaction_notification_tests.rs"]
+mod redaction_notification_tests;
 
 #[cfg(test)]
 mod tests {
