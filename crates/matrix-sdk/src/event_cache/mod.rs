@@ -80,7 +80,9 @@ pub use self::{
         pagination::{BackPaginationOutcome, PaginationStatus},
         pinned_events::PinnedEventsCache,
         room::{
-            RoomEventCache, RoomEventCacheGenericUpdate, RoomEventCacheUpdate,
+            RoomEventCache,
+            RoomEventCacheGenericUpdate,
+            RoomEventCacheUpdate,
             RoomTimelineSyncObservation,
             // Matrix desktop fork patch surface: cache-only back pagination and
             // persisted gap inspection/repair are not part of upstream matrix-sdk.
@@ -256,6 +258,48 @@ impl fmt::Debug for EventCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventCache").finish_non_exhaustive()
     }
+}
+
+/// Content-free counts of one room's resident room-timeline linked chunk.
+///
+/// Covers the in-memory linked chunk only; thread, pinned-events and
+/// event-focused caches are separate owners and are not counted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventCacheRoomMemoryCounters {
+    /// Resident chunk nodes (a resident empty sentinel counts as one).
+    pub chunks: u64,
+    /// Resident items across all items chunks; this is a resident length, not
+    /// a deduplicated event count.
+    pub events: u64,
+    /// Resident gap chunks.
+    pub gap_chunks: u64,
+    /// Active subscribers.
+    pub subscribers: u64,
+}
+
+/// Content-free aggregate snapshot of the event cache's resident room-timeline
+/// linked chunks.
+///
+/// Observation-only: the count never reloads state from the store and never
+/// initializes lazily-created chunk links, so sampling cannot change the
+/// residency it measures. Scope is room-timeline linked chunks only; thread,
+/// pinned-events and event-focused caches are not included.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventCacheMemoryDiagnostics {
+    /// Rooms with a resident room-timeline linked chunk.
+    pub rooms: u64,
+    /// Resident chunk nodes across those rooms (a resident empty sentinel
+    /// counts as one chunk).
+    pub chunks: u64,
+    /// Resident gap chunks.
+    pub gap_chunks: u64,
+    /// Resident items across those rooms' items chunks; resident lengths, not
+    /// deduplicated event counts.
+    pub events: u64,
+    /// Rooms with a resident linked chunk and zero active subscribers.
+    pub zero_subscriber_rooms: u64,
+    /// Of those, rooms that also hold resident events.
+    pub zero_subscriber_rooms_with_events: u64,
 }
 
 impl EventCache {
@@ -456,6 +500,16 @@ impl EventCache {
             subscribed: self.has_subscribed(),
             redecryptor_alive,
         }
+    }
+
+    /// Return a room-specific view over the [`EventCache`].
+    /// Content-free aggregate snapshot of the resident room-timeline linked
+    /// chunks.
+    ///
+    /// Observation-only: never reloads from the store and never initializes
+    /// lazily-created chunk links; see [`EventCacheMemoryDiagnostics`].
+    pub async fn memory_diagnostics(&self) -> EventCacheMemoryDiagnostics {
+        self.inner.state.in_memory_counters().await
     }
 
     /// Return a room-specific view over the [`EventCache`].
@@ -1194,5 +1248,71 @@ mod tests {
             "Too many strong references to the event cache {}",
             event_cache_weak.strong_count()
         );
+    }
+
+    #[async_test]
+    async fn test_event_cache_memory_diagnostics_counts_rooms_events_and_subscribers() {
+        let client = logged_in_client(None).await;
+        let room_id1 = room_id!("!galette:saucisse.bzh");
+        let room_id2 = room_id!("!crepe:saucisse.bzh");
+
+        client.base_client().get_or_create_room(room_id1, RoomState::Joined);
+        client.base_client().get_or_create_room(room_id2, RoomState::Joined);
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        let f = EventFactory::new().room(room_id1).sender(user_id!("@ben:saucisse.bzh"));
+
+        let eid1 = event_id!("$1");
+        let eid2 = event_id!("$2");
+        let eid3 = event_id!("$3");
+
+        let joined_room_update1 = JoinedRoomUpdate {
+            timeline: Timeline {
+                events: vec![
+                    f.text_msg("hey").event_id(eid1).into(),
+                    f.text_msg("you").event_id(eid2).into(),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let joined_room_update2 = JoinedRoomUpdate {
+            timeline: Timeline {
+                events: vec![f.text_msg("bjr").event_id(eid3).into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut updates = RoomUpdates::default();
+        updates.joined.insert(room_id1.to_owned(), joined_room_update1);
+        updates.joined.insert(room_id2.to_owned(), joined_room_update2);
+
+        // Have the event cache handle them.
+        event_cache.inner.handle_room_updates(updates).await.unwrap();
+
+        let diagnostics = event_cache.memory_diagnostics().await;
+        assert_eq!(diagnostics.rooms, 2);
+        assert_eq!(diagnostics.events, 3);
+        assert!(diagnostics.chunks >= 2, "each room owns at least one resident chunk");
+        assert_eq!(diagnostics.zero_subscriber_rooms, 2);
+        assert_eq!(diagnostics.zero_subscriber_rooms_with_events, 2);
+
+        // Subscribing one room removes it from the zero-subscriber classes.
+        let room = client.get_room(room_id1).unwrap();
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        let _subscriber = room_event_cache.subscribe().await.unwrap();
+
+        let diagnostics = event_cache.memory_diagnostics().await;
+        assert_eq!(diagnostics.zero_subscriber_rooms, 1);
+        assert_eq!(diagnostics.zero_subscriber_rooms_with_events, 1);
+
+        // Sampling must not shrink or reload anything: the counts stay stable.
+        let diagnostics = event_cache.memory_diagnostics().await;
+        assert_eq!(diagnostics.rooms, 2);
+        assert_eq!(diagnostics.events, 3);
     }
 }

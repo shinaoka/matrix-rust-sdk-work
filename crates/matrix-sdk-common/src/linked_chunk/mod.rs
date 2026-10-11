@@ -943,6 +943,42 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
         Iter::new(self.links.first_chunk())
     }
 
+    /// Content-free, non-initializing count of the resident chunk structure.
+    ///
+    /// Unlike [`Self::chunks`] / [`Self::rchunks`] — which lazily create the
+    /// sentinel first chunk through `Ends::first_chunk` when none exists — this
+    /// snapshot reads only already-initialized links and therefore never
+    /// mutates the structure nor queues updates while sampling. A sentinel
+    /// chunk that is already resident counts as a chunk. Returns zero for a
+    /// freshly cleared or never-populated structure.
+    pub fn memory_stats(&self) -> LinkedChunkMemoryStats {
+        let mut stats = LinkedChunkMemoryStats::default();
+
+        // The first link is only ever initialized through the mutation paths, so
+        // `get()` here observes initialization without creating the sentinel.
+        let Some(first) = self.links.first.get() else {
+            return stats;
+        };
+
+        // All chunks are leaked `NonNull`s (see `Chunk::*_leaked`); the `next`
+        // chain is only mutated under the owning state lock, which the caller
+        // holds, so following the pointers is safe.
+        let mut current = Some(*first);
+        while let Some(pointer) = current {
+            // SAFETY: every reachable pointer was produced by `Chunk::*_leaked`
+            // and remains valid for the lifetime of the linked chunk.
+            let chunk = unsafe { pointer.as_ref() };
+            match &chunk.content {
+                ChunkContent::Items(items) => stats.items += items.len() as u64,
+                ChunkContent::Gap(_) => stats.gaps += 1,
+            }
+            stats.chunks += 1;
+            current = chunk.next;
+        }
+
+        stats
+    }
+
     /// Iterate over the chunks, starting from `identifier`, backward.
     ///
     /// It iterates from the chunk with the identifier `identifier` to the first
@@ -1314,6 +1350,21 @@ impl<'a, const CAP: usize, Item, Gap> Iterator for Iter<'a, CAP, Item, Gap> {
     fn next(&mut self) -> Option<Self::Item> {
         self.chunk.inspect(|chunk| self.chunk = chunk.next())
     }
+}
+
+/// Content-free snapshot of a [`LinkedChunk`]'s resident structure.
+///
+/// Counts only what is already in memory: chunk nodes (including a resident
+/// empty sentinel), resident items, and gap chunks. Used by diagnostic
+/// sampling; carries no event content.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinkedChunkMemoryStats {
+    /// Number of resident chunk nodes.
+    pub chunks: u64,
+    /// Number of resident items across all items chunks.
+    pub items: u64,
+    /// Number of resident gap chunks.
+    pub gaps: u64,
 }
 
 /// This enum represents the content of a [`Chunk`].
@@ -1781,7 +1832,7 @@ mod tests {
 
     use super::{
         Chunk, ChunkContent, ChunkIdentifier, ChunkIdentifierGenerator, Error, LinkedChunk,
-        Position, Update::*,
+        LinkedChunkMemoryStats, Position, Update::*,
     };
 
     #[test]
@@ -3695,5 +3746,35 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn memory_stats_counts_only_initialized_links_without_initializing() {
+        let mut linked_chunk = LinkedChunk::<3, u32, ()>::new_with_update_history();
+
+        // A fresh structure reports zero and must not initialize the sentinel.
+        assert_eq!(linked_chunk.memory_stats(), LinkedChunkMemoryStats::default());
+        assert_eq!(linked_chunk.updates().unwrap().take(), &[]);
+
+        // Three items, a gap, then one more item: 4 chunks, 4 items, 1 gap.
+        linked_chunk.push_items_back([1u32, 2, 3, 4]);
+        linked_chunk.push_gap_back(());
+        linked_chunk.push_items_back([5u32]);
+
+        assert_eq!(
+            linked_chunk.memory_stats(),
+            LinkedChunkMemoryStats { chunks: 4, items: 5, gaps: 1 }
+        );
+
+        // Sampling is observation-only: drain the mutation updates that the
+        // pushes queued, then a snapshot must not queue anything new.
+        let _ = linked_chunk.updates().unwrap().take();
+        let _ = linked_chunk.memory_stats();
+        let _ = linked_chunk.memory_stats();
+        assert_eq!(linked_chunk.updates().unwrap().take(), &[]);
+
+        // Clearing returns the resident structure to zero.
+        linked_chunk.clear();
+        assert_eq!(linked_chunk.memory_stats(), LinkedChunkMemoryStats::default());
     }
 }

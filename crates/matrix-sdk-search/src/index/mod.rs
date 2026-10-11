@@ -25,6 +25,9 @@ use std::{
 };
 
 pub use cursor::SearchCursor;
+// Koushi fork patch surface: the shared accounting for decrypted index files,
+// named by `matrix-sdk` when it threads it into the room index builders.
+pub use crate::encrypted::encrypted_dir::DecryptedFileAccounting;
 use cursor::{CursorTopCollector, candidate_cursor};
 use once_cell::sync::OnceCell;
 use ruma::{
@@ -191,6 +194,14 @@ impl RoomIndex {
     fn writer(&self) -> Result<SearchIndexWriter, IndexError> {
         let writer = self.index.writer(TANTIVY_INDEX_MEMORY_BUDGET)?;
         Ok(SearchIndexWriter::new(writer, self.schema.clone()))
+    }
+
+    /// Whether a reader was created and is kept cached for this index.
+    ///
+    /// This observes the existing [`OnceCell`] without initializing it, so it
+    /// is safe for diagnostic sampling.
+    pub fn has_active_reader(&self) -> bool {
+        self.reader.get().is_some()
     }
 
     /// Get or create the cached [`IndexReader`] for this index.

@@ -29,7 +29,8 @@ use matrix_sdk_search::{
     config::SearchIndexConfig,
     error::IndexError,
     index::{
-        IndexableEvent, RoomIndex, RoomIndexOperation, SearchCursor, builder::RoomIndexBuilder,
+        DecryptedFileAccounting, IndexableEvent, RoomIndex, RoomIndexOperation, SearchCursor,
+        builder::RoomIndexBuilder,
     },
 };
 use ruma::{
@@ -104,6 +105,31 @@ pub struct SearchIndex {
 
     /// Base directory that stores the directories for each RoomIndex
     search_index_store_kind: SearchIndexStoreKind,
+
+    /// Shared decrypted-allocation accounting for every encrypted room index
+    /// this search index opens (#1344 memory audit).
+    decrypted_file_accounting: Arc<DecryptedFileAccounting>,
+}
+
+/// Content-free snapshot of one [`SearchIndex`]'s retention-relevant state
+/// (#1344 memory audit). Byte figures cover the encrypted store's decrypted
+/// allocations; count figures cover the retained room indexes and readers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SearchIndexDiagnostics {
+    /// Joined rooms with a `RoomIndex`.
+    pub rooms_total: u64,
+    /// Of those, rooms with a cached `IndexReader`.
+    pub rooms_with_active_reader: u64,
+    /// Lifetime `open_read`/`atomic_read` round trips since the search index
+    /// was created.
+    pub opened_files_total: u64,
+    /// Lifetime decrypted plaintext bytes read.
+    pub decrypted_bytes_total: u64,
+    /// Decrypted plaintext bytes currently referenced by readers.
+    pub live_decrypted_len_bytes: u64,
+    /// Allocation capacity currently referenced by readers (capacity slack is
+    /// part of the retained allocation).
+    pub live_decrypted_capacity_bytes: u64,
 }
 
 impl SearchIndex {
@@ -112,7 +138,11 @@ impl SearchIndex {
         room_indexes: Arc<Mutex<HashMap<OwnedRoomId, RoomIndex>>>,
         search_index_store_kind: SearchIndexStoreKind,
     ) -> Self {
-        Self { room_indexes, search_index_store_kind }
+        Self {
+            room_indexes,
+            search_index_store_kind,
+            decrypted_file_accounting: Arc::new(DecryptedFileAccounting::default()),
+        }
     }
 
     /// Acquire [`SearchIndexGuard`] for this [`SearchIndex`].
@@ -120,6 +150,27 @@ impl SearchIndex {
         SearchIndexGuard {
             index_map: self.room_indexes.lock().await,
             search_index_store_kind: &self.search_index_store_kind,
+            decrypted_file_accounting: &self.decrypted_file_accounting,
+        }
+    }
+
+    /// Content-free snapshot of the retention-relevant state (#1344).
+    ///
+    /// Locks the room-index map briefly; a long bulk execution holds that lock
+    /// and the sample waits for it, so the caller sees a consistent state.
+    pub async fn diagnostics(&self) -> SearchIndexDiagnostics {
+        let index_map = self.room_indexes.lock().await;
+        let accounting = self.decrypted_file_accounting.snapshot();
+        SearchIndexDiagnostics {
+            rooms_total: index_map.len() as u64,
+            rooms_with_active_reader: index_map
+                .values()
+                .filter(|room_index| room_index.has_active_reader())
+                .count() as u64,
+            opened_files_total: accounting.opened_files_total,
+            decrypted_bytes_total: accounting.decrypted_bytes_total,
+            live_decrypted_len_bytes: accounting.live_len_bytes,
+            live_decrypted_capacity_bytes: accounting.live_capacity_bytes,
         }
     }
 }
@@ -132,6 +183,10 @@ pub struct SearchIndexGuard<'a> {
 
     /// Base directory that stores the directories for each RoomIndex
     search_index_store_kind: &'a SearchIndexStoreKind,
+
+    /// Shared decrypted-allocation accounting past through to new room
+    /// indexes.
+    decrypted_file_accounting: &'a Arc<DecryptedFileAccounting>,
 }
 
 impl SearchIndexGuard<'_> {
@@ -152,12 +207,14 @@ impl SearchIndexGuard<'_> {
             SearchIndexStoreKind::EncryptedDirectory(path, password) => {
                 RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id)
                     .encrypted(password)
+                    .with_decrypted_accounting(self.decrypted_file_accounting.clone())
                     .build()?
             }
             SearchIndexStoreKind::EncryptedDirectoryWithConfig(path, password, config) => {
                 RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id)
                     .config(config.clone())
                     .encrypted(password)
+                    .with_decrypted_accounting(self.decrypted_file_accounting.clone())
                     .build()?
             }
             SearchIndexStoreKind::InMemory => RoomIndexBuilder::new_in_memory(room_id).build(),
@@ -1941,5 +1998,75 @@ mod tests {
         let results = room.search("alpha", 3, None).await.unwrap();
         assert_eq!(results.len(), 1, "Original should stay indexed, got {results:?}");
         assert_eq!(results[0].1, original_id, "unexpected event id: {results:?}");
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_search_index_diagnostics_count_rooms_readers_and_decrypted_allocations() {
+        use tempfile::tempdir;
+
+        let room_id = room_id!("!room_id:localhost");
+        let event_id = event_id!("$event_id:localhost");
+        let user_id = user_id!("@user_id:localhost");
+        let tmpdir = tempdir().expect("tempdir");
+        let index = SearchIndex::new(
+            Arc::new(Mutex::new(HashMap::new())),
+            SearchIndexStoreKind::encrypted_directory_ngram(
+                tmpdir.path().to_path_buf(),
+                "secret".to_owned(),
+                2,
+                4,
+            )
+            .expect("ngram bounds should be valid"),
+        );
+
+        let before = index.diagnostics().await;
+        assert_eq!(before.rooms_total, 0);
+        assert_eq!(before.rooms_with_active_reader, 0);
+        assert_eq!(before.opened_files_total, 0);
+        assert_eq!(before.decrypted_bytes_total, 0);
+        assert_eq!(before.live_decrypted_len_bytes, 0);
+        assert_eq!(before.live_decrypted_capacity_bytes, 0);
+
+        let event = EventFactory::new()
+            .room(room_id)
+            .sender(user_id)
+            .text_msg("再アンケートです")
+            .event_id(event_id)
+            .into_any_sync_message_like_event();
+        let AnySyncMessageLikeEvent::RoomMessage(event) = event else {
+            panic!("expected room message event");
+        };
+        let event = event.as_original().expect("message should be original").clone();
+        let MessageType::Text(content) = &event.content.msgtype else {
+            panic!("expected a text message");
+        };
+        let indexable = IndexableEvent::new(
+            event.event_id.clone(),
+            event.event_id.clone(),
+            event.sender.clone(),
+            Some(event.origin_server_ts),
+            content.body.clone(),
+        );
+
+        let mut guard = index.lock().await;
+        guard
+            .execute(RoomIndexOperation::Add(indexable), room_id)
+            .expect("event should be indexed");
+        drop(guard);
+
+        let after = index.diagnostics().await;
+        assert_eq!(after.rooms_total, 1);
+        assert_eq!(after.rooms_with_active_reader, 1);
+        assert!(after.opened_files_total > 0, "indexing must have decrypted at least one file");
+        assert!(after.decrypted_bytes_total > 0);
+        assert!(
+            after.live_decrypted_len_bytes > 0,
+            "the retained reader must hold decrypted bytes"
+        );
+        assert!(
+            after.live_decrypted_capacity_bytes >= after.live_decrypted_len_bytes,
+            "capacity must cover the retained plaintext"
+        );
     }
 }
