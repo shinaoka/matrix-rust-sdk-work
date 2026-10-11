@@ -208,10 +208,10 @@ impl RoomIndex {
         Ok(self.index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?)
     }
 
-    /// Commit added events to [`RoomIndex`]. The changes are not reflected in
-    /// the search results until the serchers are reloaded.
+    /// Commit added events to [`RoomIndex`].
     ///
-    /// Use [`RoomIndex::commit_and_reload`] for this purpose.
+    /// The changes are visible to every reader built after this returns; an
+    /// operation's own reader is dropped when the operation ends.
     fn commit(&mut self, writer: &mut SearchIndexWriter) -> Result<OpStamp, IndexError> {
         let last_commit_opstamp = writer.commit()?; // TODO: This is blocking. Handle it.
         self.uncommitted_adds.clear();
@@ -219,28 +219,18 @@ impl RoomIndex {
         Ok(last_commit_opstamp)
     }
 
-    /// Commit added events to [`RoomIndex`] and
-    /// update searchers so that they reflect the state of the last
-    /// `.commit()`.
+    /// Commit added events to [`RoomIndex`].
     ///
-    /// Every commit should be rapidly reflected on your `IndexReader` and you
-    /// should not need to call `reload()` at all.
-    ///
-    /// This automatic reload can take 10s of milliseconds to kick in however,
-    /// and in unit tests it can be nice to deterministically force the
-    /// reload of searchers.
-    fn commit_and_reload(
-        &mut self,
-        writer: &mut SearchIndexWriter,
-        reader: &IndexReader,
-    ) -> Result<OpStamp, IndexError> {
+    /// Nothing is reloaded here. The reader an operation built is dropped when
+    /// that operation ends, and the next operation builds a reader from the
+    /// committed metadata, so reloading a reader that is about to be discarded
+    /// would only re-open and re-decrypt this room's component files twice.
+    fn commit_batch(&mut self, writer: &mut SearchIndexWriter) -> Result<OpStamp, IndexError> {
         debug!(
-            "RoomIndex: committing and reloading: uncommitted: {:?}, {:?}",
+            "RoomIndex: committing: uncommitted: {:?}, {:?}",
             self.uncommitted_adds, self.uncommitted_removes
         );
-        let last_commit_opstamp = self.commit(writer)?;
-        reader.reload()?;
-        Ok(last_commit_opstamp)
+        self.commit(writer)
     }
 
     /// Search the [`RoomIndex`] for some query. Returns a list of
@@ -535,7 +525,7 @@ impl RoomIndex {
         let reader = self.reader()?;
         let rollback = self.begin_batch();
         let result = match self.execute_with_retry(&mut writer, &reader, &operation, 5) {
-            Ok(()) => self.commit_and_reload(&mut writer, &reader).map(|_| ()),
+            Ok(()) => self.commit_batch(&mut writer).map(|_| ()),
             Err(err) => Err(err),
         };
         if let Err(err) = result {
@@ -590,7 +580,7 @@ impl RoomIndex {
         }
 
         let result = result
-            .and_then(|()| self.commit_and_reload(&mut writer, &reader).map(|_| ()))
+            .and_then(|()| self.commit_batch(&mut writer).map(|_| ()))
             .and_then(|()| writer.wait_merging_threads().map_err(IndexError::from));
         if let Err(err) = result {
             self.rollback_batch(rollback);
