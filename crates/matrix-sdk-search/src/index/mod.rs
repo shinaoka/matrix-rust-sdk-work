@@ -29,7 +29,6 @@ pub use cursor::SearchCursor;
 // named by `matrix-sdk` when it threads it into the room index builders.
 pub use crate::encrypted::encrypted_dir::DecryptedFileAccounting;
 use cursor::{CursorTopCollector, candidate_cursor};
-use once_cell::sync::OnceCell;
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt,
 };
@@ -41,7 +40,7 @@ use tantivy::{
     schema::{Field, IndexRecordOption, Term, Value},
     tokenizer::{NgramTokenizer, TokenStream},
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::{
     OpStamp, TANTIVY_INDEX_MEMORY_BUDGET,
@@ -152,11 +151,6 @@ pub struct RoomIndex {
     /// which deletes by that key, can reconcile these entries too.
     uncommitted_adds: HashMap<OwnedEventId, OwnedEventId>,
     uncommitted_removes: HashSet<OwnedEventId>,
-    /// Cached [`IndexReader`].
-    ///
-    /// It is costly to create one, so let's keep it in memory when needed; see
-    /// [`RoomIndex::reader`] to learn more.
-    reader: OnceCell<IndexReader>,
 }
 
 impl fmt::Debug for RoomIndex {
@@ -186,7 +180,6 @@ impl RoomIndex {
             room_id: room_id.to_owned(),
             uncommitted_adds: HashMap::new(),
             uncommitted_removes: HashSet::new(),
-            reader: OnceCell::new(),
         }
     }
 
@@ -196,25 +189,23 @@ impl RoomIndex {
         Ok(SearchIndexWriter::new(writer, self.schema.clone()))
     }
 
-    /// Whether a reader was created and is kept cached for this index.
+    /// Build an [`IndexReader`] for this index.
     ///
-    /// This observes the existing [`OnceCell`] without initializing it, so it
-    /// is safe for diagnostic sampling.
-    pub fn has_active_reader(&self) -> bool {
-        self.reader.get().is_some()
-    }
-
-    /// Get or create the cached [`IndexReader`] for this index.
+    /// Readers are deliberately not retained. "Search reader memory plateaus
+    /// under the agreed budget as indexed room/history counts grow": an
+    /// encrypted index decrypts every component file into a fresh allocation
+    /// when its reader is built, so keeping one reader per room kept a
+    /// whole-room decrypted copy resident for the whole session (measured: 153
+    /// rooms, 222.52 MiB of live decrypted buffers). Each operation builds the
+    /// reader it needs and drops it when the operation ends.
     ///
     /// The reload policy is [`ReloadPolicy::Manual`]: we are the only writer of
-    /// this index, and every commit goes through
-    /// [`RoomIndex::commit_and_reload`], which reloads explicitly. Tantivy's
-    /// default policy would instead spawn one meta file watcher thread per
-    /// index, i.e. one per room, and panics if that thread cannot be spawned.
-    fn reader(&self) -> Result<&IndexReader, IndexError> {
-        self.reader.get_or_try_init(|| {
-            Ok(self.index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?)
-        })
+    /// this index, and a reader built after a commit already sees that commit,
+    /// so no watcher thread is needed. Tantivy's default policy would instead
+    /// spawn one meta file watcher thread per index, i.e. one per room, and
+    /// panics if that thread cannot be spawned.
+    fn reader(&self) -> Result<IndexReader, IndexError> {
+        Ok(self.index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?)
     }
 
     /// Commit added events to [`RoomIndex`]. The changes are not reflected in
@@ -238,13 +229,17 @@ impl RoomIndex {
     /// This automatic reload can take 10s of milliseconds to kick in however,
     /// and in unit tests it can be nice to deterministically force the
     /// reload of searchers.
-    fn commit_and_reload(&mut self, writer: &mut SearchIndexWriter) -> Result<OpStamp, IndexError> {
+    fn commit_and_reload(
+        &mut self,
+        writer: &mut SearchIndexWriter,
+        reader: &IndexReader,
+    ) -> Result<OpStamp, IndexError> {
         debug!(
             "RoomIndex: committing and reloading: uncommitted: {:?}, {:?}",
             self.uncommitted_adds, self.uncommitted_removes
         );
         let last_commit_opstamp = self.commit(writer)?;
-        self.reader()?.reload()?;
+        reader.reload()?;
         Ok(last_commit_opstamp)
     }
 
@@ -261,8 +256,23 @@ impl RoomIndex {
         max_number_of_results: usize,
         pagination_offset: Option<usize>,
     ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
+        let reader = self.reader()?;
+        self.search_with_reader(&reader, query, max_number_of_results, pagination_offset)
+    }
+
+    /// [`RoomIndex::search`] against a caller-held reader.
+    ///
+    /// A batch resolves one reader for all of its lookups, so deduplication does
+    /// not pay one reader build per event.
+    fn search_with_reader(
+        &self,
+        reader: &IndexReader,
+        query: &str,
+        max_number_of_results: usize,
+        pagination_offset: Option<usize>,
+    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
         let query = self.query_parser.parse_query(query)?;
-        let searcher = self.reader()?.searcher();
+        let searcher = reader.searcher();
 
         let offset = pagination_offset.unwrap_or(0);
 
@@ -294,7 +304,8 @@ impl RoomIndex {
             return Ok(Vec::new());
         }
         let query = self.literal_query(query)?;
-        let searcher = self.reader()?.searcher();
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
         let candidates = searcher.search(&query, &CursorTopCollector { limit, cursor })?;
         Ok(candidates.iter().filter_map(candidate_cursor).collect())
     }
@@ -370,14 +381,19 @@ impl RoomIndex {
         Ok(ret)
     }
 
-    fn events_to_be_removed(&self, event_id: &EventId) -> Result<Vec<OwnedEventId>, IndexError> {
+    fn events_to_be_removed(
+        &self,
+        reader: &IndexReader,
+        event_id: &EventId,
+    ) -> Result<Vec<OwnedEventId>, IndexError> {
         // Match by primary key too: an edit document is keyed by the edit event
         // id with the original event id as its deletion key, so removing the
         // redacted edit by its own id must still find it.
         let primary = self.schema.get_field_name(self.schema.primary_key());
         let deletion = self.schema.get_field_name(self.schema.deletion_key());
         Ok(self
-            .search(
+            .search_with_reader(
+                reader,
                 format!("{primary}:\"{event_id}\" OR {deletion}:\"{event_id}\"").as_str(),
                 10000,
                 None,
@@ -390,9 +406,10 @@ impl RoomIndex {
     fn add(
         &mut self,
         writer: &mut SearchIndexWriter,
+        reader: &IndexReader,
         event: IndexableEvent,
     ) -> Result<(), IndexError> {
-        if !self.contains(&event.event_id) {
+        if !self.contains(reader, &event.event_id)? {
             writer.add(self.schema.make_doc(event.clone())?)?;
         }
         self.uncommitted_removes.remove(&event.event_id);
@@ -403,9 +420,10 @@ impl RoomIndex {
     fn remove(
         &mut self,
         writer: &mut SearchIndexWriter,
+        reader: &IndexReader,
         event_id: OwnedEventId,
     ) -> Result<(), IndexError> {
-        let events = self.events_to_be_removed(&event_id)?;
+        let events = self.events_to_be_removed(reader, &event_id)?;
 
         writer.remove(&event_id);
 
@@ -438,19 +456,20 @@ impl RoomIndex {
     fn execute_impl(
         &mut self,
         writer: &mut SearchIndexWriter,
+        reader: &IndexReader,
         operation: &RoomIndexOperation,
     ) -> Result<(), IndexError> {
         debug!("INDEX: executing {operation:?}");
         match operation.clone() {
             RoomIndexOperation::Add(event) => {
-                self.add(writer, event)?;
+                self.add(writer, reader, event)?;
             }
             RoomIndexOperation::Remove(event_id) => {
-                self.remove(writer, event_id)?;
+                self.remove(writer, reader, event_id)?;
             }
             RoomIndexOperation::Edit(remove_event_id, event) => {
-                self.remove(writer, remove_event_id)?;
-                self.add(writer, event)?;
+                self.remove(writer, reader, remove_event_id)?;
+                self.add(writer, reader, event)?;
             }
             RoomIndexOperation::Noop => {}
         }
@@ -461,12 +480,13 @@ impl RoomIndex {
     fn execute_with_retry(
         &mut self,
         writer: &mut SearchIndexWriter,
+        reader: &IndexReader,
         operation: &RoomIndexOperation,
         retries: usize,
     ) -> Result<(), IndexError> {
         let mut num_tries = 0;
 
-        while let Err(err) = self.execute_impl(writer, operation) {
+        while let Err(err) = self.execute_impl(writer, reader, operation) {
             if num_tries == retries {
                 return Err(err);
             }
@@ -512,9 +532,36 @@ impl RoomIndex {
     /// Prefer [`RoomIndex::bulk_execute`] for multiple operations.
     pub fn execute(&mut self, operation: RoomIndexOperation) -> Result<(), IndexError> {
         let mut writer = self.writer()?;
-        self.execute_with_retry(&mut writer, &operation, 5)?;
-        self.commit_and_reload(&mut writer)?;
+        let reader = self.reader()?;
+        let rollback = self.begin_batch();
+        let result = match self.execute_with_retry(&mut writer, &reader, &operation, 5) {
+            Ok(()) => self.commit_and_reload(&mut writer, &reader).map(|_| ()),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            self.rollback_batch(rollback);
+            return Err(err);
+        }
         Ok(())
+    }
+
+    /// Snapshot the batch bookkeeping.
+    ///
+    /// A batch that fails before its commit must not leave the operations it
+    /// already staged looking committed: [`RoomIndex::contains`] consults these
+    /// maps, so a stale entry would make a later replay skip an event that was
+    /// never written.
+    fn begin_batch(&self) -> (HashMap<OwnedEventId, OwnedEventId>, HashSet<OwnedEventId>) {
+        (self.uncommitted_adds.clone(), self.uncommitted_removes.clone())
+    }
+
+    /// Restore the batch bookkeeping recorded by [`RoomIndex::begin_batch`].
+    fn rollback_batch(
+        &mut self,
+        snapshot: (HashMap<OwnedEventId, OwnedEventId>, HashSet<OwnedEventId>),
+    ) {
+        self.uncommitted_adds = snapshot.0;
+        self.uncommitted_removes = snapshot.1;
     }
 
     /// Bulk execute [`RoomIndexOperation`]s
@@ -528,37 +575,41 @@ impl RoomIndex {
     /// calls.
     pub fn bulk_execute(&mut self, operations: Vec<RoomIndexOperation>) -> Result<(), IndexError> {
         let mut writer = self.writer()?;
+        let reader = self.reader()?;
+        let rollback = self.begin_batch();
         let mut operations = operations.into_iter();
         let mut next_operation = operations.next();
 
+        let mut result = Ok(());
         while let Some(ref operation) = next_operation {
-            self.execute_with_retry(&mut writer, operation, 5)?;
+            if let Err(err) = self.execute_with_retry(&mut writer, &reader, operation, 5) {
+                result = Err(err);
+                break;
+            }
             next_operation = operations.next();
         }
 
-        self.commit_and_reload(&mut writer)?;
-        writer.wait_merging_threads()?;
+        let result = result
+            .and_then(|()| self.commit_and_reload(&mut writer, &reader).map(|_| ()))
+            .and_then(|()| writer.wait_merging_threads().map_err(IndexError::from));
+        if let Err(err) = result {
+            self.rollback_batch(rollback);
+            return Err(err);
+        }
 
         Ok(())
     }
 
-    fn contains(&self, event_id: &EventId) -> bool {
-        let search_result = self.search(
+    fn contains(&self, reader: &IndexReader, event_id: &EventId) -> Result<bool, IndexError> {
+        let results = self.search_with_reader(
+            reader,
             format!("{}:\"{event_id}\"", self.schema.get_field_name(self.schema.primary_key()))
                 .as_str(),
             1,
             None,
-        );
-        match search_result {
-            Ok(results) => {
-                !self.uncommitted_removes.contains(event_id)
-                    && (!results.is_empty() || self.uncommitted_adds.contains_key(event_id))
-            }
-            Err(err) => {
-                warn!("Failed to check if event has been indexed, assuming it has: {err}");
-                true
-            }
-        }
+        )?;
+        Ok(!self.uncommitted_removes.contains(event_id)
+            && (!results.is_empty() || self.uncommitted_adds.contains_key(event_id)))
     }
 }
 
@@ -597,6 +648,15 @@ mod tests {
         IndexableEvent, MAX_MILLISECONDS, MilliSecondsSinceUnixEpoch, RoomIndex,
         RoomIndexOperation, UInt, builder::RoomIndexBuilder,
     };
+
+    /// Whether the committed index holds `event_id`.
+    ///
+    /// `RoomIndex::contains` takes the operation's reader and is fallible, so
+    /// tests resolve a reader the way an operation does.
+    fn contains(index: &RoomIndex, event_id: &EventId) -> bool {
+        let reader = index.reader().expect("build reader");
+        index.contains(&reader, event_id).expect("contains")
+    }
     use crate::{config::SearchIndexConfig, error::IndexError};
 
     /// Build an [`IndexableEvent`] from a text room message (tests only handle
@@ -688,7 +748,7 @@ mod tests {
                 index.execute(remove).unwrap();
             }
             assert!(index.search("replacementunique", 10, None).unwrap().is_empty());
-            assert!(!index.contains(edit));
+            assert!(!contains(&index, edit));
         }
     }
 
@@ -1109,7 +1169,7 @@ mod tests {
 
         let event_id = event_id!("$event_id:localhost");
 
-        assert!(!index.contains(event_id), "Index should not contain event");
+        assert!(!contains(&index, event_id), "Index should not contain event");
     }
 
     #[test]
@@ -1127,7 +1187,7 @@ mod tests {
 
         index_message(&mut index, event)?;
 
-        assert!(index.contains(event_id), "Index should contain event");
+        assert!(contains(&index, event_id), "Index should contain event");
 
         Ok(())
     }
@@ -1147,12 +1207,12 @@ mod tests {
 
         index_message(&mut index, event.clone())?;
 
-        assert!(index.contains(event_id), "Index should contain event");
+        assert!(contains(&index, event_id), "Index should contain event");
 
         // indexing again should do nothing
         index_message(&mut index, event)?;
 
-        assert!(index.contains(event_id), "Index should still contain event");
+        assert!(contains(&index, event_id), "Index should still contain event");
 
         let result = index.search("sentence", 10, None).expect("search failed with: {result:?}");
 
@@ -1175,11 +1235,11 @@ mod tests {
 
         index_message(&mut index, event)?;
 
-        assert!(index.contains(event_id), "Index should contain event");
+        assert!(contains(&index, event_id), "Index should contain event");
 
         index_remove(&mut index, event_id)?;
 
-        assert!(!index.contains(event_id), "Index should not contain event");
+        assert!(!contains(&index, event_id), "Index should not contain event");
 
         Ok(())
     }
@@ -1200,7 +1260,7 @@ mod tests {
 
         index_message(&mut index, old_event)?;
 
-        assert!(index.contains(old_event_id), "Index should contain event");
+        assert!(contains(&index, old_event_id), "Index should contain event");
 
         let new_event_id = event_id!("$new_event_id:localhost");
         let edit = f
@@ -1214,8 +1274,8 @@ mod tests {
 
         index_edit(&mut index, old_event_id, edit)?;
 
-        assert!(!index.contains(old_event_id), "Index should not contain old event");
-        assert!(index.contains(new_event_id), "Index should contain edited event");
+        assert!(!contains(&index, old_event_id), "Index should not contain old event");
+        assert!(contains(&index, new_event_id), "Index should contain edited event");
 
         Ok(())
     }
@@ -1248,7 +1308,7 @@ mod tests {
             RoomIndexOperation::Edit(original_id.to_owned(), edit),
         ])?;
 
-        assert!(index.contains(edit_id), "Edited document should be indexed");
+        assert!(contains(&index, edit_id), "Edited document should be indexed");
 
         let result = index.search("sentence", 10, None)?;
         assert_eq!(result.len(), 1, "Search should find the edited document, got {result:?}");
