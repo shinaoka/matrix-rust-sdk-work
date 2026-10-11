@@ -16,7 +16,10 @@ use std::{
     fs::{File, create_dir_all},
     io::{BufWriter, Cursor, Error as IoError, ErrorKind, Read, Write},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use aes::{
@@ -177,10 +180,122 @@ pub struct EncryptedMmapDirectory {
     mmap_dir: tantivy::directory::MmapDirectory,
     encryption_key: KeyBuffer,
     mac_key: KeyBuffer,
+    /// Optional shared allocation accounting for the #1344 memory audit.
+    /// `None` keeps every pre-existing caller on the unchanged path.
+    accounting: Option<Arc<DecryptedFileAccounting>>,
 }
 
+// Matrix desktop fork patch surface: content-free, shared accounting for the
+// decrypted index-file allocations. `live_*` tracks the plaintext allocation
+// through its owner type (see [`TrackedDecryptedBytes`]); the totals are
+// lifetime transfer counters for `open_read` and `atomic_read`.
+/// Shared accounting for the decrypted index-file allocations.
+#[derive(Debug, Default)]
+pub struct DecryptedFileAccounting {
+    /// Number of `open_read`/`atomic_read` round trips since the directory
+    /// opened.
+    opened_files_total: AtomicU64,
+    /// Total decrypted plaintext bytes read since the directory opened.
+    decrypted_bytes_total: AtomicU64,
+    /// Plaintext bytes currently referenced by at least one live owner.
+    live_len_bytes: AtomicU64,
+    /// Allocation capacity currently referenced by at least one live owner.
+    live_capacity_bytes: AtomicU64,
+}
+
+/// Point-in-time snapshot of [`DecryptedFileAccounting`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DecryptedFileAccountingSnapshot {
+    /// Number of `open_read`/`atomic_read` round trips since the directory
+    /// opened.
+    pub opened_files_total: u64,
+    /// Total decrypted plaintext bytes read since the directory opened.
+    pub decrypted_bytes_total: u64,
+    /// Plaintext bytes currently referenced by at least one live owner.
+    pub live_len_bytes: u64,
+    /// Allocation capacity currently referenced by at least one live owner.
+    pub live_capacity_bytes: u64,
+}
+
+impl DecryptedFileAccounting {
+    /// Record a read round trip and its decrypted plaintext length.
+    fn record_opened(&self, decrypted_len_bytes: usize) {
+        self.opened_files_total.fetch_add(1, Ordering::Relaxed);
+        self.decrypted_bytes_total.fetch_add(decrypted_len_bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Snapshot the current totals and live charges.
+    pub fn snapshot(&self) -> DecryptedFileAccountingSnapshot {
+        DecryptedFileAccountingSnapshot {
+            opened_files_total: self.opened_files_total.load(Ordering::Relaxed),
+            decrypted_bytes_total: self.decrypted_bytes_total.load(Ordering::Relaxed),
+            live_len_bytes: self.live_len_bytes.load(Ordering::Relaxed),
+            live_capacity_bytes: self.live_capacity_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Owns the decrypted plaintext of one encrypted file and charges its live
+/// allocation to the shared accounting until the last reference drops.
+///
+/// Every `OwnedBytes` slice/clone of the decrypted file shares this one owner
+/// (the underlying `Arc`), so the charge covers converted readers that keep
+/// `OwnedBytes` (for example a Delete file read into an `AliveBitSet`) rather
+/// than only the original `FileSlice`.
+struct TrackedDecryptedBytes {
+    bytes: Vec<u8>,
+    accounting: Arc<DecryptedFileAccounting>,
+}
+
+impl TrackedDecryptedBytes {
+    /// Charge the live counters for the allocation being handed out.
+    fn new(bytes: Vec<u8>, accounting: Arc<DecryptedFileAccounting>) -> Self {
+        accounting.live_len_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        accounting.live_capacity_bytes.fetch_add(bytes.capacity() as u64, Ordering::Relaxed);
+        Self { bytes, accounting }
+    }
+}
+
+impl std::fmt::Debug for TrackedDecryptedBytes {
+    /// Content-free: never formats the plaintext bytes.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TrackedDecryptedBytes")
+            .field("len", &self.bytes.len())
+            .field("capacity", &self.bytes.capacity())
+            .finish()
+    }
+}
+
+impl Drop for TrackedDecryptedBytes {
+    fn drop(&mut self) {
+        // The allocation is freed only when the last reference to this owner
+        // drops; the Vec fields are still intact here.
+        self.accounting.live_len_bytes.fetch_sub(self.bytes.len() as u64, Ordering::Relaxed);
+        self.accounting
+            .live_capacity_bytes
+            .fetch_sub(self.bytes.capacity() as u64, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for TrackedDecryptedBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+// SAFETY: the Vec's heap allocation keeps its address when the wrapper moves,
+// and the wrapper exposes no shared mutation that reallocates or replaces that
+// allocation, so the Deref target address is stable for the owner's lifetime.
+unsafe impl stable_deref_trait::StableDeref for TrackedDecryptedBytes {}
+
 impl EncryptedMmapDirectory {
-    fn new(store_key: KeyBuffer, path: &Path) -> Result<Self, OpenDirectoryError> {
+    fn new(
+        store_key: KeyBuffer,
+        path: &Path,
+        accounting: Option<Arc<DecryptedFileAccounting>>,
+    ) -> Result<Self, OpenDirectoryError> {
         // Expand the store key into a encryption and MAC key.
         let (encryption_key, mac_key) = EncryptedMmapDirectory::expand_store_key(&store_key)
             .map_err(|err| err.into_tv_err(path))?;
@@ -188,7 +303,7 @@ impl EncryptedMmapDirectory {
         // Open our underlying bare Tantivy mmap based directory.
         let mmap_dir = tantivy::directory::MmapDirectory::open(path)?;
 
-        Ok(EncryptedMmapDirectory { mmap_dir, encryption_key, mac_key })
+        Ok(EncryptedMmapDirectory { mmap_dir, encryption_key, mac_key, accounting })
     }
     /// Open a encrypted mmap directory. If the directory is empty a new
     ///   directory key will be generated and encrypted with the given
@@ -215,6 +330,19 @@ impl EncryptedMmapDirectory {
         path: P,
         passphrase: &str,
         key_derivation_count: u32,
+    ) -> Result<Self, OpenDirectoryError> {
+        Self::open_or_create_with_accounting(path, passphrase, key_derivation_count, None)
+    }
+
+    /// Open a encrypted mmap directory like [`Self::open_or_create`], with a
+    /// shared accounting handle for the #1344 memory audit. `Some(accounting)``
+    /// makes `open_read` and `atomic_read` record their decrypted plaintext
+    /// allocations; `None` keeps the historical behavior.
+    pub fn open_or_create_with_accounting<P: AsRef<Path>>(
+        path: P,
+        passphrase: &str,
+        key_derivation_count: u32,
+        accounting: Option<Arc<DecryptedFileAccounting>>,
     ) -> Result<Self, OpenDirectoryError> {
         if passphrase.is_empty() {
             return Err(IoError::other("empty passphrase").into_tv_err(path.as_ref()));
@@ -246,7 +374,7 @@ impl EncryptedMmapDirectory {
                 )?
             }
         };
-        EncryptedMmapDirectory::new(store_key, path.as_ref())
+        EncryptedMmapDirectory::new(store_key, path.as_ref(), accounting)
     }
 
     /// Open a encrypted mmap directory.
@@ -273,7 +401,7 @@ impl EncryptedMmapDirectory {
         // Expand the store key into a encryption and MAC key.
         let (_, store_key) = EncryptedMmapDirectory::load_store_key(key_file, passphrase)
             .map_err(|err| err.into_tv_err(path.as_ref()))?;
-        EncryptedMmapDirectory::new(store_key, path.as_ref())
+        EncryptedMmapDirectory::new(store_key, path.as_ref(), None)
     }
 
     /// Change the passphrase that is used to encrypt the store key.
@@ -564,7 +692,15 @@ impl Directory for EncryptedMmapDirectory {
             .read_to_end(&mut decrypted)
             .map_err(|err| <IoError as IntoTvError<OpenReadError>>::into_tv_err(err, path))?;
 
-        Ok(FileSlice::from(decrypted))
+        match &self.accounting {
+            Some(accounting) => {
+                // Track the decrypted allocation as long as any `OwnedBytes`
+                // derived from this file is referenced.
+                accounting.record_opened(decrypted.len());
+                Ok(FileSlice::from(TrackedDecryptedBytes::new(decrypted, accounting.clone())))
+            }
+            None => Ok(FileSlice::from(decrypted)),
+        }
     }
 
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
@@ -610,6 +746,11 @@ impl Directory for EncryptedMmapDirectory {
         reader
             .read_to_end(&mut decrypted)
             .map_err(|err| <IoError as IntoTvError<OpenReadError>>::into_tv_err(err, path))?;
+        if let Some(accounting) = &self.accounting {
+            // The returned `Vec` belongs to the caller and is transient; only
+            // the lifetime transfer counters are recorded for it.
+            accounting.record_opened(decrypted.len());
+        }
         Ok(decrypted)
     }
 
@@ -655,9 +796,13 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use tantivy::Directory;
     use tempfile::tempdir;
 
-    use crate::encrypted::encrypted_dir::{EncryptedMmapDirectory, PBKDF_COUNT};
+    use crate::{
+        encrypted::encrypted_dir::{EncryptedMmapDirectory, PBKDF_COUNT},
+        index::DecryptedFileAccounting,
+    };
 
     #[test]
     fn create_new_store_and_reopen() {
@@ -706,5 +851,141 @@ mod tests {
         let dir = EncryptedMmapDirectory::open_or_create(&nested_path, "password", PBKDF_COUNT)
             .expect("Should create store in non-existent nested directory");
         drop(dir);
+    }
+
+    #[test]
+    fn open_read_accounting_tracks_the_decrypted_allocation_until_the_last_owner_drops() {
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let tmpdir = tempdir().unwrap();
+        let accounting = Arc::new(DecryptedFileAccounting::default());
+        let dir = EncryptedMmapDirectory::open_or_create_with_accounting(
+            tmpdir.path(),
+            "wordpass",
+            PBKDF_COUNT,
+            Some(accounting.clone()),
+        )
+        .expect("can't create a store");
+
+        dir.atomic_write(Path::new("index.bin"), &[7u8; 4096]).expect("write should succeed");
+
+        let before = accounting.snapshot();
+        assert_eq!(before.opened_files_total, 0);
+        assert_eq!(before.live_len_bytes, 0);
+
+        let file_slice = dir.open_read(Path::new("index.bin")).expect("read should succeed");
+        let derived_owned_bytes = file_slice.read_bytes().expect("bytes should read");
+
+        let after_open = accounting.snapshot();
+        assert_eq!(after_open.opened_files_total, 1);
+        assert_eq!(after_open.decrypted_bytes_total, 4096);
+        assert_eq!(after_open.live_len_bytes, 4096);
+        assert!(after_open.live_capacity_bytes >= 4096, "capacity must cover the allocation");
+
+        // The charge lives with the allocation, not with the FileSlice: a reader
+        // that converted to OwnedBytes (e.g. an AliveBitSet) keeps the bytes.
+        drop(file_slice);
+        let after_file_slice_drop = accounting.snapshot();
+        assert_eq!(after_file_slice_drop.live_len_bytes, 4096);
+
+        // The last reference to the decrypted allocation releases the charge.
+        drop(derived_owned_bytes);
+        let after_all_dropped = accounting.snapshot();
+        assert_eq!(after_all_dropped.live_len_bytes, 0);
+        assert_eq!(after_all_dropped.live_capacity_bytes, 0);
+    }
+
+    #[test]
+    fn accounting_clones_share_one_live_charge_and_slicing_keeps_the_allocation() {
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let tmpdir = tempdir().unwrap();
+        let accounting = Arc::new(DecryptedFileAccounting::default());
+        let dir = EncryptedMmapDirectory::open_or_create_with_accounting(
+            tmpdir.path(),
+            "wordpass",
+            PBKDF_COUNT,
+            Some(accounting.clone()),
+        )
+        .expect("can't create a store");
+
+        dir.atomic_write(Path::new("index.bin"), &[3u8; 2048]).expect("write should succeed");
+
+        let file_slice = dir.open_read(Path::new("index.bin")).expect("read should succeed");
+        let full = file_slice.read_bytes().expect("bytes should read");
+        let subrange = full.slice(0..16);
+
+        drop(file_slice);
+        drop(full);
+        assert_eq!(accounting.snapshot().live_len_bytes, 2048);
+
+        drop(subrange);
+        assert_eq!(accounting.snapshot().live_len_bytes, 0);
+    }
+
+    #[test]
+    fn accounting_charges_are_independent_per_decrypted_file() {
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let tmpdir = tempdir().unwrap();
+        let accounting = Arc::new(DecryptedFileAccounting::default());
+        let dir = EncryptedMmapDirectory::open_or_create_with_accounting(
+            tmpdir.path(),
+            "wordpass",
+            PBKDF_COUNT,
+            Some(accounting.clone()),
+        )
+        .expect("can't create a store");
+
+        dir.atomic_write(Path::new("a.bin"), &[1u8; 1024]).expect("write should succeed");
+        dir.atomic_write(Path::new("b.bin"), &[2u8; 512]).expect("write should succeed");
+
+        let a = dir.open_read(Path::new("a.bin")).expect("read should succeed");
+        let b = dir.open_read(Path::new("b.bin")).expect("read should succeed");
+        assert_eq!(accounting.snapshot().opened_files_total, 2);
+        assert_eq!(accounting.snapshot().live_len_bytes, 1024 + 512);
+
+        drop(a);
+        assert_eq!(accounting.snapshot().live_len_bytes, 512);
+        drop(b);
+        assert_eq!(accounting.snapshot().live_len_bytes, 0);
+    }
+
+    #[test]
+    fn atomic_read_records_transfer_without_a_live_charge() {
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let tmpdir = tempdir().unwrap();
+        let accounting = Arc::new(DecryptedFileAccounting::default());
+        let dir = EncryptedMmapDirectory::open_or_create_with_accounting(
+            tmpdir.path(),
+            "wordpass",
+            PBKDF_COUNT,
+            Some(accounting.clone()),
+        )
+        .expect("can't create a store");
+
+        dir.atomic_write(Path::new("meta.bin"), &[9u8; 128]).expect("write should succeed");
+        let data = dir.atomic_read(Path::new("meta.bin")).expect("read should succeed");
+        assert_eq!(data.len(), 128);
+        assert_eq!(accounting.snapshot().opened_files_total, 1);
+        assert_eq!(accounting.snapshot().decrypted_bytes_total, 128);
+        assert_eq!(accounting.snapshot().live_len_bytes, 0, "atomic reads are caller-owned");
+    }
+
+    #[test]
+    fn open_read_without_accounting_keeps_the_historical_path() {
+        use std::path::Path;
+
+        let tmpdir = tempdir().unwrap();
+        let dir = EncryptedMmapDirectory::open_or_create(tmpdir.path(), "wordpass", PBKDF_COUNT)
+            .expect("can't create a store");
+        dir.atomic_write(Path::new("index.bin"), &[5u8; 64]).expect("write should succeed");
+        let slice = dir.open_read(Path::new("index.bin")).expect("read should succeed");
+        assert_eq!(slice.read_bytes().expect("bytes should read").len(), 64);
     }
 }

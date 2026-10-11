@@ -238,7 +238,23 @@ impl RoomEventCacheState {
         &self.room_linked_chunk
     }
 
-    pub(super) fn pending_redactions_for(&self, event_ids: &[OwnedEventId]) -> std::collections::HashSet<OwnedEventId> {
+    /// Content-free, in-memory-only counts of this room's resident linked
+    /// chunk. Never touches the store and never initializes the lazily created
+    /// sentinel chunk; sampling is observation-only.
+    pub fn memory_counters(&self) -> crate::event_cache::EventCacheRoomMemoryCounters {
+        let stats = self.room_linked_chunk.memory_stats();
+        crate::event_cache::EventCacheRoomMemoryCounters {
+            chunks: stats.chunks,
+            events: stats.items,
+            gap_chunks: stats.gaps,
+            subscribers: self.subscribers_handle.count() as u64,
+        }
+    }
+
+    pub(super) fn pending_redactions_for(
+        &self,
+        event_ids: &[OwnedEventId],
+    ) -> std::collections::HashSet<OwnedEventId> {
         let pending = self.pending_redactions.lock().unwrap();
         event_ids.iter().filter(|id| pending.contains_key(*id)).cloned().collect()
     }
@@ -341,13 +357,7 @@ impl RoomEventCacheState {
         }
 
         let mut replaced_in_memory = false;
-        let targets = self
-            .pending_redactions
-            .lock()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let targets = self.pending_redactions.lock().unwrap().keys().cloned().collect::<Vec<_>>();
         for target_id in targets {
             let redaction = self.pending_redactions.lock().unwrap().get(&target_id).cloned();
             let Some(redaction) = redaction else {
@@ -405,7 +415,10 @@ impl<'a> StateLockReadGuard<'a, RoomEventCacheState> {
 
     /// Return the newest event identity in the loaded room timeline.
     pub(super) fn newest_event_id(&self) -> Option<OwnedEventId> {
-        self.state.room_linked_chunk.revents().find_map(|(_, event)| event.event_id().map(|id| id.to_owned()))
+        self.state
+            .room_linked_chunk
+            .revents()
+            .find_map(|(_, event)| event.event_id().map(|id| id.to_owned()))
     }
 
     /// See documentation of [`find_event`].
@@ -475,7 +488,10 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
 
     /// Return the newest event identity in the loaded room timeline.
     pub(super) fn newest_event_id(&self) -> Option<OwnedEventId> {
-        self.state.room_linked_chunk.revents().find_map(|(_, event)| event.event_id().map(|id| id.to_owned()))
+        self.state
+            .room_linked_chunk
+            .revents()
+            .find_map(|(_, event)| event.event_id().map(|id| id.to_owned()))
     }
 
     /// Return a mutable reference to the underlying room linked chunk.

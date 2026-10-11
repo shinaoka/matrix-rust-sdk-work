@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     config::SearchIndexConfig,
-    encrypted::encrypted_dir::{EncryptedMmapDirectory, PBKDF_COUNT},
+    encrypted::encrypted_dir::{DecryptedFileAccounting, EncryptedMmapDirectory, PBKDF_COUNT},
     error::IndexError,
     index::RoomIndex,
     schema::{MatrixSearchIndexSchema, RoomMessageSchema},
@@ -68,6 +68,7 @@ impl PhysicalRoomIndexBuilder {
             room_id: self.room_id.clone(),
             config: self.config.clone(),
             password: Zeroizing::new(password.into()),
+            accounting: None,
         }
     }
 }
@@ -110,28 +111,43 @@ pub struct EncryptedPhysicalRoomIndexBuilder {
     room_id: OwnedRoomId,
     config: SearchIndexConfig,
     password: Zeroizing<String>,
+    accounting: Option<Arc<DecryptedFileAccounting>>,
 }
 
 impl EncryptedPhysicalRoomIndexBuilder {
+    /// Share decrypted-allocation accounting with the built directory (#1344).
+    ///
+    /// Koushi fork patch surface, threaded by `matrix-sdk`'s [`SearchIndex`](
+    /// crate::index::RoomIndex). Without it the built index records nothing.
+    #[doc(hidden)]
+    pub fn with_decrypted_accounting(mut self, accounting: Arc<DecryptedFileAccounting>) -> Self {
+        self.accounting = Some(accounting);
+        self
+    }
+
     /// Build the [`RoomIndex`]
     pub fn build(&self) -> Result<RoomIndex, IndexError> {
         let path = self.path.join(self.room_id.as_str());
-        let mmap_dir =
-            match EncryptedMmapDirectory::open_or_create(path, &self.password, PBKDF_COUNT) {
-                Ok(dir) => Ok(dir),
-                Err(err) => match err {
-                    OpenDirectoryError::DoesNotExist(path) => {
-                        fs::create_dir_all(path.clone()).map_err(|err| {
-                            OpenDirectoryError::IoError {
-                                io_error: Arc::new(err),
-                                directory_path: path.to_path_buf(),
-                            }
-                        })?;
-                        EncryptedMmapDirectory::open_or_create(path, &self.password, PBKDF_COUNT)
-                    }
-                    _ => Err(err),
-                },
-            }?;
+        let mmap_dir = match EncryptedMmapDirectory::open_or_create_with_accounting(
+            path,
+            &self.password,
+            PBKDF_COUNT,
+            self.accounting.clone(),
+        ) {
+            Ok(dir) => Ok(dir),
+            Err(err) => match err {
+                OpenDirectoryError::DoesNotExist(path) => {
+                    fs::create_dir_all(path.clone()).map_err(|err| {
+                        OpenDirectoryError::IoError {
+                            io_error: Arc::new(err),
+                            directory_path: path.to_path_buf(),
+                        }
+                    })?;
+                    EncryptedMmapDirectory::open_or_create(path, &self.password, PBKDF_COUNT)
+                }
+                _ => Err(err),
+            },
+        }?;
         let schema = RoomMessageSchema::new_with_config(&self.config);
         let index = Index::open_or_create(mmap_dir, schema.as_tantivy_schema())?;
         Ok(RoomIndex::new_with(index, schema, &self.room_id, &self.config))

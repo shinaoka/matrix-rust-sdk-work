@@ -23,8 +23,8 @@ use matrix_sdk_base::{
     },
 };
 use matrix_sdk_common::linked_chunk::{
-    AsVector, Chunk, ChunkIdentifier, Error, Iter, IterBackward, LinkedChunk, ObservableUpdates,
-    Position,
+    AsVector, Chunk, ChunkIdentifier, Error, Iter, IterBackward, LinkedChunk,
+    LinkedChunkMemoryStats, ObservableUpdates, Position,
 };
 use tracing::{instrument, trace};
 
@@ -84,6 +84,11 @@ impl EventLinkedChunk {
     /// the ether, forever.
     pub fn reset(&mut self) {
         self.chunks.clear();
+    }
+
+    /// Content-free, non-initializing count of the resident chunk structure.
+    pub(in crate::event_cache) fn memory_stats(&self) -> LinkedChunkMemoryStats {
+        self.chunks.memory_stats()
     }
 
     /// Push events after all events or gaps.

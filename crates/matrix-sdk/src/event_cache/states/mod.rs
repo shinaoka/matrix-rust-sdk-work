@@ -192,6 +192,36 @@ impl StateLock {
         })
     }
 
+    /// Snapshot the resident room-timeline linked-chunk structure.
+    ///
+    /// In-memory only: unlike [`Self::read`] / [`Self::write`], this never
+    /// acquires the cross-process store lock, so a dirty store cannot trigger a
+    /// reload (reload unloads and re-hydrates history), and it never
+    /// initializes the lazily-created sentinel chunk of a linked chunk. A
+    /// diagnostic sample is therefore observation-only.
+    pub(in super::super) async fn in_memory_counters(
+        &self,
+    ) -> crate::event_cache::EventCacheMemoryDiagnostics {
+        let state = self.inner.locked_state.read().await;
+        let mut counters = crate::event_cache::EventCacheMemoryDiagnostics::default();
+        for room_state in state.by_room.values() {
+            if let Some(room) = &room_state.room {
+                let room_counters = room.memory_counters();
+                counters.rooms += 1;
+                counters.chunks = counters.chunks.saturating_add(room_counters.chunks);
+                counters.events = counters.events.saturating_add(room_counters.events);
+                counters.gap_chunks = counters.gap_chunks.saturating_add(room_counters.gap_chunks);
+                if room_counters.subscribers == 0 {
+                    counters.zero_subscriber_rooms += 1;
+                    if room_counters.events > 0 {
+                        counters.zero_subscriber_rooms_with_events += 1;
+                    }
+                }
+            }
+        }
+        counters
+    }
+
     /// Lock this [`StateLock`] with exclusive per-thread write access.
     ///
     /// This method locks the per-thread lock over the state, and then locks
