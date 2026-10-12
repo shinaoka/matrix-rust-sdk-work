@@ -118,8 +118,6 @@ pub struct SearchIndex {
 pub struct SearchIndexDiagnostics {
     /// Joined rooms with a `RoomIndex`.
     pub rooms_total: u64,
-    /// Of those, rooms with a cached `IndexReader`.
-    pub rooms_with_active_reader: u64,
     /// Lifetime `open_read`/`atomic_read` round trips since the search index
     /// was created.
     pub opened_files_total: u64,
@@ -163,10 +161,6 @@ impl SearchIndex {
         let accounting = self.decrypted_file_accounting.snapshot();
         SearchIndexDiagnostics {
             rooms_total: index_map.len() as u64,
-            rooms_with_active_reader: index_map
-                .values()
-                .filter(|room_index| room_index.has_active_reader())
-                .count() as u64,
             opened_files_total: accounting.opened_files_total,
             decrypted_bytes_total: accounting.decrypted_bytes_total,
             live_decrypted_len_bytes: accounting.live_len_bytes,
@@ -2002,7 +1996,7 @@ mod tests {
 
     #[cfg(feature = "experimental-search")]
     #[async_test]
-    async fn test_search_index_diagnostics_count_rooms_readers_and_decrypted_allocations() {
+    async fn test_search_index_diagnostics_release_readers_between_operations() {
         use tempfile::tempdir;
 
         let room_id = room_id!("!room_id:localhost");
@@ -2022,7 +2016,6 @@ mod tests {
 
         let before = index.diagnostics().await;
         assert_eq!(before.rooms_total, 0);
-        assert_eq!(before.rooms_with_active_reader, 0);
         assert_eq!(before.opened_files_total, 0);
         assert_eq!(before.decrypted_bytes_total, 0);
         assert_eq!(before.live_decrypted_len_bytes, 0);
@@ -2051,22 +2044,37 @@ mod tests {
 
         let mut guard = index.lock().await;
         guard
-            .execute(RoomIndexOperation::Add(indexable), room_id)
+            .bulk_execute(vec![RoomIndexOperation::Add(indexable)], room_id)
             .expect("event should be indexed");
         drop(guard);
+        let after_write = index.diagnostics().await;
 
-        let after = index.diagnostics().await;
-        assert_eq!(after.rooms_total, 1);
-        assert_eq!(after.rooms_with_active_reader, 1);
-        assert!(after.opened_files_total > 0, "indexing must have decrypted at least one file");
-        assert!(after.decrypted_bytes_total > 0);
-        assert!(
-            after.live_decrypted_len_bytes > 0,
-            "the retained reader must hold decrypted bytes"
+        assert_eq!(after_write.rooms_total, 1);
+        assert!(after_write.opened_files_total > 0, "indexing must have decrypted at least one file");
+        assert!(after_write.decrypted_bytes_total > 0);
+        // A reader is built per operation and dropped when the operation ends, so
+        // no decrypted index file may stay referenced between operations. Before
+        // this change the room kept one reader per room for the whole session.
+        assert_eq!(
+            after_write.live_decrypted_len_bytes, 0,
+            "no decrypted allocation may outlive the indexing operation"
         );
+        assert_eq!(after_write.live_decrypted_capacity_bytes, 0);
+
+        let results = {
+            let mut guard = index.lock().await;
+            guard.search("アンケート", 10, None, room_id).expect("search should run")
+        };
+        let after_search = index.diagnostics().await;
+
+        assert_eq!(results.len(), 1, "the search reader must see the committed document");
         assert!(
-            after.live_decrypted_capacity_bytes >= after.live_decrypted_len_bytes,
-            "capacity must cover the retained plaintext"
+            after_search.decrypted_bytes_total > after_write.decrypted_bytes_total,
+            "the search must have built its own reader"
+        );
+        assert_eq!(
+            after_search.live_decrypted_len_bytes, 0,
+            "no decrypted allocation may outlive the search operation"
         );
     }
 }
