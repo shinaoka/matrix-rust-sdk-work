@@ -61,6 +61,7 @@ use crate::{
         SqliteKeyValueStoreConnExt, SqliteTransactionExt, host_parameters,
     },
 };
+use matrix_sdk_base::event_cache::store::PersistedChunkTopology;
 
 mod keys {
     // Tables
@@ -363,7 +364,90 @@ struct EncodedEvent {
     relates_to: Option<Key>,
 }
 
+/// Direction of a gap-boundary walk over chunk links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundaryDirection {
+    /// Walk toward older chunks, following `previous` links.
+    Older,
+    /// Walk toward newer chunks, following `next` links.
+    Newer,
+}
+
+impl BoundaryDirection {
+    fn order_clause(self) -> &'static str {
+        match self {
+            BoundaryDirection::Older => "DESC",
+            BoundaryDirection::Newer => "ASC",
+        }
+    }
+}
+
+/// Chunk-link metadata shared by one boundary walk.
+struct BoundaryWalk<'a> {
+    /// Chunk identifier to `(previous, next)` link map.
+    links: &'a HashMap<u64, (Option<u64>, Option<u64>)>,
+    /// Chunk identifier to “is a gap chunk” map.
+    is_gap: &'a HashMap<u64, bool>,
+    /// Running count of decoded event bodies.
+    decoded: &'a mut usize,
+}
+
+/// Walk the chunk links from `start` in `direction` until an event chunk
+/// yields an ID-bearing event.
+///
+/// Gap chunks and event chunks without any ID-bearing decoded event are
+/// skipped, mirroring the canonical `inspect_ordered_chunks` scan. The walk is
+/// bounded by the number of chunks; a broken or cyclic link just ends the walk
+/// (`Ok(None)`), leaving the authoritative chain validation to the caller, so
+/// malformed topology keeps its existing error class.
+fn walk_boundary(
+    txn: &Transaction<'_>,
+    encryption: &Encryption,
+    linked_chunk_id: &Key,
+    walk: &mut BoundaryWalk<'_>,
+    start: u64,
+    direction: BoundaryDirection,
+) -> Result<Option<(u64, Event)>> {
+    let mut cursor = start;
+    for _ in 0..walk.links.len() {
+        let Some(&(previous, next)) = walk.links.get(&cursor) else {
+            return Ok(None);
+        };
+        let neighbor = match direction {
+            BoundaryDirection::Older => previous,
+            BoundaryDirection::Newer => next,
+        };
+        let Some(neighbor) = neighbor else {
+            return Ok(None);
+        };
+        if walk.is_gap.get(&neighbor).copied().unwrap_or(false) {
+            cursor = neighbor;
+            continue;
+        }
+        if let Some(event) = txn.load_boundary_event(
+            encryption,
+            linked_chunk_id,
+            ChunkIdentifier::new(neighbor),
+            direction,
+            walk.decoded,
+        )? {
+            return Ok(Some((neighbor, event)));
+        }
+        cursor = neighbor;
+    }
+    Ok(None)
+}
+
 trait TransactionExtForLinkedChunks {
+    fn load_boundary_event(
+        &self,
+        encryption: &Encryption,
+        linked_chunk_id: &Key,
+        chunk_id: ChunkIdentifier,
+        direction: BoundaryDirection,
+        decoded: &mut usize,
+    ) -> Result<Option<Event>>;
+
     fn rebuild_chunk(
         &self,
         encryption: &Encryption,
@@ -446,6 +530,62 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
         let prev_token_bytes = encryption.decode_value(&encoded_prev_token)?;
         let prev_token = String::from_utf8(prev_token_bytes.into_owned())?;
         Ok(Gap { token: prev_token })
+    }
+
+    /// Load the first ID-bearing event of a chunk, in the requested direction.
+    ///
+    /// The ordinary case is one row (the outermost item of the chunk) with an
+    /// event ID; the fallback scans the whole chunk in the same direction so
+    /// a cached-ID/raw-ID mismatch or a corrupted body keeps the result equal
+    /// to the canonical in-memory scan. Returns `None` when the chunk is empty
+    /// or none of its decoded events carries an event ID.
+    fn load_boundary_event(
+        &self,
+        encryption: &Encryption,
+        linked_chunk_id: &Key,
+        chunk_id: ChunkIdentifier,
+        direction: BoundaryDirection,
+        decoded: &mut usize,
+    ) -> Result<Option<Event>> {
+        let order = direction.order_clause();
+        let base_sql = format!(
+            "SELECT e.content FROM event_chunks ec \
+            JOIN events e ON e.event_id = ec.event_id \
+            WHERE ec.linked_chunk_id = ? AND ec.chunk_id = ? \
+            ORDER BY ec.position {order}"
+        );
+
+        // Fast path: the single outermost item of the chunk (`query_row` +
+        // `optional`: the chunk may legitimately be empty).
+        let maybe_encoded: Option<Vec<u8>> = self
+            .query_row(
+                &format!("{base_sql} LIMIT 1"),
+                (&linked_chunk_id, chunk_id.index()),
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(encoded) = maybe_encoded {
+            let event = encryption.decode_event(&encoded)?;
+            *decoded += 1;
+            if event.event_id().is_some() {
+                return Ok(Some(event));
+            }
+        }
+
+        // Fallback: scan the chunk in the same direction, matching the
+        // canonical `find_map` walk over the chunk's events.
+        for encoded in self
+            .prepare(&base_sql)?
+            .query_map((&linked_chunk_id, chunk_id.index()), |row| row.get::<_, Vec<u8>>(0))?
+        {
+            let event = encryption.decode_event(&encoded?)?;
+            *decoded += 1;
+            if event.event_id().is_some() {
+                return Ok(Some(event));
+            }
+        }
+
+        Ok(None)
     }
 
     fn load_events_content(
@@ -1149,6 +1289,139 @@ impl EventCacheStore for SqliteEventCacheStore {
             .await?;
 
         Ok(result)
+    }
+
+    #[instrument(skip(self))]
+    async fn load_chunk_topology(
+        &self,
+        linked_chunk_id: LinkedChunkId<'_>,
+    ) -> Result<PersistedChunkTopology, Self::Error> {
+        let _timer = timer!("method");
+
+        let hashed_linked_chunk_id =
+            self.encryption.encode_linked_chunk(keys::LINKED_CHUNKS, &linked_chunk_id);
+        let encryption = self.encryption.clone();
+
+        // All reads share one transaction so a concurrent writer cannot mix
+        // topology with boundary events.
+        self.read().await?.with_transaction(move |txn| -> Result<_> {
+            let rows = txn
+                .prepare(
+                    "SELECT id, previous, next, type FROM linked_chunks WHERE linked_chunk_id = ? ORDER BY id",
+                )?
+                .query_map((&hashed_linked_chunk_id,), Self::map_row_to_chunk)?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if rows.is_empty() {
+                return Ok(PersistedChunkTopology { chunks: Vec::new(), event_bodies_decoded: 0 });
+            }
+
+            let has_gap =
+                rows.iter().any(|(_, _, _, chunk_type)| chunk_type == CHUNK_TYPE_GAP_TYPE_STRING);
+
+            // Healthy chain: no event chunk decodes anything. The caller still
+            // validates and orders the chain from the metadata (link structure
+            // is preserved verbatim).
+            if !has_gap {
+                let chunks = rows
+                    .into_iter()
+                    .map(|(identifier, previous, next, _)| RawChunk {
+                        content: ChunkContent::Items(Vec::new()),
+                        previous: previous.map(ChunkIdentifier::new),
+                        identifier: ChunkIdentifier::new(identifier),
+                        next: next.map(ChunkIdentifier::new),
+                    })
+                    .collect();
+                return Ok(PersistedChunkTopology { chunks, event_bodies_decoded: 0 });
+            }
+
+            let links = rows
+                .iter()
+                .map(|(id, previous, next, _)| {
+                    (*id, (previous.as_ref().copied(), next.as_ref().copied()))
+                })
+                .collect::<HashMap<_, _>>();
+            let is_gap = rows
+                .iter()
+                .map(|(id, _, _, chunk_type)| {
+                    (*id, chunk_type == CHUNK_TYPE_GAP_TYPE_STRING)
+                })
+                .collect::<HashMap<_, _>>();
+
+            // Per-event-chunk boundary events, in ascending stored position:
+            // `first` is the newer boundary (used by a gap that precedes the
+            // chunk), `last` is the older boundary (used by a gap that follows
+            // it). The walk follows links, skipping gap chunks and chunks that
+            // yield no ID-bearing event, exactly like `inspect_ordered_chunks`.
+            let mut first: HashMap<u64, Event> = HashMap::new();
+            let mut last: HashMap<u64, Event> = HashMap::new();
+            let mut decoded = 0usize;
+
+            let mut walk = BoundaryWalk { links: &links, is_gap: &is_gap, decoded: &mut decoded };
+            for (identifier, _, _, chunk_type) in &rows {
+                if chunk_type != CHUNK_TYPE_GAP_TYPE_STRING {
+                    continue;
+                }
+                if let Some((chunk, event)) = walk_boundary(
+                    txn,
+                    &encryption,
+                    &hashed_linked_chunk_id,
+                    &mut walk,
+                    *identifier,
+                    BoundaryDirection::Older,
+                )? {
+                    last.entry(chunk).or_insert(event);
+                }
+                if let Some((chunk, event)) = walk_boundary(
+                    txn,
+                    &encryption,
+                    &hashed_linked_chunk_id,
+                    &mut walk,
+                    *identifier,
+                    BoundaryDirection::Newer,
+                )? {
+                    first.entry(chunk).or_insert(event);
+                }
+            }
+
+            let chunks = rows
+                .into_iter()
+                .map(|(identifier, previous, next, chunk_type)| -> Result<RawChunk<Event, Gap>> {
+                    let content = if chunk_type == CHUNK_TYPE_GAP_TYPE_STRING {
+                        let gap = txn.load_gap_content(
+                            &encryption,
+                            &hashed_linked_chunk_id,
+                            ChunkIdentifier::new(identifier),
+                        )?;
+                        ChunkContent::Gap(gap)
+                    } else {
+                        let mut events = Vec::new();
+                        match (first.get(&identifier), last.get(&identifier)) {
+                            (Some(a), Some(b)) if a.event_id() == b.event_id() => {
+                                events.push(a.clone());
+                            }
+                            (Some(a), Some(b)) => {
+                                events.push(a.clone());
+                                events.push(b.clone());
+                            }
+                            (Some(a), None) => events.push(a.clone()),
+                            (None, Some(b)) => events.push(b.clone()),
+                            (None, None) => {}
+                        }
+                        ChunkContent::Items(events)
+                    };
+                    Ok(RawChunk {
+                        content,
+                        previous: previous.map(ChunkIdentifier::new),
+                        identifier: ChunkIdentifier::new(identifier),
+                        next: next.map(ChunkIdentifier::new),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(PersistedChunkTopology { chunks, event_bodies_decoded: decoded })
+        })
+        .await
     }
 
     #[instrument(skip(self))]
@@ -2033,15 +2306,21 @@ mod tests {
 
     use assert_matches::assert_matches;
     use matrix_sdk_base::{
-        event_cache::store::{
-            EventCacheStore, EventCacheStoreError, IntoEventCacheStore,
-            integration_tests::EventCacheStoreIntegrationTests,
+        event_cache::{
+            Event, Gap,
+            store::{
+                EventCacheStore, EventCacheStoreError, IntoEventCacheStore,
+                integration_tests::EventCacheStoreIntegrationTests,
+            },
         },
         event_cache_store_integration_tests, event_cache_store_integration_tests_time,
-        linked_chunk::{ChunkIdentifier, LinkedChunkId, Update},
+        linked_chunk::{
+            ChunkContent, ChunkIdentifier, ChunkIdentifier as CId, LinkedChunkId, Position,
+            RawChunk, Update,
+        },
     };
-    use matrix_sdk_test::{DEFAULT_TEST_ROOM_ID, async_test};
-    use ruma::{OwnedEventId, event_id};
+    use matrix_sdk_test::{DEFAULT_TEST_ROOM_ID, async_test, event_factory::EventFactory};
+    use ruma::{EventId, OwnedEventId, RoomId, event_id, room_id, user_id};
     use tempfile::{TempDir, tempdir};
 
     use super::{SqliteEventCacheStore, keys};
@@ -2214,6 +2493,535 @@ mod tests {
         // rolled back.
         let chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
         assert!(chunks.is_empty());
+    }
+
+    /// Collect the event IDs of a sparse chunk's carried events, in stored order.
+    fn chunk_boundary_ids(chunk: &RawChunk<Event, Gap>) -> Vec<&str> {
+        match &chunk.content {
+            ChunkContent::Items(events) => events
+                .iter()
+                .filter_map(|event| event.event_id().map(|id| id.as_str()))
+                .collect::<Vec<_>>(),
+            ChunkContent::Gap(_) => Vec::new(),
+        }
+    }
+
+    /// Overwrite every event body of a room with garbage.
+    async fn corrupt_all_event_contents(store: &SqliteEventCacheStore, room_id: &RoomId) {
+        let guard = store.connections.lock().await;
+        let conns = guard.as_ref().expect("store must be open");
+        let write_connection = &*conns.write_connection.lock().await;
+        let hashed_room_id = store.encryption.encode_room_id(keys::EVENTS, room_id);
+        let updated = write_connection
+            .execute(
+                "UPDATE events SET content = x'DEADBEEF' WHERE room_id = ?1",
+                (hashed_room_id,),
+            )
+            .await
+            .expect("corrupting event contents must succeed");
+        assert!(updated > 0, "at least one event body must be corrupted");
+    }
+
+    /// Overwrite one event body with garbage.
+    async fn corrupt_event_content(store: &SqliteEventCacheStore, event_id: &EventId) {
+        let guard = store.connections.lock().await;
+        let conns = guard.as_ref().expect("store must be open");
+        let write_connection = &*conns.write_connection.lock().await;
+        let hashed_event_id = store.encryption.encode_event_id(keys::EVENTS, event_id);
+        let updated = write_connection
+            .execute(
+                "UPDATE events SET content = x'DEADBEEF' WHERE event_id = ?1",
+                (hashed_event_id,),
+            )
+            .await
+            .expect("corrupting an event body must succeed");
+        assert_eq!(updated, 1, "exactly one event body must be corrupted");
+    }
+
+    /// A healthy chain performs zero event-body reads: the topology snapshot
+    /// succeeds even when every stored event body is corrupted, while the
+    /// full-chunk loader fails on the same data.
+    #[async_test]
+    async fn test_load_chunk_topology_healthy_chain_never_decodes_bodies() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r0:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        store
+            .handle_linked_chunk_updates(
+                linked_chunk_id,
+                vec![
+                    Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                    Update::PushItems {
+                        at: Position::new(CId::new(0), 0),
+                        items: vec![
+                            f.text_msg("a").event_id(event_id!("$a")).into_event(),
+                            f.text_msg("b").event_id(event_id!("$b")).into_event(),
+                        ],
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(0)),
+                        new: CId::new(1),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(1), 0),
+                        items: vec![f.text_msg("c").event_id(event_id!("$c")).into_event()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        corrupt_all_event_contents(&store, room_id).await;
+
+        let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+        assert_eq!(topology.event_bodies_decoded, 0);
+        assert_eq!(topology.chunks.len(), 2);
+        for chunk in &topology.chunks {
+            let events = match &chunk.content {
+                ChunkContent::Items(events) => events,
+                ChunkContent::Gap(_) => panic!("a healthy chain has no gap chunk"),
+            };
+            assert!(events.is_empty(), "healthy event chunks carry no boundary events");
+        }
+
+        // The corruption is real: the full-chunk loader fails on the same data.
+        assert!(store.load_all_chunks(linked_chunk_id).await.is_err());
+
+        // The erased production wrapper must forward to the optimized path.
+        let erased = store.into_event_cache_store();
+        let topology = erased.load_chunk_topology(linked_chunk_id).await.unwrap();
+        assert_eq!(topology.event_bodies_decoded, 0);
+        assert_eq!(topology.chunks.len(), 2);
+    }
+
+    /// A gapped chain decodes only the boundary events; corrupted non-boundary
+    /// bodies never get read.
+    #[async_test]
+    async fn test_load_chunk_topology_gapped_chain_decodes_only_boundary_events() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r1:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        // C0[$a, $b] -> gap -> C2[$c, $d]. Boundaries are $b (older) and $c
+        // (newer); $a and $d are never read by the topology path.
+        store
+            .handle_linked_chunk_updates(
+                linked_chunk_id,
+                vec![
+                    Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                    Update::PushItems {
+                        at: Position::new(CId::new(0), 0),
+                        items: vec![
+                            f.text_msg("a").event_id(event_id!("$a")).into_event(),
+                            f.text_msg("b").event_id(event_id!("$b")).into_event(),
+                        ],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(CId::new(0)),
+                        new: CId::new(1),
+                        next: None,
+                        gap: Gap { token: "opaque-token".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(1)),
+                        new: CId::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(2), 0),
+                        items: vec![
+                            f.text_msg("c").event_id(event_id!("$c")).into_event(),
+                            f.text_msg("d").event_id(event_id!("$d")).into_event(),
+                        ],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Corrupt only the non-boundary bodies.
+        corrupt_event_content(&store, event_id!("$a")).await;
+        corrupt_event_content(&store, event_id!("$d")).await;
+
+        let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+        assert_eq!(topology.event_bodies_decoded, 2, "exactly the two boundary bodies");
+        assert_eq!(topology.chunks.len(), 3);
+
+        let ids = chunk_boundary_ids;
+        assert_eq!(ids(&topology.chunks[0]), vec!["$b"]);
+        assert_eq!(ids(&topology.chunks[1]), Vec::<&str>::new());
+        match &topology.chunks[1].content {
+            ChunkContent::Gap(gap) => assert_eq!(gap.token, "opaque-token"),
+            ChunkContent::Items(_) => panic!("chunk 1 is a gap"),
+        }
+        assert_eq!(ids(&topology.chunks[2]), vec!["$c"]);
+
+        // The corrupted bodies are real: the full-chunk loader fails on them.
+        assert!(store.load_all_chunks(linked_chunk_id).await.is_err());
+    }
+
+    /// One event chunk bordering two gaps must carry its first and last
+    /// ID-bearing events in ascending stored position, decoding only the
+    /// boundary bodies.
+    #[async_test]
+    async fn test_load_chunk_topology_shared_boundary_chunk_keeps_first_and_last() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r2:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        // C0[$a0, $a1] -> gap1 -> C2[$b0, $b1, $b2] -> gap3 -> C4[$c0, $c1]
+        store
+            .handle_linked_chunk_updates(
+                linked_chunk_id,
+                vec![
+                    Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                    Update::PushItems {
+                        at: Position::new(CId::new(0), 0),
+                        items: vec![
+                            f.text_msg("a0").event_id(event_id!("$a0")).into_event(),
+                            f.text_msg("a1").event_id(event_id!("$a1")).into_event(),
+                        ],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(CId::new(0)),
+                        new: CId::new(1),
+                        next: None,
+                        gap: Gap { token: "tok1".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(1)),
+                        new: CId::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(2), 0),
+                        items: vec![
+                            f.text_msg("b0").event_id(event_id!("$b0")).into_event(),
+                            f.text_msg("b1").event_id(event_id!("$b1")).into_event(),
+                            f.text_msg("b2").event_id(event_id!("$b2")).into_event(),
+                        ],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(CId::new(2)),
+                        new: CId::new(3),
+                        next: None,
+                        gap: Gap { token: "tok3".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(3)),
+                        new: CId::new(4),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(4), 0),
+                        items: vec![
+                            f.text_msg("c0").event_id(event_id!("$c0")).into_event(),
+                            f.text_msg("c1").event_id(event_id!("$c1")).into_event(),
+                        ],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+        assert_eq!(topology.event_bodies_decoded, 4, "two boundary bodies per gap");
+
+        let ids = chunk_boundary_ids;
+        assert_eq!(ids(&topology.chunks[0]), vec!["$a1"], "older boundary of gap1");
+        assert_eq!(
+            ids(&topology.chunks[2]),
+            vec!["$b0", "$b2"],
+            "shared chunk keeps first and last in stored order"
+        );
+        assert_eq!(ids(&topology.chunks[4]), vec!["$c0"], "newer boundary of gap3");
+    }
+
+    /// Synthetic healthy-history benchmark (no timing assertions, for flake
+    /// safety; results print for the #1392 evidence record): a room with many
+    /// persisted events must be inspectable through `load_chunk_topology` with
+    /// zero event-body decodes, while the unchanged `load_all_chunks` baseline
+    /// decodes every event.
+    #[async_test]
+    async fn test_load_chunk_topology_healthy_history_scales_with_chunks_not_events() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r9:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        const CHUNKS: u64 = 40;
+        const EVENTS_PER_CHUNK: usize = 40;
+        let mut updates = Vec::with_capacity(CHUNKS as usize * 2 + 1);
+        for chunk in 0..CHUNKS {
+            updates.push(Update::NewItemsChunk {
+                previous: (chunk > 0).then(|| CId::new(chunk - 1)),
+                new: CId::new(chunk),
+                next: None,
+            });
+            let events = (0..EVENTS_PER_CHUNK)
+                .map(|index| {
+                    let event_id = ruma::EventId::parse(format!("$bench-{chunk}-{index}"))
+                        .expect("a valid event id");
+                    f.text_msg(format!("m{chunk}-{index}")).event_id(&event_id).into_event()
+                })
+                .collect::<Vec<_>>();
+            updates
+                .push(Update::PushItems { at: Position::new(CId::new(chunk), 0), items: events });
+        }
+        store.handle_linked_chunk_updates(linked_chunk_id, updates).await.unwrap();
+
+        // Warm the page cache once, then measure both paths over the same data.
+        assert_eq!(store.load_all_chunks(linked_chunk_id).await.unwrap().len(), CHUNKS as usize);
+
+        let iterations = 50usize;
+        let mut topology_durations = Vec::with_capacity(iterations);
+        let mut baseline_durations = Vec::with_capacity(iterations);
+        let mut decodes = None;
+        for _ in 0..iterations {
+            let started = std::time::Instant::now();
+            let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+            topology_durations.push(started.elapsed());
+            assert_eq!(topology.event_bodies_decoded, 0, "healthy inspection decodes nothing");
+            decodes = Some(topology.event_bodies_decoded);
+
+            let started = std::time::Instant::now();
+            let all = store.load_all_chunks(linked_chunk_id).await.unwrap();
+            baseline_durations.push(started.elapsed());
+            assert_eq!(
+                all.iter()
+                    .filter_map(|chunk| match &chunk.content {
+                        ChunkContent::Items(items) => Some(items.len()),
+                        ChunkContent::Gap(_) => None,
+                    })
+                    .sum::<usize>(),
+                CHUNKS as usize * EVENTS_PER_CHUNK,
+            );
+        }
+
+        let pct = |mut samples: Vec<std::time::Duration>| {
+            samples.sort();
+            let p50 = samples[iterations / 2];
+            let p95 = samples[(iterations * 95) / 100];
+            (p50, p95)
+        };
+        let (top_p50, top_p95) = pct(topology_durations);
+        let (base_p50, base_p95) = pct(baseline_durations);
+        eprintln!(
+            "#1392 perf: chunks={CHUNKS} events={} iterations={iterations} \
+             load_chunk_topology p50={top_p50:?} p95={top_p95:?} decodes={} \
+             load_all_chunks p50={base_p50:?} p95={base_p95:?} decodes={}",
+            CHUNKS as usize * EVENTS_PER_CHUNK,
+            decodes.unwrap(),
+            CHUNKS as usize * EVENTS_PER_CHUNK,
+        );
+    }
+
+    /// A gap at the head of the chain has no older boundary and one at the
+    /// tail has no newer boundary; both must resolve to `None` without error,
+    /// and a gap whose direct newer neighbor is an empty chunk must resolve
+    /// its newer boundary from the chunk beyond it.
+    #[async_test]
+    async fn test_load_chunk_topology_head_tail_gaps_and_empty_newer_neighbor() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r4:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        // gap0 at the head -> C1[] (empty) -> C2[$x, $y] -> gap3 at the tail
+        store
+            .handle_linked_chunk_updates(
+                linked_chunk_id,
+                vec![
+                    Update::NewGapChunk {
+                        previous: None,
+                        new: CId::new(0),
+                        next: None,
+                        gap: Gap { token: "head-token".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(0)),
+                        new: CId::new(1),
+                        next: None,
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(1)),
+                        new: CId::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(2), 0),
+                        items: vec![
+                            f.text_msg("x").event_id(event_id!("$x")).into_event(),
+                            f.text_msg("y").event_id(event_id!("$y")).into_event(),
+                        ],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(CId::new(2)),
+                        new: CId::new(3),
+                        next: None,
+                        gap: Gap { token: "tail-token".to_owned() },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+        assert_eq!(topology.event_bodies_decoded, 2, "one boundary per flanking gap");
+
+        let ids = chunk_boundary_ids;
+        // Head gap: only a newer boundary, resolved past the empty chunk 1.
+        assert_eq!(ids(&topology.chunks[0]), Vec::<&str>::new());
+        match &topology.chunks[0].content {
+            ChunkContent::Gap(gap) => assert_eq!(gap.token, "head-token"),
+            ChunkContent::Items(_) => panic!("chunk 0 is a gap"),
+        }
+        assert_eq!(ids(&topology.chunks[1]), Vec::<&str>::new(), "empty chunk stays empty");
+        // Chunk 2 borders both gaps: $x is the head gap's newer boundary and
+        // $y the tail gap's older boundary, in stored order.
+        assert_eq!(ids(&topology.chunks[2]), vec!["$x", "$y"]);
+        // Tail gap: only an older boundary, $y from chunk 2.
+        match &topology.chunks[3].content {
+            ChunkContent::Gap(gap) => assert_eq!(gap.token, "tail-token"),
+            ChunkContent::Items(_) => panic!("chunk 3 is a gap"),
+        }
+    }
+
+    /// A broken link (a chunk referencing a removed `previous`) must not make
+    /// the topology read error: the walk ends as exhausted and the caller's
+    /// chain validation keeps raising the malformed-topology error class.
+    #[async_test]
+    async fn test_load_chunk_topology_broken_link_ends_walk_without_error() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r5:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        store
+            .handle_linked_chunk_updates(
+                linked_chunk_id,
+                vec![
+                    Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                    Update::PushItems {
+                        at: Position::new(CId::new(0), 0),
+                        items: vec![f.text_msg("a").event_id(event_id!("$a")).into_event()],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(CId::new(0)),
+                        new: CId::new(1),
+                        next: None,
+                        gap: Gap { token: "tok".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(1)),
+                        new: CId::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(2), 0),
+                        items: vec![f.text_msg("b").event_id(event_id!("$b")).into_event()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Sever the link between chunk 1 and its older neighbor chunk 0.
+        let hashed_linked_chunk_id =
+            store.encryption.encode_linked_chunk(keys::LINKED_CHUNKS, &linked_chunk_id);
+        {
+            let guard = store.connections.lock().await;
+            let conns = guard.as_ref().expect("store must be open");
+            let write_connection = &*conns.write_connection.lock().await;
+            write_connection
+                .execute(
+                    "DELETE FROM linked_chunks WHERE linked_chunk_id = ?1 AND id = 0",
+                    (hashed_linked_chunk_id,),
+                )
+                .await
+                .unwrap();
+        }
+
+        // The topology read must succeed; the older boundary is unresolvable
+        // (the walk terminates at the severed link), the newer boundary still
+        // resolves, and the walk never decodes more than the reachable chunk.
+        let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+        let ids = chunk_boundary_ids;
+        assert_eq!(topology.chunks.len(), 2, "the severed chunk row is no longer returned");
+        assert_eq!(ids(&topology.chunks[0]), Vec::<&str>::new());
+        match &topology.chunks[0].content {
+            ChunkContent::Gap(gap) => assert_eq!(gap.token, "tok"),
+            ChunkContent::Items(_) => panic!("chunk 0 is a gap"),
+        }
+        assert_eq!(ids(&topology.chunks[1]), vec!["$b"]);
+        assert_eq!(topology.event_bodies_decoded, 1);
+    }
+
+    /// A single-event chunk bordering two gaps is deduplicated instead of
+    /// appearing twice.
+    #[async_test]
+    async fn test_load_chunk_topology_single_event_shared_chunk_is_deduplicated() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r3:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        // C0[$x] -> gap1 -> C2[$y] -> gap3 -> C4[$z]
+        store
+            .handle_linked_chunk_updates(
+                linked_chunk_id,
+                vec![
+                    Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                    Update::PushItems {
+                        at: Position::new(CId::new(0), 0),
+                        items: vec![f.text_msg("x").event_id(event_id!("$x")).into_event()],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(CId::new(0)),
+                        new: CId::new(1),
+                        next: None,
+                        gap: Gap { token: "tok1".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(1)),
+                        new: CId::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(2), 0),
+                        items: vec![f.text_msg("y").event_id(event_id!("$y")).into_event()],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(CId::new(2)),
+                        new: CId::new(3),
+                        next: None,
+                        gap: Gap { token: "tok3".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(3)),
+                        new: CId::new(4),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(4), 0),
+                        items: vec![f.text_msg("z").event_id(event_id!("$z")).into_event()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+        assert_eq!(topology.event_bodies_decoded, 4);
+        let ids = chunk_boundary_ids;
+        assert_eq!(ids(&topology.chunks[0]), vec!["$x"]);
+        assert_eq!(ids(&topology.chunks[2]), vec!["$y"], "a single boundary is not duplicated");
+        assert_eq!(ids(&topology.chunks[4]), vec!["$z"]);
     }
 }
 

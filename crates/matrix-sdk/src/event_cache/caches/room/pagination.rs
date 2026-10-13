@@ -23,6 +23,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use eyeball::{SharedObservable, Subscriber};
@@ -107,6 +108,17 @@ impl fmt::Debug for RoomTimelineGapDescriptor {
     }
 }
 
+/// Content-free counters for one room-timeline gap inspection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoomTimelineGapInspectionDiagnostics {
+    /// Number of persisted chunks whose metadata was scanned.
+    pub scanned_chunks: usize,
+    /// Number of event bodies decoded while resolving gap boundaries.
+    pub event_bodies_decoded: usize,
+    /// Wall-clock duration of the inspection, in milliseconds.
+    pub duration_ms: u64,
+}
+
 /// Snapshot of the persisted gap topology for a room.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoomTimelineGapInspection {
@@ -114,6 +126,8 @@ pub struct RoomTimelineGapInspection {
     pub continuity: RoomTimelineContinuity,
     /// Gaps ordered from oldest to newest.
     pub gaps: Vec<RoomTimelineGapDescriptor>,
+    /// Content-free counters for this inspection.
+    pub diagnostics: RoomTimelineGapInspectionDiagnostics,
 }
 
 /// Limits one targeted gap-repair operation.
@@ -346,6 +360,7 @@ pub(super) fn inspect_ordered_chunks(
         return RoomTimelineGapInspection {
             continuity: RoomTimelineContinuity::Unknown,
             gaps: Vec::new(),
+            diagnostics: RoomTimelineGapInspectionDiagnostics::default(),
         };
     }
 
@@ -358,9 +373,10 @@ pub(super) fn inspect_ordered_chunks(
                 let older_event_id =
                     chunks[..index].iter().rev().find_map(|chunk| match &chunk.content {
                         ChunkContent::Gap(_) => None,
-                        ChunkContent::Items(events) => {
-                            events.iter().rev().find_map(|event| event.event_id().map(|id| id.to_owned()))
-                        }
+                        ChunkContent::Items(events) => events
+                            .iter()
+                            .rev()
+                            .find_map(|event| event.event_id().map(|id| id.to_owned())),
                     });
                 let newer_event_id =
                     chunks[index + 1..].iter().find_map(|chunk| match &chunk.content {
@@ -402,6 +418,7 @@ pub(super) fn inspect_ordered_chunks(
             RoomTimelineContinuity::Gapped
         },
         gaps,
+        diagnostics: RoomTimelineGapInspectionDiagnostics::default(),
     }
 }
 
@@ -614,14 +631,26 @@ impl RoomPagination {
     /// Inspect all persisted room-timeline gaps without exposing SDK
     /// pagination tokens or linked-chunk identifiers.
     pub async fn inspect_timeline_gaps(&self) -> Result<RoomTimelineGapInspection> {
+        let started = Instant::now();
         let state = self.0.cache.state.read().await?;
-        let chunks = state.store.load_all_chunks(LinkedChunkId::Room(&state.state.room_id)).await?;
-        Ok(inspect_ordered_chunks(
+        // Topology-first store path: a healthy chain performs no event-body
+        // reads; a gapped chain decodes only the boundary events needed to
+        // identify the nearest older/newer events around each gap.
+        let topology =
+            state.store.load_chunk_topology(LinkedChunkId::Room(&state.state.room_id)).await?;
+        let chunks = order_persisted_chunks(topology.chunks)?;
+        let mut inspection = inspect_ordered_chunks(
             &state.state.room_id,
             state.gap_snapshot_id(),
             state.gap_topology_generation(),
-            &order_persisted_chunks(chunks)?,
-        ))
+            &chunks,
+        );
+        inspection.diagnostics = RoomTimelineGapInspectionDiagnostics {
+            scanned_chunks: chunks.len(),
+            event_bodies_decoded: topology.event_bodies_decoded,
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+        Ok(inspection)
     }
 
     /// Repair one gap while causally tagging any published timeline update.

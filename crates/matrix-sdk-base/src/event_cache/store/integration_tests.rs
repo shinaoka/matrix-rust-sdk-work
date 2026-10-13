@@ -27,7 +27,8 @@ use matrix_sdk_common::{
         UnableToDecryptInfo, UnableToDecryptReason, VerificationState,
     },
     linked_chunk::{
-        ChunkContent, ChunkIdentifier as CId, LinkedChunkId, Position, Update, lazy_loader,
+        ChunkContent, ChunkIdentifier as CId, LinkedChunkId, Position, RawChunk, Update,
+        lazy_loader,
     },
 };
 use matrix_sdk_test::{ALICE, DEFAULT_TEST_ROOM_ID, event_factory::EventFactory};
@@ -46,6 +47,31 @@ use super::{
     DEFAULT_CHUNK_CAPACITY, DynEventCacheStore,
 };
 use crate::read_receipts::ReadReceipts;
+
+/// Collect the event IDs of every event, in stored order.
+fn boundary_event_ids(events: &[TimelineEvent]) -> Vec<&EventId> {
+    events.iter().filter_map(|event| event.event_id()).collect()
+}
+
+/// Resolve a gap's older boundary exactly like the canonical
+/// `inspect_ordered_chunks` walk: the last ID-bearing event of the nearest
+/// preceding non-gap chunk.
+fn older_boundary_from(chunks: &[RawChunk<TimelineEvent, Gap>], index: usize) -> Option<&EventId> {
+    chunks[..index].iter().rev().find_map(|chunk| match &chunk.content {
+        ChunkContent::Gap(_) => None,
+        ChunkContent::Items(events) => boundary_event_ids(events).into_iter().rev().next(),
+    })
+}
+
+/// Resolve a gap's newer boundary exactly like the canonical
+/// `inspect_ordered_chunks` walk: the first ID-bearing event of the nearest
+/// following non-gap chunk.
+fn newer_boundary_from(chunks: &[RawChunk<TimelineEvent, Gap>], index: usize) -> Option<&EventId> {
+    chunks[index + 1..].iter().find_map(|chunk| match &chunk.content {
+        ChunkContent::Gap(_) => None,
+        ChunkContent::Items(events) => boundary_event_ids(events).into_iter().next(),
+    })
+}
 
 /// Create a test event with all data filled, for testing that linked chunk
 /// correctly stores event data.
@@ -196,6 +222,14 @@ pub trait EventCacheStoreIntegrationTests {
 
     /// Test that loading a linked chunk's metadata works as intended.
     async fn test_load_all_chunks_metadata(&self);
+
+    /// Test that the topology-first snapshot resolves gap boundaries equal to
+    /// the full-chunk reconstruction.
+    async fn test_load_chunk_topology(&self);
+
+    /// Test that a gap whose direct neighbor is an empty event chunk resolves
+    /// its boundary from the nearest non-empty chunk beyond it.
+    async fn test_load_chunk_topology_skips_empty_neighbor_chunks(&self);
 
     /// Test that loading and updating a `ThreadInfo` acts as expected.
     async fn test_load_and_update_thread_info(&self);
@@ -504,6 +538,173 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         assert_eq!(metas[3].previous, Some(CId::new(2)));
         assert_eq!(metas[3].next, None);
         assert_eq!(metas[3].num_items, 0);
+    }
+
+    /// The topology-first snapshot must resolve every gap boundary to the same
+    /// event as the full-chunk reconstruction, including when the neighbor
+    /// chunk is empty and when one event chunk borders two gaps.
+    async fn test_load_chunk_topology(&self) {
+        // C0[a0, a1] -> gap1 -> C2[b0, b1, b2] -> gap3 -> C4[c0, c1]
+        let room_id = room_id!("!r0:matrix.org");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        self.handle_linked_chunk_updates(
+            linked_chunk_id,
+            vec![
+                Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                Update::PushItems {
+                    at: Position::new(CId::new(0), 0),
+                    items: vec![make_test_event(room_id, "a0"), make_test_event(room_id, "a1")],
+                },
+                Update::NewGapChunk {
+                    previous: Some(CId::new(0)),
+                    new: CId::new(1),
+                    next: None,
+                    gap: Gap { token: "tok1".to_owned() },
+                },
+                Update::NewItemsChunk { previous: Some(CId::new(1)), new: CId::new(2), next: None },
+                Update::PushItems {
+                    at: Position::new(CId::new(2), 0),
+                    items: vec![
+                        make_test_event(room_id, "b0"),
+                        make_test_event(room_id, "b1"),
+                        make_test_event(room_id, "b2"),
+                    ],
+                },
+                Update::NewGapChunk {
+                    previous: Some(CId::new(2)),
+                    new: CId::new(3),
+                    next: None,
+                    gap: Gap { token: "tok3".to_owned() },
+                },
+                Update::NewItemsChunk { previous: Some(CId::new(3)), new: CId::new(4), next: None },
+                Update::PushItems {
+                    at: Position::new(CId::new(4), 0),
+                    items: vec![make_test_event(room_id, "c0"), make_test_event(room_id, "c1")],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let full = self.load_all_chunks(linked_chunk_id).await.unwrap();
+        let topology = self.load_chunk_topology(linked_chunk_id).await.unwrap();
+
+        // Storage order and link order coincide in this fixture, so indices
+        // align between the full and the sparse snapshots.
+        assert_eq!(full.len(), topology.chunks.len());
+        assert_eq!(full.len(), 5);
+        assert!(topology.chunks.iter().any(|chunk| matches!(chunk.content, ChunkContent::Gap(_))));
+
+        let all_full_ids = full
+            .iter()
+            .map(|chunk| match &chunk.content {
+                ChunkContent::Gap(_) => Vec::new(),
+                ChunkContent::Items(events) => boundary_event_ids(events),
+            })
+            .collect::<Vec<_>>();
+
+        // Storage order and link order coincide in this fixture, so indices
+        // align between the full and the sparse snapshots.
+        assert_eq!(full.len(), topology.chunks.len());
+        assert_eq!(full.len(), 5);
+        assert!(topology.chunks.iter().any(|chunk| matches!(chunk.content, ChunkContent::Gap(_))));
+
+        for (index, chunk) in topology.chunks.iter().enumerate() {
+            match &chunk.content {
+                ChunkContent::Gap(gap) => {
+                    let full_token = match &full[index].content {
+                        ChunkContent::Gap(full_gap) => Some(full_gap.token.as_str()),
+                        ChunkContent::Items(_) => None,
+                    }
+                    .unwrap();
+                    assert_eq!(gap.token, full_token, "gap token must be preserved");
+
+                    // The sparse snapshot must resolve the same boundaries as
+                    // the full chain, including when the neighbor chunk is
+                    // empty or entirely without usable event IDs.
+                    assert_eq!(
+                        older_boundary_from(&topology.chunks, index),
+                        older_boundary_from(&full, index),
+                        "older boundary at gap {index} must match the full chain"
+                    );
+                    assert_eq!(
+                        newer_boundary_from(&topology.chunks, index),
+                        newer_boundary_from(&full, index),
+                        "newer boundary at gap {index} must match the full chain"
+                    );
+                }
+                ChunkContent::Items(events) => {
+                    // Every sparse boundary event must come from the full chunk.
+                    let full_ids: std::collections::HashSet<&str> =
+                        std::collections::HashSet::from_iter(
+                            all_full_ids[index].iter().map(|id| (*id).as_str()),
+                        );
+                    for event in events {
+                        let event_id = event.event_id().expect("boundary events carry an event ID");
+                        assert!(
+                            full_ids.contains(event_id.as_str()),
+                            "event {event_id} must originate from the full chunk {index}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The snapshot may never decode more bodies than the full chunk holds.
+        let total_events = all_full_ids.iter().map(Vec::len).sum::<usize>();
+        assert!(topology.event_bodies_decoded <= total_events);
+    }
+
+    /// A gap whose direct neighbor is an empty event chunk must resolve its
+    /// boundary from the nearest non-empty chunk beyond it.
+    async fn test_load_chunk_topology_skips_empty_neighbor_chunks(&self) {
+        let room_id = room_id!("!r1:matrix.org");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        self.handle_linked_chunk_updates(
+            linked_chunk_id,
+            vec![
+                Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                Update::PushItems {
+                    at: Position::new(CId::new(0), 0),
+                    items: vec![make_test_event(room_id, "x0"), make_test_event(room_id, "x1")],
+                },
+                // An empty event chunk directly before the gap.
+                Update::NewItemsChunk { previous: Some(CId::new(0)), new: CId::new(1), next: None },
+                Update::NewGapChunk {
+                    previous: Some(CId::new(1)),
+                    new: CId::new(2),
+                    next: None,
+                    gap: Gap { token: "tok".to_owned() },
+                },
+                Update::NewItemsChunk { previous: Some(CId::new(2)), new: CId::new(3), next: None },
+                Update::PushItems {
+                    at: Position::new(CId::new(3), 0),
+                    items: vec![make_test_event(room_id, "y0")],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let full = self.load_all_chunks(linked_chunk_id).await.unwrap();
+        let topology = self.load_chunk_topology(linked_chunk_id).await.unwrap();
+        assert_eq!(full.len(), topology.chunks.len());
+
+        // Older boundary of the gap must come from chunk 0: the empty chunk 1
+        // is skipped by both the full-chain oracle and the sparse snapshot.
+        let full_older = older_boundary_from(&full, 2);
+        assert!(full_older.is_some(), "the full chain has an older boundary");
+
+        let gap_index = topology
+            .chunks
+            .iter()
+            .position(|chunk| matches!(chunk.content, ChunkContent::Gap(_)))
+            .expect("one gap");
+        assert_eq!(
+            older_boundary_from(&topology.chunks, gap_index),
+            full_older,
+            "the empty neighbor chunk must be skipped"
+        );
     }
 
     async fn test_load_last_chunk(&self) {
@@ -2772,6 +2973,20 @@ macro_rules! event_cache_store_integration_tests {
                 let event_cache_store =
                     get_event_cache_store().await.unwrap().into_event_cache_store();
                 event_cache_store.test_load_all_chunks_metadata().await;
+            }
+
+            #[async_test]
+            async fn test_load_chunk_topology() {
+                let event_cache_store =
+                    get_event_cache_store().await.unwrap().into_event_cache_store();
+                event_cache_store.test_load_chunk_topology().await;
+            }
+
+            #[async_test]
+            async fn test_load_chunk_topology_skips_empty_neighbor_chunks() {
+                let event_cache_store =
+                    get_event_cache_store().await.unwrap().into_event_cache_store();
+                event_cache_store.test_load_chunk_topology_skips_empty_neighbor_chunks().await;
             }
 
             #[async_test]
