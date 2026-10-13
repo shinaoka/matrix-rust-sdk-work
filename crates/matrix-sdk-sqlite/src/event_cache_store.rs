@@ -560,7 +560,7 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
         let maybe_encoded: Option<Vec<u8>> = self
             .query_row(
                 &format!("{base_sql} LIMIT 1"),
-                (chunk_id.index(), &linked_chunk_id),
+                (&linked_chunk_id, chunk_id.index()),
                 |row| row.get(0),
             )
             .optional()?;
@@ -1292,7 +1292,6 @@ impl EventCacheStore for SqliteEventCacheStore {
     }
 
     #[instrument(skip(self))]
-    #[instrument(skip(self))]
     async fn load_chunk_topology(
         &self,
         linked_chunk_id: LinkedChunkId<'_>,
@@ -1425,6 +1424,7 @@ impl EventCacheStore for SqliteEventCacheStore {
         .await
     }
 
+    #[instrument(skip(self))]
     async fn load_all_chunks_metadata(
         &self,
         linked_chunk_id: LinkedChunkId<'_>,
@@ -2803,7 +2803,7 @@ mod tests {
             );
         }
 
-        let mut pct = |mut samples: Vec<std::time::Duration>| {
+        let pct = |mut samples: Vec<std::time::Duration>| {
             samples.sort();
             let p50 = samples[iterations / 2];
             let p95 = samples[(iterations * 95) / 100];
@@ -2819,6 +2819,147 @@ mod tests {
             decodes.unwrap(),
             CHUNKS as usize * EVENTS_PER_CHUNK,
         );
+    }
+
+    /// A gap at the head of the chain has no older boundary and one at the
+    /// tail has no newer boundary; both must resolve to `None` without error,
+    /// and a gap whose direct newer neighbor is an empty chunk must resolve
+    /// its newer boundary from the chunk beyond it.
+    #[async_test]
+    async fn test_load_chunk_topology_head_tail_gaps_and_empty_newer_neighbor() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r4:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        // gap0 at the head -> C1[] (empty) -> C2[$x, $y] -> gap3 at the tail
+        store
+            .handle_linked_chunk_updates(
+                linked_chunk_id,
+                vec![
+                    Update::NewGapChunk {
+                        previous: None,
+                        new: CId::new(0),
+                        next: None,
+                        gap: Gap { token: "head-token".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(0)),
+                        new: CId::new(1),
+                        next: None,
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(1)),
+                        new: CId::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(2), 0),
+                        items: vec![
+                            f.text_msg("x").event_id(event_id!("$x")).into_event(),
+                            f.text_msg("y").event_id(event_id!("$y")).into_event(),
+                        ],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(CId::new(2)),
+                        new: CId::new(3),
+                        next: None,
+                        gap: Gap { token: "tail-token".to_owned() },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+        assert_eq!(topology.event_bodies_decoded, 2, "one boundary per flanking gap");
+
+        let ids = chunk_boundary_ids;
+        // Head gap: only a newer boundary, resolved past the empty chunk 1.
+        assert_eq!(ids(&topology.chunks[0]), Vec::<&str>::new());
+        match &topology.chunks[0].content {
+            ChunkContent::Gap(gap) => assert_eq!(gap.token, "head-token"),
+            ChunkContent::Items(_) => panic!("chunk 0 is a gap"),
+        }
+        assert_eq!(ids(&topology.chunks[1]), Vec::<&str>::new(), "empty chunk stays empty");
+        // Chunk 2 borders both gaps: $x is the head gap's newer boundary and
+        // $y the tail gap's older boundary, in stored order.
+        assert_eq!(ids(&topology.chunks[2]), vec!["$x", "$y"]);
+        // Tail gap: only an older boundary, $y from chunk 2.
+        match &topology.chunks[3].content {
+            ChunkContent::Gap(gap) => assert_eq!(gap.token, "tail-token"),
+            ChunkContent::Items(_) => panic!("chunk 3 is a gap"),
+        }
+    }
+
+    /// A broken link (a chunk referencing a removed `previous`) must not make
+    /// the topology read error: the walk ends as exhausted and the caller's
+    /// chain validation keeps raising the malformed-topology error class.
+    #[async_test]
+    async fn test_load_chunk_topology_broken_link_ends_walk_without_error() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r5:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        store
+            .handle_linked_chunk_updates(
+                linked_chunk_id,
+                vec![
+                    Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                    Update::PushItems {
+                        at: Position::new(CId::new(0), 0),
+                        items: vec![f.text_msg("a").event_id(event_id!("$a")).into_event()],
+                    },
+                    Update::NewGapChunk {
+                        previous: Some(CId::new(0)),
+                        new: CId::new(1),
+                        next: None,
+                        gap: Gap { token: "tok".to_owned() },
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(CId::new(1)),
+                        new: CId::new(2),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(CId::new(2), 0),
+                        items: vec![f.text_msg("b").event_id(event_id!("$b")).into_event()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Sever the link between chunk 1 and its older neighbor chunk 0.
+        let hashed_linked_chunk_id =
+            store.encryption.encode_linked_chunk(keys::LINKED_CHUNKS, &linked_chunk_id);
+        {
+            let guard = store.connections.lock().await;
+            let conns = guard.as_ref().expect("store must be open");
+            let write_connection = &*conns.write_connection.lock().await;
+            write_connection
+                .execute(
+                    "DELETE FROM linked_chunks WHERE linked_chunk_id = ?1 AND id = 0",
+                    (hashed_linked_chunk_id,),
+                )
+                .await
+                .unwrap();
+        }
+
+        // The topology read must succeed; the older boundary is unresolvable
+        // (the walk terminates at the severed link), the newer boundary still
+        // resolves, and the walk never decodes more than the reachable chunk.
+        let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+        let ids = chunk_boundary_ids;
+        assert_eq!(topology.chunks.len(), 2, "the severed chunk row is no longer returned");
+        assert_eq!(ids(&topology.chunks[0]), Vec::<&str>::new());
+        match &topology.chunks[0].content {
+            ChunkContent::Gap(gap) => assert_eq!(gap.token, "tok"),
+            ChunkContent::Items(_) => panic!("chunk 0 is a gap"),
+        }
+        assert_eq!(ids(&topology.chunks[1]), vec!["$b"]);
+        assert_eq!(topology.event_bodies_decoded, 1);
     }
 
     /// A single-event chunk bordering two gaps is deduplicated instead of
