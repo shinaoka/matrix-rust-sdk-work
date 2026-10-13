@@ -2742,6 +2742,87 @@ mod tests {
         assert_eq!(ids(&topology.chunks[4]), vec!["$c0"], "newer boundary of gap3");
     }
 
+    /// Synthetic healthy-history benchmark (no timing assertions, for flake
+    /// safety; results print for the #1392 evidence record): a room with many
+    /// persisted events must be inspectable through `load_chunk_topology` with
+    /// zero event-body decodes, while the unchanged `load_all_chunks` baseline
+    /// decodes every event.
+    #[async_test]
+    async fn test_load_chunk_topology_healthy_history_scales_with_chunks_not_events() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+        let room_id = room_id!("!r9:example.invalid");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.invalid"));
+
+        const CHUNKS: u64 = 40;
+        const EVENTS_PER_CHUNK: usize = 40;
+        let mut updates = Vec::with_capacity(CHUNKS as usize * 2 + 1);
+        for chunk in 0..CHUNKS {
+            updates.push(Update::NewItemsChunk {
+                previous: (chunk > 0).then(|| CId::new(chunk - 1)),
+                new: CId::new(chunk),
+                next: None,
+            });
+            let events = (0..EVENTS_PER_CHUNK)
+                .map(|index| {
+                    let event_id = ruma::EventId::parse(format!("$bench-{chunk}-{index}"))
+                        .expect("a valid event id");
+                    f.text_msg(format!("m{chunk}-{index}")).event_id(&event_id).into_event()
+                })
+                .collect::<Vec<_>>();
+            updates.push(Update::PushItems {
+                at: Position::new(CId::new(chunk), 0),
+                items: events,
+            });
+        }
+        store.handle_linked_chunk_updates(linked_chunk_id, updates).await.unwrap();
+
+        // Warm the page cache once, then measure both paths over the same data.
+        assert_eq!(store.load_all_chunks(linked_chunk_id).await.unwrap().len(), CHUNKS as usize);
+
+        let iterations = 50usize;
+        let mut topology_durations = Vec::with_capacity(iterations);
+        let mut baseline_durations = Vec::with_capacity(iterations);
+        let mut decodes = None;
+        for _ in 0..iterations {
+            let started = std::time::Instant::now();
+            let topology = store.load_chunk_topology(linked_chunk_id).await.unwrap();
+            topology_durations.push(started.elapsed());
+            assert_eq!(topology.event_bodies_decoded, 0, "healthy inspection decodes nothing");
+            decodes = Some(topology.event_bodies_decoded);
+
+            let started = std::time::Instant::now();
+            let all = store.load_all_chunks(linked_chunk_id).await.unwrap();
+            baseline_durations.push(started.elapsed());
+            assert_eq!(
+                all.iter()
+                    .filter_map(|chunk| match &chunk.content {
+                        ChunkContent::Items(items) => Some(items.len()),
+                        ChunkContent::Gap(_) => None,
+                    })
+                    .sum::<usize>(),
+                CHUNKS as usize * EVENTS_PER_CHUNK,
+            );
+        }
+
+        let mut pct = |mut samples: Vec<std::time::Duration>| {
+            samples.sort();
+            let p50 = samples[iterations / 2];
+            let p95 = samples[(iterations * 95) / 100];
+            (p50, p95)
+        };
+        let (top_p50, top_p95) = pct(topology_durations);
+        let (base_p50, base_p95) = pct(baseline_durations);
+        eprintln!(
+            "#1392 perf: chunks={CHUNKS} events={} iterations={iterations} \
+             load_chunk_topology p50={top_p50:?} p95={top_p95:?} decodes={} \
+             load_all_chunks p50={base_p50:?} p95={base_p95:?} decodes={}",
+            CHUNKS as usize * EVENTS_PER_CHUNK,
+            decodes.unwrap(),
+            CHUNKS as usize * EVENTS_PER_CHUNK,
+        );
+    }
+
     /// A single-event chunk bordering two gaps is deduplicated instead of
     /// appearing twice.
     #[async_test]
