@@ -19,15 +19,15 @@ use matrix_sdk_common::{
     AsyncTraitDeps,
     cross_process_lock::CrossProcessLockGeneration,
     linked_chunk::{
-        ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId, Position,
-        RawChunk, Update,
+        ChunkContent, ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId,
+        Position, RawChunk, Update,
     },
 };
 use ruma::{EventId, OwnedEventId, RoomId, events::relation::RelationType};
 
 use super::{
     super::{Event, Gap, thread::ThreadInfo},
-    EventCacheStoreError,
+    EventCacheStoreError, PersistedChunkTopology,
 };
 
 /// A default capacity for linked chunks, when manipulating in conjunction with
@@ -67,6 +67,37 @@ pub trait EventCacheStore: AsyncTraitDeps {
         &self,
         linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error>;
+
+    /// Load a topology-first snapshot of a persisted linked chunk for gap
+    /// inspection.
+    ///
+    /// Event chunks returned in [`PersistedChunkTopology::chunks`] may carry
+    /// only the boundary events needed to identify the nearest older/newer
+    /// events around a gap chunk — or no events at all when the chain is
+    /// healthy — while gap chunks always carry their opaque pagination token.
+    /// Event bodies are decrypted and parsed only where a gap boundary must be
+    /// resolved; a healthy chain with no gap chunk must not decode any.
+    ///
+    /// The returned chunks are in storage (identifier) order; the caller
+    /// validates the chain and orders it by its links. The default
+    /// implementation loads every chunk and every event body and is correct
+    /// for stores without a topology-optimized read path (e.g. in-memory and
+    /// IndexedDB).
+    #[doc(hidden)]
+    async fn load_chunk_topology(
+        &self,
+        linked_chunk_id: LinkedChunkId<'_>,
+    ) -> Result<PersistedChunkTopology, Self::Error> {
+        let chunks = self.load_all_chunks(linked_chunk_id).await?;
+        let event_bodies_decoded = chunks
+            .iter()
+            .filter_map(|chunk| match &chunk.content {
+                ChunkContent::Items(items) => Some(items.len()),
+                ChunkContent::Gap(_) => None,
+            })
+            .sum();
+        Ok(PersistedChunkTopology { chunks, event_bodies_decoded })
+    }
 
     /// Load all of the chunks' metadata for the given [`LinkedChunkId`].
     ///
@@ -257,6 +288,13 @@ impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
         linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error> {
         self.0.load_all_chunks(linked_chunk_id).await.map_err(Into::into)
+    }
+
+    async fn load_chunk_topology(
+        &self,
+        linked_chunk_id: LinkedChunkId<'_>,
+    ) -> Result<PersistedChunkTopology, Self::Error> {
+        self.0.load_chunk_topology(linked_chunk_id).await.map_err(Into::into)
     }
 
     async fn load_all_chunks_metadata(

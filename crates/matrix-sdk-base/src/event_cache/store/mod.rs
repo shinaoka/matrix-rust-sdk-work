@@ -27,9 +27,12 @@ pub mod integration_tests;
 mod memory_store;
 mod traits;
 
-use matrix_sdk_common::cross_process_lock::{
-    CrossProcessLock, CrossProcessLockConfig, CrossProcessLockError, CrossProcessLockGeneration,
-    CrossProcessLockGuard, MappedCrossProcessLockState, TryLock,
+use matrix_sdk_common::{
+    cross_process_lock::{
+        CrossProcessLock, CrossProcessLockConfig, CrossProcessLockError,
+        CrossProcessLockGeneration, CrossProcessLockGuard, MappedCrossProcessLockState, TryLock,
+    },
+    linked_chunk::RawChunk,
 };
 pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
 use ruma::{OwnedEventId, events::AnySyncTimelineEvent, serde::Raw};
@@ -41,6 +44,39 @@ pub use self::{
     memory_store::MemoryStore,
     traits::{DEFAULT_CHUNK_CAPACITY, DynEventCacheStore, EventCacheStore, IntoEventCacheStore},
 };
+use super::{Event, Gap};
+
+/// Topology-first, read-optimized snapshot of a persisted linked chunk, for
+/// room-timeline gap inspection.
+///
+/// Built by [`EventCacheStore::load_chunk_topology`]. Event chunks in
+/// [`Self::chunks`] carry only the boundary events needed to resolve
+/// neighboring gap descriptors — or no events at all — so a healthy chain is
+/// inspected without reading, decrypting, or parsing event bodies. Gap chunks
+/// always carry their opaque pagination token.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PersistedChunkTopology {
+    /// Every persisted chunk row, in storage (identifier) order. The caller
+    /// validates the chain and orders it by its links, exactly as it does for
+    /// [`EventCacheStore::load_all_chunks`].
+    pub chunks: Vec<RawChunk<Event, Gap>>,
+    /// Number of event bodies decoded while building this snapshot.
+    pub event_bodies_decoded: usize,
+}
+
+#[cfg(not(tarpaulin_include))]
+impl fmt::Debug for PersistedChunkTopology {
+    /// Prints structural counts only: gap tokens are opaque pagination
+    /// secrets and event debug output can expose event IDs.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistedChunkTopology")
+            .field("chunks", &self.chunks.len())
+            .field("event_bodies_decoded", &self.event_bodies_decoded)
+            .finish()
+    }
+}
 
 /// The high-level public type to represent an `EventCacheStore` lock.
 #[derive(Clone)]
