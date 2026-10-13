@@ -2770,10 +2770,8 @@ mod tests {
                     f.text_msg(format!("m{chunk}-{index}")).event_id(&event_id).into_event()
                 })
                 .collect::<Vec<_>>();
-            updates.push(Update::PushItems {
-                at: Position::new(CId::new(chunk), 0),
-                items: events,
-            });
+            updates
+                .push(Update::PushItems { at: Position::new(CId::new(chunk), 0), items: events });
         }
         store.handle_linked_chunk_updates(linked_chunk_id, updates).await.unwrap();
 
