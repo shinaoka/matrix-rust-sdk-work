@@ -563,35 +563,6 @@ impl<P: RoomDataProvider> TimelineController<P> {
         }
     }
 
-    /// Reveal `num` events that were loaded into the cache but are currently
-    /// hidden by the `Skip` adaptor.
-    ///
-    /// This is the skip-count counterpart of [`live_lazy_paginate_backwards`]
-    /// for use after [`RoomPagination::run_backwards_cache_only`]: the events
-    /// are already in the observable (the broadcast fired by
-    /// `conclude_backwards_pagination_from_disk` has been delivered), so we
-    /// only need to decrement `skip_count` by the loaded count to make them
-    /// visible in the timeline stream.
-    ///
-    /// It is a no-op when `skip_count` is already zero (all items are visible).
-    ///
-    /// [`live_lazy_paginate_backwards`]: Self::live_lazy_paginate_backwards
-    /// [`RoomPagination::run_backwards_cache_only`]: matrix_sdk::event_cache::RoomPagination::run_backwards_cache_only
-    // Matrix desktop fork patch surface: helper for the cache-only deep-history
-    // restore path; used by live_restore_from_cache to reveal already-loaded
-    // items without an additional disk load. Not part of upstream matrix-sdk-ui.
-    #[allow(dead_code)]
-    pub(super) async fn reveal_lazy_items(&self, num: usize) {
-        if num == 0 {
-            return;
-        }
-        let state = self.state.read().await;
-        let (count, _needs) =
-            state.meta.subscriber_skip_count.compute_next_when_paginating_backwards(num);
-        let is_live_timeline = true;
-        state.meta.subscriber_skip_count.update(count, is_live_timeline);
-    }
-
     /// Run a lazy backwards pagination (in live mode).
     ///
     /// It adjusts the `count` value of the `Skip` higher-order stream so that
@@ -609,15 +580,10 @@ impl<P: RoomDataProvider> TimelineController<P> {
     /// the `Skip` adaptor's count actually changed.
     ///
     /// When the skip count changes, the `Skip` higher-order stream emits one
-    /// synthetic batch of `VectorDiff`s to the timeline subscriber. The caller
-    /// can use `did_reveal` as a DiffBatch count contribution for settle-fence
-    /// accounting.
+    /// synthetic batch of `VectorDiff`s to the timeline subscriber, so a caller
+    /// that needs to count the emitted batches can use `did_reveal`.
     ///
     /// Returns `(did_reveal, Option<needs>)`.
-    // Matrix desktop fork patch surface: reveal-batch accounting for the
-    // cache-only deep-history restore path. Callers need to know whether the
-    // lazy reveal produced a DiffBatch so the settle fence waits for it.
-    // Not part of upstream matrix-sdk-ui.
     pub(super) async fn live_lazy_paginate_backwards_with_reveal(
         &self,
         num_events: u16,
