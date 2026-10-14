@@ -84,15 +84,14 @@ pub use self::{
             RoomEventCacheGenericUpdate,
             RoomEventCacheUpdate,
             RoomTimelineSyncObservation,
-            // Matrix desktop fork patch surface: cache-only back pagination and
-            // persisted gap inspection/repair are not part of upstream matrix-sdk.
+            // Matrix desktop fork patch surface: persisted gap inspection/repair
+            // and live-tail refresh are not part of upstream matrix-sdk.
             pagination::{
-                CacheOnlyBackOutcome, RoomLiveTailRefreshCancellation,
-                RoomLiveTailRefreshDiagnostics, RoomLiveTailRefreshOutcome,
-                RoomLiveTailRefreshResult, RoomPagination, RoomTimelineContinuity,
-                RoomTimelineGapDescriptor, RoomTimelineGapHandle, RoomTimelineGapInspection,
-                RoomTimelineGapInspectionDiagnostics, RoomTimelineGapProjectionId,
-                RoomTimelineGapRepairBudget,
+                RoomLiveTailRefreshCancellation, RoomLiveTailRefreshDiagnostics,
+                RoomLiveTailRefreshOutcome, RoomLiveTailRefreshResult, RoomPagination,
+                RoomTimelineContinuity, RoomTimelineGapDescriptor, RoomTimelineGapHandle,
+                RoomTimelineGapInspection, RoomTimelineGapInspectionDiagnostics,
+                RoomTimelineGapProjectionId, RoomTimelineGapRepairBudget,
                 RoomTimelineGapRepairOutcome, RoomTimelineGapRepairResult,
             },
         },
