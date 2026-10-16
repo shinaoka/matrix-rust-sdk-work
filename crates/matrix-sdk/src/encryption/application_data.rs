@@ -16,10 +16,16 @@ impl Encryption {
         Ok(olm.store().get_value(&format!("application:{key}")).await?)
     }
 
-    /// Persist application metadata in the crypto store.
+    /// Persist application metadata in the crypto store. Empty data removes the
+    /// namespaced value idempotently, avoiding accumulation of empty cache
+    /// rows.
     pub async fn set_application_crypto_data(&self, key: &str, data: &[u8]) -> Result<()> {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
+        if data.is_empty() {
+            olm.store().remove_custom_value(&format!("application:{key}")).await?;
+            return Ok(());
+        }
         Ok(olm.store().set_value(&format!("application:{key}"), &data).await?)
     }
 
