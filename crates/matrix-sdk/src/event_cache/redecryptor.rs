@@ -139,7 +139,10 @@ use matrix_sdk_base::{
 use matrix_sdk_common::deserialized_responses::EncryptionInfo;
 use ruma::{
     OwnedEventId, OwnedRoomId, RoomId,
-    events::{AnySyncTimelineEvent, room::encrypted::OriginalSyncRoomEncryptedEvent},
+    events::{
+        AnyMessageLikeEvent, AnySyncTimelineEvent, AnyTimelineEvent, MessageLikeEvent,
+        room::{encrypted::OriginalSyncRoomEncryptedEvent, message::MessageType},
+    },
     push::Action,
     serde::Raw,
 };
@@ -169,6 +172,67 @@ type OwnedSessionId = String;
 
 type EventIdAndUtd = (OwnedEventId, Raw<AnySyncTimelineEvent>);
 type EventIdAndEvent = (OwnedEventId, DecryptedRoomEvent);
+
+/// Whether a decrypted room event is relevant to the verification machine.
+///
+/// Mirrors the event selection used when sync feeds freshly decrypted events
+/// to the verification machine: an original `m.room.message` with the
+/// `m.key.verification.request` msgtype, or one of the in-room
+/// `m.key.verification.*` events.
+fn is_verification_event(event: &AnyMessageLikeEvent) -> bool {
+    match event {
+        AnyMessageLikeEvent::RoomMessage(MessageLikeEvent::Original(original)) => {
+            matches!(original.content.msgtype, MessageType::VerificationRequest(_))
+        }
+        AnyMessageLikeEvent::KeyVerificationReady(_)
+        | AnyMessageLikeEvent::KeyVerificationStart(_)
+        | AnyMessageLikeEvent::KeyVerificationCancel(_)
+        | AnyMessageLikeEvent::KeyVerificationAccept(_)
+        | AnyMessageLikeEvent::KeyVerificationKey(_)
+        | AnyMessageLikeEvent::KeyVerificationMac(_)
+        | AnyMessageLikeEvent::KeyVerificationDone(_) => true,
+        _ => false,
+    }
+}
+
+/// Feed late-decrypted in-room verification events to the verification
+/// machine.
+///
+/// Sync only hands an in-room verification event to the verification machine
+/// when it decrypts on the first attempt. When the room key arrives after the
+/// event (for example because the room key and the room event travel on
+/// different sync connections), the event is first stored as a UTD and only
+/// resolved here, so without this step an in-room verification request would
+/// be displayed but never become an actionable request.
+async fn receive_resolved_verification_events(client: &Client, resolved: &[ResolvedUtd]) {
+    if !client.base_client().handle_verification_events {
+        return;
+    }
+
+    let machine = client.olm_machine().await;
+    let Some(machine) = machine.as_ref() else {
+        return;
+    };
+
+    for resolved_utd in resolved {
+        let Ok(AnyTimelineEvent::MessageLike(event)) =
+            resolved_utd.decrypted_event.event.deserialize()
+        else {
+            continue;
+        };
+
+        if !is_verification_event(&event) {
+            continue;
+        }
+
+        if let Err(error) = machine.receive_verification_event(&event).await {
+            warn!(
+                event_id = %resolved_utd.event_id,
+                "Failed to handle a late-decrypted verification event: {error}"
+            );
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct ResolvedUtd {
@@ -854,6 +918,17 @@ impl EventCache {
             if let Some((decrypted_event, actions)) = resolved {
                 decrypted_events.push(ResolvedUtd { event_id, decrypted_event, actions });
             }
+        }
+
+        // A verification event that was a UTD at sync time never reached the
+        // verification machine, because sync only feeds successfully decrypted
+        // events to it. Feed the resolved ones now, before listeners learn
+        // that the UTDs have been resolved, so the request is already known
+        // when they look it up.
+        if !decrypted_events.is_empty()
+            && let Ok(client) = self.inner.client()
+        {
+            receive_resolved_verification_events(&client, &decrypted_events).await;
         }
 
         if !decrypted_events.is_empty() && tracing::level_enabled!(tracing::Level::TRACE) {
@@ -1742,6 +1817,19 @@ mod tests {
         bob: &Client,
         room_id: &RoomId,
     ) -> (Raw<AnySyncTimelineEvent>, Raw<ToDeviceEvent<ToDeviceEncryptedEventContent>>) {
+        let content = json!({"body": "It's a secret to everybody", "msgtype": "m.text"});
+        prepare_room_with_content(matrix_mock_server, event_factory, alice, bob, room_id, content)
+            .await
+    }
+
+    async fn prepare_room_with_content(
+        matrix_mock_server: &MatrixMockServer,
+        event_factory: &EventFactory,
+        alice: &Client,
+        bob: &Client,
+        room_id: &RoomId,
+        content: serde_json::Value,
+    ) -> (Raw<AnySyncTimelineEvent>, Raw<ToDeviceEvent<ToDeviceEncryptedEventContent>>) {
         let alice_user_id = alice.user_id().unwrap();
         let bob_user_id = bob.user_id().unwrap();
 
@@ -1757,7 +1845,6 @@ mod tests {
         // and the to-device message.
 
         let event_type = "m.room.message";
-        let content = json!({"body": "It's a secret to everybody", "msgtype": "m.text"});
 
         let event_id = event_id!("$some_id");
         let (event_receiver, mock) =
@@ -1873,6 +1960,89 @@ mod tests {
         );
         assert_eq!(expected_room_id, room_id);
         assert!(generic_stream.is_empty());
+    }
+
+    /// An in-room verification request that is a UTD when it is first synced
+    /// must still reach the verification machine once R2D2 resolves it;
+    /// otherwise the request is only ever displayed and the recipient can
+    /// never act on it.
+    #[async_test]
+    async fn test_redecryptor_feeds_late_decrypted_verification_request() {
+        let room_id = room_id!("!test:localhost");
+
+        let event_factory = EventFactory::new().room(room_id);
+        let (alice, bob, matrix_mock_server, _) = set_up_clients(room_id, true, false).await;
+
+        let alice_user_id = alice.user_id().unwrap().to_owned();
+        let content = json!({
+            "body": "Alice is requesting to verify your device",
+            "msgtype": "m.key.verification.request",
+            "to": bob.user_id().unwrap(),
+            "from_device": alice.device_id().unwrap(),
+            "methods": ["m.sas.v1"],
+        });
+        let (event, room_key) = prepare_room_with_content(
+            &matrix_mock_server,
+            &event_factory,
+            &alice,
+            &bob,
+            room_id,
+            content,
+        )
+        .await;
+        let event_id = event
+            .get_field::<OwnedEventId>("event_id")
+            .expect("the captured event should be valid")
+            .expect("the captured event should have an event id");
+
+        let event_cache = bob.event_cache();
+        let (room_cache, _) = event_cache.room(room_id).await.expect("room event cache");
+        let (_, mut subscriber) = room_cache.subscribe().await.unwrap();
+
+        // Deliver the encrypted request before its room key: it is a UTD.
+        matrix_mock_server
+            .mock_sync()
+            .ok_and_run(&bob, |builder| {
+                builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(event));
+            })
+            .await;
+
+        assert_let_timeout!(
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                subscriber.recv()
+        );
+        assert_matches!(&diffs[0], VectorDiff::Append { values });
+        assert_matches!(&values[0].kind, TimelineEventKind::UnableToDecrypt { .. });
+        assert!(
+            bob.encryption().get_verification_request(&alice_user_id, &event_id).await.is_none(),
+            "a UTD request cannot be known to the verification machine yet"
+        );
+
+        // The room key arrives afterwards; R2D2 resolves the UTD.
+        matrix_mock_server
+            .mock_sync()
+            .ok_and_run(&bob, |builder| {
+                builder.add_to_device_event(
+                    room_key
+                        .deserialize_as()
+                        .expect("We should be able to deserialize the room key"),
+                );
+            })
+            .await;
+
+        assert_let_timeout!(
+            Duration::from_secs(1),
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                subscriber.recv()
+        );
+        assert_matches!(&diffs[0], VectorDiff::Set { value, .. });
+        assert_matches!(&value.kind, TimelineEventKind::Decrypted { .. });
+
+        let request = bob.encryption().get_verification_request(&alice_user_id, &event_id).await;
+        assert!(
+            request.is_some(),
+            "the late-decrypted request must reach the verification machine"
+        );
     }
 
     #[async_test]
