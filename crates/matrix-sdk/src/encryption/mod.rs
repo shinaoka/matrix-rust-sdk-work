@@ -116,6 +116,8 @@ use crate::{
     error::HttpResult,
 };
 
+#[cfg(feature = "experimental-send-custom-to-device")]
+mod application_data;
 pub mod backups;
 pub mod dehydrated_devices;
 pub mod futures;

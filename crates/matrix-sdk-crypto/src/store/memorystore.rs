@@ -536,6 +536,28 @@ impl CryptoStore for MemoryStore {
         Ok(inbounds)
     }
 
+    async fn get_bounded_room_sessions(
+        &self,
+        room_id: &RoomId,
+        max_sessions: usize,
+    ) -> Result<Option<Vec<InboundGroupSession>>> {
+        let rooms = self.inbound_group_sessions.read();
+        let Some(sessions) = rooms.get(room_id) else { return Ok(Some(Vec::new())) };
+        if sessions.len() > max_sessions {
+            return Ok(None);
+        }
+        Ok(Some(
+            sessions
+                .values()
+                .map(|serialized| {
+                    let pickle = serde_json::from_str(serialized)
+                        .expect("Pickle deserialization should work");
+                    InboundGroupSession::from_pickle(pickle).expect("Stored pickle should load")
+                })
+                .collect(),
+        ))
+    }
+
     async fn get_inbound_group_sessions_for_device_batch(
         &self,
         sender_key: Curve25519PublicKey,

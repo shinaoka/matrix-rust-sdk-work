@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashSet, iter, time::Duration};
+use std::{
+    collections::HashSet,
+    iter,
+    time::{Duration, SystemTime},
+};
 
 use matrix_sdk_base::{
     RoomState,
@@ -135,7 +139,7 @@ pub(super) async fn share_room_history(room: &Room, user_id: OwnedUserId) -> Res
 /// This function checks if the client has recorded invite acceptance details
 /// for the room and ensures that the bundle sender matches the inviter.
 /// Additionally, it verifies that the room is in a joined state and that the
-/// bundle is received within one day of the invite being accepted.
+/// bundle is received within 30 days of the invite being accepted.
 ///
 /// # Arguments
 ///
@@ -172,7 +176,7 @@ pub(crate) async fn should_accept_key_bundle(room: &Room, bundle_info: &RoomKeyB
 /// processed.
 ///
 /// This function checks if the invite acceptance timestamp is within the
-/// allowed time window (one day). If the elapsed time since the invite was
+/// allowed time window (30 days). If the elapsed time since the invite was
 /// accepted exceeds this window, the pending key bundle details will not be
 /// processed.
 ///
@@ -188,15 +192,21 @@ pub(crate) async fn should_accept_key_bundle(room: &Room, bundle_info: &RoomKeyB
 pub(crate) fn should_process_room_pending_key_bundle_details(
     details: &RoomPendingKeyBundleDetails,
 ) -> bool {
-    // We accept historic room key bundles up to one day after we have accepted an
-    // invite.
-    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    should_process_room_pending_key_bundle_details_at(details, SystemTime::now())
+}
+
+fn should_process_room_pending_key_bundle_details_at(
+    details: &RoomPendingKeyBundleDetails,
+    now: SystemTime,
+) -> bool {
+    // Koushi allows delayed recovery for 30 days after accepting an invite.
+    const HISTORY_KEY_BUNDLE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
     details
         .invite_accepted_at
         .to_system_time()
-        .and_then(|t| t.elapsed().ok())
-        .map(|elapsed_since_join| elapsed_since_join < DAY)
+        .and_then(|t| now.duration_since(t).ok())
+        .map(|elapsed_since_join| elapsed_since_join < HISTORY_KEY_BUNDLE_ACCEPTANCE_WINDOW)
         .unwrap_or(false)
 }
 
@@ -308,6 +318,10 @@ pub(crate) async fn maybe_accept_key_bundle(room: &Room, inviter: &UserId) -> Re
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "shared_room_history_window_tests.rs"]
+mod window_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod test {
