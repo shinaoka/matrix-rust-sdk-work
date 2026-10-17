@@ -151,6 +151,17 @@ pub trait CryptoStore: AsyncTraitDeps {
         room_id: &RoomId,
     ) -> Result<Vec<InboundGroupSession>, Self::Error>;
 
+    /// Read at most `max_sessions` room sessions without first materializing an
+    /// unbounded inventory. `None` means unsupported or over the limit. The
+    /// conservative default allows custom stores to opt in safely.
+    async fn get_bounded_room_sessions(
+        &self,
+        _room_id: &RoomId,
+        _max_sessions: usize,
+    ) -> Result<Option<Vec<InboundGroupSession>>, Self::Error> {
+        Ok(None)
+    }
+
     /// Get a batch of inbound group sessions for the device with the supplied
     /// curve key, whose sender data is of the supplied type.
     ///
@@ -493,6 +504,14 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
         room_id: &RoomId,
     ) -> Result<Vec<InboundGroupSession>> {
         self.0.get_inbound_group_sessions_by_room_id(room_id).await.map_err(Into::into)
+    }
+
+    async fn get_bounded_room_sessions(
+        &self,
+        room_id: &RoomId,
+        max_sessions: usize,
+    ) -> Result<Option<Vec<InboundGroupSession>>> {
+        self.0.get_bounded_room_sessions(room_id, max_sessions).await.map_err(Into::into)
     }
 
     async fn get_inbound_group_sessions_for_device_batch(

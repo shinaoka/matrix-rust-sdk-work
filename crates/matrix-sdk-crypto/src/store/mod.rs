@@ -1656,7 +1656,7 @@ impl Store {
             return Err(error);
         }
 
-        info!(total_count, imported_count, room_keys = ?keys, "Successfully imported room keys");
+        info!(total_count, imported_count, "Successfully imported room keys");
 
         Ok(RoomKeyImportResult::new(imported_count, total_count, keys))
     }
@@ -1784,6 +1784,69 @@ impl Store {
         }
 
         Ok(bundle)
+    }
+
+    /// Assemble only shared-history keys, rejecting excessive key count or
+    /// serialized bytes before materializing an oversized export.
+    pub async fn build_bounded_shared_history_bundle(
+        &self,
+        room_id: &RoomId,
+        max_keys: usize,
+        max_bytes: usize,
+    ) -> Result<Option<RoomKeyBundle>, CryptoStoreError> {
+        let Some(sessions) = self.get_bounded_room_sessions(room_id, max_keys).await? else {
+            return Ok(None);
+        };
+        let mut bundle = RoomKeyBundle::default();
+        let mut bytes = 0usize;
+        for session in sessions {
+            if !session.shared_history() {
+                continue;
+            }
+            let key: crate::types::room_history::HistoricRoomKey = session.export().await.into();
+            let Ok(encoded) = serde_json::to_vec(&key) else {
+                return Ok(None);
+            };
+            bytes = bytes.saturating_add(encoded.len());
+            if bytes > max_bytes {
+                return Ok(None);
+            }
+            bundle.room_keys.push(key);
+        }
+        Ok(Some(bundle))
+    }
+
+    /// Import a room-scoped bundle from an authenticated,
+    /// cross-signing-verified forwarder. The caller is responsible for
+    /// current room authorization. Invalid bundles are rejected atomically,
+    /// without logging their contents.
+    pub async fn import_verified_room_key_bundle(
+        &self,
+        room_id: &RoomId,
+        device: &Device,
+        bundle: RoomKeyBundle,
+    ) -> Result<Option<RoomKeyImportResult>, CryptoStoreError> {
+        let sender = SenderData::from_device(device);
+        if device.is_blacklisted()
+            || !matches!(sender, SenderData::SenderVerified(_))
+            || !bundle.withheld.is_empty()
+        {
+            return Ok(None);
+        }
+        let Ok(forwarder): std::result::Result<ForwarderData, _> = (&sender).try_into() else {
+            return Ok(None);
+        };
+        let mut keys = Vec::with_capacity(bundle.room_keys.len());
+        for key in &bundle.room_keys {
+            if key.room_id != room_id {
+                return Ok(None);
+            }
+            let Ok(session) = key.try_into_inbound_group_session(&forwarder) else {
+                return Ok(None);
+            };
+            keys.push(session);
+        }
+        self.import_sessions_impl(keys.into_iter(), None, |_, _| {}).await.map(Some)
     }
 
     /// Import the contents of a downloaded and decrypted [MSC4268] key bundle.
@@ -2016,6 +2079,9 @@ impl matrix_sdk_common::cross_process_lock::TryLock for LockableCryptoStore {
         self.0.try_take_leased_lock(lease_duration_ms, key, holder).await
     }
 }
+
+#[cfg(test)]
+mod history_recovery_tests;
 
 #[cfg(test)]
 mod tests {

@@ -839,13 +839,15 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
     async fn get_inbound_group_sessions_by_room_id(
         &self,
         room_id: Key,
+        max_rows: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, bool)>> {
         Ok(self
             .prepare(
-                "SELECT data, backed_up FROM inbound_group_session WHERE room_id = :room_id",
+                "SELECT data, backed_up FROM inbound_group_session WHERE room_id = :room_id LIMIT :limit",
                 move |mut stmt| {
                     stmt.query(named_params! {
                         ":room_id": room_id,
+                        ":limit": max_rows.map(|n| i64::try_from(n).unwrap_or(i64::MAX)).unwrap_or(-1),
                     })?
                     .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
                     .collect()
@@ -1438,13 +1440,36 @@ impl CryptoStore for SqliteCryptoStore {
         let room_id = self.encode_key("inbound_group_session", room_id.as_bytes());
         self.read()
             .await?
-            .get_inbound_group_sessions_by_room_id(room_id)
+            .get_inbound_group_sessions_by_room_id(room_id, None)
             .await?
             .into_iter()
             .map(|(value, backed_up)| {
                 self.deserialize_and_unpickle_inbound_group_session(value, backed_up)
             })
             .collect()
+    }
+
+    async fn get_bounded_room_sessions(
+        &self,
+        room_id: &RoomId,
+        max_sessions: usize,
+    ) -> Result<Option<Vec<InboundGroupSession>>> {
+        let Some(max_rows) = max_sessions.checked_add(1) else { return Ok(None) };
+        let room_id = self.encode_key("inbound_group_session", room_id.as_bytes());
+        let rows = self
+            .read()
+            .await?
+            .get_inbound_group_sessions_by_room_id(room_id, Some(max_rows))
+            .await?;
+        if rows.len() > max_sessions {
+            return Ok(None);
+        }
+        rows.into_iter()
+            .map(|(value, backed_up)| {
+                self.deserialize_and_unpickle_inbound_group_session(value, backed_up)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 
     async fn get_inbound_group_sessions_for_device_batch(
@@ -1918,6 +1943,10 @@ impl CryptoStore for SqliteCryptoStore {
         Ok(Some(self.read().await?.get_db_size().await?))
     }
 }
+
+#[cfg(test)]
+#[path = "crypto_store_history_recovery_tests.rs"]
+mod history_recovery_tests;
 
 #[cfg(test)]
 mod tests {
