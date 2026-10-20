@@ -9,8 +9,9 @@ use crate::{
     Account, LocalTrust, OlmMachine,
     machine::test_helpers::{
         create_signed_device_of_unverified_user, create_signed_device_of_verified_user,
+        create_unsigned_device,
     },
-    olm::{InboundGroupSession, PrivateCrossSigningIdentity, SenderData},
+    olm::{ForwarderData, InboundGroupSession, PrivateCrossSigningIdentity, SenderData},
     types::EventEncryptionAlgorithm,
 };
 
@@ -47,6 +48,32 @@ async fn fixture() -> (OlmMachine, OlmMachine, crate::Device, crate::Device) {
     .unwrap();
     source.store().save_inbound_group_sessions(&[session]).await.unwrap();
     (source, receiver, verified, unverified)
+}
+
+#[async_test]
+async fn test_import_accepts_cross_signed_unverified_forwarder_without_promoting_trust() {
+    let (source, receiver, _, unverified) = fixture().await;
+    let room = room_id!("!shared:example.invalid");
+    assert!(matches!(SenderData::from_device(&unverified), SenderData::SenderUnverified(_)));
+    for expected in [1, 0] {
+        let bundle = source
+            .store()
+            .build_bounded_shared_history_bundle(room, 4, 65536)
+            .await
+            .unwrap()
+            .unwrap();
+        let imported = receiver
+            .store()
+            .import_room_key_bundle_from_device(room, &unverified, bundle)
+            .await
+            .unwrap()
+            .expect("cross-signed unverified forwarder must be accepted");
+        assert_eq!(imported.imported_count, expected);
+    }
+    let sessions = receiver.store().get_inbound_group_sessions_by_room_id(room).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert!(matches!(sessions[0].forwarder_data, Some(ForwarderData::SenderUnverified(_))));
+    assert!(matches!(SenderData::from_device(&unverified), SenderData::SenderUnverified(_)));
 }
 
 #[async_test]
@@ -98,15 +125,35 @@ async fn test_export_never_includes_sessions_without_shared_history() {
 }
 
 #[async_test]
-async fn test_import_requires_verified_unblocked_forwarder_and_is_room_scoped() {
+async fn test_import_rejects_unsigned_blocked_or_changed_identity_and_is_room_scoped() {
     let (source, receiver, verified, unverified) = fixture().await;
     let room = room_id!("!shared:example.invalid");
+    let unsigned = create_unsigned_device(unverified.as_device_keys().clone());
+    unsigned.set_local_trust(LocalTrust::Verified).await.unwrap();
     let bundle =
         source.store().build_bounded_shared_history_bundle(room, 4, 65536).await.unwrap().unwrap();
     assert!(
         receiver
             .store()
-            .import_verified_room_key_bundle(room, &unverified, bundle)
+            .import_room_key_bundle_from_device(room, &unsigned, bundle)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    unverified
+        .device_owner_identity
+        .as_ref()
+        .unwrap()
+        .other()
+        .unwrap()
+        .mark_as_previously_verified();
+    assert!(matches!(SenderData::from_device(&unverified), SenderData::VerificationViolation(_)));
+    let bundle =
+        source.store().build_bounded_shared_history_bundle(room, 4, 65536).await.unwrap().unwrap();
+    assert!(
+        receiver
+            .store()
+            .import_room_key_bundle_from_device(room, &unverified, bundle)
             .await
             .unwrap()
             .is_none()
@@ -116,7 +163,33 @@ async fn test_import_requires_verified_unblocked_forwarder_and_is_room_scoped() 
     assert!(
         receiver
             .store()
-            .import_verified_room_key_bundle(room_id!("!other:example.invalid"), &verified, bundle)
+            .import_room_key_bundle_from_device(
+                room_id!("!other:example.invalid"),
+                &verified,
+                bundle
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(receiver.store().get_inbound_group_sessions_by_room_id(room).await.unwrap().is_empty());
+    // A good entry followed by a wrong-room entry must not partially import.
+    let mut bundle =
+        source.store().build_bounded_shared_history_bundle(room, 4, 65536).await.unwrap().unwrap();
+    let mut wrong_room = source
+        .store()
+        .build_bounded_shared_history_bundle(room, 4, 65536)
+        .await
+        .unwrap()
+        .unwrap()
+        .room_keys
+        .remove(0);
+    wrong_room.room_id = room_id!("!other:example.invalid").to_owned();
+    bundle.room_keys.push(wrong_room);
+    assert!(
+        receiver
+            .store()
+            .import_room_key_bundle_from_device(room, &verified, bundle)
             .await
             .unwrap()
             .is_none()
@@ -128,7 +201,7 @@ async fn test_import_requires_verified_unblocked_forwarder_and_is_room_scoped() 
     assert!(
         receiver
             .store()
-            .import_verified_room_key_bundle(room, &verified, bundle)
+            .import_room_key_bundle_from_device(room, &verified, bundle)
             .await
             .unwrap()
             .is_none()
@@ -143,7 +216,7 @@ async fn test_import_requires_verified_unblocked_forwarder_and_is_room_scoped() 
             .unwrap();
         let imported = receiver
             .store()
-            .import_verified_room_key_bundle(room, &verified, bundle)
+            .import_room_key_bundle_from_device(room, &verified, bundle)
             .await
             .unwrap()
             .unwrap();

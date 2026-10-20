@@ -1817,20 +1817,18 @@ impl Store {
     }
 
     /// Import a room-scoped bundle from an authenticated,
-    /// cross-signing-verified forwarder. The caller is responsible for
-    /// current room authorization. Invalid bundles are rejected atomically,
-    /// without logging their contents.
-    pub async fn import_verified_room_key_bundle(
+    /// owner-cross-signed forwarder. Manual user verification is optional;
+    /// unsigned devices and verification violations remain ineligible. The
+    /// caller must supply a current device and enforce room authorization.
+    /// Invalid bundles are rejected atomically without logging their contents.
+    pub async fn import_room_key_bundle_from_device(
         &self,
         room_id: &RoomId,
         device: &Device,
         bundle: RoomKeyBundle,
     ) -> Result<Option<RoomKeyImportResult>, CryptoStoreError> {
         let sender = SenderData::from_device(device);
-        if device.is_blacklisted()
-            || !matches!(sender, SenderData::SenderVerified(_))
-            || !bundle.withheld.is_empty()
-        {
+        if device.is_blacklisted() || !bundle.withheld.is_empty() {
             return Ok(None);
         }
         let Ok(forwarder): std::result::Result<ForwarderData, _> = (&sender).try_into() else {
