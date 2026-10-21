@@ -1,10 +1,12 @@
 // Copyright 2026 The Matrix.org Foundation C.I.C.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
+use tokio::sync::Barrier;
+
 use super::*;
 use crate::types::requests::AnyOutgoingRequest;
-use std::sync::Arc;
-use tokio::sync::Barrier;
 
 #[async_test]
 async fn test_initial_unknown_lookup_observes_overlapping_committed_sender_keys() {
@@ -67,7 +69,8 @@ async fn test_full_incoming_owner_rejects_room_request_without_lookup_or_extra_s
             .await
             .unwrap();
     }
-    let (query_id, _) = f.bob.inner.identity_manager.users_for_key_query().await.unwrap().pop_first().unwrap();
+    let (query_id, _) =
+        f.bob.inner.identity_manager.users_for_key_query().await.unwrap().pop_first().unwrap();
     keys(&f, &query_id, true).await;
     assert_eq!(f.bob.inner.verification_machine.incoming_verification_request_owner_count(), 32);
     let event = request(&f, "!overflow:example.invalid", "$overflow:example.invalid");
@@ -96,8 +99,12 @@ async fn test_full_incoming_owner_rejects_room_request_without_lookup_or_extra_s
     );
     let before = f.bob.inner.verification_machine.outgoing_messages().len();
     let mut other = request(&f, "!other:example.invalid", "$other:example.invalid");
-    if let AnyMessageLikeEvent::RoomMessage(ruma::events::MessageLikeEvent::Original(event)) = &mut other {
-        if let ruma::events::room::message::MessageType::VerificationRequest(content) = &mut event.content.msgtype {
+    if let AnyMessageLikeEvent::RoomMessage(ruma::events::MessageLikeEvent::Original(event)) =
+        &mut other
+    {
+        if let ruma::events::room::message::MessageType::VerificationRequest(content) =
+            &mut event.content.msgtype
+        {
             content.to = "@other:example.invalid".try_into().unwrap();
         }
     }

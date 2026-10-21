@@ -96,9 +96,9 @@ use crate::{
 };
 
 mod decryption_verification_state;
+mod in_room_verification;
 mod initial_share_diagnostics;
 mod interactive_verification;
-mod in_room_verification;
 mod megolm_sender_data;
 mod olm_encryption;
 mod persisted_rotation_reason;

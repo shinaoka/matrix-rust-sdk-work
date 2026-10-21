@@ -1,9 +1,11 @@
 // Copyright 2026 The Matrix.org Foundation C.I.C.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
 use std::sync::Arc;
+
 use tokio::sync::Barrier;
+
+use super::*;
 
 #[async_test]
 async fn test_interrupted_in_room_replay_claim_remains_retryable() {

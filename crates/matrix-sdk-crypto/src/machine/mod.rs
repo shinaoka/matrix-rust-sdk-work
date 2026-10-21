@@ -1841,9 +1841,9 @@ impl OlmMachine {
 
     /// Subscribe to materialized incoming verification requests.
     ///
-    /// This is a single-owner, bounded subscription. Creating a new subscription
-    /// closes the previous one. Normal delivery and sender-key recovery share
-    /// one bounded lease queue.
+    /// This is a single-owner, bounded subscription. Creating a new
+    /// subscription closes the previous one. Normal delivery and sender-key
+    /// recovery share one bounded lease queue.
     pub fn subscribe_to_incoming_verification_requests(
         &self,
     ) -> impl futures_core::Stream<Item = crate::verification::IncomingVerificationRequestDelivery>

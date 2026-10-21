@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
@@ -21,9 +23,6 @@ use std::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
     },
 };
-
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use futures_util::{StreamExt, stream};
 use matrix_sdk_common::locks::RwLock as StdRwLock;
@@ -55,9 +54,11 @@ use crate::{
     DeviceData, OtherUserIdentityData,
     olm::{PrivateCrossSigningIdentity, StaticAccountData},
     store::{CryptoStoreError, CryptoStoreWrapper},
-    types::events::ToDeviceEvents,
-    types::requests::{
-        OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
+    types::{
+        events::ToDeviceEvents,
+        requests::{
+            OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
+        },
     },
 };
 
@@ -1702,9 +1703,10 @@ impl VerificationMachine {
             return true;
         }
 
-        // Capacity exhaustion is an explicit protocol-terminal rejection, not a silent product
-        // drop. `UnexpectedMessage` is the existing generic protocol-level rejection code and
-        // carries no local queue details or private identifiers to the peer.
+        // Capacity exhaustion is an explicit protocol-terminal rejection, not a silent
+        // product drop. `UnexpectedMessage` is the existing generic
+        // protocol-level rejection code and carries no local queue details or
+        // private identifiers to the peer.
         if let Some(cancel) = request.cancel_with_code(CancelCode::UnexpectedMessage) {
             self.verifications.add_verification_request(cancel);
         }
