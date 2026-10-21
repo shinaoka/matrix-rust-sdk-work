@@ -28,10 +28,10 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use futures_util::{StreamExt, stream};
 use matrix_sdk_common::locks::RwLock as StdRwLock;
 use ruma::{
-    DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedTransactionId, OwnedUserId,
-    RoomId, SecondsSinceUnixEpoch, TransactionId, UInt, UserId,
+    DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedRoomId, OwnedTransactionId,
+    OwnedUserId, RoomId, SecondsSinceUnixEpoch, TransactionId, UInt, UserId,
     events::{
-        AnyToDeviceEvent, AnyToDeviceEventContent, ToDeviceEvent,
+        AnyMessageLikeEvent, AnyToDeviceEvent, AnyToDeviceEventContent, ToDeviceEvent,
         key::verification::{
             VerificationMethod, cancel::CancelCode, request::ToDeviceKeyVerificationRequestEvent,
         },
@@ -40,7 +40,9 @@ use ruma::{
     uint,
 };
 use tokio::sync::{Mutex, watch};
-use tracing::{debug, info, instrument, trace, warn};
+#[cfg(test)]
+use tracing::instrument;
+use tracing::{debug, info, trace, warn};
 
 use super::{
     FlowId, Verification, VerificationResult, VerificationStore,
@@ -62,14 +64,65 @@ use crate::{
 const MAX_PENDING_TO_DEVICE_VERIFICATION_REQUESTS: usize = 32;
 
 #[derive(Clone)]
+enum PendingIncomingVerificationEvent {
+    ToDevice(Arc<ToDeviceEvents>),
+    InRoom(Box<AnyMessageLikeEvent>),
+}
+
+impl PendingIncomingVerificationEvent {
+    fn as_any(&self) -> AnyEvent<'_> {
+        match self {
+            Self::ToDevice(event) => AnyEvent::from(event.as_ref()),
+            Self::InRoom(event) => AnyEvent::from(event.as_ref()),
+        }
+    }
+
+    fn sender(&self) -> &UserId {
+        match self {
+            Self::ToDevice(event) => event.sender(),
+            Self::InRoom(event) => event.sender(),
+        }
+    }
+
+    fn timestamp(&self) -> MilliSecondsSinceUnixEpoch {
+        match self {
+            Self::ToDevice(event) => match event.as_ref() {
+                ToDeviceEvents::KeyVerificationRequest(event) => event.content.timestamp,
+                _ => unreachable!("only verification requests are retained"),
+            },
+            Self::InRoom(event) => event.origin_server_ts(),
+        }
+    }
+
+    fn key(&self) -> PendingToDeviceVerificationRequestKey {
+        match self {
+            Self::ToDevice(event) => match event.as_ref() {
+                ToDeviceEvents::KeyVerificationRequest(event) => event.into(),
+                _ => unreachable!("only verification requests are retained"),
+            },
+            Self::InRoom(event) => PendingToDeviceVerificationRequestKey {
+                sender: event.sender().to_owned(),
+                transaction_id: OwnedTransactionId::from(event.event_id().as_str()),
+                room_id: Some(event.room_id().to_owned()),
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
 struct PendingToDeviceVerificationRequest {
-    event: ToDeviceKeyVerificationRequestEvent,
+    event: PendingIncomingVerificationEvent,
     state: PendingToDeviceVerificationRequestState,
     committed_update_generation: u64,
+    // In-room cancellation is retained in the same bounded slot until expiry.
+    cancelled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PendingToDeviceVerificationRequestState {
+    InitialLookup {
+        token: u64,
+    },
     #[default]
     NeedsQuery,
     QueryInFlight,
@@ -87,7 +140,10 @@ enum PendingToDeviceVerificationRequestState {
 
 impl PendingToDeviceVerificationRequestState {
     fn is_claimed(self) -> bool {
-        matches!(self, Self::ResponseClaimed { .. } | Self::ReplayClaimed { .. })
+        matches!(
+            self,
+            Self::InitialLookup { .. } | Self::ResponseClaimed { .. } | Self::ReplayClaimed { .. }
+        )
     }
 }
 
@@ -105,7 +161,7 @@ pub(crate) enum VerificationEventResult {
 
 enum PreparedIncomingVerificationRequest {
     Terminal(VerificationEventResult),
-    Ready(VerificationRequest),
+    Ready(VerificationRequest, Option<PendingToDeviceVerificationRequestClaim>),
 }
 
 enum VerificationRequestInsertion {
@@ -149,6 +205,18 @@ struct IncomingVerificationRequestOwner {
 }
 
 impl IncomingVerificationRequestOwner {
+    fn active_front_position(&self) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            !matches!(entry,
+            IncomingVerificationRequestEntry::Pending(pending) if pending.cancelled)
+        })
+    }
+
+    fn active_front_mut(&mut self) -> Option<&mut IncomingVerificationRequestEntry> {
+        let position = self.active_front_position()?;
+        self.entries.get_mut(position)
+    }
+
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -221,35 +289,48 @@ impl VerificationRequestInsertion {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct PendingToDeviceVerificationRequestKey {
     sender: OwnedUserId,
     transaction_id: OwnedTransactionId,
+    room_id: Option<OwnedRoomId>,
+}
+
+impl fmt::Debug for PendingToDeviceVerificationRequestKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("PendingToDeviceVerificationRequestKey").finish_non_exhaustive()
+    }
 }
 
 impl PendingToDeviceVerificationRequestKey {
     fn new(sender: &UserId, transaction_id: &str) -> Self {
-        Self { sender: sender.to_owned(), transaction_id: OwnedTransactionId::from(transaction_id) }
+        Self {
+            sender: sender.to_owned(),
+            transaction_id: OwnedTransactionId::from(transaction_id),
+            room_id: None,
+        }
     }
 }
 
 impl From<&PendingToDeviceVerificationRequest> for PendingToDeviceVerificationRequestKey {
     fn from(pending: &PendingToDeviceVerificationRequest) -> Self {
-        Self {
-            sender: pending.event.sender.clone(),
-            transaction_id: pending.event.content.transaction_id.clone(),
-        }
+        pending.event.key()
     }
 }
 
 impl From<&ToDeviceKeyVerificationRequestEvent> for PendingToDeviceVerificationRequestKey {
     fn from(event: &ToDeviceKeyVerificationRequestEvent) -> Self {
-        Self { sender: event.sender.clone(), transaction_id: event.content.transaction_id.clone() }
+        Self {
+            sender: event.sender.clone(),
+            transaction_id: event.content.transaction_id.clone(),
+            room_id: None,
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingToDeviceVerificationRequestClaimKind {
+    InitialLookup,
     Replay,
 }
 
@@ -261,6 +342,13 @@ struct PendingToDeviceVerificationRequestClaim {
     response_token: u64,
     kind: PendingToDeviceVerificationRequestClaimKind,
     active: bool,
+}
+
+enum InitialLookupReservation {
+    Owned(PendingToDeviceVerificationRequestClaim),
+    Existing,
+    Busy,
+    Full,
 }
 
 pub(crate) struct PendingToDeviceKeyQueryResponseClaim {
@@ -346,15 +434,35 @@ impl PendingToDeviceVerificationRequestClaim {
                     ..
                 },
             ) => response_token == self.response_token && replay_token == self.token,
+            (
+                PendingToDeviceVerificationRequestClaimKind::InitialLookup,
+                PendingToDeviceVerificationRequestState::InitialLookup { token },
+            ) => token == self.token,
             _ => false,
         }
     }
 
     fn finish(&mut self) {
         let mut owner = self.owner.write();
+        let cancelled = {
+            let pending = owner
+                .pending_mut()
+                .find(|pending| pending.event.key() == self.key && pending.cancelled);
+            if let Some(pending) = pending {
+                pending.state = PendingToDeviceVerificationRequestState::WaitingForExternalUpdate;
+                true
+            } else {
+                false
+            }
+        };
+        if cancelled {
+            self.active = false;
+            drop(owner);
+            notify_watch(&self.publication_changed);
+            return;
+        }
         let removed = owner.retain_pending(|pending| {
-            let is_key = pending.event.sender == self.key.sender
-                && pending.event.content.transaction_id == self.key.transaction_id;
+            let is_key = pending.event.key() == self.key;
             !is_key || !self.state_matches(pending.state)
         });
         self.active = false;
@@ -366,14 +474,12 @@ impl PendingToDeviceVerificationRequestClaim {
 
     fn release_to_response_claim(&mut self) {
         let mut owner = self.owner.write();
-        if let Some(pending) = owner.pending_mut().find(|pending| {
-            pending.event.sender == self.key.sender
-                && pending.event.content.transaction_id == self.key.transaction_id
-        }) && let PendingToDeviceVerificationRequestState::ReplayClaimed {
-            response_token,
-            replay_token,
-            observed_generation,
-        } = pending.state
+        if let Some(pending) = owner.pending_mut().find(|pending| pending.event.key() == self.key)
+            && let PendingToDeviceVerificationRequestState::ReplayClaimed {
+                response_token,
+                replay_token,
+                observed_generation,
+            } = pending.state
             && response_token == self.response_token
             && replay_token == self.token
         {
@@ -385,6 +491,36 @@ impl PendingToDeviceVerificationRequestClaim {
         self.active = false;
     }
 
+    fn committed_generation(&self) -> u64 {
+        self.owner
+            .read()
+            .pending()
+            .find(|pending| pending.event.key() == self.key)
+            .map_or(0, |pending| pending.committed_update_generation)
+    }
+
+    fn retry_or_promote_initial_lookup(&self, observed_generation: u64, unknown: bool) -> bool {
+        let mut owner = self.owner.write();
+        let pending = owner
+            .pending_mut()
+            .find(|pending| pending.event.key() == self.key && self.state_matches(pending.state));
+        let Some(pending) = pending else { return false };
+        if pending.committed_update_generation != observed_generation {
+            return true;
+        }
+        if unknown {
+            pending.state = PendingToDeviceVerificationRequestState::NeedsQuery;
+        }
+        false
+    }
+
+    fn cancelled(&self) -> bool {
+        self.owner
+            .read()
+            .pending()
+            .any(|pending| pending.event.key() == self.key && pending.cancelled)
+    }
+
     fn publish(
         &mut self,
         request: VerificationRequest,
@@ -392,12 +528,29 @@ impl PendingToDeviceVerificationRequestClaim {
         changed: &watch::Sender<u64>,
     ) {
         let mut owner = self.owner.write();
+        let cancelled = {
+            let pending = owner
+                .pending_mut()
+                .find(|pending| pending.event.key() == self.key && pending.cancelled);
+            if let Some(pending) = pending {
+                pending.state = PendingToDeviceVerificationRequestState::WaitingForExternalUpdate;
+                true
+            } else {
+                false
+            }
+        };
+        if cancelled {
+            self.active = false;
+            drop(owner);
+            let _ = request.cancel();
+            notify_watch(changed);
+            return;
+        }
         let position = owner.entries.iter().position(|entry| {
             matches!(
                 entry,
                 IncomingVerificationRequestEntry::Pending(pending)
-                    if pending.event.sender == self.key.sender
-                        && pending.event.content.transaction_id == self.key.transaction_id
+                    if pending.event.key() == self.key
                         && self.state_matches(pending.state)
             )
         });
@@ -427,17 +580,33 @@ impl Drop for PendingToDeviceVerificationRequestClaim {
         }
 
         let mut owner = self.owner.write();
-        if let Some(pending) = owner.pending_mut().find(|pending| {
-            pending.event.sender == self.key.sender
-                && pending.event.content.transaction_id == self.key.transaction_id
-        }) && self.state_matches(pending.state)
+        if self.kind == PendingToDeviceVerificationRequestClaimKind::InitialLookup {
+            for pending in owner.pending_mut().filter(|pending| {
+                pending.event.key() == self.key && self.state_matches(pending.state)
+            }) {
+                if pending.cancelled {
+                    pending.state =
+                        PendingToDeviceVerificationRequestState::WaitingForExternalUpdate;
+                }
+            }
+            owner.retain_pending(|pending| {
+                pending.event.key() != self.key
+                    || !self.state_matches(pending.state)
+                    || pending.cancelled
+            });
+            drop(owner);
+            notify_watch(&self.publication_changed);
+            return;
+        }
+        if let Some(pending) = owner.pending_mut().find(|pending| pending.event.key() == self.key)
+            && self.state_matches(pending.state)
         {
             pending.state = PendingToDeviceVerificationRequestState::NeedsQuery;
         }
     }
 }
 
-/// Lease for a materialized incoming to-device verification request.
+/// Lease for a materialized incoming verification request.
 ///
 /// Polling only claims the stable queue head. Callers commit after their final
 /// application handoff succeeds. Dropping the lease releases the claim in
@@ -467,19 +636,21 @@ impl IncomingVerificationRequestDelivery {
     /// Commit successful application delivery of the request.
     pub fn commit(mut self) {
         let mut owner = self.owner.write();
-        if owner.entries.front().is_some_and(|entry| {
-            matches!(
-                entry,
-                IncomingVerificationRequestEntry::Publication(publication)
-                    if publication.key == self.key
-                        && publication.state
-                            == (IncomingVerificationRequestPublicationState::Claimed {
-                                generation: self.generation,
-                                token: self.token,
-                            })
-            )
-        }) {
-            owner.entries.pop_front();
+        if let Some(position) = owner.active_front_position()
+            && owner.entries.get(position).is_some_and(|entry| {
+                matches!(
+                    entry,
+                    IncomingVerificationRequestEntry::Publication(publication)
+                        if publication.key == self.key
+                            && publication.state
+                                == (IncomingVerificationRequestPublicationState::Claimed {
+                                    generation: self.generation,
+                                    token: self.token,
+                                })
+                )
+            })
+        {
+            owner.entries.remove(position);
         }
         self.active = false;
         drop(owner);
@@ -502,7 +673,7 @@ impl Drop for IncomingVerificationRequestDelivery {
         }
         let mut owner = self.owner.write();
         if let Some(IncomingVerificationRequestEntry::Publication(publication)) =
-            owner.entries.front_mut()
+            owner.active_front_mut()
             && publication.key == self.key
             && publication.state
                 == (IncomingVerificationRequestPublicationState::Claimed {
@@ -609,7 +780,7 @@ impl VerificationMachine {
                         if owner.subscriber_generation != Some(generation) {
                             return None;
                         }
-                        match owner.entries.front_mut() {
+                        match owner.active_front_mut() {
                             None => None,
                             Some(IncomingVerificationRequestEntry::Publication(publication))
                                 if publication.state
@@ -786,6 +957,15 @@ impl VerificationMachine {
         let mut requests = self.requests.write();
         let user_requests = requests.entry(request.other_user().to_owned()).or_default();
         if let Some(existing) = user_requests.get(request.flow_id().as_str()) {
+            if existing.request.flow_id() != request.flow_id() {
+                if let Some(cancel) = request.cancel_with_code(CancelCode::UnexpectedMessage) {
+                    self.verifications.add_verification_request(cancel);
+                }
+                return VerificationRequestInsertion::Existing {
+                    request,
+                    incoming_to_device: false,
+                };
+            }
             debug!("Ignoring known verification request");
             return VerificationRequestInsertion::Existing {
                 request: existing.request.clone(),
@@ -868,7 +1048,7 @@ impl VerificationMachine {
 
         let mut owner = self.incoming_verification_request_owner.write();
         let owner_changed = owner.retain_pending(|pending| {
-            pending.state.is_claimed() || Self::is_timestamp_valid(pending.event.content.timestamp)
+            pending.state.is_claimed() || Self::is_timestamp_valid(pending.event.timestamp())
         });
         drop(owner);
         if owner_changed {
@@ -941,12 +1121,20 @@ impl VerificationMachine {
         Ok(())
     }
 
+    #[cfg(test)]
     #[instrument(skip_all)]
     pub async fn receive_any_event(
         &self,
         event: impl Into<AnyEvent<'_>>,
     ) -> Result<(), CryptoStoreError> {
         self.receive_any_event_inner(event.into(), false).await.map(|_| ())
+    }
+
+    pub(crate) async fn receive_room_event(
+        &self,
+        event: &AnyMessageLikeEvent,
+    ) -> Result<VerificationEventResult, CryptoStoreError> {
+        self.receive_any_event_inner(event.into(), true).await
     }
 
     pub(crate) async fn receive_to_device_event(
@@ -999,18 +1187,95 @@ impl VerificationMachine {
             ));
         }
 
-        #[cfg(test)]
-        let device_result =
-            if self.fail_next_verification_request_device_lookup.swap(false, Ordering::SeqCst) {
+        if matches!(content, RequestContent::Room(content) if content.to != self.store.account.user_id)
+        {
+            return Ok(PreparedIncomingVerificationRequest::Terminal(
+                VerificationEventResult::Handled,
+            ));
+        }
+
+        let initial_lookup = if retain_unknown_sender && event.is_room_event() {
+            match self.reserve_in_room_initial_lookup(event) {
+                InitialLookupReservation::Owned(claim) => Some(claim),
+                InitialLookupReservation::Existing => None,
+                InitialLookupReservation::Busy => {
+                    return Ok(PreparedIncomingVerificationRequest::Terminal(
+                        VerificationEventResult::Handled,
+                    ));
+                }
+                InitialLookupReservation::Full => {
+                    if let FlowId::InRoom(room_id, event_id) = &flow_id {
+                        let cancel = ruma::events::key::verification::cancel::KeyVerificationCancelEventContent::new(
+                            "Unexpected verification request".to_owned(), CancelCode::UnexpectedMessage,
+                            ruma::events::relation::Reference::new(event_id.clone()),
+                        );
+                        self.queue_up_content(
+                            event.sender(),
+                            content.from_device(),
+                            (
+                                room_id.clone(),
+                                ruma::events::AnyMessageLikeEventContent::KeyVerificationCancel(
+                                    cancel,
+                                ),
+                            )
+                                .into(),
+                            None,
+                        );
+                    }
+                    return Ok(PreparedIncomingVerificationRequest::Terminal(
+                        VerificationEventResult::Handled,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        let device_result = loop {
+            let observed_generation =
+                initial_lookup.as_ref().map(|claim| claim.committed_generation());
+            #[cfg(test)]
+            let device_result = if self
+                .fail_next_verification_request_device_lookup
+                .swap(false, Ordering::SeqCst)
+            {
                 Err(CryptoStoreError::AccountUnset)
             } else {
                 self.store.get_device(event.sender(), content.from_device()).await
             };
-        #[cfg(not(test))]
-        let device_result = self.store.get_device(event.sender(), content.from_device()).await;
+            #[cfg(not(test))]
+            let device_result = self.store.get_device(event.sender(), content.from_device()).await;
+            #[cfg(test)]
+            self.pause_request_device_lookup_completed_for_test().await;
+            if let Some(claim) = initial_lookup.as_ref() {
+                if claim.retry_or_promote_initial_lookup(
+                    observed_generation.unwrap_or(0),
+                    !matches!(device_result, Ok(Some(_))),
+                ) {
+                    continue;
+                }
+            }
+            break device_result;
+        };
 
-        #[cfg(test)]
-        self.pause_request_device_lookup_completed_for_test().await;
+        if event.is_room_event()
+            && (!Self::is_timestamp_valid(timestamp)
+                || self.in_room_pending_lookup_terminal(event.sender(), &flow_id))
+        {
+            self.finish_in_room_initial_lookup(event.sender(), &flow_id);
+            return Ok(PreparedIncomingVerificationRequest::Terminal(
+                VerificationEventResult::Handled,
+            ));
+        }
+
+        if initial_lookup.is_some() && !matches!(device_result, Ok(Some(_))) {
+            return Ok(PreparedIncomingVerificationRequest::Terminal(
+                VerificationEventResult::UnknownSenderQueued {
+                    sender: event.sender().to_owned(),
+                    query_needed: true,
+                },
+            ));
+        }
 
         let device_data = match device_result {
             Ok(Some(device_data)) => device_data,
@@ -1042,14 +1307,17 @@ impl VerificationMachine {
             }
         };
 
-        Ok(PreparedIncomingVerificationRequest::Ready(VerificationRequest::from_request(
-            self.verifications.clone(),
-            self.store.clone(),
-            event.sender(),
-            flow_id,
-            content,
-            device_data,
-        )))
+        Ok(PreparedIncomingVerificationRequest::Ready(
+            VerificationRequest::from_request(
+                self.verifications.clone(),
+                self.store.clone(),
+                event.sender(),
+                flow_id,
+                content,
+                device_data,
+            ),
+            initial_lookup,
+        ))
     }
 
     async fn receive_any_event_inner(
@@ -1075,8 +1343,24 @@ impl VerificationMachine {
         let Some(content) = event.verification_content() else {
             return Ok(VerificationEventResult::Handled);
         };
+        if matches!(content, AnyVerificationContent::Cancel(_)) && event.is_room_event() {
+            self.cancel_pending_in_room_request(event.sender(), &flow_id);
+        }
+        // A cache lookup by its public string id must never cross transport or
+        // room identity, including Cancel and Done which otherwise mutate it.
+        if !matches!(content, AnyVerificationContent::Request(_))
+            && self
+                .get_request(event.sender(), flow_id.as_str())
+                .is_some_and(|request| request.flow_id() != &flow_id)
+        {
+            flow_id_mismatch();
+            return Ok(VerificationEventResult::Handled);
+        }
         match &content {
             AnyVerificationContent::Request(r) => {
+                if self.in_room_request_was_cancelled(event.sender(), &flow_id) {
+                    return Ok(VerificationEventResult::Handled);
+                }
                 return match self
                     .prepare_incoming_verification_request(
                         &event,
@@ -1087,18 +1371,31 @@ impl VerificationMachine {
                     .await?
                 {
                     PreparedIncomingVerificationRequest::Terminal(result) => Ok(result),
-                    PreparedIncomingVerificationRequest::Ready(request) => {
-                        let insertion = if incoming_to_device {
+                    PreparedIncomingVerificationRequest::Ready(request, _initial_lookup) => {
+                        if self.in_room_request_was_cancelled(event.sender(), request.flow_id()) {
+                            return Ok(VerificationEventResult::Handled);
+                        }
+                        let insertion = if incoming_to_device || event.is_room_event() {
                             self.insert_incoming_to_device_request(request)
                         } else {
                             self.insert_request(request)
                         };
+                        let room_duplicate = event.is_room_event()
+                            && matches!(insertion, VerificationRequestInsertion::Existing { .. });
                         let (request, publishable) = insertion.into_request_and_provenance();
-                        if incoming_to_device && publishable {
-                            let key = PendingToDeviceVerificationRequestKey::new(
+                        if self.in_room_request_was_cancelled(event.sender(), request.flow_id()) {
+                            let _ = request.cancel();
+                            return Ok(VerificationEventResult::Handled);
+                        }
+                        if event.is_room_event() && (!publishable || room_duplicate) {
+                            self.finish_in_room_initial_lookup(event.sender(), request.flow_id());
+                        }
+                        if publishable && !room_duplicate {
+                            let mut key = PendingToDeviceVerificationRequestKey::new(
                                 request.other_user(),
                                 request.flow_id().as_str(),
                             );
+                            key.room_id = request.flow_id().room_id().map(ToOwned::to_owned);
                             self.publish_or_reject_incoming_verification_request(
                                 key,
                                 request.clone(),
@@ -1117,11 +1414,21 @@ impl VerificationMachine {
                 {
                     match verification {
                         Verification::SasV1(sas) => {
+                            if sas.flow_id() != &flow_id {
+                                flow_id_mismatch();
+                                return Ok(VerificationEventResult::Handled);
+                            }
                             // This won't produce an outgoing content
                             let _ = sas.receive_any_event(event.sender(), &content);
                         }
                         #[cfg(feature = "qrcode")]
-                        Verification::QrV1(qr) => qr.receive_cancel(event.sender(), c),
+                        Verification::QrV1(qr) => {
+                            if qr.flow_id() != &flow_id {
+                                flow_id_mismatch();
+                                return Ok(VerificationEventResult::Handled);
+                            }
+                            qr.receive_cancel(event.sender(), c)
+                        }
                     }
                 }
             }
@@ -1232,6 +1539,10 @@ impl VerificationMachine {
                 #[allow(clippy::single_match)]
                 match self.get_verification(event.sender(), flow_id.as_str()) {
                     Some(Verification::SasV1(sas)) => {
+                        if sas.flow_id() != &flow_id {
+                            flow_id_mismatch();
+                            return Ok(VerificationEventResult::Handled);
+                        }
                         let content = sas.receive_any_event(event.sender(), &content);
 
                         if sas.is_done() {
@@ -1240,6 +1551,10 @@ impl VerificationMachine {
                     }
                     #[cfg(feature = "qrcode")]
                     Some(Verification::QrV1(qr)) => {
+                        if qr.flow_id() != &flow_id {
+                            flow_id_mismatch();
+                            return Ok(VerificationEventResult::Handled);
+                        }
                         let (cancellation, request) = Box::pin(qr.receive_done(c)).await?;
 
                         if let Some(c) = cancellation {
@@ -1258,25 +1573,43 @@ impl VerificationMachine {
         Ok(VerificationEventResult::Handled)
     }
 
+    #[cfg(test)]
     fn retain_pending_to_device_request(
         &self,
         event: &ToDeviceKeyVerificationRequestEvent,
     ) -> bool {
-        let key = PendingToDeviceVerificationRequestKey::from(event);
+        self.retain_pending_incoming_request(PendingIncomingVerificationEvent::ToDevice(Arc::new(
+            ToDeviceEvents::KeyVerificationRequest(event.clone()),
+        )))
+    }
+
+    fn retain_pending_incoming_request(&self, event: PendingIncomingVerificationEvent) -> bool {
+        let key = event.key();
         let (query_needed, removed) = {
             let mut owner = self.incoming_verification_request_owner.write();
             let removed = owner.retain_pending(|pending| {
-                pending.state.is_claimed()
-                    || Self::is_timestamp_valid(pending.event.content.timestamp)
+                pending.state.is_claimed() || Self::is_timestamp_valid(pending.event.timestamp())
             });
 
             let query_needed = if owner.publication_position(&key).is_some() {
                 false
-            } else if let Some(pending) = owner.pending().find(|pending| {
-                pending.event.sender == event.sender
-                    && pending.event.content.transaction_id == event.content.transaction_id
-            }) {
-                pending.state == PendingToDeviceVerificationRequestState::NeedsQuery
+            } else if let Some(position) = owner.pending_position(&key) {
+                let IncomingVerificationRequestEntry::Pending(pending) =
+                    &mut owner.entries[position]
+                else {
+                    unreachable!("pending position belongs to pending entry")
+                };
+                if pending.cancelled {
+                    false
+                } else {
+                    if matches!(
+                        pending.state,
+                        PendingToDeviceVerificationRequestState::InitialLookup { .. }
+                    ) {
+                        pending.state = PendingToDeviceVerificationRequestState::NeedsQuery;
+                    }
+                    pending.state == PendingToDeviceVerificationRequestState::NeedsQuery
+                }
             } else if owner.len() >= MAX_PENDING_TO_DEVICE_VERIFICATION_REQUESTS {
                 false
             } else {
@@ -1285,6 +1618,7 @@ impl VerificationMachine {
                         event: event.clone(),
                         state: PendingToDeviceVerificationRequestState::NeedsQuery,
                         committed_update_generation: 0,
+                        cancelled: false,
                     },
                 ));
                 true
@@ -1298,10 +1632,10 @@ impl VerificationMachine {
     }
 
     fn remove_pending_to_device_request(&self, key: &PendingToDeviceVerificationRequestKey) {
-        let removed = self.incoming_verification_request_owner.write().retain_pending(|pending| {
-            pending.event.sender != key.sender
-                || pending.event.content.transaction_id != key.transaction_id
-        });
+        let removed = self
+            .incoming_verification_request_owner
+            .write()
+            .retain_pending(|pending| pending.event.key() != *key);
         if removed {
             notify_watch(&self.incoming_verification_request_changed);
         }
@@ -1312,13 +1646,18 @@ impl VerificationMachine {
         key: PendingToDeviceVerificationRequestKey,
         request: VerificationRequest,
     ) -> bool {
+        let cancellation_handle = request.clone();
+        let mut cancelled = false;
         let (admitted, changed) = {
             let mut owner = self.incoming_verification_request_owner.write();
             let mut changed = owner.retain_pending(|pending| {
-                pending.state.is_claimed()
-                    || Self::is_timestamp_valid(pending.event.content.timestamp)
+                pending.state.is_claimed() || Self::is_timestamp_valid(pending.event.timestamp())
             });
             let admitted = if owner.publication_position(&key).is_some() {
+                true
+            } else if owner.pending().any(|pending| pending.event.key() == key && pending.cancelled)
+            {
+                cancelled = true;
                 true
             } else if let Some(position) = owner.pending_position(&key) {
                 owner.entries[position] = IncomingVerificationRequestEntry::Publication(
@@ -1345,6 +1684,9 @@ impl VerificationMachine {
             };
             (admitted, changed)
         };
+        if cancelled {
+            let _ = cancellation_handle.cancel();
+        }
         if changed {
             notify_watch(&self.incoming_verification_request_changed);
         }
@@ -1377,20 +1719,143 @@ impl VerificationMachine {
         if !retain_unknown_sender {
             return None;
         }
-        let AnyEvent::ToDevice(ToDeviceEvents::KeyVerificationRequest(event)) = event else {
-            return None;
+        let retained = match event {
+            AnyEvent::ToDevice(ToDeviceEvents::KeyVerificationRequest(event)) => {
+                PendingIncomingVerificationEvent::ToDevice(Arc::new(
+                    ToDeviceEvents::KeyVerificationRequest(event.clone()),
+                ))
+            }
+            AnyEvent::Room(event) => {
+                PendingIncomingVerificationEvent::InRoom(Box::new((*event).clone()))
+            }
+            _ => return None,
         };
-        let query_needed = self.retain_pending_to_device_request(event);
+        let query_needed = self.retain_pending_incoming_request(retained);
         super::protection_counters::note_unknown_sender_deferred();
         Some(VerificationEventResult::UnknownSenderQueued {
-            sender: event.sender.clone(),
+            sender: event.sender().to_owned(),
             query_needed,
         })
     }
 
+    fn reserve_in_room_initial_lookup(&self, event: &AnyEvent<'_>) -> InitialLookupReservation {
+        let AnyEvent::Room(event) = event else { return InitialLookupReservation::Existing };
+        let retained = PendingIncomingVerificationEvent::InRoom(Box::new((*event).clone()));
+        let key = retained.key();
+        let mut owner = self.incoming_verification_request_owner.write();
+        if let Some(pending) = owner.pending().find(|pending| pending.event.key() == key) {
+            return if pending.cancelled
+                || matches!(
+                    pending.state,
+                    PendingToDeviceVerificationRequestState::InitialLookup { .. }
+                ) {
+                InitialLookupReservation::Busy
+            } else {
+                InitialLookupReservation::Existing
+            };
+        }
+        if owner.publication_position(&key).is_some() {
+            return InitialLookupReservation::Existing;
+        }
+        owner.retain_pending(|pending| {
+            pending.state.is_claimed() || Self::is_timestamp_valid(pending.event.timestamp())
+        });
+        if owner.len() >= MAX_PENDING_TO_DEVICE_VERIFICATION_REQUESTS {
+            return InitialLookupReservation::Full;
+        }
+        let token = self.next_pending_to_device_request_claim_token();
+        owner.entries.push_back(IncomingVerificationRequestEntry::Pending(
+            PendingToDeviceVerificationRequest {
+                event: retained,
+                state: PendingToDeviceVerificationRequestState::InitialLookup { token },
+                committed_update_generation: 0,
+                cancelled: false,
+            },
+        ));
+        let claim = PendingToDeviceVerificationRequestClaim {
+            owner: self.incoming_verification_request_owner.clone(),
+            publication_changed: self.incoming_verification_request_changed.clone(),
+            key,
+            token,
+            response_token: 0,
+            kind: PendingToDeviceVerificationRequestClaimKind::InitialLookup,
+            active: true,
+        };
+        drop(owner);
+        notify_watch(&self.incoming_verification_request_changed);
+        InitialLookupReservation::Owned(claim)
+    }
+
+    fn in_room_pending_lookup_terminal(&self, sender: &UserId, flow: &FlowId) -> bool {
+        let Some(room) = flow.room_id() else { return false };
+        self.incoming_verification_request_owner.read().pending().any(|pending| {
+            pending.event.sender() == sender
+                && pending.event.key().transaction_id.as_str() == flow.as_str()
+                && pending.event.key().room_id.as_deref() == Some(room)
+                && (pending.cancelled || !Self::is_timestamp_valid(pending.event.timestamp()))
+        })
+    }
+
+    fn finish_in_room_initial_lookup(&self, sender: &UserId, flow: &FlowId) {
+        let Some(room) = flow.room_id() else { return };
+        let mut owner = self.incoming_verification_request_owner.write();
+        for pending in owner.pending_mut().filter(|pending| {
+            pending.event.sender() == sender
+                && pending.event.key().transaction_id.as_str() == flow.as_str()
+                && pending.event.key().room_id.as_deref() == Some(room)
+        }) {
+            if pending.cancelled
+                && matches!(
+                    pending.state,
+                    PendingToDeviceVerificationRequestState::InitialLookup { .. }
+                )
+            {
+                pending.state = PendingToDeviceVerificationRequestState::WaitingForExternalUpdate;
+            }
+        }
+        owner.retain_pending(|pending| {
+            pending.event.sender() != sender
+                || pending.event.key().transaction_id.as_str() != flow.as_str()
+                || pending.event.key().room_id.as_deref() != Some(room)
+                || pending.cancelled
+                || !matches!(
+                    pending.state,
+                    PendingToDeviceVerificationRequestState::InitialLookup { .. }
+                )
+        });
+        drop(owner);
+        notify_watch(&self.incoming_verification_request_changed);
+    }
+
+    fn in_room_request_was_cancelled(&self, sender: &UserId, flow: &FlowId) -> bool {
+        let Some(room) = flow.room_id() else { return false };
+        self.incoming_verification_request_owner.read().pending().any(|pending| {
+            pending.cancelled
+                && pending.event.sender() == sender
+                && pending.event.key().transaction_id.as_str() == flow.as_str()
+                && pending.event.key().room_id.as_deref() == Some(room)
+        })
+    }
+
+    fn cancel_pending_in_room_request(&self, sender: &UserId, flow: &FlowId) {
+        let Some(room) = flow.room_id() else { return };
+        let mut owner = self.incoming_verification_request_owner.write();
+        let pending = owner.pending_mut().find(|pending| {
+            pending.event.sender() == sender
+                && pending.event.key().transaction_id.as_str() == flow.as_str()
+                && pending.event.key().room_id.as_deref() == Some(room)
+        });
+        if let Some(pending) = pending {
+            pending.cancelled = true;
+        }
+        drop(owner);
+        notify_watch(&self.incoming_verification_request_changed);
+    }
+
     pub(crate) fn mark_pending_to_device_key_query_scheduled(&self, user_id: &UserId) {
         for pending in self.incoming_verification_request_owner.write().pending_mut() {
-            if pending.event.sender == user_id
+            if !pending.cancelled
+                && pending.event.sender() == user_id
                 && pending.state == PendingToDeviceVerificationRequestState::NeedsQuery
             {
                 pending.state = PendingToDeviceVerificationRequestState::QueryInFlight;
@@ -1402,8 +1867,11 @@ impl VerificationMachine {
         self.incoming_verification_request_owner
             .read()
             .pending()
-            .filter(|pending| pending.state == PendingToDeviceVerificationRequestState::NeedsQuery)
-            .map(|pending| pending.event.sender.clone())
+            .filter(|pending| {
+                !pending.cancelled
+                    && pending.state == PendingToDeviceVerificationRequestState::NeedsQuery
+            })
+            .map(|pending| pending.event.sender().to_owned())
             .collect()
     }
 
@@ -1432,7 +1900,10 @@ impl VerificationMachine {
             .fetch_add(1, AtomicOrdering::Relaxed);
         let mut owner = self.incoming_verification_request_owner.write();
         for pending in owner.pending_mut() {
-            if users.contains(&pending.event.sender) && !pending.state.is_claimed() {
+            if !pending.cancelled
+                && users.contains(pending.event.sender())
+                && !pending.state.is_claimed()
+            {
                 pending.state = PendingToDeviceVerificationRequestState::ResponseClaimed {
                     token,
                     observed_generation: pending.committed_update_generation,
@@ -1453,7 +1924,10 @@ impl VerificationMachine {
         response_token: u64,
     ) {
         let mut owner = self.incoming_verification_request_owner.write();
-        for pending in owner.pending_mut().filter(|pending| users.contains(&pending.event.sender)) {
+        for pending in owner
+            .pending_mut()
+            .filter(|pending| !pending.cancelled && users.contains(pending.event.sender()))
+        {
             pending.committed_update_generation =
                 pending.committed_update_generation.wrapping_add(1);
             let committed_update_generation = pending.committed_update_generation;
@@ -1496,13 +1970,13 @@ impl VerificationMachine {
         let (retry_keys, removed) = {
             let mut owner = self.incoming_verification_request_owner.write();
             let removed = owner.retain_pending(|pending| {
-                pending.state.is_claimed()
-                    || Self::is_timestamp_valid(pending.event.content.timestamp)
+                pending.state.is_claimed() || Self::is_timestamp_valid(pending.event.timestamp())
             });
             let retry_keys = owner
                 .pending()
                 .filter(|pending| {
-                    users.contains(&pending.event.sender)
+                    !pending.cancelled
+                        && users.contains(pending.event.sender())
                         && matches!(
                             pending.state,
                             PendingToDeviceVerificationRequestState::ResponseClaimed {
@@ -1535,8 +2009,7 @@ impl VerificationMachine {
                 return Err(CryptoStoreError::AccountUnset);
             }
 
-            let event = ToDeviceEvents::KeyVerificationRequest(pending_event);
-            let event = AnyEvent::from(&event);
+            let event = pending_event.as_any();
             let Ok(flow_id) = FlowId::try_from(&event) else {
                 claim.finish();
                 continue;
@@ -1546,12 +2019,28 @@ impl VerificationMachine {
                 claim.finish();
                 continue;
             };
-            match self.prepare_incoming_verification_request(&event, flow_id, &content, true).await
-            {
-                Ok(PreparedIncomingVerificationRequest::Ready(request)) => {
-                    let (request, publishable) = self
-                        .insert_incoming_to_device_request(request)
-                        .into_request_and_provenance();
+            let prepared =
+                self.prepare_incoming_verification_request(&event, flow_id, &content, true).await;
+            if claim.cancelled() {
+                claim.finish();
+                continue;
+            }
+            match prepared {
+                Ok(PreparedIncomingVerificationRequest::Ready(request, _initial_lookup)) => {
+                    if claim.cancelled() {
+                        claim.finish();
+                        continue;
+                    }
+                    let insertion = self.insert_incoming_to_device_request(request);
+                    let room_duplicate = event.is_room_event()
+                        && matches!(insertion, VerificationRequestInsertion::Existing { .. });
+                    let (request, publishable) = insertion.into_request_and_provenance();
+                    if claim.cancelled() {
+                        let _ = request.cancel();
+                        claim.finish();
+                        continue;
+                    }
+                    let publishable = publishable && !room_duplicate;
                     // The pending slot and the resulting publication are transitioned under the
                     // single owner lock, so recovery cannot strand a committed replay at capacity.
                     claim.publish(
@@ -1589,14 +2078,10 @@ impl VerificationMachine {
         &self,
         key: &PendingToDeviceVerificationRequestKey,
         response_token: u64,
-    ) -> Option<(PendingToDeviceVerificationRequestClaim, ToDeviceKeyVerificationRequestEvent)>
-    {
+    ) -> Option<(PendingToDeviceVerificationRequestClaim, PendingIncomingVerificationEvent)> {
         let token = self.next_pending_to_device_request_claim_token();
         let mut owner = self.incoming_verification_request_owner.write();
-        let pending = owner.pending_mut().find(|pending| {
-            pending.event.sender == key.sender
-                && pending.event.content.transaction_id == key.transaction_id
-        })?;
+        let pending = owner.pending_mut().find(|pending| pending.event.key() == *key)?;
         let PendingToDeviceVerificationRequestState::ResponseClaimed {
             token: owner_token,
             observed_generation,
@@ -1743,8 +2228,8 @@ impl VerificationMachine {
     #[cfg(test)]
     pub(crate) fn has_pending_to_device_request(&self, user_id: &UserId, flow_id: &str) -> bool {
         self.incoming_verification_request_owner.read().pending().any(|pending| {
-            pending.event.sender == user_id
-                && pending.event.content.transaction_id.as_str() == flow_id
+            pending.event.sender() == user_id
+                && pending.event.key().transaction_id.as_str() == flow_id
         })
     }
 
@@ -1753,7 +2238,23 @@ impl VerificationMachine {
         let expired = MilliSecondsSinceUnixEpoch::from_system_time(std::time::UNIX_EPOCH)
             .expect("the Unix epoch is a valid Matrix timestamp");
         for pending in self.incoming_verification_request_owner.write().pending_mut() {
-            pending.event.content.timestamp = expired;
+            match &mut pending.event {
+                PendingIncomingVerificationEvent::ToDevice(event) => {
+                    if let ToDeviceEvents::KeyVerificationRequest(request) = event.as_ref() {
+                        let mut request = request.clone();
+                        request.content.timestamp = expired;
+                        *event = Arc::new(ToDeviceEvents::KeyVerificationRequest(request));
+                    }
+                }
+                PendingIncomingVerificationEvent::InRoom(event) => {
+                    if let AnyMessageLikeEvent::RoomMessage(
+                        ruma::events::MessageLikeEvent::Original(event),
+                    ) = event.as_mut()
+                    {
+                        event.origin_server_ts = expired;
+                    }
+                }
+            }
         }
     }
 
@@ -1798,6 +2299,13 @@ mod tests {
             tests::{alice_device_id, alice_id, setup_stores, wrap_any_to_device_content},
         },
     };
+
+    #[test]
+    fn test_pending_request_key_debug_redacts_sender_room_and_flow() {
+        let mut key = PendingToDeviceVerificationRequestKey::new(alice_id(), "synthetic-flow");
+        key.room_id = Some("!private:example.invalid".try_into().unwrap());
+        assert_eq!(format!("{key:?}"), "PendingToDeviceVerificationRequestKey { .. }");
+    }
 
     async fn verification_machine() -> (VerificationMachine, VerificationStore) {
         let (_account, store, _bob, bob_store) = setup_stores().await;

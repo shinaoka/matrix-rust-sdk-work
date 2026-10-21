@@ -1648,23 +1648,34 @@ impl OlmMachine {
         &self,
         event: &AnyMessageLikeEvent,
     ) -> StoreResult<()> {
-        self.inner.verification_machine.receive_any_event(event).await
+        self.receive_verification_event(event).await
     }
 
     /// Receive a verification event.
     ///
     /// The event should be in the decrypted form.
     ///
-    /// **Note**: If the supplied event is an `m.room.message` event with
-    /// `msgtype: m.key.verification.request`, then the device information for
-    /// the sending user must be up-to-date before calling this method
-    /// (otherwise, the request will be ignored). It is hard to guarantee this
-    /// is the case, but you can maximize your chances by explicitly making a
-    /// request for this user's device info by calling
-    /// [`OlmMachine::query_keys_for_users`], sending the request, and
-    /// processing the response with [`OlmMachine::mark_request_as_sent`].
+    /// Unknown sender devices are retained by the bounded incoming-request
+    /// owner and retried after the corresponding device-key query commits.
     pub async fn receive_verification_event(&self, event: &AnyMessageLikeEvent) -> StoreResult<()> {
-        self.inner.verification_machine.receive_any_event(event).await
+        match self.inner.verification_machine.receive_room_event(event).await? {
+            crate::verification::VerificationEventResult::UnknownSenderQueued {
+                sender,
+                query_needed,
+            } if query_needed
+                && self
+                    .inner
+                    .verification_machine
+                    .pending_to_device_key_query_retry_users()
+                    .contains(&sender) =>
+            {
+                let cache = self.inner.store.cache().await?;
+                self.inner.identity_manager.mark_user_as_changed(&cache, &sender).await?;
+                self.inner.verification_machine.mark_pending_to_device_key_query_scheduled(&sender);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Receive and properly handle a decrypted to-device event.
@@ -1828,7 +1839,7 @@ impl OlmMachine {
         self.inner.verification_machine.get_requests(user_id)
     }
 
-    /// Subscribe to materialized incoming to-device verification requests.
+    /// Subscribe to materialized incoming verification requests.
     ///
     /// This is a single-owner, bounded subscription. Creating a new subscription
     /// closes the previous one. Normal delivery and sender-key recovery share

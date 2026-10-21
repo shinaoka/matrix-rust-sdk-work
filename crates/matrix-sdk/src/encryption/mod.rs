@@ -1340,7 +1340,7 @@ impl Encryption {
             .map(|r| VerificationRequest { inner: r, client: self.client.clone() })
     }
 
-    /// Subscribe to materialized incoming to-device verification requests.
+    /// Subscribe to materialized incoming verification requests from either transport.
     ///
     /// This is a single-owner bounded stream. A later subscription replaces and
     /// closes the previous one. Normal delivery and sender-key recovery share
