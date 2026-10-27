@@ -96,6 +96,7 @@ use crate::{
 };
 
 mod decryption_verification_state;
+mod in_room_verification;
 mod initial_share_diagnostics;
 mod interactive_verification;
 mod megolm_sender_data;

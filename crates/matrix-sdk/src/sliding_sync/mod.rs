@@ -20,6 +20,7 @@ mod cache;
 mod client;
 mod error;
 mod list;
+mod required_state_repair;
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
@@ -620,6 +621,7 @@ impl SlidingSync {
 
         // Prepare the request.
         let requested_required_states = RequestedRequiredStates::from(&request);
+        let explicitly_subscribed_rooms = request.room_subscriptions.keys().cloned().collect();
         let request = self.inner.client.send(request).with_request_config(request_config);
 
         // Send the request and get a response with end-to-end encryption support.
@@ -705,6 +707,14 @@ impl SlidingSync {
             // `position_guard`, so we're fine.
 
             // Handle the response.
+            let mut response = response;
+            required_state_repair::repair(
+                &this.inner.client,
+                &requested_required_states,
+                &explicitly_subscribed_rooms,
+                &mut response,
+            )
+            .await;
             let updates = this
                 .handle_response(response, &mut position_guard, requested_required_states)
                 .await?;

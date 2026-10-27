@@ -44,10 +44,9 @@ use matrix_sdk_base::{
     cross_process_lock::{AcquireCrossProcessLockFn, CrossProcessLock, CrossProcessLockError},
     crypto::{
         CrossSigningBootstrapRequests, OlmMachine,
-        store::types::RoomKeyWithheldInfo,
         store::{
             LockableCryptoStore, SecretImportError,
-            types::{RoomKeyBundleInfo, RoomKeyInfo},
+            types::{RoomKeyBundleInfo, RoomKeyInfo, RoomKeyWithheldInfo},
         },
         types::{
             SecretsBundle, SignedKey,
@@ -136,15 +135,14 @@ use matrix_sdk_base::crypto::OlmMachineBuilder;
 pub use matrix_sdk_base::crypto::{
     CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, ForwardedRoomKeyAuthOutcome,
     IncomingRoomKeyRequestDiagnostic, IncomingRoomKeyRequestOutcome, IncomingRoomKeyRequestStage,
-    InitialShareDeviceClass, InitialShareDeviceDiagnostic, InitialShareSessionDiagnostic,
-    InitialShareStage, KeyExportError, LocalTrust, MediaEncryptionInfo, MegolmError, OlmError,
-    RequestedRoomKeySession, RoomKeyCreationOutcome, RoomKeyDiagnosticAlias,
-    RoomKeyDiagnosticEvent, RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome,
-    RoomKeyImportResult, RoomKeyIngressKind, RoomKeyMemberReloadDiagnostic,
-    RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision, RoomKeyReceiveCounters,
-    IncomingVerificationRequestProtectionCounters,
-    RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind, RoomKeyRefusalReason,
-    RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
+    IncomingVerificationRequestProtectionCounters, InitialShareDeviceClass,
+    InitialShareDeviceDiagnostic, InitialShareSessionDiagnostic, InitialShareStage, KeyExportError,
+    LocalTrust, MediaEncryptionInfo, MegolmError, OlmError, RequestedRoomKeySession,
+    RoomKeyCreationOutcome, RoomKeyDiagnosticAlias, RoomKeyDiagnosticEvent,
+    RoomKeyDiagnosticObserver, RoomKeyFirstShareOutcome, RoomKeyImportResult, RoomKeyIngressKind,
+    RoomKeyMemberReloadDiagnostic, RoomKeyMemberReloadDiscardOutcome, RoomKeyMergeDecision,
+    RoomKeyReceiveCounters, RoomKeyReceiveDiagnostic, RoomKeyReceiveDiagnosticKind,
+    RoomKeyRefusalReason, RoomKeyRequestAction, RoomKeyRequesterDeviceState, RoomKeyRequesterScope,
     RoomKeyRotationDiagnostic, RoomKeyRotationReason, SessionCreationError, SignatureError,
     VERSION,
     olm::{
@@ -1112,7 +1110,8 @@ impl Encryption {
             .and_then(|machine| machine.room_key_rotation_reason(room_id, session_id))
     }
 
-    /// Return whether the local crypto store contains an inbound Megolm session.
+    /// Return whether the local crypto store contains an inbound Megolm
+    /// session.
     pub async fn has_inbound_group_session(
         &self,
         room_id: &RoomId,
@@ -1128,7 +1127,8 @@ impl Encryption {
             .map_err(Into::into)
     }
 
-    /// Return a privacy-safe count and whether every inbound session for the room starts at index 0.
+    /// Return a privacy-safe count and whether every inbound session for the
+    /// room starts at index 0.
     #[doc(hidden)]
     pub async fn inbound_group_session_index0_summary(
         &self,
@@ -1340,7 +1340,8 @@ impl Encryption {
             .map(|r| VerificationRequest { inner: r, client: self.client.clone() })
     }
 
-    /// Subscribe to materialized incoming to-device verification requests.
+    /// Subscribe to materialized incoming verification requests from either
+    /// transport.
     ///
     /// This is a single-owner bounded stream. A later subscription replaces and
     /// closes the previous one. Normal delivery and sender-key recovery share
@@ -2578,10 +2579,11 @@ impl Encryption {
     }
 }
 
-/// An incoming verification request whose application delivery is not yet committed.
+/// An incoming verification request whose application delivery is not yet
+/// committed.
 ///
-/// Dropping this value without calling [`Self::commit`] returns the request to the bounded
-/// bounded stream for a later subscriber.
+/// Dropping this value without calling [`Self::commit`] returns the request to
+/// the bounded bounded stream for a later subscriber.
 pub struct IncomingVerificationRequestDelivery {
     request: VerificationRequest,
     inner: Option<matrix_sdk_base::crypto::IncomingVerificationRequestDelivery>,
