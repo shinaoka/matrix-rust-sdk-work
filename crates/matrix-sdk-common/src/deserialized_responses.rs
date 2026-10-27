@@ -892,7 +892,11 @@ impl TimelineEvent {
         Self::from_bundled_event(
             &self.kind,
             Some(bundled_thread.latest_event),
-            self.timestamp_raw().unwrap_or_else(MilliSecondsSinceUnixEpoch::now),
+            // A reply is posted after its root, so this event's own timestamp is not
+            // a valid ceiling: it would date every bundled reply at the root's time,
+            // and the event cache stores that value with the reply. The ceiling only
+            // has to stop a forged future timestamp (issue: Koushi #1626).
+            MilliSecondsSinceUnixEpoch::now(),
             UnsignedEventLocation::RelationsThreadLatestEvent,
         )
         .map(|event| *event)
@@ -2230,6 +2234,80 @@ mod tests {
         assert_let!(TimelineEventKind::UnableToDecrypt { utd_info, .. } = result.kind);
         assert!(utd_info.session_id.is_some());
         assert_eq!(utd_info.session_id.unwrap(), session_id);
+    }
+
+    #[test]
+    fn test_bundled_latest_thread_event_keeps_the_reply_timestamp() {
+        // A thread root can carry its latest reply in `unsigned.m.relations`.
+        // A reply is always posted after its root, so clamping it against the
+        // root's own timestamp dates it at the root's time; the event cache
+        // then stores that wrong timestamp with the reply (issue #1626).
+        let root = TimelineEvent::from_plaintext(
+            Raw::new(&json!({
+                "event_id": "$root",
+                "type": "m.room.message",
+                "sender": "@alice:example.org",
+                "origin_server_ts": 1_000u64,
+                "content": { "msgtype": "m.text", "body": "thread root" },
+                "unsigned": {
+                    "m.relations": {
+                        "m.thread": {
+                            "latest_event": {
+                                "event_id": "$reply",
+                                "type": "m.room.message",
+                                "sender": "@bob:example.org",
+                                "origin_server_ts": 2_000u64,
+                                "content": { "msgtype": "m.text", "body": "latest reply" },
+                            },
+                            "count": 1,
+                            "current_user_participated": false,
+                        }
+                    }
+                },
+            }))
+            .unwrap()
+            .cast_unchecked(),
+        );
+
+        let latest = root.bundled_latest_thread_event().expect("bundled latest reply");
+        assert_eq!(latest.event_id(), Some(event_id!("$reply")));
+        assert_eq!(u64::from(latest.timestamp().expect("reply timestamp").0), 2_000u64);
+    }
+
+    #[test]
+    fn test_bundled_latest_thread_event_still_caps_a_future_timestamp() {
+        // The clamp exists to stop a server from dating a reply in the future.
+        let future = u64::from(MilliSecondsSinceUnixEpoch::now().0) + 86_400_000;
+        let root = TimelineEvent::from_plaintext(
+            Raw::new(&json!({
+                "event_id": "$root",
+                "type": "m.room.message",
+                "sender": "@alice:example.org",
+                "origin_server_ts": 1_000u64,
+                "content": { "msgtype": "m.text", "body": "thread root" },
+                "unsigned": {
+                    "m.relations": {
+                        "m.thread": {
+                            "latest_event": {
+                                "event_id": "$reply",
+                                "type": "m.room.message",
+                                "sender": "@bob:example.org",
+                                "origin_server_ts": future,
+                                "content": { "msgtype": "m.text", "body": "forged reply" },
+                            },
+                            "count": 1,
+                            "current_user_participated": false,
+                        }
+                    }
+                },
+            }))
+            .unwrap()
+            .cast_unchecked(),
+        );
+
+        let latest = root.bundled_latest_thread_event().expect("bundled latest reply");
+        let timestamp = u64::from(latest.timestamp().expect("reply timestamp").0);
+        assert!(timestamp >= 1_000 && timestamp < future, "{timestamp}");
     }
 
     #[test]
