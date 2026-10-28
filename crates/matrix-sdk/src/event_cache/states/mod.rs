@@ -324,7 +324,10 @@ impl StateLock {
         Selector: selectors::CacheState,
         Constructor: AsyncFnOnce(EventCacheStoreLockGuard) -> Result<Selector::Item>,
     {
-        let mut state = self.write().await?;
+        let stage = super::focused_diagnostics::Stage::new("state_lock");
+        let state = self.write().await;
+        stage.finish(state.is_ok());
+        let mut state = state?;
         let cache_state = cache_constructor(state.store).await?;
 
         cache_state_selector

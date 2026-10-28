@@ -186,8 +186,11 @@ impl EventFocusedCacheState {
 
         let paginator = Paginator::new(room);
 
+        let stage = crate::event_cache::focused_diagnostics::Stage::new("context");
         let result =
-            paginator.start_from(&self.focused_event_id, UInt::from(num_context_events)).await?;
+            paginator.start_from(&self.focused_event_id, UInt::from(num_context_events)).await;
+        stage.finish(result.is_ok());
+        let result = result?;
 
         // Detect if the focused event is part of a thread.
         let thread_root = match thread_mode {

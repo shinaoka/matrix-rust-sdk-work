@@ -59,6 +59,7 @@ use crate::{
 pub(crate) mod back_pagination_queue;
 mod caches;
 mod deduplicator;
+pub mod focused_diagnostics;
 mod persistence;
 #[cfg(feature = "e2e-encryption")]
 mod redecryptor;

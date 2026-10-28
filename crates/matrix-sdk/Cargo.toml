@@ -174,7 +174,7 @@ wiremock = { workspace = true, optional = true }
 [target.'cfg(target_family = "wasm")'.dependencies]
 gloo-timers = { workspace = true, features = ["futures"] }
 reqwest = { workspace = true, features = ["gzip", "http2", "rustls-no-provider"] }
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [dev-dependencies]
 anyhow.workspace = true

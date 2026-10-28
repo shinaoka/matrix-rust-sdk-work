@@ -288,15 +288,18 @@ impl Caches {
     > {
         let key = event_focused::EventFocusedCacheKey { focused_event_id: event_id, thread_mode };
 
+        let lock_stage = super::focused_diagnostics::Stage::new("cache_lock");
+        let cache_guard = self.event_focused.clone().write_owned().await;
+        lock_stage.finish(true);
         Ok(
-            match OwnedRwLockWriteGuard::try_downgrade_map(
-                self.event_focused.clone().write_owned().await,
-                |event_focused_caches| event_focused_caches.get(&key),
-            ) {
+            match OwnedRwLockWriteGuard::try_downgrade_map(cache_guard, |event_focused_caches| {
+                event_focused_caches.get(&key)
+            }) {
                 // Event-focused cache exists.
                 Ok(locked_cache) => locked_cache,
                 // Event-focused cache does not exist, let's create it.
                 Err(mut event_focused_caches) => {
+                    let stage = super::focused_diagnostics::Stage::new("cache_initialization");
                     let cache = event_focused::EventFocusedCache::new(
                         self.room.weak_room().clone(),
                         key.clone(),
@@ -304,7 +307,9 @@ impl Caches {
                         self.internals.linked_chunk_update_sender.clone(),
                         number_of_initial_events,
                     )
-                    .await?;
+                    .await;
+                    stage.finish(cache.is_ok());
+                    let cache = cache?;
 
                     event_focused_caches.insert(key.clone(), cache);
 
