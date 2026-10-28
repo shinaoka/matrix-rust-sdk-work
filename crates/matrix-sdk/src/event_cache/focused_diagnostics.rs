@@ -13,7 +13,8 @@ tokio::task_local! {
     static OBSERVER: FocusedBuildObserver;
 }
 
-/// Observe only work polled inside this future (not unrelated or spawned tasks).
+/// Observe only work polled inside this future (not unrelated or spawned
+/// tasks).
 pub async fn observe_focused_build<F: Future>(
     observer: FocusedBuildObserver,
     future: F,
@@ -52,8 +53,9 @@ impl Drop for Stage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Mutex;
+
+    use super::*;
 
     #[tokio::test]
     async fn scoped_stages_report_success_failure_and_cancellation() {
