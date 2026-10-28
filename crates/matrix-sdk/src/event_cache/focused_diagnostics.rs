@@ -4,7 +4,9 @@
 //! Opt-in, task-scoped timings for event-focused cache construction.
 //! Observations contain no Matrix identifiers, content, or error text.
 
-use std::{future::Future, sync::Arc, time::Instant};
+use std::{future::Future, sync::Arc};
+
+use ruma::time::Instant;
 
 /// A synchronous, nonblocking observer of focused-build stages.
 pub type FocusedBuildObserver = Arc<dyn Fn(&'static str, &'static str, u64) + Send + Sync>;
