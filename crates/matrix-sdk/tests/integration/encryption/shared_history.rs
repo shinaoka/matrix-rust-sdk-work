@@ -574,12 +574,14 @@ async fn test_invite_acceptance_is_recorded_when_sync_sees_the_join_first() {
     sync_invite_from_alice(&matrix_mock_server, &client, room_id).await;
     let room = client.get_room(room_id).expect("the invite should be synced");
 
+    // Hold the join response long enough for a sync to be processed first; the
+    // test checks below that this ordering really happened.
     matrix_mock_server
         .mock_room_join(room_id)
         .respond_with(
             wiremock::ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({ "room_id": room_id }))
-                .set_delay(std::time::Duration::from_millis(500)),
+                .set_delay(std::time::Duration::from_secs(3)),
         )
         .mock_once()
         .mount()
@@ -588,16 +590,20 @@ async fn test_invite_acceptance_is_recorded_when_sync_sees_the_join_first() {
 
     // Wait until the join request is on the wire, then let a sync deliver the
     // joined room before the response arrives.
-    while !matrix_mock_server
-        .server()
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .any(|request| request.url.path().ends_with("/join"))
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !matrix_mock_server
+            .server()
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| request.url.path().ends_with("/join"))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the join request should be sent");
     matrix_mock_server
         .mock_sync()
         .ok_and_run(&client, |builder| {
@@ -605,8 +611,13 @@ async fn test_invite_acceptance_is_recorded_when_sync_sees_the_join_first() {
         })
         .await;
     assert_eq!(client.get_room(room_id).unwrap().state(), matrix_sdk::RoomState::Joined);
+    assert!(!join.is_finished(), "the sync must be processed while the join is in flight");
 
-    join.await.unwrap().expect("the join should succeed");
+    tokio::time::timeout(std::time::Duration::from_secs(10), join)
+        .await
+        .expect("the join should complete")
+        .unwrap()
+        .expect("the join should succeed");
 
     let details = client
         .get_pending_key_bundle_details_for_room(room_id)
@@ -617,33 +628,27 @@ async fn test_invite_acceptance_is_recorded_when_sync_sees_the_join_first() {
 }
 
 /// The inviter read for one room never vouches for another room that the join
-/// response names, even one we already joined.
+/// response names, even one we are invited to as well.
 #[async_test]
-async fn test_invite_acceptance_is_not_recorded_for_another_joined_room() {
+async fn test_invite_acceptance_is_not_recorded_for_another_room() {
     let invited_room_id = room_id!("!invited:localhost");
-    let joined_room_id = room_id!("!joined:localhost");
+    let other_room_id = room_id!("!other:localhost");
     let matrix_mock_server = MatrixMockServer::new().await;
     let client = matrix_mock_server.client_builder().build().await;
-    matrix_mock_server
-        .mock_sync()
-        .ok_and_run(&client, |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(joined_room_id));
-        })
-        .await;
+    sync_invite_from_alice(&matrix_mock_server, &client, other_room_id).await;
     sync_invite_from_alice(&matrix_mock_server, &client, invited_room_id).await;
 
     matrix_mock_server
         .mock_room_join(invited_room_id)
         .respond_with(
             wiremock::ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({ "room_id": joined_room_id })),
+                .set_body_json(serde_json::json!({ "room_id": other_room_id })),
         )
         .mock_once()
         .mount()
         .await;
     client.join_room_by_id(invited_room_id).await.expect("the join should succeed");
 
-    assert!(
-        client.get_pending_key_bundle_details_for_room(joined_room_id).await.unwrap().is_none()
-    );
+    assert_eq!(client.get_room(other_room_id).unwrap().state(), matrix_sdk::RoomState::Joined);
+    assert!(client.get_pending_key_bundle_details_for_room(other_room_id).await.unwrap().is_none());
 }
