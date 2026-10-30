@@ -393,7 +393,8 @@ pub(crate) struct ClientInner {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) enable_share_history_on_invite: bool,
 
-    /// Read-only lifecycle observation for the application-owned encryption sync.
+    /// Read-only lifecycle observation for the application-owned encryption
+    /// sync.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) encryption_sync_readiness: crate::encryption::EncryptionSyncReadiness,
 
@@ -1803,16 +1804,16 @@ impl Client {
             false
         };
 
-        let base_room = self
-            .base_client()
-            .room_joined(
-                room_id,
-                pre_join_room_info
-                    .as_ref()
-                    .and_then(|info| info.inviter.as_ref())
-                    .map(|i| i.user_id().to_owned()),
-            )
-            .await?;
+        // The inviter was read while the room was still an invite, before the join
+        // request; a sync response may have marked the room as joined since.
+        let inviter = pre_join_room_info
+            .as_ref()
+            .and_then(|info| info.inviter.as_ref())
+            .map(|i| i.user_id().to_owned());
+        let base_room = match inviter {
+            Some(inviter) => self.base_client().room_joined_after_invite(room_id, inviter).await?,
+            None => self.base_client().room_joined(room_id, None).await?,
+        };
         let room = Room::new(self.clone(), base_room);
 
         if mark_as_dm {

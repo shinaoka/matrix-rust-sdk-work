@@ -328,6 +328,50 @@ mod tests {
         test_utils::logged_in_base_client,
     };
 
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_invite_details_are_set_when_sliding_sync_sees_the_join_first() {
+        let client = logged_in_base_client(None).await;
+        let room_id = room_id!("!invite:e.uk");
+        let user_id = client.session_meta().unwrap().user_id.to_owned();
+        let inviter = user_id!("@inviter:e.uk");
+
+        let mut room = http::response::Room::new();
+        set_room_invited(&mut room, inviter, &user_id);
+        client
+            .process_sliding_sync(
+                &response_with_room(room_id, room),
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Invited);
+
+        // The inviter was read before the join request; the response carrying our
+        // own join is processed before the join completes.
+        let mut room = http::response::Room::new();
+        set_room_joined(&mut room, &user_id);
+        client
+            .process_sliding_sync(
+                &response_with_room(room_id, room),
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Joined);
+
+        client.room_joined_after_invite(room_id, inviter.to_owned()).await.unwrap();
+
+        let details = client
+            .get_pending_key_bundle_details_for_room(room_id)
+            .await
+            .unwrap()
+            .expect("the accepted invite is recorded");
+        assert_eq!(details.inviter, inviter);
+    }
+
     #[async_test]
     async fn test_invited_state_without_update_emits_invited_room() {
         let client = logged_in_base_client(None).await;
