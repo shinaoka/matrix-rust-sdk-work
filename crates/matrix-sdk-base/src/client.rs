@@ -576,9 +576,11 @@ impl BaseClient {
         room_id: &RoomId,
         inviter: OwnedUserId,
     ) -> Result<Room> {
+        // Read whether the room existed, and its state, under the store lock, so a
+        // concurrent sync cannot change either between the two observations.
+        let store_guard = self.state_store_lock().lock().await;
         let room_existed = self.state_store.room_exists(room_id);
         let room = self.state_store.get_or_create_room(room_id, RoomState::Joined);
-        let store_guard = self.state_store_lock().lock().await;
         let previous_state = room.state();
 
         #[cfg(feature = "e2e-encryption")]
