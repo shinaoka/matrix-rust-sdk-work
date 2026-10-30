@@ -393,7 +393,8 @@ pub(crate) struct ClientInner {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) enable_share_history_on_invite: bool,
 
-    /// Read-only lifecycle observation for the application-owned encryption sync.
+    /// Read-only lifecycle observation for the application-owned encryption
+    /// sync.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) encryption_sync_readiness: crate::encryption::EncryptionSyncReadiness,
 
@@ -1772,7 +1773,7 @@ impl Client {
             }
         };
 
-        Some(PreJoinRoomInfo { inviter })
+        Some(PreJoinRoomInfo { room_id: room_id.to_owned(), inviter })
     }
 
     /// Finish joining a room.
@@ -1803,16 +1804,22 @@ impl Client {
             false
         };
 
-        let base_room = self
-            .base_client()
-            .room_joined(
-                room_id,
-                pre_join_room_info
-                    .as_ref()
-                    .and_then(|info| info.inviter.as_ref())
-                    .map(|i| i.user_id().to_owned()),
-            )
-            .await?;
+        // The inviter was read while the room was still an invite, before the join
+        // request. It vouches only for that room: never for a different room the
+        // join response names.
+        let inviter = pre_join_room_info
+            .as_ref()
+            .filter(|info| info.room_id == room_id)
+            .and_then(|info| info.inviter.as_ref())
+            .map(|i| i.user_id().to_owned());
+        // A sync response that has marked the room as joined since does not undo
+        // the acceptance.
+        let base_room = match &inviter {
+            Some(inviter) => {
+                self.base_client().room_joined_after_invite(room_id, inviter.clone()).await?
+            }
+            None => self.base_client().room_joined(room_id, None).await?,
+        };
         let room = Room::new(self.clone(), base_room);
 
         if mark_as_dm {
@@ -1827,16 +1834,14 @@ impl Client {
         // race.
         #[cfg(feature = "e2e-encryption")]
         if self.inner.enable_share_history_on_invite
-            && let Some(inviter) =
-                pre_join_room_info.as_ref().and_then(|info| info.inviter.as_ref())
+            && let Some(inviter) = &inviter
         {
-            crate::room::shared_room_history::maybe_accept_key_bundle(&room, inviter.user_id())
-                .await?;
+            crate::room::shared_room_history::maybe_accept_key_bundle(&room, inviter).await?;
         }
 
-        // Suppress "unused variable" and "unused field" lints
+        // Suppress "unused variable" lints
         #[cfg(not(feature = "e2e-encryption"))]
-        let _ = pre_join_room_info.map(|i| i.inviter);
+        let _ = inviter;
 
         Ok(room)
     }
@@ -4037,8 +4042,10 @@ impl WeakClient {
 }
 
 /// Information about the state of a room before we joined it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct PreJoinRoomInfo {
+    /// The room these details were read from.
+    pub room_id: OwnedRoomId,
     /// The user who invited us to the room, if any.
     pub inviter: Option<RoomMember>,
 }

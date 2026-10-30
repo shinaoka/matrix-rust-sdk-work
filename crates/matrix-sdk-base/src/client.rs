@@ -553,16 +553,69 @@ impl BaseClient {
                 let _ = inviter;
             }
 
-            room.update_and_save_room_info_with_store_guard(&store_guard, |mut info| {
-                info.mark_as_joined();
-                info.mark_state_partially_synced();
-                info.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
-                (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
-            })
-            .await?;
+            Self::save_room_joined(&room, &store_guard).await?;
         }
 
         Ok(room)
+    }
+
+    /// The user has joined a room in response to an invitation from `inviter`.
+    ///
+    /// The caller must have observed this room in the invited state, with this
+    /// inviter, before sending the join request, like
+    /// [`room_joined`](Self::room_joined) with `Some(inviter)`. Unlike
+    /// [`room_joined`](Self::room_joined), the
+    /// [`RoomPendingKeyBundleDetails`] are stored even if a sync response has
+    /// already marked the room as joined: the response carrying our own join
+    /// can be processed between the join request and this call. Nothing is
+    /// stored for a room that was unknown before this call.
+    ///
+    /// Update the internal and cached state accordingly. Return the final Room.
+    pub async fn room_joined_after_invite(
+        &self,
+        room_id: &RoomId,
+        inviter: OwnedUserId,
+    ) -> Result<Room> {
+        // Read whether the room existed, and its state, under the store lock, so a
+        // concurrent sync cannot change either between the two observations.
+        let store_guard = self.state_store_lock().lock().await;
+        let room_existed = self.state_store.room_exists(room_id);
+        let room = self.state_store.get_or_create_room(room_id, RoomState::Joined);
+        let previous_state = room.state();
+
+        #[cfg(feature = "e2e-encryption")]
+        {
+            // See `room_joined`: the caller saw the invite before joining, so a room
+            // that a sync response has already marked as joined still counts as an
+            // accepted invite.
+            let accepted_invite = previous_state == RoomState::Invited
+                || (room_existed && previous_state == RoomState::Joined);
+            if accepted_invite && let Some(olm_machine) = self.olm_machine().await.as_ref() {
+                olm_machine.store().store_room_pending_key_bundle(room_id, &inviter).await?
+            }
+        }
+        #[cfg(not(feature = "e2e-encryption"))]
+        {
+            // suppress unused argument warnings
+            let _ = (room_existed, inviter);
+        }
+
+        if previous_state != RoomState::Joined {
+            Self::save_room_joined(&room, &store_guard).await?;
+        }
+
+        Ok(room)
+    }
+
+    async fn save_room_joined(room: &Room, store_guard: &MutexGuard<'_, ()>) -> Result<()> {
+        room.update_and_save_room_info_with_store_guard(store_guard, |mut info| {
+            info.mark_as_joined();
+            info.mark_state_partially_synced();
+            info.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
+            (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
+        })
+        .await?;
+        Ok(())
     }
 
     /// User has left a room.
@@ -2117,6 +2170,77 @@ mod tests {
         client.receive_sync_response(response).await.unwrap();
 
         assert!(client.is_user_ignored(ignored_user_id).await);
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_invite_details_are_set_when_sync_sees_the_join_first() {
+        let user_id = user_id!("@alice:localhost");
+        let inviter = user_id!("@bob:localhost");
+        let client = logged_in_base_client(Some(user_id)).await;
+        let room_id = room_id!("!invited:localhost");
+
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response =
+            sync_builder.add_invited_room(InvitedRoomBuilder::new(room_id)).build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Invited);
+
+        // The inviter was read before the `/join` request, but the sync response
+        // carrying our own join is processed before the join completes.
+        sync_builder.clear();
+        let response = sync_builder
+            .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Joined);
+
+        let joined_room = client
+            .room_joined_after_invite(room_id, inviter.to_owned())
+            .await
+            .expect("We should be able to mark a room as joined");
+
+        // We still accepted an invite from the inviter, so the details are kept.
+        assert_eq!(joined_room.state(), RoomState::Joined);
+        assert_matches!(
+            client.get_pending_key_bundle_details_for_room(room_id).await,
+            Ok(Some(details))
+        );
+        assert_eq!(details.inviter, inviter);
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_invite_details_are_not_set_without_an_observed_invite() {
+        let user_id = user_id!("@alice:localhost");
+        let inviter = user_id!("@bob:localhost");
+        let client = logged_in_base_client(Some(user_id)).await;
+        let joined_room_id = room_id!("!joined:localhost");
+        let unknown_room_id = room_id!("!unknown:localhost");
+
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
+            .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(joined_room_id))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        // A room we were already in: only a caller that saw the invite before
+        // joining may record an acceptance.
+        client.room_joined(joined_room_id, Some(inviter.to_owned())).await.unwrap();
+        assert!(
+            client.get_pending_key_bundle_details_for_room(joined_room_id).await.unwrap().is_none()
+        );
+
+        // A room we did not know about cannot have been an invite we saw.
+        client.room_joined_after_invite(unknown_room_id, inviter.to_owned()).await.unwrap();
+        assert_eq!(client.get_room(unknown_room_id).unwrap().state(), RoomState::Joined);
+        assert!(
+            client
+                .get_pending_key_bundle_details_for_room(unknown_room_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(feature = "e2e-encryption")]

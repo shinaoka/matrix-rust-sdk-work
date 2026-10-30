@@ -536,3 +536,119 @@ fn megolm_session_id(raw: &Raw<AnySyncTimelineEvent>) -> String {
         .expect("Encrypted event content should have `session_id` field")
         .to_owned()
 }
+
+/// Syncs an invite from Alice into `room_id` for `client`, with the stripped
+/// state that `Room::invite_details` reads the inviter from.
+async fn sync_invite_from_alice(
+    matrix_mock_server: &MatrixMockServer,
+    client: &Client,
+    room_id: &ruma::RoomId,
+) {
+    let alice_user_id = user_id!("@alice:localhost");
+    let own_user_id = client.user_id().unwrap().to_owned();
+    let event_factory = EventFactory::new().room(room_id).sender(alice_user_id);
+    let alice_member_event: Raw<ruma::events::AnyStrippedStateEvent> =
+        event_factory.member(alice_user_id).into_raw();
+    let own_member_event = event_factory.member(alice_user_id).invited(&own_user_id);
+
+    matrix_mock_server
+        .mock_sync()
+        .ok_and_run(client, |builder| {
+            builder.add_invited_room(
+                InvitedRoomBuilder::new(room_id)
+                    .add_state_event(alice_member_event)
+                    .add_state_event(own_member_event),
+            );
+        })
+        .await;
+}
+
+/// The response carrying our own join can be processed while the join request
+/// is still in flight. The invite was accepted all the same, so the pending
+/// key bundle details must be recorded.
+#[async_test]
+async fn test_invite_acceptance_is_recorded_when_sync_sees_the_join_first() {
+    let room_id = room_id!("!test:localhost");
+    let matrix_mock_server = MatrixMockServer::new().await;
+    let client = matrix_mock_server.client_builder().build().await;
+    sync_invite_from_alice(&matrix_mock_server, &client, room_id).await;
+    let room = client.get_room(room_id).expect("the invite should be synced");
+
+    // Hold the join response long enough for a sync to be processed first; the
+    // test checks below that this ordering really happened.
+    matrix_mock_server
+        .mock_room_join(room_id)
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "room_id": room_id }))
+                .set_delay(std::time::Duration::from_secs(3)),
+        )
+        .mock_once()
+        .mount()
+        .await;
+    let join = tokio::spawn(async move { room.join().await });
+
+    // Wait until the join request is on the wire, then let a sync deliver the
+    // joined room before the response arrives.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !matrix_mock_server
+            .server()
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| request.url.path().ends_with("/join"))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the join request should be sent");
+    matrix_mock_server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+        })
+        .await;
+    assert_eq!(client.get_room(room_id).unwrap().state(), matrix_sdk::RoomState::Joined);
+    assert!(!join.is_finished(), "the sync must be processed while the join is in flight");
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), join)
+        .await
+        .expect("the join should complete")
+        .unwrap()
+        .expect("the join should succeed");
+
+    let details = client
+        .get_pending_key_bundle_details_for_room(room_id)
+        .await
+        .unwrap()
+        .expect("the accepted invite should be recorded");
+    assert_eq!(details.inviter, user_id!("@alice:localhost"));
+}
+
+/// The inviter read for one room never vouches for another room that the join
+/// response names, even one we are invited to as well.
+#[async_test]
+async fn test_invite_acceptance_is_not_recorded_for_another_room() {
+    let invited_room_id = room_id!("!invited:localhost");
+    let other_room_id = room_id!("!other:localhost");
+    let matrix_mock_server = MatrixMockServer::new().await;
+    let client = matrix_mock_server.client_builder().build().await;
+    sync_invite_from_alice(&matrix_mock_server, &client, other_room_id).await;
+    sync_invite_from_alice(&matrix_mock_server, &client, invited_room_id).await;
+
+    matrix_mock_server
+        .mock_room_join(invited_room_id)
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "room_id": other_room_id })),
+        )
+        .mock_once()
+        .mount()
+        .await;
+    client.join_room_by_id(invited_room_id).await.expect("the join should succeed");
+
+    assert_eq!(client.get_room(other_room_id).unwrap().state(), matrix_sdk::RoomState::Joined);
+    assert!(client.get_pending_key_bundle_details_for_room(other_room_id).await.unwrap().is_none());
+}
