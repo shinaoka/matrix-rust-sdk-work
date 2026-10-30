@@ -31,8 +31,8 @@ use matrix_sdk_crypto::x509::{RawX509Signer, RawX509Verifier};
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, EncryptionSettings, OlmError, OlmMachine,
     OlmMachineBuilder, RoomKeyMemberReloadContext, RoomKeyRotationReason, TrustRequirement,
-    store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
-    types::requests::ToDeviceRequest,
+    store::DynCryptoStore,
+    store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
 use ruma::DeviceId;
@@ -520,12 +520,48 @@ impl BaseClient {
         room_id: &RoomId,
         inviter: Option<OwnedUserId>,
     ) -> Result<Room> {
-        self.room_joined_inner(room_id, inviter, false).await
+        let room = self.state_store.get_or_create_room(room_id, RoomState::Joined);
+
+        // If the state isn't `RoomState::Joined` then this means that we knew about
+        // this room before. Let's modify the existing state now.
+        if room.state() != RoomState::Joined {
+            let store_guard = self.state_store_lock().lock().await;
+
+            #[cfg(feature = "e2e-encryption")]
+            {
+                // If our previous state was an invite and we're now in the joined state, this
+                // means that the user has explicitly accepted an invite. Let's
+                // remember some details about the invite.
+                //
+                // This is somewhat of a workaround for our lack of cryptographic membership.
+                // Later on we will decide if historic room keys should be accepted
+                // based on this info. If a user has accepted an invite and we receive a room
+                // key bundle shortly after, we might accept it. If we don't do
+                // this, the homeserver could trick us into accepting any historic room key
+                // bundle.
+                let previous_state = room.state();
+                if previous_state == RoomState::Invited
+                    && let Some(inviter) = inviter
+                    && let Some(olm_machine) = self.olm_machine().await.as_ref()
+                {
+                    olm_machine.store().store_room_pending_key_bundle(room_id, &inviter).await?
+                }
+            }
+            #[cfg(not(feature = "e2e-encryption"))]
+            {
+                // suppress unused argument warning
+                let _ = inviter;
+            }
+
+            Self::save_room_joined(&room, &store_guard).await?;
+        }
+
+        Ok(room)
     }
 
     /// The user has joined a room in response to an invitation from `inviter`.
     ///
-    /// The caller must have observed the room in the invited state, with this
+    /// The caller must have observed this room in the invited state, with this
     /// inviter, before sending the join request, like
     /// [`room_joined`](Self::room_joined) with `Some(inviter)`. Unlike
     /// [`room_joined`](Self::room_joined), the
@@ -540,68 +576,44 @@ impl BaseClient {
         room_id: &RoomId,
         inviter: OwnedUserId,
     ) -> Result<Room> {
-        self.room_joined_inner(room_id, Some(inviter), true).await
-    }
-
-    async fn room_joined_inner(
-        &self,
-        room_id: &RoomId,
-        inviter: Option<OwnedUserId>,
-        invite_observed_before_join: bool,
-    ) -> Result<Room> {
         let room_existed = self.state_store.room_exists(room_id);
         let room = self.state_store.get_or_create_room(room_id, RoomState::Joined);
+        let store_guard = self.state_store_lock().lock().await;
         let previous_state = room.state();
 
-        // If our previous state was an invite and we're now in the joined state,
-        // this means that the user has explicitly accepted an invite. The same
-        // holds if a sync response already marked the room as joined while the
-        // caller saw the invite before sending the join request.
-        let accepted_invite = previous_state == RoomState::Invited
-            || (invite_observed_before_join && room_existed && previous_state == RoomState::Joined);
-
-        // If the state isn't `RoomState::Joined` then this means that we knew about
-        // this room before. Let's modify the existing state now.
-        if previous_state != RoomState::Joined || accepted_invite {
-            let store_guard = self.state_store_lock().lock().await;
-
-            #[cfg(feature = "e2e-encryption")]
-            {
-                // Remember some details about the accepted invite.
-                //
-                // This is somewhat of a workaround for our lack of cryptographic membership.
-                // Later on we will decide if historic room keys should be accepted
-                // based on this info. If a user has accepted an invite and we receive a room
-                // key bundle shortly after, we might accept it. If we don't do
-                // this, the homeserver could trick us into accepting any historic room key
-                // bundle.
-                if accepted_invite
-                    && let Some(inviter) = inviter
-                    && let Some(olm_machine) = self.olm_machine().await.as_ref()
-                {
-                    olm_machine.store().store_room_pending_key_bundle(room_id, &inviter).await?
-                }
+        #[cfg(feature = "e2e-encryption")]
+        {
+            // See `room_joined`: the caller saw the invite before joining, so a room
+            // that a sync response has already marked as joined still counts as an
+            // accepted invite.
+            let accepted_invite = previous_state == RoomState::Invited
+                || (room_existed && previous_state == RoomState::Joined);
+            if accepted_invite && let Some(olm_machine) = self.olm_machine().await.as_ref() {
+                olm_machine.store().store_room_pending_key_bundle(room_id, &inviter).await?
             }
-            #[cfg(not(feature = "e2e-encryption"))]
-            {
-                // suppress unused argument warning
-                let _ = inviter;
-            }
+        }
+        #[cfg(not(feature = "e2e-encryption"))]
+        {
+            // suppress unused argument warnings
+            let _ = (room_existed, inviter);
+        }
 
-            if previous_state != RoomState::Joined {
-                room.update_and_save_room_info_with_store_guard(&store_guard, |mut info| {
-                    info.mark_as_joined();
-                    info.mark_state_partially_synced();
-                    info.mark_members_missing_with_reason(
-                        RoomMembersMissingReason::MembershipChange,
-                    );
-                    (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
-                })
-                .await?;
-            }
+        if previous_state != RoomState::Joined {
+            Self::save_room_joined(&room, &store_guard).await?;
         }
 
         Ok(room)
+    }
+
+    async fn save_room_joined(room: &Room, store_guard: &MutexGuard<'_, ()>) -> Result<()> {
+        room.update_and_save_room_info_with_store_guard(store_guard, |mut info| {
+            info.mark_as_joined();
+            info.mark_state_partially_synced();
+            info.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
+            (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
+        })
+        .await?;
+        Ok(())
     }
 
     /// User has left a room.

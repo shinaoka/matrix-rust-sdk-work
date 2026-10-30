@@ -393,8 +393,7 @@ pub(crate) struct ClientInner {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) enable_share_history_on_invite: bool,
 
-    /// Read-only lifecycle observation for the application-owned encryption
-    /// sync.
+    /// Read-only lifecycle observation for the application-owned encryption sync.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) encryption_sync_readiness: crate::encryption::EncryptionSyncReadiness,
 
@@ -1773,7 +1772,7 @@ impl Client {
             }
         };
 
-        Some(PreJoinRoomInfo { inviter })
+        Some(PreJoinRoomInfo { room_id: room_id.to_owned(), inviter })
     }
 
     /// Finish joining a room.
@@ -1804,15 +1803,21 @@ impl Client {
             false
         };
 
-        // The inviter was read while the room was still an invite, before the join
-        // request; a sync response may have marked the room as joined since.
         let inviter = pre_join_room_info
             .as_ref()
             .and_then(|info| info.inviter.as_ref())
             .map(|i| i.user_id().to_owned());
+        // The inviter was read while this room was still an invite, before the join
+        // request, so a sync response that has marked the room as joined since does
+        // not undo the acceptance. That only holds for the room the invite was read
+        // from.
+        let invited_room_joined =
+            pre_join_room_info.as_ref().is_some_and(|info| info.room_id == room_id);
         let base_room = match inviter {
-            Some(inviter) => self.base_client().room_joined_after_invite(room_id, inviter).await?,
-            None => self.base_client().room_joined(room_id, None).await?,
+            Some(inviter) if invited_room_joined => {
+                self.base_client().room_joined_after_invite(room_id, inviter).await?
+            }
+            inviter => self.base_client().room_joined(room_id, inviter).await?,
         };
         let room = Room::new(self.clone(), base_room);
 
@@ -4038,8 +4043,10 @@ impl WeakClient {
 }
 
 /// Information about the state of a room before we joined it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct PreJoinRoomInfo {
+    /// The room these details were read from.
+    pub room_id: OwnedRoomId,
     /// The user who invited us to the room, if any.
     pub inviter: Option<RoomMember>,
 }
