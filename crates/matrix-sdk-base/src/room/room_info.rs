@@ -86,7 +86,8 @@ pub enum RoomMembersMissingReason {
     Unknown,
     /// A Sliding Sync room subscription was newly installed.
     RoomSubscription,
-    /// A limited sync response invalidated the completeness of lazy-loaded members.
+    /// A limited sync response invalidated the completeness of lazy-loaded
+    /// members.
     LimitedSyncResponse,
     /// The room membership changed or an invite was sent locally.
     MembershipChange,
@@ -690,6 +691,12 @@ pub struct RoomInfo {
     /// stamp nicely acts as a default fallback.
     #[serde(default)]
     pub(crate) recency_stamp: Option<RoomRecencyStamp>,
+
+    /// Whether this client left the room itself and no sync response has
+    /// carried our membership since. Not persisted: it only covers responses
+    /// already in flight when `/leave` returned.
+    #[serde(skip)]
+    pub(crate) left_locally: bool,
 }
 
 impl RoomInfo {
@@ -713,6 +720,7 @@ impl RoomInfo {
             cached_display_name: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: None,
+            left_locally: false,
         }
     }
 
@@ -724,6 +732,13 @@ impl RoomInfo {
     /// Mark this Room as left.
     pub fn mark_as_left(&mut self) {
         self.set_state(RoomState::Left);
+    }
+
+    /// Mark this Room as left by this client, before any sync response has
+    /// confirmed it.
+    pub(crate) fn mark_as_left_locally(&mut self) {
+        self.set_state(RoomState::Left);
+        self.left_locally = true;
     }
 
     /// Mark this Room as invited.
@@ -744,6 +759,7 @@ impl RoomInfo {
     /// Set the membership RoomState of this Room
     pub fn set_state(&mut self, room_state: RoomState) {
         self.room_state = room_state;
+        self.left_locally = false;
     }
 
     /// Mark this Room as having all the members synced.
@@ -1622,6 +1638,7 @@ mod tests {
             cached_display_name: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: Some(42.into()),
+            left_locally: false,
         };
 
         let info_json = json!({

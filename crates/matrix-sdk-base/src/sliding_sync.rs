@@ -980,6 +980,7 @@ mod tests {
 
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
         assert!(!sync_resp.rooms.joined.contains_key(room_id));
+        assert!(sync_resp.rooms.left.contains_key(room_id));
     }
 
     #[async_test]
@@ -1006,6 +1007,54 @@ mod tests {
         let mut room = http::response::Room::new();
         set_room_joined(&mut room, user_id);
         let response = response_with_room(room_id, room);
+        let sync_resp = client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Joined);
+        assert!(sync_resp.rooms.joined.contains_key(room_id));
+    }
+
+    #[async_test]
+    async fn test_left_room_known_from_sync_keeps_the_joined_default() {
+        // Only a leave this client made itself is protected. A room whose leave
+        // came from sync keeps the existing default when it is listed again
+        // without our membership.
+        let client = logged_in_base_client(None).await;
+        let room_id = room_id!("!r:e.uk");
+        let user_id = user_id!("@u:e.uk");
+
+        let mut room = http::response::Room::new();
+        set_room_joined(&mut room, user_id);
+        let response = response_with_room(room_id, room);
+        client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+
+        let mut room = http::response::Room::new();
+        set_room_left(&mut room, user_id);
+        let response = response_with_room(room_id, room);
+        client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
+
+        let response = response_with_room(room_id, http::response::Room::new());
         client
             .process_sliding_sync(
                 &response,

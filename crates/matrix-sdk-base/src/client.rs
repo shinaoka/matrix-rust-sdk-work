@@ -635,7 +635,7 @@ impl BaseClient {
             }
 
             room.update_and_save_room_info_with_store_guard(&store_guard, |mut info| {
-                info.mark_as_left();
+                info.mark_as_left_locally();
                 info.mark_state_partially_synced();
                 info.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
                 (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
