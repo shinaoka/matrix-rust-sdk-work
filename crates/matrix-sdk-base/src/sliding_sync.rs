@@ -944,6 +944,81 @@ mod tests {
     }
 
     #[async_test]
+    async fn test_locally_left_room_stays_left_on_a_response_without_membership() {
+        // A response that was already in flight when `/leave` returned carries
+        // the room without our membership. It must not revive the room the
+        // client has just left: the server will not send the leave again.
+        let client = logged_in_base_client(None).await;
+        let room_id = room_id!("!r:e.uk");
+        let user_id = user_id!("@u:e.uk");
+
+        let mut room = http::response::Room::new();
+        set_room_joined(&mut room, user_id);
+        let response = response_with_room(room_id, room);
+        client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Joined);
+
+        client.room_left(room_id).await.expect("local leave");
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
+
+        let response = response_with_room(room_id, http::response::Room::new());
+        let sync_resp = client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
+        assert!(!sync_resp.rooms.joined.contains_key(room_id));
+    }
+
+    #[async_test]
+    async fn test_locally_left_room_is_joined_again_by_its_join_membership() {
+        // Joining again (on another device, say) sends our join membership in
+        // `required_state`, which still moves a left room back to joined.
+        let client = logged_in_base_client(None).await;
+        let room_id = room_id!("!r:e.uk");
+        let user_id = user_id!("@u:e.uk");
+
+        let mut room = http::response::Room::new();
+        set_room_joined(&mut room, user_id);
+        let response = response_with_room(room_id, room);
+        client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+        client.room_left(room_id).await.expect("local leave");
+
+        let mut room = http::response::Room::new();
+        set_room_joined(&mut room, user_id);
+        let response = response_with_room(room_id, room);
+        client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Joined);
+    }
+
+    #[async_test]
     async fn test_kick_or_ban_updates_room_to_left() {
         for membership in [MembershipState::Leave, MembershipState::Ban] {
             let room_id = room_id!("!r:e.uk");

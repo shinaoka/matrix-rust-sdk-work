@@ -307,7 +307,16 @@ fn membership(
         // actually left (and we remembered to request membership events in our sync
         // request), then we can find this out from the events in required_state by
         // calling handle_own_room_membership.
-        room_info.mark_as_joined();
+        //
+        // A room we have left stays left unless `required_state` carries our
+        // membership: a response already in flight when `/leave` returned lists
+        // the room without it, and the server does not send the leave again, so
+        // defaulting to joined would revive the room for good. Joining again
+        // sends our join membership, which `own_membership_and_update_room_state`
+        // applies below.
+        if room_info.state() != RoomState::Left {
+            room_info.mark_as_joined();
+        }
 
         // We don't need to do this in a v2 sync, because the membership of a room can
         // be figured out by whether the room is in the `join`, `leave` etc. property.
