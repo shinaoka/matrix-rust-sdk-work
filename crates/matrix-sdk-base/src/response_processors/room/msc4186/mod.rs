@@ -86,6 +86,14 @@ pub async fn update_any_room(
     let mut raw_invite_state_events =
         room_response.invite_state.as_ref().map(|events| state_events::stripped::collect(events));
 
+    // Whether this request asked for our own membership, so a response for a
+    // room we are joined to again would carry it.
+    let requests_own_membership =
+        requested_required_states.for_room(room_id).iter().any(|(event_type, state_key)| {
+            *event_type == StateEventType::RoomMember
+                && (state_key == "$ME" || state_key == "*" || state_key == user_id.as_str())
+        });
+
     #[allow(unused_mut)] // Required for some feature flag combinations
     let (mut room, mut room_info, maybe_room_update_kind) = membership(
         context,
@@ -94,6 +102,7 @@ pub async fn update_any_room(
         state_store,
         user_id,
         room_id,
+        requests_own_membership,
     );
 
     // If we are not joined to the room, we cannot be waiting for a key bundle:
@@ -244,6 +253,7 @@ fn membership(
     store: &BaseStateStore,
     user_id: &UserId,
     room_id: &RoomId,
+    requests_own_membership: bool,
 ) -> (Room, RoomInfo, Option<RoomUpdateKind>) {
     // There are invite state events. It means the room can be:
     //
@@ -307,7 +317,16 @@ fn membership(
         // actually left (and we remembered to request membership events in our sync
         // request), then we can find this out from the events in required_state by
         // calling handle_own_room_membership.
-        room_info.mark_as_joined();
+        //
+        // A room this client has just left stays left when the request asked
+        // for our membership and the response does not carry it: a response
+        // already in flight when `/leave` returned lists the room without it,
+        // and the server does not send the leave again, so defaulting to joined
+        // would revive the room for good. Joining again (on another device, say)
+        // changes our membership, which such a request always receives.
+        if !(room_info.left_locally && requests_own_membership) {
+            room_info.mark_as_joined();
+        }
 
         // We don't need to do this in a v2 sync, because the membership of a room can
         // be figured out by whether the room is in the `join`, `leave` etc. property.

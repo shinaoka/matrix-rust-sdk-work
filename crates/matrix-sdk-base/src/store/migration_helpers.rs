@@ -117,6 +117,7 @@ impl RoomInfoV1 {
             cached_display_name: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: None,
+            left_locally: false,
         }
     }
 }

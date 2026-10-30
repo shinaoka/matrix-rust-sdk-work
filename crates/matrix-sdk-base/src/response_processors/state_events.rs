@@ -250,6 +250,8 @@ pub mod sync {
             }
         }) {
             let new_state: RoomState = member.membership().into();
+            // The server has now spoken for our membership.
+            room_info.left_locally = false;
 
             if new_state != room_info.state() {
                 room_info.set_state(new_state);
