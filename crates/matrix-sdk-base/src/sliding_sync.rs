@@ -972,7 +972,7 @@ mod tests {
         let sync_resp = client
             .process_sliding_sync(
                 &response,
-                &RequestedRequiredStates::default(),
+                &requesting_own_membership(),
                 &client.state_store_lock().lock().await,
             )
             .await
@@ -981,6 +981,47 @@ mod tests {
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
         assert!(!sync_resp.rooms.joined.contains_key(room_id));
         assert!(sync_resp.rooms.left.contains_key(room_id));
+    }
+
+    #[async_test]
+    async fn test_locally_left_room_keeps_the_joined_default_without_requesting_membership() {
+        // Without our membership in the request, a later join on another
+        // device need not carry it, so the guard does not apply.
+        let client = logged_in_base_client(None).await;
+        let room_id = room_id!("!r:e.uk");
+        let user_id = user_id!("@u:e.uk");
+
+        let mut room = http::response::Room::new();
+        set_room_joined(&mut room, user_id);
+        let response = response_with_room(room_id, room);
+        client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+        client.room_left(room_id).await.expect("local leave");
+
+        let response = response_with_room(room_id, http::response::Room::new());
+        client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+
+        assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Joined);
+    }
+
+    fn requesting_own_membership() -> RequestedRequiredStates {
+        RequestedRequiredStates::new(
+            vec![(StateEventType::RoomMember, "$ME".to_owned())],
+            Default::default(),
+        )
     }
 
     #[async_test]
@@ -1010,7 +1051,7 @@ mod tests {
         let sync_resp = client
             .process_sliding_sync(
                 &response,
-                &RequestedRequiredStates::default(),
+                &requesting_own_membership(),
                 &client.state_store_lock().lock().await,
             )
             .await
@@ -1018,6 +1059,7 @@ mod tests {
 
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Joined);
         assert!(sync_resp.rooms.joined.contains_key(room_id));
+        assert!(!sync_resp.rooms.left.contains_key(room_id));
     }
 
     #[async_test]
