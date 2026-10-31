@@ -263,10 +263,7 @@ impl ThreadEventCache {
         timeline: Timeline,
         read_receipts: MaybeReceiptEventContent,
     ) -> Result<()> {
-        if timeline.events.is_empty() && timeline.prev_batch.is_none() && read_receipts.is_none() {
-            return Ok(());
-        }
-
+        // Empty updates can resolve a stored receipt whose room target just arrived.
         trace!("adding new events");
 
         let mut state = self.inner.state.write().await?;

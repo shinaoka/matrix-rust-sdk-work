@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use matrix_sdk_base::{
     serde_helpers::{extract_redaction_target, extract_relation, extract_thread_root},
@@ -180,6 +180,19 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
         }
     }
 
+    // An outside receipt target can arrive later without another receipt.
+    for (root, thread) in existing_threads.iter() {
+        let info = thread.thread_info.read().await;
+        if timeline
+            .events
+            .iter()
+            .filter_map(|event| event.event_id())
+            .any(|id| info.read_receipts.pending.iter().any(|pending| pending == id))
+        {
+            new_events_by_thread.entry(root.clone()).or_insert_with(default_entry);
+        }
+    }
+
     for (thread_root, (read_receipt_event_id, read_receipt_event)) in
         filter_read_receipts_and_group_by(ephemeral, |receipt_thread| match receipt_thread {
             ReceiptThread::Thread(thread_id) => Some(thread_id),
@@ -195,6 +208,32 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
             .1
             .get_or_insert_with(|| ReceiptEventContent(BTreeMap::new()))
             .insert(read_receipt_event_id.clone(), read_receipt_event.clone());
+    }
+
+    let unthreaded = filter_read_receipts_and_group_by(ephemeral, |thread| {
+        matches!(thread, ReceiptThread::Unthreaded).then_some(())
+    })
+    .collect::<Vec<_>>();
+    if !unthreaded.is_empty() {
+        // A room-wide receipt must also wake threads with no new events.
+        let roots = existing_threads
+            .keys()
+            .chain(new_events_by_thread.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        for root in roots {
+            let receipts = new_events_by_thread
+                .entry(root)
+                .or_insert_with(default_entry)
+                .1
+                .get_or_insert_with(|| ReceiptEventContent(BTreeMap::new()));
+            for (_, (event_id, event_receipts)) in &unthreaded {
+                let entry = receipts.entry((*event_id).clone()).or_default();
+                for (kind, users) in event_receipts.iter() {
+                    entry.entry(kind.clone()).or_default().extend(users.clone());
+                }
+            }
+        }
     }
 
     Ok(new_events_by_thread)
