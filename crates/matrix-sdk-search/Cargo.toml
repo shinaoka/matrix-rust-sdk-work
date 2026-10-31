@@ -20,7 +20,6 @@ hmac = { workspace = true, features = ["zeroize"] }
 hkdf.workspace = true
 matrix-sdk-test = { workspace = true, optional = true }
 pbkdf2.workspace = true
-once_cell.workspace = true
 rand = { workspace = true, features = ["thread_rng"] }
 sha2 = { workspace =  true, features = ["alloc", "zeroize"] }
 tantivy = { version = "0.27.0", default-features = false, features = ["mmap", "stopwords", "stemmer", "lz4-compression", "columnar-zstd-compression"] }

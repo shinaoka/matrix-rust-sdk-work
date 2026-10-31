@@ -3962,7 +3962,6 @@ dependencies = [
  "hkdf",
  "hmac",
  "matrix-sdk-test",
- "once_cell",
  "pbkdf2",
  "rand 0.10.2",
  "ruma",
