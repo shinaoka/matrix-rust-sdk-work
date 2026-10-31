@@ -133,6 +133,9 @@ use super::{
 };
 use crate::event_cache::caches::pagination::BackPaginationOutcome;
 
+mod unthreaded;
+pub(super) use unthreaded::add_unthreaded_thread_boundaries;
+
 /// Number of paginations allowed per read-receipt request: the safety net for a
 /// receipt target that never surfaces.
 const READ_RECEIPT_MAX_BATCHES: usize = 20;
@@ -446,18 +449,17 @@ impl<'cache> EventFilter for ThreadReadReceiptEventFilter<'cache> {
         self.room_id
     }
 
-    fn filter(&self, _event: &TimelineEvent) -> bool {
-        // This type is built from a `ThreadEventCacheState`. The thread event cache
-        // contains all in-thread events for this particular thread. No need to filter
-        // them.
-        true
+    fn filter(&self, event: &TimelineEvent) -> bool {
+        // The root is displayed here too, but belongs to the main timeline's count.
+        event.event_id() != Some(self.thread_id)
     }
 
     fn receipt_thread_matches(&self, receipt_thread: &ReceiptThread) -> bool {
-        matches!(
-            receipt_thread,
-            ReceiptThread::Thread(thread_id) if self.thread_id == thread_id
-        )
+        matches!(receipt_thread, ReceiptThread::Unthreaded)
+            || matches!(
+                receipt_thread,
+                ReceiptThread::Thread(thread_id) if self.thread_id == thread_id
+            )
     }
 
     async fn stored_receipt_event_for_user(

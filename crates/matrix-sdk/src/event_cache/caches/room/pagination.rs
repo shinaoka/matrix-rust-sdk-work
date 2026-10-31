@@ -912,6 +912,7 @@ impl RoomPagination {
             );
             last_projection_batch = Some(projection_batch);
         }
+        self.0.cache.refresh_pending_thread_receipts().await?;
 
         let outcome = if after.continuity == RoomTimelineContinuity::Complete {
             RoomTimelineGapRepairOutcome::StartReached { events: events_count }
@@ -1225,6 +1226,9 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
             );
         }
 
+        // Publish before unlocking so sync cannot reorder the room diffs.
+        drop(state);
+        self.refresh_pending_thread_receipts().await?;
         Ok(Some(BackPaginationOutcome { events, reached_start }))
     }
 }

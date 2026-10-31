@@ -509,6 +509,18 @@ pub(super) struct RoomEventCacheInner {
 }
 
 impl RoomEventCacheInner {
+    /// Call only after dropping the room state/store guard.
+    async fn refresh_pending_thread_receipts(&self) -> Result<()> {
+        let Some(room) = self.weak_room.get() else { return Ok(()) };
+        let client = room.client();
+        let event_cache = client.event_cache();
+        let caches = event_cache.inner.by_room.read().await;
+        if let Some(caches) = caches.get(&self.room_id) {
+            caches.refresh_pending_thread_receipts().await?;
+        }
+        Ok(())
+    }
+
     fn handle_account_data(&self, account_data: Vec<Raw<AnyRoomAccountDataEvent>>) {
         if account_data.is_empty() {
             return;

@@ -44,6 +44,7 @@ use tracing::{debug, error, instrument, trace};
 
 #[cfg(feature = "e2e-encryption")]
 use super::super::super::redecryptor::MaybeResolvedEvent;
+use super::super::room::RoomEventCacheState;
 use super::{
     super::{
         super::{
@@ -58,7 +59,8 @@ use super::{
         EventLocation,
         event_linked_chunk::{EventLinkedChunk, sort_positions_descending},
         read_receipts::{
-            MaybeReceiptEventContent, ThreadReadReceiptEventFilter, compute_unread_counts,
+            MaybeReceiptEventContent, ThreadReadReceiptEventFilter,
+            add_unthreaded_thread_boundaries, compute_unread_counts,
         },
         room::RoomEventCacheLinkedChunkUpdate,
         subscriber::SubscribersHandle,
@@ -66,7 +68,6 @@ use super::{
     ThreadEventCacheUpdateSender,
 };
 use crate::room::WeakRoom;
-use super::super::room::RoomEventCacheState;
 
 pub struct ThreadEventCacheState {
     /// The room owning this thread.
@@ -584,6 +585,14 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
 
         let client = room.client();
         let event_filter = ThreadReadReceiptEventFilter::new(&self.state, client.state_store());
+        add_unthreaded_thread_boundaries(
+            &self.state.own_user_id,
+            &event_filter,
+            &self.state.thread_linked_chunk,
+            &self.store,
+            &mut read_receipts,
+        )
+        .await?;
 
         compute_unread_counts(
             &self.state.own_user_id,
