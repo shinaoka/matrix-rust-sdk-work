@@ -13,9 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This file originates from the rust-aes-stream repo[1], it has been moddified
-// to use AES-CTR mode and to authenticate the encrypted files.
-// [1] https://github.com/oberien/rust-aes-stream/
+// This file originates from [the `rust-aes-stream` repository][1], it has been
+// modified to use AES-CTR mode and to authenticate the encrypted files.
+//
+// [1]: https://github.com/oberien/rust-aes-stream/
 
 //! Read/Write Wrapper for AES Encryption and Decryption during I/O Operations
 use std::{
@@ -61,10 +62,10 @@ impl<
     ///
     /// # Arguments
     ///
-    /// * `writer`: Writer to write encrypted data into
-    /// * `key`: The encryption key for the stream cipher.
-    /// * `mac_key`: The authentication key for the MAC.
-    /// * `iv_size`: The size of the initialization vector or nonce for the
+    /// - `writer`: Writer to write encrypted data into
+    /// - `key`: The encryption key for the stream cipher.
+    /// - `mac_key`: The authentication key for the MAC.
+    /// - `iv_size`: The size of the initialization vector or nonce for the
     ///   stream cipher.
     pub fn new(
         mut writer: W,
@@ -85,12 +86,17 @@ impl<
         Ok(AesWriter { writer, enc, mac, finalized: false })
     }
 
+    /// Get a mutable reference to the underlying writer.
+    pub(crate) fn writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
     /// Encrypts the passed buffer and writes all resulting encrypted blocks to
     /// the underlying writer
     ///
     /// # Arguments
     ///
-    /// * `buf`: Plaintext to encrypt and write.
+    /// - `buf`: Plaintext to encrypt and write.
     fn encrypt_write(&mut self, buf: &mut [u8]) -> Result<usize> {
         if self.finalized {
             return Err(Error::other("File has been already finalized"));
@@ -115,7 +121,7 @@ impl<
         let mac_result = <M as Mac>::finalize_reset(&mut self.mac).into_bytes();
         self.writer.write_all(mac_result.as_slice())?;
 
-        // Mark the file as finalized and flush our underlying writer.
+        // Mark the file as finalized.
         self.finalized = true;
 
         Ok(())
@@ -137,7 +143,8 @@ impl<
     }
 
     /// Flush this output stream, ensuring that all intermediately buffered
-    /// contents reach their destination. [Read more](https://doc.rust-lang.org/nightly/std/io/trait.Write.html#tymethod.flush)
+    /// contents reach their destination.
+    /// [Read more](https://doc.rust-lang.org/nightly/std/io/trait.Write.html#tymethod.flush)
     fn flush(&mut self) -> Result<()> {
         self.writer.flush()
     }
@@ -183,10 +190,10 @@ impl<D: StreamCipher + KeyIvInit, R: Read + Seek + Clone> AesReader<D, R> {
     ///
     /// # Arguments
     ///
-    /// * `reader`: Reader to read encrypted data from
-    /// * `key`: The decryption key for the stream cipher.
-    /// * `mac_key`: The authentication key for the MAC.
-    /// * `iv_size`: The size of the initialization vector or nonce for the
+    /// - `reader`: Reader to read encrypted data from
+    /// - `key`: The decryption key for the stream cipher.
+    /// - `mac_key`: The authentication key for the MAC.
+    /// - `iv_size`: The size of the initialization vector or nonce for the
     ///   stream cipher.
     pub fn new<M: Mac + KeyInit + Update + FixedOutputReset>(
         mut reader: R,
@@ -254,10 +261,10 @@ impl<D: StreamCipher + KeyIvInit, R: Read + Seek + Clone> AesReader<D, R> {
     ///
     /// # Arguments
     ///
-    /// * `buffer`: The buffer to fill.
-    /// * `reader`: Reader to read encrypted data from
-    /// * `total_length`: The total number of bytes that the reader contains.
-    /// * `mac_length`: The length of the MAC that is stored the file we are
+    /// - `buffer`: The buffer to fill.
+    /// - `reader`: Reader to read encrypted data from
+    /// - `total_length`: The total number of bytes that the reader contains.
+    /// - `mac_length`: The length of the MAC that is stored the file we are
     ///   reading from.
     fn read_until_mac(
         buffer: &mut [u8],
@@ -283,7 +290,7 @@ impl<D: StreamCipher + KeyIvInit, R: Read + Seek + Clone> AesReader<D, R> {
     ///
     /// # Arguments
     ///
-    /// * `buf`: Buffer to write decrypted data into.
+    /// - `buf`: Buffer to write decrypted data into.
     fn read_decrypt(&mut self, buf: &mut [u8]) -> Result<usize> {
         let read =
             AesReader::<D, R>::read_until_mac(buf, &mut self.reader, self.length, self.mac_length)?;

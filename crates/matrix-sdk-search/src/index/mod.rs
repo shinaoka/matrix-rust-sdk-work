@@ -25,23 +25,24 @@ use std::{
 };
 
 pub use cursor::SearchCursor;
-// Koushi fork patch surface: the shared accounting for decrypted index files,
-// named by `matrix-sdk` when it threads it into the room index builders.
-pub use crate::encrypted::encrypted_dir::DecryptedFileAccounting;
 use cursor::{CursorTopCollector, candidate_cursor};
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt,
 };
 use tantivy::{
-    Index, IndexReader, ReloadPolicy, TantivyDocument,
-    collector::TopDocs,
+    DateTime, Index, IndexReader, Order, ReloadPolicy, TantivyDocument,
+    collector::{Count, MultiCollector, TopDocs},
     directory::error::OpenDirectoryError,
+    merge_policy::LogMergePolicy,
     query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
     schema::{Field, IndexRecordOption, Term, Value},
     tokenizer::{NgramTokenizer, TokenStream},
 };
 use tracing::{debug, error};
 
+// Koushi fork patch surface: the shared accounting for decrypted index files,
+// named by `matrix-sdk` when it threads it into the room index builders.
+pub use crate::encrypted::encrypted_dir::DecryptedFileAccounting;
 use crate::{
     OpStamp, TANTIVY_INDEX_MEMORY_BUDGET,
     config::SearchIndexConfig,
@@ -50,6 +51,24 @@ use crate::{
     schema::{MatrixSearchIndexSchema, RoomMessageSchema},
     writer::SearchIndexWriter,
 };
+
+/// The result type for a search operation.
+#[derive(Debug)]
+pub struct SearchResult {
+    /// The total count of search results that were found.
+    ///
+    /// Might be bigger than the length of [`SearchResult::events`] as the
+    /// search is paginated.
+    pub total_count: usize,
+
+    /// A list of search results.
+    ///
+    /// Each entry contains the timestamp and the ID of the event that matched
+    /// the search query, newest first. The list may be incomplete because the
+    /// search results are paginated; use [`SearchResult::total_count`] to
+    /// determine the total number of matching results.
+    pub events: Vec<(MilliSecondsSinceUnixEpoch, OwnedEventId)>,
+}
 
 /// The subset of an event's data required to index it and later retrieve it.
 ///
@@ -99,11 +118,12 @@ impl IndexableEvent {
         mut timestamp: Option<MilliSecondsSinceUnixEpoch>,
         body: String,
     ) -> Self {
-        // Tantivy will transform the number of milliseconds to nanoseconds
-        // by multiplying by 1_000_000 [1]. If the number of milliseconds is too
+        // Tantivy will transform the number of milliseconds to nanoseconds by
+        // multiplying by 1_000_000 ([1]). If the number of milliseconds is too
         // big, the multiplication will overflow.
         //
-        // To avoid this panic, we cap the number of milliseconds to a maximum value.
+        // To avoid this panic, we cap the number of milliseconds to a maximum
+        // value.
         //
         // [1]: https://github.com/quickwit-oss/tantivy/blob/31ca1a8ba290b425f871d2e2384592045ec01b8d/common/src/datetime.rs#L62-L67
         if let Some(timestamp) = &mut timestamp {
@@ -125,15 +145,15 @@ pub enum RoomIndexOperation {
     /// `MatrixSearchIndexSchema::deletion_key()` matches this event id.
     Remove(OwnedEventId),
     /// Replace all documents in the index where
-    /// `MatrixSearchIndexSchema::deletion_key()` matches this event id with
-    /// the new event.
+    /// `MatrixSearchIndexSchema::deletion_key()` matches this event id with the
+    /// new event.
     Edit(OwnedEventId, IndexableEvent),
     /// Do nothing.
     Noop,
 }
 
-/// A struct that holds all data pertaining to a particular room's
-/// message index.
+/// A struct that holds all data pertaining to a particular room's message
+/// index.
 pub struct RoomIndex {
     index: Index,
     schema: RoomMessageSchema,
@@ -184,8 +204,18 @@ impl RoomIndex {
     }
 
     /// Get a [`SearchIndexWriter`] for this index.
+    ///
+    /// Every commit creates a segment, and opening an index opens every file of
+    /// every segment, which dominates the cost of opening many room indexes.
+    /// Merge as soon as there are two segments of the same layer, so a room
+    /// index usually stays at a single segment.
     fn writer(&self) -> Result<SearchIndexWriter, IndexError> {
         let writer = self.index.writer(TANTIVY_INDEX_MEMORY_BUDGET)?;
+
+        let mut merge_policy = LogMergePolicy::default();
+        merge_policy.set_min_num_segments(2);
+        writer.set_merge_policy(Box::new(merge_policy));
+
         Ok(SearchIndexWriter::new(writer, self.schema.clone()))
     }
 
@@ -206,6 +236,11 @@ impl RoomIndex {
     /// panics if that thread cannot be spawned.
     fn reader(&self) -> Result<IndexReader, IndexError> {
         Ok(self.index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?)
+    }
+
+    /// Open this index's segments ahead of the first search.
+    pub fn warm_up(&self) -> Result<(), IndexError> {
+        self.reader().map(|_| ())
     }
 
     /// Commit added events to [`RoomIndex`].
@@ -233,44 +268,62 @@ impl RoomIndex {
         self.commit(writer)
     }
 
-    /// Search the [`RoomIndex`] for some query. Returns a list of
-    /// results with a maximum given length. If `pagination_offset` is
-    /// set then the results will start there, i.e.
+    /// Search the [`RoomIndex`] for some query. Returns a list of results with
+    /// a maximum given length. If `pagination_offset` is set then the results
+    /// will start there, i.e.
     ///
-    /// if `max_number_of_results = 3` and `pagination_offset = 10`
-    /// (and there are a surplus of results)
-    /// then this will return results `11, 12, 13`
+    /// if `max_number_of_results = 3` and `pagination_offset = 10` (and there
+    /// are a surplus of results) then this will return results `11, 12, 13`
     pub fn search(
         &self,
         query: &str,
         max_number_of_results: usize,
         pagination_offset: Option<usize>,
-    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
+    ) -> Result<SearchResult, IndexError> {
         let reader = self.reader()?;
         self.search_with_reader(&reader, query, max_number_of_results, pagination_offset)
     }
 
     /// [`RoomIndex::search`] against a caller-held reader.
     ///
-    /// A batch resolves one reader for all of its lookups, so deduplication does
-    /// not pay one reader build per event.
+    /// A batch resolves one reader for all of its lookups, so deduplication
+    /// does not pay one reader build per event.
     fn search_with_reader(
         &self,
         reader: &IndexReader,
         query: &str,
         max_number_of_results: usize,
         pagination_offset: Option<usize>,
-    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
+    ) -> Result<SearchResult, IndexError> {
         let query = self.query_parser.parse_query(query)?;
         let searcher = reader.searcher();
 
         let offset = pagination_offset.unwrap_or(0);
 
-        let results = searcher.search(
-            &query,
-            &TopDocs::with_limit(max_number_of_results).and_offset(offset).order_by_score(),
-        )?;
-        self.collect_event_ids(&searcher, results)
+        let top_docs = TopDocs::with_limit(max_number_of_results)
+            .and_offset(offset)
+            .order_by_fast_field::<DateTime>("date", Order::Desc);
+        let mut multi = MultiCollector::new();
+        let count_handle = multi.add_collector(Count);
+        let top_docs_handle = multi.add_collector(top_docs);
+        let mut results = searcher.search(&query, &multi)?;
+        let total_count = count_handle.extract(&mut results);
+        let pk = self.schema.primary_key();
+        let mut events = Vec::new();
+        for (date, doc_address) in top_docs_handle.extract(&mut results) {
+            let timestamp = MilliSecondsSinceUnixEpoch(UInt::new_saturating(
+                date.map_or(0, DateTime::into_timestamp_millis).cast_unsigned(),
+            ));
+            let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
+            match retrieved_doc.get_first(pk).and_then(|value| value.as_str()) {
+                Some(value) => match OwnedEventId::try_from(value) {
+                    Ok(event_id) => events.push((timestamp, event_id)),
+                    Err(err) => error!("error while parsing event_id from search result: {err:?}"),
+                },
+                _ => error!("unexpected value type while searching documents"),
+            }
+        }
+        Ok(SearchResult { total_count, events })
     }
 
     /// Page literal search results newest-first.
@@ -351,26 +404,6 @@ impl RoomIndex {
         if clauses.is_empty() { Ok(None) } else { Ok(Some(Box::new(BooleanQuery::new(clauses)))) }
     }
 
-    fn collect_event_ids(
-        &self,
-        searcher: &tantivy::Searcher,
-        results: Vec<(f32, tantivy::DocAddress)>,
-    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
-        let mut ret: Vec<(f32, OwnedEventId)> = Vec::new();
-        let pk = self.schema.primary_key();
-        for (score, doc_address) in results {
-            let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-            match retrieved_doc.get_first(pk).and_then(|maybe_value| maybe_value.as_str()) {
-                Some(value) => match OwnedEventId::try_from(value) {
-                    Ok(event_id) => ret.push((score, event_id)),
-                    Err(err) => error!("error while parsing event_id from search result: {err:?}"),
-                },
-                _ => error!("unexpected value type while searching documents"),
-            }
-        }
-        Ok(ret)
-    }
-
     fn events_to_be_removed(
         &self,
         reader: &IndexReader,
@@ -388,6 +421,7 @@ impl RoomIndex {
                 10000,
                 None,
             )?
+            .events
             .into_iter()
             .map(|(_, id)| id)
             .collect())
@@ -423,10 +457,10 @@ impl RoomIndex {
             self.uncommitted_removes.insert(event);
         }
 
-        // Uncommitted documents added in this same batch also get deleted by the
-        // term above, so reconcile them too. Otherwise `contains` would still
-        // report them as present and a subsequent re-add (e.g. from an edit)
-        // would be wrongly skipped, leaving the document deleted.
+        // Uncommitted documents added in this same batch also get deleted by
+        // the term above, so reconcile them too. Otherwise `contains` would
+        // still report them as present and a subsequent re-add (e.g. from an
+        // edit) would be wrongly skipped, leaving the document deleted.
         let uncommitted: Vec<_> = self
             .uncommitted_adds
             .iter()
@@ -599,7 +633,7 @@ impl RoomIndex {
             None,
         )?;
         Ok(!self.uncommitted_removes.contains(event_id)
-            && (!results.is_empty() || self.uncommitted_adds.contains_key(event_id)))
+            && (!results.events.is_empty() || self.uncommitted_adds.contains_key(event_id)))
     }
 }
 
@@ -734,10 +768,10 @@ mod tests {
                 index.bulk_execute(vec![replacement, remove]).unwrap();
             } else {
                 index.execute(replacement).unwrap();
-                assert_eq!(index.search("replacementunique", 10, None).unwrap().len(), 1);
+                assert_eq!(index.search("replacementunique", 10, None).unwrap().events.len(), 1);
                 index.execute(remove).unwrap();
             }
-            assert!(index.search("replacementunique", 10, None).unwrap().is_empty());
+            assert!(index.search("replacementunique", 10, None).unwrap().events.is_empty());
             assert!(!contains(&index, edit));
         }
     }
@@ -755,6 +789,65 @@ mod tests {
             .into_any_sync_message_like_event();
 
         index_message(&mut index, event).expect("failed to add event");
+    }
+
+    #[test]
+    fn test_encrypted_index_is_preserved_after_wrong_passphrase() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let room_id = room_id!("!r");
+        let add = RoomIndexOperation::Add(IndexableEvent::new(
+            event_id!("$ev").to_owned(),
+            event_id!("$ev").to_owned(),
+            user_id!("@mnt_io:matrix.org").to_owned(),
+            None,
+            "body".to_owned(),
+        ));
+
+        let mut index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+            .encrypted("key")
+            .build()
+            .unwrap();
+        index.execute(add).unwrap();
+        assert_eq!(index.search("body", 10, None).unwrap().events.len(), 1);
+        drop(index);
+
+        // A wrong passphrase must not erase an existing encrypted index.
+        assert!(
+            RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+                .encrypted("another key")
+                .build()
+                .is_err()
+        );
+        let index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+            .encrypted("key")
+            .build()
+            .unwrap();
+        assert_eq!(index.search("body", 10, None).unwrap().events.len(), 1);
+    }
+
+    #[test]
+    fn test_commits_are_merged_into_a_single_segment() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let mut index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id!("!r"))
+            .unencrypted()
+            .build()
+            .unwrap();
+
+        for nth in 0..10 {
+            let event_id = EventId::parse(format!("$ev{nth}")).unwrap();
+            index
+                .bulk_execute(vec![RoomIndexOperation::Add(IndexableEvent::new(
+                    event_id.clone(),
+                    event_id,
+                    user_id!("@mnt_io:matrix.org").to_owned(),
+                    None,
+                    "body".to_owned(),
+                ))])
+                .unwrap();
+        }
+
+        assert_eq!(index.index.searchable_segment_ids().unwrap().len(), 1);
+        assert_eq!(index.search("body", 100, None).unwrap().events.len(), 10);
     }
 
     #[test]
@@ -870,7 +963,7 @@ mod tests {
         )?;
 
         let result = index.search("sentence", 10, None).expect("search failed with: {result:?}");
-        let result: HashSet<_> = result.iter().map(|(_, id)| id).collect();
+        let result: HashSet<_> = result.events.iter().map(|(_, id)| id).collect();
 
         let true_value = [event_id_1.to_owned(), event_id_3.to_owned()];
         let true_value: HashSet<_> = true_value.iter().collect();
@@ -898,7 +991,7 @@ mod tests {
         index_message(&mut index, event)?;
 
         let result = index.search("アンケート", 10, None).expect("search failed with: {result:?}");
-        let result: HashSet<_> = result.iter().map(|(_, id)| id).collect();
+        let result: HashSet<_> = result.events.iter().map(|(_, id)| id).collect();
 
         let true_value = [event_id.to_owned()];
         let true_value: HashSet<_> = true_value.iter().collect();
@@ -1147,7 +1240,7 @@ mod tests {
 
         let result = index.search("sentence", 10, None).expect("search failed with: {result:?}");
 
-        assert!(result.is_empty(), "search result not empty: {result:?}");
+        assert!(result.events.is_empty(), "search result not empty: {result:?}");
 
         Ok(())
     }
@@ -1206,7 +1299,7 @@ mod tests {
 
         let result = index.search("sentence", 10, None).expect("search failed with: {result:?}");
 
-        assert_eq!(result.len(), 1, "Index should have ignored second indexing");
+        assert_eq!(result.events.len(), 1, "Index should have ignored second indexing");
 
         Ok(())
     }
@@ -1291,8 +1384,8 @@ mod tests {
         let edit = to_indexable(&edit);
 
         // An original and its edit arriving in the same batch produce an `Add`
-        // and an `Edit` of the same document. The `Edit`'s removal must not drop
-        // the document added earlier in the same uncommitted batch.
+        // and an `Edit` of the same document. The `Edit`'s removal must not
+        // drop the document added earlier in the same uncommitted batch.
         index.bulk_execute(vec![
             RoomIndexOperation::Add(edit.clone()),
             RoomIndexOperation::Edit(original_id.to_owned(), edit),
@@ -1301,8 +1394,13 @@ mod tests {
         assert!(contains(&index, edit_id), "Edited document should be indexed");
 
         let result = index.search("sentence", 10, None)?;
-        assert_eq!(result.len(), 1, "Search should find the edited document, got {result:?}");
-        assert_eq!(result[0].1, edit_id, "unexpected event id: {result:?}");
+        assert_eq!(result.total_count, 1, "Search should return the total count of results it got");
+        assert_eq!(
+            result.events.len(),
+            1,
+            "Search should find the edited document, got {result:?}"
+        );
+        assert_eq!(result.events[0].1, edit_id, "unexpected event id: {result:?}");
 
         Ok(())
     }

@@ -60,6 +60,9 @@ pub struct SyncSettings {
     pub(crate) filter: Option<Box<sync_events::v3::Filter>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) ignore_timeout_on_first_sync: bool,
+    /// Whether sync should be throttled, if the server sends responses too
+    /// fast.
+    pub(crate) throttle_sync_loop: bool,
     pub(crate) token: SyncToken,
     pub(crate) full_state: bool,
     pub(crate) set_presence: Option<PresenceState>,
@@ -81,11 +84,13 @@ impl fmt::Debug for SyncSettings {
             token: _,
             full_state,
             set_presence,
+            throttle_sync_loop,
         } = self;
         f.debug_struct("SyncSettings")
             .maybe_field("filter", filter)
             .maybe_field("timeout", timeout)
             .field("ignore_timeout_on_first_sync", ignore_timeout_on_first_sync)
+            .field("throttle_sync_loop", throttle_sync_loop)
             .field("full_state", full_state)
             .maybe_field("set_presence", set_presence)
             .finish()
@@ -100,6 +105,7 @@ impl SyncSettings {
             filter: None,
             timeout: Some(DEFAULT_SYNC_TIMEOUT),
             ignore_timeout_on_first_sync: false,
+            throttle_sync_loop: true,
             token: SyncToken::default(),
             full_state: false,
             set_presence: None,
@@ -122,10 +128,26 @@ impl SyncSettings {
     ///
     /// # Arguments
     ///
-    /// * `timeout` - The time the server is allowed to wait.
+    /// - `timeout` - The time the server is allowed to wait.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Whether to throttle sync loops.
+    ///
+    /// By default, in sync loops, sync requests are throttled and sent at most
+    /// once per second, even if the server responds faster than this. This
+    /// behavior can be controlled using the `value` parameter passed here.
+    ///
+    /// This setting is only active when using one of the sync loop methods:
+    /// - [`crate::Client::sync()`],
+    /// - [`crate::Client::sync_with_callback`]
+    /// - [`crate::Client::sync_with_result_callback`]
+    /// - [`crate::Client::sync_stream`]
+    pub fn throttle_sync_loop(mut self, value: bool) -> Self {
+        self.throttle_sync_loop = value;
         self
     }
 
@@ -133,9 +155,9 @@ impl SyncSettings {
     /// is called.
     ///
     /// If there is no new data to show, the server will wait until the end of
-    /// `timeout` before returning a response. It can be an undesirable
-    /// behavior when starting a client and informing the user that we are
-    /// "catching up" while waiting for the first response.
+    /// `timeout` before returning a response. It can be an undesirable behavior
+    /// when starting a client and informing the user that we are "catching up"
+    /// while waiting for the first response.
     ///
     /// By not setting a `timeout` on the first request to `/sync`, the
     /// homeserver should reply immediately, whether the response is empty or
@@ -146,7 +168,7 @@ impl SyncSettings {
     ///
     /// # Arguments
     ///
-    /// * `ignore` - Whether to ignore the `timeout` the first time that the
+    /// - `ignore` - Whether to ignore the `timeout` the first time that the
     ///   `/sync` endpoint is called.
     ///
     /// [`Client::sync_once()`]: crate::Client::sync_once
@@ -156,12 +178,12 @@ impl SyncSettings {
         self
     }
 
-    /// Set the sync filter.
-    /// It can be either the filter ID, or the definition for the filter.
+    /// Set the sync filter. It can be either the filter ID, or the definition
+    /// for the filter.
     ///
     /// # Arguments
     ///
-    /// * `filter` - The filter configuration that should be used for the sync
+    /// - `filter` - The filter configuration that should be used for the sync
     ///   call.
     #[must_use]
     pub fn filter(mut self, filter: sync_events::v3::Filter) -> Self {
@@ -174,7 +196,8 @@ impl SyncSettings {
     /// This does nothing if no sync token is set.
     ///
     /// # Arguments
-    /// * `full_state` - A boolean deciding if the server should return the full
+    ///
+    /// - `full_state` - A boolean deciding if the server should return the full
     ///   state or not.
     #[must_use]
     pub fn full_state(mut self, full_state: bool) -> Self {
@@ -200,7 +223,8 @@ impl SyncSettings {
     /// client-owned sync presence value directly.
     ///
     /// # Arguments
-    /// * `set_presence` - The `PresenceState` that the server should set for
+    ///
+    /// - `set_presence` - The `PresenceState` that the server should set for
     ///   the client.
     ///
     /// [`Client::set_presence`]: crate::Client::set_presence

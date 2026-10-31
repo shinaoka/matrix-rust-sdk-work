@@ -21,14 +21,12 @@ const PERSISTED_ROTATION_REASONS_KEY: &str = "koushi.room_key_rotation_reasons.v
 #[async_test]
 async fn test_persisted_rotation_reason_survives_machine_replacement() {
     let store = Arc::new(MemoryStore::new());
-    let machine = OlmMachineBuilder::new(
-        user_id!("@persisted:example.invalid"),
-        device_id!("PERSISTED"),
-    )
-    .with_crypto_store(store.clone())
-    .build()
-    .await
-    .unwrap();
+    let machine =
+        OlmMachineBuilder::new(user_id!("@persisted:example.invalid"), device_id!("PERSISTED"))
+            .with_crypto_store(store.clone())
+            .build()
+            .await
+            .unwrap();
 
     let initial_room = room_id!("!initial:example.invalid");
     let (initial, _) = machine
@@ -44,8 +42,7 @@ async fn test_persisted_rotation_reason_survives_machine_replacement() {
     let initial_session = initial.session_id().to_owned();
 
     let expiry_room = room_id!("!expiry:example.invalid");
-    let mut expiring_settings = EncryptionSettings::default();
-    expiring_settings.rotation_period_msgs = 1;
+    let expiring_settings = EncryptionSettings { rotation_period_msgs: 1, ..Default::default() };
     let (expiring, _) = machine
         .inner
         .group_session_manager
@@ -93,14 +90,12 @@ async fn test_persisted_rotation_reason_survives_machine_replacement() {
     let reloaded_session = reloaded.session_id().to_owned();
 
     drop(machine);
-    let restored = OlmMachineBuilder::new(
-        user_id!("@persisted:example.invalid"),
-        device_id!("PERSISTED"),
-    )
-    .with_crypto_store(store)
-    .build()
-    .await
-    .unwrap();
+    let restored =
+        OlmMachineBuilder::new(user_id!("@persisted:example.invalid"), device_id!("PERSISTED"))
+            .with_crypto_store(store)
+            .build()
+            .await
+            .unwrap();
 
     assert_eq!(
         restored.room_key_rotation_reason(initial_room, &initial_session),
@@ -136,14 +131,12 @@ async fn test_invalid_persisted_rotation_reasons_fail_closed() {
         vec![0; 128 * 1024 + 1],
     ] {
         store.set_custom_value(PERSISTED_ROTATION_REASONS_KEY, invalid).await.unwrap();
-        let machine = OlmMachineBuilder::new(
-            user_id!("@invalid:example.invalid"),
-            device_id!("INVALID"),
-        )
-        .with_crypto_store(store.clone())
-        .build()
-        .await
-        .expect("invalid attribution must not block the crypto machine");
+        let machine =
+            OlmMachineBuilder::new(user_id!("@invalid:example.invalid"), device_id!("INVALID"))
+                .with_crypto_store(store.clone())
+                .build()
+                .await
+                .expect("invalid attribution must not block the crypto machine");
         assert_eq!(
             machine.room_key_rotation_reason(room_id!("!unknown:example.invalid"), "unknown"),
             None

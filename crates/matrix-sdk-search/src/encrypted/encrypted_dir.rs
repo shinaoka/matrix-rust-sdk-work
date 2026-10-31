@@ -786,23 +786,94 @@ impl Directory for EncryptedMmapDirectory {
 impl<
     E: StreamCipher + KeyIvInit + Sync + Send,
     M: Mac + KeyInit + Update + FixedOutputReset + Sync + Send,
-    W: Write + Sync + Send,
+    W: TerminatingWrite + Sync + Send,
 > TerminatingWrite for AesWriter<E, M, W>
 {
-    fn terminate_ref(&mut self, _: AntiCallToken) -> std::io::Result<()> {
-        self.finalize()
+    fn terminate_ref(&mut self, token: AntiCallToken) -> std::io::Result<()> {
+        self.finalize()?;
+        // Terminate the underlying writer as well, so it gets the chance to
+        // flush and persist the file.
+        self.writer_mut().terminate_ref(token)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use tantivy::Directory;
+    use std::{
+        io::{Result as IoResult, Write},
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use hmac::HmacReset;
+    use sha2::Sha256;
+    use tantivy::directory::{AntiCallToken, Directory, TerminatingWrite};
     use tempfile::tempdir;
 
+    use super::{Aes256Ctr, IV_SIZE, KEY_SIZE};
     use crate::{
-        encrypted::encrypted_dir::{EncryptedMmapDirectory, PBKDF_COUNT},
+        encrypted::{
+            encrypted_dir::{EncryptedMmapDirectory, PBKDF_COUNT},
+            encrypted_stream::AesWriter,
+        },
         index::DecryptedFileAccounting,
     };
+
+    /// A writer that discards its input and records whether it was terminated.
+    struct RecordingWriter {
+        terminated: Arc<AtomicBool>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    impl TerminatingWrite for RecordingWriter {
+        fn terminate_ref(&mut self, _: AntiCallToken) -> IoResult<()> {
+            self.terminated.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn terminating_the_writer_terminates_the_underlying_writer() {
+        let terminated = Arc::new(AtomicBool::new(false));
+
+        let mut writer = AesWriter::<Aes256Ctr, HmacReset<Sha256>, _>::new(
+            RecordingWriter { terminated: terminated.clone() },
+            &[0u8; KEY_SIZE],
+            &[0u8; KEY_SIZE],
+            IV_SIZE,
+        )
+        .unwrap();
+        writer.write_all(b"data").unwrap();
+        writer.terminate().unwrap();
+
+        assert!(terminated.load(Ordering::SeqCst), "The underlying writer wasn't terminated");
+    }
+
+    #[test]
+    fn write_terminate_and_read_back() {
+        let tmpdir = tempdir().unwrap();
+        let file = Path::new("file");
+
+        let dir =
+            EncryptedMmapDirectory::open_or_create(tmpdir.path(), "wordpass", PBKDF_COUNT).unwrap();
+        let mut writer = dir.open_write(file).unwrap();
+        writer.write_all(b"data").unwrap();
+        writer.terminate().unwrap();
+
+        assert_eq!(dir.atomic_read(file).unwrap(), b"data");
+    }
 
     #[test]
     fn create_new_store_and_reopen() {
@@ -855,8 +926,7 @@ mod tests {
 
     #[test]
     fn open_read_accounting_tracks_the_decrypted_allocation_until_the_last_owner_drops() {
-        use std::path::Path;
-        use std::sync::Arc;
+        use std::{path::Path, sync::Arc};
 
         let tmpdir = tempdir().unwrap();
         let accounting = Arc::new(DecryptedFileAccounting::default());
@@ -883,8 +953,9 @@ mod tests {
         assert_eq!(after_open.live_len_bytes, 4096);
         assert!(after_open.live_capacity_bytes >= 4096, "capacity must cover the allocation");
 
-        // The charge lives with the allocation, not with the FileSlice: a reader
-        // that converted to OwnedBytes (e.g. an AliveBitSet) keeps the bytes.
+        // The charge lives with the allocation, not with the FileSlice: a
+        // reader that converted to OwnedBytes (e.g. an AliveBitSet)
+        // keeps the bytes.
         drop(file_slice);
         let after_file_slice_drop = accounting.snapshot();
         assert_eq!(after_file_slice_drop.live_len_bytes, 4096);
@@ -898,8 +969,7 @@ mod tests {
 
     #[test]
     fn accounting_clones_share_one_live_charge_and_slicing_keeps_the_allocation() {
-        use std::path::Path;
-        use std::sync::Arc;
+        use std::{path::Path, sync::Arc};
 
         let tmpdir = tempdir().unwrap();
         let accounting = Arc::new(DecryptedFileAccounting::default());
@@ -927,8 +997,7 @@ mod tests {
 
     #[test]
     fn accounting_charges_are_independent_per_decrypted_file() {
-        use std::path::Path;
-        use std::sync::Arc;
+        use std::{path::Path, sync::Arc};
 
         let tmpdir = tempdir().unwrap();
         let accounting = Arc::new(DecryptedFileAccounting::default());
@@ -956,8 +1025,7 @@ mod tests {
 
     #[test]
     fn atomic_read_records_transfer_without_a_live_charge() {
-        use std::path::Path;
-        use std::sync::Arc;
+        use std::{path::Path, sync::Arc};
 
         let tmpdir = tempdir().unwrap();
         let accounting = Arc::new(DecryptedFileAccounting::default());

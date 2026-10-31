@@ -60,10 +60,10 @@ pub(super) async fn store_sliding_sync_state(
         let position = _position;
         let instance_storage_key = format_storage_key_for_sliding_sync(storage_key);
 
-        // FIXME (TERRIBLE HACK): we want to save `pos` in a cross-process safe manner,
-        // with both processes sharing the same database backend; that needs to
-        // go in the crypto process store at the moment, but should be fixed
-        // later on.
+        // FIXME (TERRIBLE HACK): we want to save `pos` in a cross-process safe
+        // manner, with both processes sharing the same database backend; that
+        // needs to go in the crypto process store at the moment, but should be
+        // fixed later on.
         if let Some(olm_machine) = &*sliding_sync.inner.client.olm_machine().await {
             // Room subscriptions are server-side state scoped to this `pos`.
             // Persist both in one record so a resumed session does not treat
@@ -83,7 +83,8 @@ pub(super) async fn store_sliding_sync_state(
         }
     }
 
-    // Write every `SlidingSyncList` that's configured for caching into the store.
+    // Write every `SlidingSyncList` that's configured for caching into the
+    // store.
     let frozen_lists = {
         sliding_sync
             .inner
@@ -134,11 +135,11 @@ pub(super) async fn restore_sliding_sync_list(
         }
 
         Some(Err(_)) => {
-            // List has been found, but it wasn't possible to deserialize it. It's declared
-            // as obsolete. The main reason might be that the internal representation of a
-            // `SlidingSyncList` might have changed. Instead of considering this as a strong
-            // error, we remove the entry from the cache and keep the list in its initial
-            // state.
+            // List has been found, but it wasn't possible to deserialize it.
+            // It's declared as obsolete. The main reason might be that the
+            // internal representation of a `SlidingSyncList` might have
+            // changed. Instead of considering this as a strong error, we remove
+            // the entry from the cache and keep the list in its initial state.
             warn!(
                 list_name,
                 "failed to deserialize the list from the cache, it is obsolete; removing the cache entry!"
@@ -148,8 +149,8 @@ pub(super) async fn restore_sliding_sync_list(
         }
 
         None => {
-            // A missing cache doesn't make anything obsolete.
-            // We just do nothing here.
+            // A missing cache doesn't make anything obsolete. We just do
+            // nothing here.
             trace!(list_name, "failed to find the list in the cache");
         }
     }
@@ -305,8 +306,8 @@ mod tests {
 
         assert_eq!(classify_to_device_token(None), (None, ToDeviceTokenFormat::Absent));
 
-        // Numeric Sliding Sync tokens (Synapse) and opaque tokens from any other
-        // server are passed through unchanged.
+        // Numeric Sliding Sync tokens (Synapse) and opaque tokens from any
+        // other server are passed through unchanged.
         for sliding in ["42", "nb0", "abc-def"] {
             assert_eq!(
                 classify_to_device_token(Some(sliding.to_owned())),
@@ -314,7 +315,8 @@ mod tests {
             );
         }
 
-        // Classic `/sync` tokens and an empty token are never sent to Sliding Sync.
+        // Classic `/sync` tokens and an empty token are never sent to Sliding
+        // Sync.
         for legacy in ["s123_4_5", "s1_2", ""] {
             assert_eq!(
                 classify_to_device_token(Some(legacy.to_owned())),
@@ -371,7 +373,8 @@ mod tests {
                 .build()
                 .await?;
 
-            // Modify both lists, so we can check expected caching behavior later.
+            // Modify both lists, so we can check expected caching behavior
+            // later.
             {
                 let lists = sliding_sync.inner.lists.write().await;
 
@@ -414,7 +417,8 @@ mod tests {
         let sliding_sync = client
             .sliding_sync(sync_id)?
             .add_cached_list(SlidingSyncList::builder("list_foo").once_built(move |list| {
-                // In the `once_built()` handler, nothing has been read from the cache yet.
+                // In the `once_built()` handler, nothing has been read from the
+                // cache yet.
                 assert_eq!(list.maximum_number_of_rooms(), None);
 
                 let mut stream = cloned_stream.write().unwrap();
@@ -518,10 +522,11 @@ mod tests {
         assert!(!after_expiry.has_restored_room_subscriptions());
         assert!(after_expiry.subscribed_rooms().is_empty());
 
-        // Test the "migration" path: assume a missing to-device token in crypto store,
-        // but present in a former state store.
+        // Test the "migration" path: assume a missing to-device token in crypto
+        // store, but present in a former state store.
 
-        // For our sanity, check no to-device token has been saved in the database.
+        // For our sanity, check no to-device token has been saved in the
+        // database.
         {
             let olm_machine = client.base_client().olm_machine().await;
             let olm_machine = olm_machine.as_ref().unwrap();

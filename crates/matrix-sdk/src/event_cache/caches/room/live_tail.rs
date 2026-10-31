@@ -21,12 +21,13 @@ use matrix_sdk_base::{
 use ruma::OwnedEventId;
 
 use super::{
-    RoomEventCacheGenericUpdate, RoomEventCacheUpdate, state::RoomEventCacheState,
+    RoomEventCacheGenericUpdate, RoomEventCacheUpdate,
     pagination::{
         RoomLiveTailRefreshCancellation, RoomLiveTailRefreshDiagnostics,
         RoomLiveTailRefreshOutcome, RoomLiveTailRefreshResult, RoomPagination,
         RoomTimelineGapProjectionId,
     },
+    state::RoomEventCacheState,
 };
 use crate::{
     event_cache::{
@@ -51,7 +52,10 @@ impl LiveTailSnapshotFence {
         for chunk in state.room_linked_chunk().rchunks() {
             match chunk.content() {
                 ChunkContent::Items(events) => contiguous_suffix_event_ids.extend(
-                    events.iter().rev().filter_map(|event| event.event_id().map(|id| id.to_owned())),
+                    events
+                        .iter()
+                        .rev()
+                        .filter_map(|event| event.event_id().map(|id| id.to_owned())),
                 ),
                 ChunkContent::Gap(_) => break,
             }
@@ -116,7 +120,7 @@ fn live_tail_anchor_indices(
                     .any(|cached_event_id| cached_event_id == *response_event_id)
             })
             .map(|(index, _)| index)
-            .last()
+            .next_back()
     });
     (newest_cached_response_index, older_anchor)
 }
@@ -132,7 +136,8 @@ fn anchored_materialized_event_count(
 }
 
 impl RoomPagination {
-    /// Install a one-shot pause immediately after the live-tail write lock is acquired.
+    /// Install a one-shot pause immediately after the live-tail write lock is
+    /// acquired.
     ///
     /// This is exposed only by the `testing` feature to verify the cancellation
     /// boundary around an already-started commit.
@@ -189,7 +194,8 @@ impl RoomPagination {
         };
 
         // Deliberately no cancellation branch below this line: after a response
-        // wins the network phase, cache mutation and publication are one commit.
+        // wins the network phase, cache mutation and publication are one
+        // commit.
         self.commit_live_tail_response(fence, response, projection).await
     }
 

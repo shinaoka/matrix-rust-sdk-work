@@ -318,8 +318,9 @@ impl OAuth {
         &self,
         lock_value: String,
     ) -> Result<(), OAuthError> {
-        // FIXME: it must be deferred only because we're using the crypto store and it's
-        // initialized only in `set_or_reload_session`, not if we use a dedicated store.
+        // FIXME: it must be deferred only because we're using the crypto store
+        // and it's initialized only in `set_or_reload_session`, not if we use a
+        // dedicated store.
         let mut lock = self.ctx().deferred_cross_process_lock_init.lock().await;
         if lock.is_some() {
             return Err(CrossProcessRefreshLockError::DuplicatedLock.into());
@@ -338,8 +339,8 @@ impl OAuth {
         let deferred_init_lock = self.ctx().deferred_cross_process_lock_init.lock().await;
 
         // Don't `take()` the value, so that subsequent calls to
-        // `enable_cross_process_refresh_lock` will keep on failing if we've enabled the
-        // lock at least once.
+        // `enable_cross_process_refresh_lock` will keep on failing if we've
+        // enabled the lock at least once.
         let Some(lock_value) = deferred_init_lock.as_ref() else {
             return;
         };
@@ -356,8 +357,8 @@ impl OAuth {
 
         let manager = CrossProcessRefreshManager::new(store.clone(), lock);
 
-        // This method is guarded with the `deferred_cross_process_lock_init` lock held,
-        // so this `set` can't be an error.
+        // This method is guarded with the `deferred_cross_process_lock_init`
+        // lock held, so this `set` can't be an error.
         let _ = self.ctx().cross_process_token_refresh_manager.set(manager);
     }
 
@@ -402,7 +403,7 @@ impl OAuth {
     ///
     /// # Arguments
     ///
-    /// * `registration_data` - The data to restore or register the client with
+    /// - `registration_data` - The data to restore or register the client with
     ///   the server. If this is not provided, an error will occur unless
     ///   [`OAuth::register_client()`] or [`OAuth::restore_registered_client()`]
     ///   was called previously.
@@ -411,7 +412,7 @@ impl OAuth {
         &'a self,
         registration_data: Option<&'a ClientRegistrationData>,
     ) -> LoginWithQrCodeBuilder<'a> {
-        LoginWithQrCodeBuilder { client: &self.client, registration_data }
+        LoginWithQrCodeBuilder::new(&self.client, registration_data)
     }
 
     /// Grant login to a new device using a QR code.
@@ -517,7 +518,8 @@ impl OAuth {
         let mut server_metadata_guard = match server_metadata_cache.refresh_lock.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
-                // There is already a refresh in progress, wait for it to finish.
+                // There is already a refresh in progress, wait for it to
+                // finish.
                 let guard = server_metadata_cache.refresh_lock.lock().await;
 
                 // Reuse the data if the request was successful.
@@ -612,7 +614,7 @@ impl OAuth {
     ///
     /// # Arguments
     ///
-    /// * `client_metadata` - The serialized client metadata to register.
+    /// - `client_metadata` - The serialized client metadata to register.
     ///
     /// # Panic
     ///
@@ -676,8 +678,8 @@ impl OAuth {
         let registration_response =
             register_client(self.http_client(), registration_endpoint, client_metadata).await?;
 
-        // The format of the credentials changes according to the client metadata that
-        // was sent. Public clients only get a client ID.
+        // The format of the credentials changes according to the client
+        // metadata that was sent. Public clients only get a client ID.
         self.restore_registered_client(registration_response.client_id.clone());
 
         Ok(registration_response)
@@ -689,12 +691,12 @@ impl OAuth {
     /// This should be called when logging in with a server that is already
     /// known by the client.
     ///
-    /// Note that this method only supports public clients, i.e. clients with
-    /// no credentials.
+    /// Note that this method only supports public clients, i.e. clients with no
+    /// credentials.
     ///
     /// # Arguments
     ///
-    /// * `client_id` - The unique identifier to authenticate the client with
+    /// - `client_id` - The unique identifier to authenticate the client with
     ///   the server, obtained after registration.
     ///
     /// # Panic
@@ -713,13 +715,29 @@ impl OAuth {
     /// Restore a previously logged in session.
     ///
     /// This can be used to restore the client to a logged in state, including
-    /// loading the sync state and the encryption keys from the store, if
-    /// one was set up.
+    /// loading the sync state and the encryption keys from the store, if one
+    /// was set up.
+    ///
+    /// # Persisting the store
+    ///
+    /// Restoring only reattaches the client to its stored state; it does not
+    /// recreate that state. The same persistent store used during the original
+    /// login (for example via [`ClientBuilder::sqlite_store()`]) must be
+    /// configured on the [`ClientBuilder`] when the session is restored,
+    /// otherwise the encryption keys and room state will not be available. When
+    /// the `e2e-encryption` feature is enabled, restoring on top of an
+    /// in-memory store will leave the client unable to send or receive
+    /// encrypted messages. See the [`persist_session`] example for a full
+    /// walk-through.
+    ///
+    /// [`ClientBuilder`]: crate::ClientBuilder
+    /// [`ClientBuilder::sqlite_store()`]: crate::ClientBuilder::sqlite_store
+    /// [`persist_session`]: https://github.com/matrix-org/matrix-rust-sdk/tree/main/examples/persist_session
     ///
     /// # Arguments
     ///
-    /// * `session` - The session to restore.
-    /// * `room_load_settings` — Specify how many rooms must be restored; use
+    /// - `session` - The session to restore.
+    /// - `room_load_settings` — Specify how many rooms must be restored; use
     ///   `::default()` if you don't know which value to pick.
     ///
     /// # Panic
@@ -736,7 +754,6 @@ impl OAuth {
 
         self.client.auth_ctx().set_session_tokens(tokens.clone());
         self.client
-            .base_client()
             .activate(
                 meta,
                 room_load_settings,
@@ -754,8 +771,8 @@ impl OAuth {
             .set(AuthData::OAuth(data))
             .expect("Client authentication data was already set");
 
-        // Initialize the cross-process locking by saving our tokens' hash into the
-        // database, if we've enabled the cross-process lock.
+        // Initialize the cross-process locking by saving our tokens' hash into
+        // the database, if we've enabled the cross-process lock.
 
         #[cfg(feature = "e2e-encryption")]
         if let Some(cross_process_lock) = self.ctx().cross_process_token_refresh_manager.get() {
@@ -766,12 +783,13 @@ impl OAuth {
                 .await
                 .map_err(|err| crate::Error::OAuth(Box::new(err.into())))?;
 
-            // After we got the lock, it's possible that our session doesn't match the one
-            // read from the database, because of a race: another process has
-            // refreshed the tokens while we were waiting for the lock.
+            // After we got the lock, it's possible that our session doesn't
+            // match the one read from the database, because of a race: another
+            // process has refreshed the tokens while we were waiting for the
+            // lock.
             //
-            // In that case, if there's a mismatch, we reload the session and update the
-            // hash. Otherwise, we save our hash into the database.
+            // In that case, if there's a mismatch, we reload the session and
+            // update the hash. Otherwise, we save our hash into the database.
 
             if guard.hash_mismatch {
                 Box::pin(self.handle_session_hash_mismatch(&mut guard))
@@ -783,8 +801,8 @@ impl OAuth {
                     .await
                     .map_err(|err| crate::Error::OAuth(Box::new(err.into())))?;
                 // No need to call the save_session_callback here; it was the
-                // source of the session, so it's already in
-                // sync with what we had.
+                // source of the session, so it's already in sync with what we
+                // had.
             }
         }
 
@@ -831,10 +849,9 @@ impl OAuth {
         additional_scopes: Option<Vec<Scope>>,
     ) -> (Vec<Scope>, OwnedDeviceId) {
         /// Scope to grand full access to the client-server API.
-        const SCOPE_MATRIX_CLIENT_SERVER_API_FULL_ACCESS: &str =
-            "urn:matrix:org.matrix.msc2967.client:api:*";
+        const SCOPE_MATRIX_CLIENT_SERVER_API_FULL_ACCESS: &str = "urn:matrix:client:api:*";
         /// Prefix of the scope to bind a device ID to an access token.
-        const SCOPE_MATRIX_DEVICE_ID_PREFIX: &str = "urn:matrix:org.matrix.msc2967.client:device:";
+        const SCOPE_MATRIX_DEVICE_ID_PREFIX: &str = "urn:matrix:client:device:";
 
         // Generate the device ID if it is not provided.
         let device_id = device_id.unwrap_or_else(DeviceId::new);
@@ -867,23 +884,24 @@ impl OAuth {
     ///
     /// # Arguments
     ///
-    /// * `redirect_uri` - The URI where the end user will be redirected after
+    /// - `redirect_uri` - The URI where the end user will be redirected after
     ///   authorizing the login. It must be one of the redirect URIs sent in the
     ///   client metadata during registration.
     ///
-    /// * `device_id` - The unique ID that will be associated with the session.
+    /// - `device_id` - The unique ID that will be associated with the session.
     ///   If not set, a random one will be generated. It can be an existing
     ///   device ID from a previous login call. Note that this should be done
     ///   only if the client also holds the corresponding encryption keys.
     ///
-    /// * `registration_data` - The data to restore or register the client with
+    /// - `registration_data` - The data to restore or register the client with
     ///   the server. If this is not provided, an error will occur unless
     ///   [`OAuth::register_client()`] or [`OAuth::restore_registered_client()`]
     ///   was called previously.
     ///
-    /// * `additional_scopes` - Additional scopes to request from the
-    ///   authorization server, e.g. "urn:matrix:client:com.example.msc9999.foo".
-    ///   The scopes for API access and the device ID according to the
+    /// - `additional_scopes` - Additional scopes to request from the
+    ///   authorization server, e.g.
+    ///   "urn:matrix:client:com.example.msc9999.foo". The scopes for API access
+    ///   and the device ID according to the
     ///   [specification](https://spec.matrix.org/v1.15/client-server-api/#allocated-scope-tokens)
     ///   are always requested.
     ///
@@ -951,7 +969,7 @@ impl OAuth {
     ///
     /// # Arguments
     ///
-    /// * `url_or_query` - The URI where the user was redirected, or just its
+    /// - `url_or_query` - The URI where the user was redirected, or just its
     ///   query part.
     ///
     /// Returns an error if the authorization failed, if a request fails, or if
@@ -988,7 +1006,6 @@ impl OAuth {
             }
         } else {
             self.client
-                .base_client()
                 .activate(
                     new_session,
                     RoomLoadSettings::default(),
@@ -1022,10 +1039,11 @@ impl OAuth {
             let mut cross_process_guard = cross_process_manager.spin_lock().await?;
 
             if cross_process_guard.hash_mismatch {
-                // At this point, we're finishing a login while another process had written
-                // something in the database. It's likely the information in the database is
-                // just outdated and wasn't properly updated, but display a warning, just in
-                // case this happens frequently.
+                // At this point, we're finishing a login while another process
+                // had written something in the database. It's likely the
+                // information in the database is just outdated and wasn't
+                // properly updated, but display a warning, just in case this
+                // happens frequently.
                 warn!("unexpected cross-process hash mismatch when finishing login (see comment)");
             }
 
@@ -1043,7 +1061,7 @@ impl OAuth {
     ///
     /// # Arguments
     ///
-    /// * `auth_code` - The response received as part of the redirect URI when
+    /// - `auth_code` - The response received as part of the redirect URI when
     ///   the authorization was successful.
     ///
     /// Returns the device ID used in the authorized scope if it succeeds.
@@ -1091,7 +1109,7 @@ impl OAuth {
     ///
     /// # Arguments
     ///
-    /// * `state` - The state provided in [`OAuthAuthorizationData`] after
+    /// - `state` - The state provided in [`OAuthAuthorizationData`] after
     ///   building the authorization URL.
     pub async fn abort_login(&self, state: &CsrfToken) {
         if let Some(data) = self.data() {
@@ -1196,10 +1214,11 @@ impl OAuth {
 
         self.client.auth_ctx().set_session_tokens(tokens);
 
-        // Call the save_session_callback if set, while the optional lock is being held.
+        // Call the save_session_callback if set, while the optional lock is
+        // being held.
         if let Some(save_session_callback) = self.client.auth_ctx().save_session_callback.get() {
-            // Satisfies the save_session_callback invariant: set_session_tokens has
-            // been called just above.
+            // Satisfies the save_session_callback invariant: set_session_tokens
+            // has been called just above.
             tracing::debug!("call save_session_callback");
             if let Err(err) = save_session_callback(self.client.clone()) {
                 error!("when saving session after refresh: {err}");
@@ -1244,8 +1263,8 @@ impl OAuth {
 
         let Ok(mut refresh_status_guard) = refresh_status_lock else {
             debug!("another refresh is happening, waiting for result.");
-            // There's already a request to refresh happening in the same process. Wait for
-            // it to finish.
+            // There's already a request to refresh happening in the same
+            // process. Wait for it to finish.
             let res = client.auth_ctx().refresh_token_lock.lock().await.clone();
             debug!("other refresh is a {}", if res.is_ok() { "success" } else { "failure " });
             return res;
@@ -1253,14 +1272,15 @@ impl OAuth {
 
         debug!("no other refresh happening in background, starting.");
 
-        // Fetch the authorization server metadata *before* taking the cross-process
-        // lock, checking the session hash, or reading the refresh token. This request
-        // can stall for a long time when the OS suspends the process (e.g. iOS
-        // background suspension), and while suspended the lock lease lapses, which
-        // lets another process refresh and rotate the token. Doing it first means the
-        // lock and the hash check happen after the stall, so such a rotation is caught
-        // below as a hash mismatch instead of being exchanged while stale, which the
-        // server rejects with `invalid_grant` and signs the user out.
+        // Fetch the authorization server metadata _before_ taking the
+        // cross-process lock, checking the session hash, or reading the refresh
+        // token. This request can stall for a long time when the OS suspends
+        // the process (e.g. iOS background suspension), and while suspended the
+        // lock lease lapses, which lets another process refresh and rotate the
+        // token. Doing it first means the lock and the hash check happen after
+        // the stall, so such a rotation is caught below as a hash mismatch
+        // instead of being exchanged while stale, which the server rejects with
+        // `invalid_grant` and signs the user out.
         let server_metadata = match self.server_metadata().await {
             Ok(metadata) => metadata,
             Err(err) => {
@@ -1296,8 +1316,9 @@ impl OAuth {
                     Box::pin(self.handle_session_hash_mismatch(&mut cross_process_guard))
                         .await
                         .map_err(|err| RefreshTokenError::OAuth(Arc::new(err.into())))?;
-                    // Optimistic exit: assume that the underlying process did update fast enough.
-                    // In the worst case, we'll do another refresh Soon™.
+                    // Optimistic exit: assume that the underlying process did
+                    // update fast enough. In the worst case, we'll do another
+                    // refresh Soon™.
                     tracing::info!("other process handled refresh for us, assuming success");
                     *refresh_status_guard = Ok(());
                     return Ok(());
@@ -1308,9 +1329,10 @@ impl OAuth {
                 None
             };
 
-        // Read the refresh token only now, after the hash check above, so we always
-        // exchange the token that is current in the store, never one that another
-        // process rotated out from under us while we were suspended.
+        // Read the refresh token only now, after the hash check above, so we
+        // always exchange the token that is current in the store, never one
+        // that another process rotated out from under us while we were
+        // suspended.
         let Some(session_tokens) = self.client.session_tokens() else {
             warn!("invalid state: missing session tokens");
             fail!(refresh_status_guard, RefreshTokenError::RefreshTokenRequired);
@@ -1321,9 +1343,9 @@ impl OAuth {
             fail!(refresh_status_guard, RefreshTokenError::RefreshTokenRequired);
         };
 
-        // Do not interrupt refresh access token requests and processing, by detaching
-        // the request sending and response processing.
-        // Make sure to keep the `refresh_status_guard` during the entire processing.
+        // Do not interrupt refresh access token requests and processing, by
+        // detaching the request sending and response processing. Make sure to
+        // keep the `refresh_status_guard` during the entire processing.
 
         let this = self.clone();
 
@@ -1397,6 +1419,11 @@ pub struct LoginWithQrCodeBuilder<'a> {
 
 #[cfg(feature = "e2e-encryption")]
 impl<'a> LoginWithQrCodeBuilder<'a> {
+    /// Create a new builder.
+    fn new(client: &'a Client, registration_data: Option<&'a ClientRegistrationData>) -> Self {
+        Self { client, registration_data }
+    }
+
     /// This method allows you to log in with a scanned QR code.
     ///
     /// The existing device needs to display the QR code which this device can
@@ -1412,7 +1439,7 @@ impl<'a> LoginWithQrCodeBuilder<'a> {
     ///
     /// # Arguments
     ///
-    /// * `data` - The data scanned from a QR code.
+    /// - `data` - The data scanned from a QR code.
     ///
     /// # Example
     ///
@@ -1479,22 +1506,22 @@ impl<'a> LoginWithQrCodeBuilder<'a> {
     /// println!("Successfully logged in: {:?} {:?}", client.user_id(), client.device_id());
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn scan(self, data: &'a QrCodeData) -> LoginWithQrCode<'a> {
+    pub fn scan(self, data: &QrCodeData) -> LoginWithQrCode {
         LoginWithQrCode::new(self.client, data, self.registration_data)
     }
 
     /// This method allows you to log in by generating a QR code.
     ///
-    /// This device needs to call this method to generate and display the
-    /// QR code which the existing device can scan and grant the log in.
+    /// This device needs to call this method to generate and display the QR
+    /// code which the existing device can scan and grant the log in.
     ///
     /// A successful login using this method will automatically mark the device
     /// as verified and transfer all end-to-end encryption related secrets, like
     /// the private cross-signing keys and the backup key from the existing
     /// device to the new device.
     ///
-    /// For the reverse flow where the existing device generates the QR code
-    /// for this device to scan, use [`LoginWithQrCodeBuilder::scan`].
+    /// For the reverse flow where the existing device generates the QR code for
+    /// this device to scan, use [`LoginWithQrCodeBuilder::scan`].
     ///
     /// # Example
     ///
@@ -1560,7 +1587,7 @@ impl<'a> LoginWithQrCodeBuilder<'a> {
     /// println!("Successfully logged in: {:?} {:?}", client.user_id(), client.device_id());
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn generate(self) -> LoginWithGeneratedQrCode<'a> {
+    pub fn generate(self) -> LoginWithGeneratedQrCode {
         LoginWithGeneratedQrCode::new(self.client, self.registration_data)
     }
 }
@@ -1587,31 +1614,30 @@ impl<'a> GrantLoginWithQrCodeBuilder<'a> {
     ///
     /// # Arguments
     ///
-    /// * `device_creation_timeout` - The duration to wait for the homeserver to
+    /// - `device_creation_timeout` - The duration to wait for the homeserver to
     ///   create the new device after consenting the login before giving up.
     pub fn device_creation_timeout(mut self, device_creation_timeout: Duration) -> Self {
         self.device_creation_timeout = device_creation_timeout;
         self
     }
 
-    /// This method allows you to grant login to a new device by scanning a
-    /// QR code generated by the new device.
+    /// This method allows you to grant login to a new device by scanning a QR
+    /// code generated by the new device.
     ///
-    /// The new device needs to display the QR code which this device can
-    /// scan and call this method to grant the login.
+    /// The new device needs to display the QR code which this device can scan
+    /// and call this method to grant the login.
     ///
     /// A successful login grant using this method will automatically mark the
-    /// new device as verified and transfer all end-to-end encryption
-    /// related secrets, like the private cross-signing keys and the backup
-    /// key from this device device to the new device.
+    /// new device as verified and transfer all end-to-end encryption related
+    /// secrets, like the private cross-signing keys and the backup key from
+    /// this device device to the new device.
     ///
-    /// For the reverse flow where this device generates the QR code
-    /// for the new device to scan, use
-    /// [`GrantLoginWithQrCodeBuilder::generate`].
+    /// For the reverse flow where this device generates the QR code for the new
+    /// device to scan, use [`GrantLoginWithQrCodeBuilder::generate`].
     ///
     /// # Arguments
     ///
-    /// * `data` - The data scanned from a QR code.
+    /// - `data` - The data scanned from a QR code.
     ///
     /// # Example
     ///
@@ -1674,23 +1700,23 @@ impl<'a> GrantLoginWithQrCodeBuilder<'a> {
     /// println!("Successfully granted login");
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn scan(self, data: &'a QrCodeData) -> GrantLoginWithScannedQrCode<'a> {
+    pub fn scan(self, data: &QrCodeData) -> GrantLoginWithScannedQrCode {
         GrantLoginWithScannedQrCode::new(self.client, data, self.device_creation_timeout)
     }
 
     /// This method allows you to grant login to a new device by generating a QR
     /// code on this device to be scanned by the new device.
     ///
-    /// This device needs to call this method to generate and display the
-    /// QR code which the new device can scan to initiate the grant process.
+    /// This device needs to call this method to generate and display the QR
+    /// code which the new device can scan to initiate the grant process.
     ///
     /// A successful login grant using this method will automatically mark the
-    /// new device as verified and transfer all end-to-end encryption
-    /// related secrets, like the private cross-signing keys and the backup
-    /// key from this device device to the new device.
+    /// new device as verified and transfer all end-to-end encryption related
+    /// secrets, like the private cross-signing keys and the backup key from
+    /// this device device to the new device.
     ///
-    /// For the reverse flow where the new device generates the QR code
-    /// for this device to scan, use [`GrantLoginWithQrCodeBuilder::scan`].
+    /// For the reverse flow where the new device generates the QR code for this
+    /// device to scan, use [`GrantLoginWithQrCodeBuilder::scan`].
     ///
     /// # Example
     ///
@@ -1755,17 +1781,18 @@ impl<'a> GrantLoginWithQrCodeBuilder<'a> {
     /// println!("Successfully granted login");
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn generate(self) -> GrantLoginWithGeneratedQrCode<'a> {
+    pub fn generate(self) -> GrantLoginWithGeneratedQrCode {
         GrantLoginWithGeneratedQrCode::new(self.client, self.device_creation_timeout)
     }
 }
 /// A full session for the OAuth 2.0 API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthSession {
     /// The client ID obtained after registration.
     pub client_id: ClientId,
 
     /// The user session.
+    #[serde(flatten)]
     pub user: UserSession,
 }
 
@@ -1822,8 +1849,8 @@ impl AuthorizationResponse {
     ///
     /// Returns an error if the query doesn't have the expected format.
     fn parse_query(query: &str) -> Result<Self, RedirectUriQueryParseError> {
-        // For some reason deserializing the enum with `serde(untagged)` doesn't work,
-        // so let's try both variants separately.
+        // For some reason deserializing the enum with `serde(untagged)` doesn't
+        // work, so let's try both variants separately.
         if let Ok(code) = serde_html_form::from_str(query) {
             return Ok(AuthorizationResponse::Success(code));
         }

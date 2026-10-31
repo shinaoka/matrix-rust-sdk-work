@@ -29,8 +29,44 @@ use zeroize::Zeroize;
 
 use crate::{
     client::Client, error::ClientError, ruma::AuthData, runtime::get_runtime_handle,
-    task_handle::TaskHandle,
+    task_handle::TaskHandle, timeline::ShieldState,
 };
+
+/// A secret storage key.
+#[derive(uniffi::Object)]
+pub struct SecretStorageKey {
+    inner: matrix_sdk_base::crypto::secret_storage::SecretStorageKey,
+}
+
+#[uniffi::export]
+impl SecretStorageKey {
+    /// Create a new random secret storage key.
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Self { inner: matrix_sdk_base::crypto::secret_storage::SecretStorageKey::new() }.into()
+    }
+
+    /// Create a new secret storage key from a passphrase.
+    #[uniffi::constructor]
+    pub fn new_from_passphrase(mut passphrase: String) -> Arc<Self> {
+        let key = Self {
+            inner: matrix_sdk_base::crypto::secret_storage::SecretStorageKey::new_from_passphrase(
+                &passphrase,
+            ),
+        };
+        passphrase.zeroize();
+        key.into()
+    }
+
+    /// The base-58 representation of the key to present to the user.
+    ///
+    /// _Note_: This returns a copy of the private key material of the
+    /// [`SecretStorageKey`] as a string. The caller needs to ensure that this
+    /// string is zeroized.
+    pub fn to_base58(&self) -> String {
+        self.inner.to_base58()
+    }
+}
 
 #[derive(uniffi::Object)]
 pub struct Encryption {
@@ -39,9 +75,59 @@ pub struct Encryption {
     /// A reference to the FFI client.
     ///
     /// Note: we do this to make it so that the FFI `NotificationClient` keeps
-    /// the FFI `Client` and thus the SDK `Client` alive. Otherwise, we
-    /// would need to repeat the hack done in the FFI `Client::drop` method.
+    /// the FFI `Client` and thus the SDK `Client` alive. Otherwise, we would
+    /// need to repeat the hack done in the FFI `Client::drop` method.
     pub(crate) _client: Arc<Client>,
+}
+
+/// The encryption data of an event that was sent encrypted (and which we
+/// managed to decrypt).
+#[derive(Clone, uniffi::Record)]
+pub struct EventEncryptionInfo {
+    /// The user id this event is cryptographically attested to come from.
+    ///
+    /// For a to-device message this is what should be trusted, rather than the
+    /// `sender` claimed in the event JSON.
+    pub sender_id: String,
+    /// The device the event was sent from, as claimed by the sender.
+    pub sender_device_id: Option<String>,
+    /// The curve25519 key of the device that sent the event.
+    pub sender_curve25519_key: Option<String>,
+    /// The megolm session the event was sent in, if it was sent with megolm.
+    pub session_id: Option<String>,
+    /// The shield to show for this event, lax interpretation.
+    pub shield_state: ShieldState,
+    /// The shield to show for this event, strict interpretation.
+    pub shield_state_strict: ShieldState,
+}
+
+impl From<&matrix_sdk_base::deserialized_responses::EncryptionInfo> for EventEncryptionInfo {
+    fn from(info: &matrix_sdk_base::deserialized_responses::EncryptionInfo) -> Self {
+        use matrix_sdk_base::deserialized_responses::AlgorithmInfo;
+        use matrix_sdk_ui::timeline::TimelineEventShieldState;
+
+        let sender_curve25519_key = match &info.algorithm_info {
+            AlgorithmInfo::MegolmV1AesSha2 { curve25519_key, .. } => Some(curve25519_key.clone()),
+            AlgorithmInfo::OlmV1Curve25519AesSha2 { curve25519_public_key_base64 } => {
+                Some(curve25519_public_key_base64.clone())
+            }
+        };
+
+        Self {
+            sender_id: info.sender.to_string(),
+            sender_device_id: info.sender_device.as_ref().map(ToString::to_string),
+            sender_curve25519_key,
+            session_id: info.session_id().map(ToOwned::to_owned),
+            shield_state: TimelineEventShieldState::from(
+                info.verification_state.to_shield_state_lax(),
+            )
+            .into(),
+            shield_state_strict: TimelineEventShieldState::from(
+                info.verification_state.to_shield_state_strict(),
+            )
+            .into(),
+        }
+    }
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
@@ -388,8 +474,8 @@ impl SecretsBundleWithUserId {
     /// Does the bundle contain a backup key.
     ///
     /// Since enabling a backup is optional, the backup key might be missing
-    /// from the bundle. Returns `false` if the backup key is missing,
-    /// otherwise `true`.
+    /// from the bundle. Returns `false` if the backup key is missing, otherwise
+    /// `true`.
     pub fn contains_backup_key(&self) -> bool {
         self.inner.backup.is_some()
     }
@@ -535,12 +621,12 @@ pub trait DehydratedDeviceEventListener: SyncOutsideWasm + SendOutsideWasm {
 /// Settings for [`Encryption::start_dehydrated_devices`].
 #[derive(uniffi::Record)]
 pub struct StartDehydratedDevicesSettings {
-    /// Force generation of a fresh random pickle key on start, replacing
-    /// any existing entry in Secret Storage and the local cache.
+    /// Force generation of a fresh random pickle key on start, replacing any
+    /// existing entry in Secret Storage and the local cache.
     #[uniffi(default = false)]
     pub create_new_key: bool,
-    /// Whether to attempt to rehydrate the existing dehydrated device, if
-    /// any, before creating the next one.
+    /// Whether to attempt to rehydrate the existing dehydrated device, if any,
+    /// before creating the next one.
     #[uniffi(default = true)]
     pub rehydrate: bool,
     /// If `true`, the call becomes a no-op when no pickle key is cached
@@ -616,9 +702,9 @@ impl Encryption {
     /// Does a backup exist on the server?
     ///
     /// Because the homeserver doesn't notify us about changes to the backup
-    /// version, the [`BackupState`] and its listener are a bit crippled.
-    /// The `BackupState::Unknown` state might mean there is no backup at all or
-    /// a backup exists but we don't have access to it.
+    /// version, the [`BackupState`] and its listener are a bit crippled. The
+    /// `BackupState::Unknown` state might mean there is no backup at all or a
+    /// backup exists but we don't have access to it.
     ///
     /// Therefore it is necessary to poll the server for an answer every time
     /// you want to differentiate between those two states.
@@ -653,11 +739,11 @@ impl Encryption {
         Ok(self.inner.recovery().is_last_device().await?)
     }
 
-    /// Does the user have other devices that the current device can verify
-    /// against?
+    /// Does the user have devices, other than the current one, that the
+    /// current device can verify against?
     ///
-    /// The device must be signed by the user's cross-signing key, must have an
-    /// identity, and must not be a dehydrated device.
+    /// The device must be signed by the user's cross-signing key, must support
+    /// Olm (have a Curve25519 key), and must not be a dehydrated device.
     pub async fn has_devices_to_verify_against(&self) -> Result<bool, ClientError> {
         Ok(self.inner.has_devices_to_verify_against().await?)
     }
@@ -691,10 +777,24 @@ impl Encryption {
         Ok(result?)
     }
 
+    /// Enable recovery on the account.
+    ///
+    /// # Arguments
+    ///
+    /// - `wait_for_backups_to_upload` - Should the enabling of the recovery
+    ///   also wait for _all_ room keys to be uploaded to the server-side key
+    ///   backup?
+    /// - `key` - The key to use to encrypt secret storage.  If `None`, a new
+    ///   key will be randomly generated.  A key can be generated from a
+    ///   passphrase by using [`SecretStorageKey::new_from_passphrase`].
+    /// - `progress_listener` - A listener to track the progress of enabling
+    ///   recovery.
+    ///
+    /// Returns the base58-representation of the secret storage key.
     pub async fn enable_recovery(
         &self,
         wait_for_backups_to_upload: bool,
-        mut passphrase: Option<String>,
+        key: Option<Arc<SecretStorageKey>>,
         progress_listener: Box<dyn EnableRecoveryProgressListener>,
     ) -> Result<String> {
         let recovery = self.inner.recovery();
@@ -705,11 +805,7 @@ impl Encryption {
             recovery.enable()
         };
 
-        let enable = if let Some(passphrase) = &passphrase {
-            enable.with_passphrase(passphrase)
-        } else {
-            enable
-        };
+        let enable = if let Some(key) = &key { enable.with_key(&key.inner) } else { enable };
 
         let mut progress_stream = enable.subscribe_to_progress();
 
@@ -723,7 +819,6 @@ impl Encryption {
         let ret = enable.await?;
 
         task.abort();
-        passphrase.zeroize();
 
         Ok(ret)
     }
@@ -770,9 +865,9 @@ impl Encryption {
     ///
     /// This will create a new key backup if:
     ///
-    /// * Key backup is enabled and the backup decryption key is missing from
+    /// - Key backup is enabled and the backup decryption key is missing from
     ///   Recovery, or
-    /// * Key backup is enabled and the backup decryption key does not match the
+    /// - Key backup is enabled and the backup decryption key does not match the
     ///   public key
     pub async fn recover_and_fix_backup(&self, mut recovery_key: String) -> Result<()> {
         let result = self.inner.recovery().recover_and_fix_backup(&recovery_key).await;
@@ -810,19 +905,18 @@ impl Encryption {
     /// Get the E2EE identity of a user.
     ///
     /// This method always tries to fetch the identity from the store, which we
-    /// only have if the user is tracked, meaning that we are both members
-    /// of the same encrypted room. If no user is found locally, a request will
-    /// be made to the homeserver unless `fallback_to_server` is set to `false`.
+    /// only have if the user is tracked, meaning that we are both members of
+    /// the same encrypted room. If no user is found locally, a request will be
+    /// made to the homeserver unless `fallback_to_server` is set to `false`.
     ///
     /// # Arguments
     ///
-    /// * `user_id` - The ID of the user that the identity belongs to.
-    /// * `fallback_to_server` - Should we request the user identity from the
+    /// - `user_id` - The ID of the user that the identity belongs to.
+    /// - `fallback_to_server` - Should we request the user identity from the
     ///   homeserver if one isn't found locally.
     ///
-    /// Returns a `UserIdentity` if one is found. Returns an error if there
-    /// was an issue with the crypto store or with the request to the
-    /// homeserver.
+    /// Returns a `UserIdentity` if one is found. Returns an error if there was
+    /// an issue with the crypto store or with the request to the homeserver.
     ///
     /// This will always return `None` if the client hasn't been logged in.
     pub async fn user_identity(
@@ -852,8 +946,8 @@ impl Encryption {
         }
     }
 
-    /// This method will import all the private cross-signing keys and
-    /// the private part of a backup key and its accompanying version into the
+    /// This method will import all the private cross-signing keys and the
+    /// private part of a backup key and its accompanying version into the
     /// store.
     ///
     /// Importing all the secrets will mark the device as verified and enable
@@ -889,8 +983,8 @@ impl Encryption {
         }
     }
 
-    /// Return whether the homeserver advertises support for MSC3814
-    /// dehydrated devices.
+    /// Return whether the homeserver advertises support for MSC3814 dehydrated
+    /// devices.
     pub async fn is_dehydrated_device_supported(&self) -> Result<bool, DehydratedDeviceError> {
         Ok(self.inner.dehydrated_devices().is_supported().await?)
     }
@@ -923,18 +1017,18 @@ impl Encryption {
         Ok(self.inner.dehydrated_devices().rehydrate(&key).await?)
     }
 
-    /// Delete the current dehydrated device, if one exists. Silent if no
-    /// device is on the server or the server does not implement MSC3814.
+    /// Delete the current dehydrated device, if one exists. Silent if no device
+    /// is on the server or the server does not implement MSC3814.
     pub async fn delete_dehydrated_device(&self) -> Result<(), DehydratedDeviceError> {
         Ok(self.inner.dehydrated_devices().delete().await?)
     }
 
-    /// Start using dehydrated devices for this client, resolving the pickle
-    /// key through Secret Storage and scheduling weekly rotation.
+    /// Start using dehydrated devices for this client, resolving the pickle key
+    /// through Secret Storage and scheduling weekly rotation.
     ///
-    /// The Rust-side copy of the recovery key is zeroized after Secret
-    /// Storage has been unlocked; the caller keeps responsibility for the
-    /// string it passed in.
+    /// The Rust-side copy of the recovery key is zeroized after Secret Storage
+    /// has been unlocked; the caller keeps responsibility for the string it
+    /// passed in.
     pub async fn start_dehydrated_devices(
         &self,
         mut recovery_key: String,
@@ -965,16 +1059,16 @@ impl Encryption {
 
     /// Stop the scheduled dehydrated-device rotation.
     ///
-    /// Has no effect when no rotation is scheduled. Existing dehydrated
-    /// devices on the server are left in place; pair with
+    /// Has no effect when no rotation is scheduled. Existing dehydrated devices
+    /// on the server are left in place; pair with
     /// [`Encryption::delete_dehydrated_device`] to remove them.
     pub fn stop_dehydrated_devices(&self) {
         self.inner.dehydrated_devices().stop();
     }
 
-    /// Subscribe to lifecycle events emitted by the dehydrated-device
-    /// manager. The returned [`TaskHandle`] keeps the listener alive; drop
-    /// it to unsubscribe.
+    /// Subscribe to lifecycle events emitted by the dehydrated-device manager.
+    /// The returned [`TaskHandle`] keeps the listener alive; drop it to
+    /// unsubscribe.
     pub fn dehydrated_device_event_listener(
         &self,
         listener: Box<dyn DehydratedDeviceEventListener>,
@@ -1005,9 +1099,9 @@ impl UserIdentity {
     /// action "pinning".
     ///
     /// If the identity presented for the user changes later on, the newly
-    /// presented identity is considered to be in "pin violation". This
-    /// method explicitly accepts the new identity, allowing it to replace
-    /// the previously pinned one and bringing it out of pin violation.
+    /// presented identity is considered to be in "pin violation". This method
+    /// explicitly accepts the new identity, allowing it to replace the
+    /// previously pinned one and bringing it out of pin violation.
     ///
     /// UIs should display a warning to the user when encountering an identity
     /// which is not verified and is in pin violation.
@@ -1069,15 +1163,15 @@ impl IdentityResetHandle {
         self.inner.auth_type().into()
     }
 
-    /// This method starts the identity reset process and
-    /// will go through the following steps:
+    /// This method starts the identity reset process and will go through the
+    /// following steps:
     ///
     /// 1. Disable backing up room keys and delete the active backup
     /// 2. Disable recovery and delete secret storage
     /// 3. Go through the cross-signing key reset flow
     /// 4. Finally, re-enable key backups only if they were enabled before
-    pub async fn reset(&self, auth: Option<AuthData>) -> Result<(), ClientError> {
-        self.inner.reset(auth.map(Into::into)).await.map_err(ClientError::from_err)
+    pub async fn reset(&self, auth: AuthData) -> Result<(), ClientError> {
+        self.inner.reset(auth.into()).await.map_err(ClientError::from_err)
     }
 
     pub async fn cancel(&self) {
@@ -1088,7 +1182,7 @@ impl IdentityResetHandle {
 #[derive(uniffi::Enum)]
 pub enum CrossSigningResetAuthType {
     /// The homeserver requires user-interactive authentication.
-    Uiaa,
+    Uiaa { info: UiaaCrossSigningResetInfo },
     /// OAuth is used for authentication and the user needs to open a URL to
     /// approve the upload of cross-signing keys.
     OAuth { info: OAuthCrossSigningResetInfo },
@@ -1097,9 +1191,21 @@ pub enum CrossSigningResetAuthType {
 impl From<&matrix_sdk::encryption::CrossSigningResetAuthType> for CrossSigningResetAuthType {
     fn from(value: &matrix_sdk::encryption::CrossSigningResetAuthType) -> Self {
         match value {
-            encryption::CrossSigningResetAuthType::Uiaa(_) => Self::Uiaa,
+            encryption::CrossSigningResetAuthType::Uiaa(info) => Self::Uiaa { info: info.into() },
             encryption::CrossSigningResetAuthType::OAuth(info) => Self::OAuth { info: info.into() },
         }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct UiaaCrossSigningResetInfo {
+    /// The UIAA session token.
+    pub session: String,
+}
+
+impl From<&matrix_sdk::encryption::UiaaCrossSigningResetInfo> for UiaaCrossSigningResetInfo {
+    fn from(value: &matrix_sdk::encryption::UiaaCrossSigningResetInfo) -> Self {
+        Self { session: value.session().to_owned() }
     }
 }
 
@@ -1107,10 +1213,20 @@ impl From<&matrix_sdk::encryption::CrossSigningResetAuthType> for CrossSigningRe
 pub struct OAuthCrossSigningResetInfo {
     /// The URL where the user can approve the reset of the cross-signing keys.
     pub approval_url: String,
+    /// The UIAA session token.
+    pub session: String,
 }
 
 impl From<&matrix_sdk::encryption::OAuthCrossSigningResetInfo> for OAuthCrossSigningResetInfo {
     fn from(value: &matrix_sdk::encryption::OAuthCrossSigningResetInfo) -> Self {
-        Self { approval_url: value.approval_url.to_string() }
+        Self { approval_url: value.approval_url.to_string(), session: value.session.clone() }
+    }
+}
+
+#[matrix_sdk_ffi_macros::export]
+impl OAuthCrossSigningResetInfo {
+    /// Create UIAA [`AuthData`] to continue this reset session.
+    pub fn as_auth_data(&self) -> AuthData {
+        AuthData::OAuth { session: self.session.clone() }
     }
 }

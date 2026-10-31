@@ -26,6 +26,15 @@ use crate::Result;
 /// Process the given event as a verification event if it is a candidate. The
 /// event must be decrypted.
 ///
+/// **Note**: If the supplied event is an `m.room.message` event with
+/// `msgtype: m.key.verification.request`, then the device information for the
+/// sending user must be up-to-date before calling this method (otherwise, the
+/// request will be ignored). It is hard to guarantee this is the case, but you
+/// can maximize your chances by explicitly making a request for this user's
+/// device info by calling [`OlmMachine::query_keys_for_users`], sending the
+/// request, and processing the response with
+/// [`OlmMachine::mark_request_as_sent`].
+///
 /// An incoming request whose sender device is not known is retained by the
 /// verification machine's bounded incoming-request owner. Sender-key query
 /// responses retry it and publish a typed incoming delivery when actionable;
@@ -48,8 +57,8 @@ pub async fn process_if_relevant(
     };
 
     match event {
-        // This is an original (i.e. non-redacted) `m.room.message` event and its
-        // content is a verification request…
+        // This is an original (i.e. non-redacted) `m.room.message` event and
+        // its content is a verification request…
         AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(original_event))
             if matches!(&original_event.content.msgtype, MessageType::VerificationRequest(_)) => {}
 

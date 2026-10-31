@@ -61,13 +61,13 @@ impl PhysicalRoomIndexBuilder {
         }
     }
 
-    /// Make an encrypted index
-    pub fn encrypted<P: Into<String>>(&self, password: P) -> EncryptedPhysicalRoomIndexBuilder {
+    /// Make an index encrypted with the given passphrase
+    pub fn encrypted<K: Into<String>>(&self, key: K) -> EncryptedPhysicalRoomIndexBuilder {
         EncryptedPhysicalRoomIndexBuilder {
             path: self.path.clone(),
             room_id: self.room_id.clone(),
             config: self.config.clone(),
-            password: Zeroizing::new(password.into()),
+            password: Zeroizing::new(key.into()),
             accounting: None,
         }
     }

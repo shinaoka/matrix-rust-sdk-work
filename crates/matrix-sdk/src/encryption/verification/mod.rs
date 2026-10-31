@@ -27,7 +27,8 @@
 //!
 //! * [`SasVerification`] - Interactive verification using a short
 //!   authentication string.
-//! * [`QrVerification`] - Interactive verification using QR codes.
+//! * `QrVerification` - Interactive verification using QR codes (`qrcode`
+//!   feature).
 
 #[cfg(feature = "qrcode")]
 mod qrcode;

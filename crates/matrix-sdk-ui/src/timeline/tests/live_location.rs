@@ -14,11 +14,10 @@
 
 //! Unit tests for live location sharing (MSC3489) in the timeline.
 
-use std::time::Duration;
+use std::{assert_matches, time::Duration};
 
-use assert_matches2::assert_matches;
 use eyeball_im::VectorDiff;
-use matrix_sdk_test::{ALICE, BOB, async_test};
+use matrix_sdk_test::{User, async_test};
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, event_id,
     events::beacon_info::{BeaconInfoEventContent, RedactedBeaconInfoEventContent},
@@ -31,8 +30,8 @@ use crate::timeline::{
     tests::TestTimeline,
 };
 
-/// A `beacon_info` state event creates a `MsgLikeKind::LiveLocation`
-/// item with `is_live() == true` and no accumulated locations.
+/// A `beacon_info` state event creates a `MsgLikeKind::LiveLocation` item with
+/// `is_live() == true` and no accumulated locations.
 #[async_test]
 async fn test_beacon_info_creates_timeline_item() {
     let timeline = TestTimeline::new().await;
@@ -41,7 +40,7 @@ async fn test_beacon_info_creates_timeline_item() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: Some("Alice's walk".to_owned()),
@@ -70,14 +69,14 @@ async fn test_beacon_info_with_expired_timeout_still_creates_item() {
     let mut stream = timeline.subscribe_events().await;
     let beacon_id = event_id!("$beacon_info:example.org");
 
-    // Use a timestamp in the past with a very short duration so that
-    // is_live() would return false (expired), but `live` field is true.
+    // Use a timestamp in the past with a very short duration so that is_live()
+    // would return false (expired), but `live` field is true.
     let past_ts = MilliSecondsSinceUnixEpoch(uint!(1_000)); // Very early timestamp
     let short_duration = Duration::from_millis(1); // Effectively expired immediately
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -92,8 +91,8 @@ async fn test_beacon_info_with_expired_timeout_still_creates_item() {
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let state = item.content().as_live_location_state().expect("should be a live location item");
 
-    // The `live` field is true, but is_live() returns false because the
-    // timeout has expired.
+    // The `live` field is true, but is_live() returns false because the timeout
+    // has expired.
     assert!(!state.is_live(), "is_live() should return false because the timeout has expired");
     assert!(state.beacon_info.live, "live should be true");
 
@@ -110,7 +109,7 @@ async fn test_beacon_info_stopped_without_start_produces_no_item() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -139,7 +138,7 @@ async fn test_beacon_update_aggregates_onto_beacon_info() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -156,7 +155,7 @@ async fn test_beacon_update_aggregates_onto_beacon_info() {
     assert!(state.locations().is_empty());
 
     let ts = MilliSecondsSinceUnixEpoch(uint!(1_000_000));
-    timeline.send_beacon_location(&ALICE, beacon_id, 51.5008, 0.1247, ts).await;
+    timeline.send_beacon_location(User::Alice, beacon_id, 51.5008, 0.1247, ts).await;
 
     // The existing item is updated in-place via a Set diff.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
@@ -183,7 +182,7 @@ async fn test_multiple_beacon_updates_accumulate_in_order() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -200,15 +199,15 @@ async fn test_multiple_beacon_updates_accumulate_in_order() {
     let ts1 = MilliSecondsSinceUnixEpoch(uint!(1_000));
     let ts3 = MilliSecondsSinceUnixEpoch(uint!(3_000));
 
-    timeline.send_beacon_location(&ALICE, beacon_id, 10.0, 20.0, ts2).await;
+    timeline.send_beacon_location(User::Alice, beacon_id, 10.0, 20.0, ts2).await;
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
     assert_eq!(item.content().as_live_location_state().unwrap().locations().len(), 1);
 
-    timeline.send_beacon_location(&ALICE, beacon_id, 11.0, 21.0, ts1).await;
+    timeline.send_beacon_location(User::Alice, beacon_id, 11.0, 21.0, ts1).await;
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
     assert_eq!(item.content().as_live_location_state().unwrap().locations().len(), 2);
 
-    timeline.send_beacon_location(&ALICE, beacon_id, 12.0, 22.0, ts3).await;
+    timeline.send_beacon_location(User::Alice, beacon_id, 12.0, 22.0, ts3).await;
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
     let state = item.content().as_live_location_state().unwrap();
     assert_eq!(state.locations().len(), 3);
@@ -223,7 +222,7 @@ async fn test_multiple_beacon_updates_accumulate_in_order() {
     assert_pending!(stream);
 }
 
-/// When a `beacon` message event arrives *before* its parent `beacon_info`
+/// When a `beacon` message event arrives _before_ its parent `beacon_info`
 /// state event, the aggregation is stashed and applied once the parent appears.
 #[async_test]
 async fn test_beacon_update_before_beacon_info_is_applied_when_parent_arrives() {
@@ -233,7 +232,7 @@ async fn test_beacon_update_before_beacon_info_is_applied_when_parent_arrives() 
 
     // Location update arrives first – no parent yet.
     let ts = MilliSecondsSinceUnixEpoch(uint!(5_000));
-    timeline.send_beacon_location(&ALICE, &beacon_id, 48.8584, 2.2945, ts).await;
+    timeline.send_beacon_location(User::Alice, &beacon_id, 48.8584, 2.2945, ts).await;
 
     // The location update event is filtered out from the visible items because
     // beacon message events are never shown as standalone items.
@@ -246,7 +245,7 @@ async fn test_beacon_update_before_beacon_info_is_applied_when_parent_arrives() 
     // Now the beacon_info arrives.
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             &beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -278,7 +277,7 @@ async fn test_multiple_users_sharing_produce_independent_items() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             alice_beacon_id,
             BeaconInfoFields {
                 description: Some("Alice".to_owned()),
@@ -290,12 +289,12 @@ async fn test_multiple_users_sharing_produce_independent_items() {
         .await;
 
     let alice_item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    assert_eq!(alice_item.sender(), *ALICE);
+    assert_eq!(alice_item.sender(), User::Alice);
     assert_eq!(alice_item.content().as_live_location_state().unwrap().description(), Some("Alice"));
 
     timeline
         .send_beacon_info(
-            &BOB,
+            User::Bob,
             bob_beacon_id,
             BeaconInfoFields {
                 description: Some("Bob".to_owned()),
@@ -307,18 +306,18 @@ async fn test_multiple_users_sharing_produce_independent_items() {
         .await;
 
     let bob_item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    assert_eq!(bob_item.sender(), *BOB);
+    assert_eq!(bob_item.sender(), User::Bob);
     assert_eq!(bob_item.content().as_live_location_state().unwrap().description(), Some("Bob"));
 
     assert_pending!(stream);
 
     // Location updates for Alice don't affect Bob's item.
     let ts = MilliSecondsSinceUnixEpoch(uint!(1_000));
-    timeline.send_beacon_location(&ALICE, alice_beacon_id, 1.0, 2.0, ts).await;
+    timeline.send_beacon_location(User::Alice, alice_beacon_id, 1.0, 2.0, ts).await;
 
     // Only Alice's item (index 0) is updated.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
-    assert_eq!(item.sender(), *ALICE);
+    assert_eq!(item.sender(), User::Alice);
     assert_eq!(item.content().as_live_location_state().unwrap().locations().len(), 1);
 
     assert_pending!(stream);
@@ -329,7 +328,7 @@ async fn test_multiple_users_sharing_produce_independent_items() {
 
     let alice_state = items
         .iter()
-        .find(|i| i.sender() == (*ALICE))
+        .find(|i| i.sender() == User::Alice)
         .unwrap()
         .content()
         .as_live_location_state()
@@ -337,7 +336,7 @@ async fn test_multiple_users_sharing_produce_independent_items() {
 
     let bob_state = items
         .iter()
-        .find(|i| i.sender() == (*BOB))
+        .find(|i| i.sender() == User::Bob)
         .unwrap()
         .content()
         .as_live_location_state()
@@ -356,7 +355,7 @@ async fn test_beacon_update_not_shown_standalone() {
     let beacon_id = event_id!("$some_beacon:example.org");
 
     let ts = MilliSecondsSinceUnixEpoch(uint!(1_000));
-    timeline.send_beacon_location(&ALICE, beacon_id, 0.0, 0.0, ts).await;
+    timeline.send_beacon_location(User::Alice, beacon_id, 0.0, 0.0, ts).await;
 
     assert_pending!(stream);
 
@@ -366,8 +365,8 @@ async fn test_beacon_update_not_shown_standalone() {
     );
 }
 
-/// A stop `beacon_info` (live = false) updates the existing start item
-/// in-place rather than creating a new timeline item.
+/// A stop `beacon_info` (live = false) updates the existing start item in-place
+/// rather than creating a new timeline item.
 #[async_test]
 async fn test_beacon_stop_updates_existing_item() {
     let timeline = TestTimeline::new().await;
@@ -380,7 +379,7 @@ async fn test_beacon_stop_updates_existing_item() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             start_id,
             BeaconInfoFields {
                 description: None,
@@ -399,7 +398,7 @@ async fn test_beacon_stop_updates_existing_item() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             stop_id,
             BeaconInfoFields {
                 description: None,
@@ -412,7 +411,8 @@ async fn test_beacon_stop_updates_existing_item() {
 
     // The existing item is updated — a Set diff, not a PushBack.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
-    // The original start item is updated — its event_id remains the start event.
+    // The original start item is updated — its event_id remains the start
+    // event.
     assert_eq!(item.event_id().unwrap(), start_id);
     assert!(
         !item.content().as_live_location_state().unwrap().is_live(),
@@ -436,7 +436,7 @@ async fn test_beacon_stop_preserves_locations() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             start_id,
             BeaconInfoFields {
                 description: None,
@@ -449,7 +449,7 @@ async fn test_beacon_stop_preserves_locations() {
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
 
     let location_ts = MilliSecondsSinceUnixEpoch(uint!(1_000));
-    timeline.send_beacon_location(&ALICE, start_id, 51.5, 0.1, location_ts).await;
+    timeline.send_beacon_location(User::Alice, start_id, 51.5, 0.1, location_ts).await;
 
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
     assert_eq!(item.content().as_live_location_state().unwrap().locations().len(), 1);
@@ -457,7 +457,7 @@ async fn test_beacon_stop_preserves_locations() {
     // Stop the session.
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             stop_id,
             BeaconInfoFields {
                 description: None,
@@ -493,7 +493,7 @@ async fn test_beacon_stop_before_start_is_applied_later() {
     // Send the stop event first — the live start item doesn't exist yet.
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             stop_id,
             BeaconInfoFields {
                 description: None,
@@ -514,7 +514,7 @@ async fn test_beacon_stop_before_start_is_applied_later() {
     // Now send the live start event.
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             start_id,
             BeaconInfoFields {
                 description: None,
@@ -525,7 +525,8 @@ async fn test_beacon_stop_before_start_is_applied_later() {
         )
         .await;
 
-    // The item should appear already stopped — a single PushBack, no follow-up Set.
+    // The item should appear already stopped — a single PushBack, no follow-up
+    // Set.
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert_eq!(item.event_id().unwrap(), start_id, "the item should carry the start event's ID");
     assert!(
@@ -538,6 +539,7 @@ async fn test_beacon_stop_before_start_is_applied_later() {
 
 /// A pending beacon stop from an OLD session should NOT be applied to a NEW
 /// session. This tests the scenario where:
+///
 /// 1. User starts session A
 /// 2. Stop for session A arrives out-of-order and is stashed
 /// 3. User starts session B — the stashed stop should NOT apply
@@ -548,17 +550,21 @@ async fn test_pending_beacon_stop_not_applied_to_different_session() {
     let old_stop_id = event_id!("$old_stop:example.org");
     let new_start_id = event_id!("$new_start:example.org");
 
-    // Use the current time as base for session B.
-    // Session A's timestamp doesn't matter since its stop will be discarded.
-    // Session B needs a recent timestamp so is_live() doesn't fail due to timeout.
-    let old_session_ts = MilliSecondsSinceUnixEpoch(uint!(1)); // Old session (past)
-    let new_session_ts = MilliSecondsSinceUnixEpoch::now(); // New session (now)
+    // Use the current time as base for session B. Session A's timestamp doesn't
+    // matter since its stop will be discarded. Session B needs a recent
+    // timestamp so is_live() doesn't fail due to timeout.
 
-    // A stop event from the OLD session arrives first (out-of-order).
-    // Its corresponding start event is missing (maybe it's from long ago).
+    // Old session (past)
+    let old_session_ts = MilliSecondsSinceUnixEpoch(uint!(1));
+
+    // New session (now)
+    let new_session_ts = MilliSecondsSinceUnixEpoch::now();
+
+    // A stop event from the OLD session arrives first (out-of-order). Its
+    // corresponding start event is missing (maybe it's from long ago).
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             old_stop_id,
             BeaconInfoFields {
                 description: None,
@@ -575,7 +581,7 @@ async fn test_pending_beacon_stop_not_applied_to_different_session() {
     // Now a NEW session starts with a DIFFERENT timestamp.
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             new_start_id,
             BeaconInfoFields {
                 description: Some("New session".to_owned()),
@@ -620,7 +626,7 @@ async fn test_replacing_live_beacon_stops_previous_item() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             old_start_id,
             BeaconInfoFields {
                 description: Some("Old session".to_owned()),
@@ -641,7 +647,7 @@ async fn test_replacing_live_beacon_stops_previous_item() {
 
     timeline
         .send_beacon_info_with_prev_content(
-            &ALICE,
+            User::Alice,
             new_start_id,
             BeaconInfoFields {
                 description: Some("New session".to_owned()),
@@ -687,7 +693,7 @@ async fn test_duplicate_beacon_location_is_deduplicated() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -700,16 +706,16 @@ async fn test_duplicate_beacon_location_is_deduplicated() {
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
 
     let ts = MilliSecondsSinceUnixEpoch(uint!(1_000));
-    timeline.send_beacon_location(&ALICE, beacon_id, 1.0, 2.0, ts).await;
+    timeline.send_beacon_location(User::Alice, beacon_id, 1.0, 2.0, ts).await;
 
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
     assert_eq!(item.content().as_live_location_state().unwrap().locations().len(), 1);
 
     // A second event with the same ts (e.g. from a retried decryption pass).
-    timeline.send_beacon_location(&ALICE, beacon_id, 1.0, 2.0, ts).await;
+    timeline.send_beacon_location(User::Alice, beacon_id, 1.0, 2.0, ts).await;
 
-    // The aggregation system still emits a Set diff, but the duplicate
-    // location is silently dropped so the count stays at 1.
+    // The aggregation system still emits a Set diff, but the duplicate location
+    // is silently dropped so the count stays at 1.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
     assert_eq!(
         item.content().as_live_location_state().unwrap().locations().len(),
@@ -728,8 +734,8 @@ async fn test_redacted_beacon_info_produces_redacted_item() {
 
     timeline
         .handle_live_event(timeline.factory.redacted_state(
-            &ALICE,
-            ALICE.as_str(),
+            User::Alice,
+            User::Alice.as_str(),
             RedactedBeaconInfoEventContent::new(),
         ))
         .await;
@@ -753,7 +759,7 @@ async fn test_reaction_on_live_location_item() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -766,18 +772,18 @@ async fn test_reaction_on_live_location_item() {
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert!(item.content().as_live_location_state().is_some());
-    assert!(item.content().reactions().unwrap().is_empty());
+    assert!(item.reactions().is_empty());
 
     // BOB reacts to the live location item.
-    timeline.handle_live_event(timeline.factory.reaction(beacon_id, "👍").sender(&BOB)).await;
+    timeline.handle_live_event(timeline.factory.reaction(beacon_id, "👍").sender(User::Bob)).await;
 
     // The item is updated in-place with the reaction applied.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
     assert!(item.content().as_live_location_state().is_some(), "still a live location item");
 
-    let reactions = item.content().reactions().expect("live location should expose reactions");
+    let reactions = item.reactions();
     let thumbs_up = reactions.get("👍").expect("👍 reaction should be present");
-    let reaction = thumbs_up.get(*BOB).expect("BOB's reaction should be present");
+    let reaction = thumbs_up.get(&User::Bob).expect("BOB's reaction should be present");
     assert_matches!(&reaction.send_state, None);
 
     assert_pending!(stream);
@@ -793,7 +799,7 @@ async fn test_multiple_reactions_on_live_location_item() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -806,24 +812,26 @@ async fn test_multiple_reactions_on_live_location_item() {
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
 
     // ALICE and BOB both react, with different keys.
-    timeline.handle_live_event(timeline.factory.reaction(beacon_id, "👍").sender(&ALICE)).await;
+    timeline
+        .handle_live_event(timeline.factory.reaction(beacon_id, "👍").sender(User::Alice))
+        .await;
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
-    let reactions = item.content().reactions().unwrap();
+    let reactions = item.reactions();
     assert_eq!(reactions.len(), 1);
-    assert!(reactions.get("👍").unwrap().get(*ALICE).is_some());
+    assert!(reactions.get("👍").unwrap().get(&User::Alice).is_some());
 
-    timeline.handle_live_event(timeline.factory.reaction(beacon_id, "❤️").sender(&BOB)).await;
+    timeline.handle_live_event(timeline.factory.reaction(beacon_id, "❤️").sender(User::Bob)).await;
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
 
-    let reactions = item.content().reactions().unwrap();
+    let reactions = item.reactions();
     assert_eq!(reactions.len(), 2, "two distinct reaction keys");
-    assert!(reactions.get("👍").unwrap().get(*ALICE).is_some());
-    assert!(reactions.get("❤️").unwrap().get(*BOB).is_some());
+    assert!(reactions.get("👍").unwrap().get(&User::Alice).is_some());
+    assert!(reactions.get("❤️").unwrap().get(&User::Bob).is_some());
 
     assert_pending!(stream);
 }
 
-/// A reaction that arrives *before* its target live location item is stashed
+/// A reaction that arrives _before_ its target live location item is stashed
 /// and applied once the beacon_info item is inserted.
 #[async_test]
 async fn test_reaction_before_live_location_item_is_applied_when_parent_arrives() {
@@ -832,7 +840,7 @@ async fn test_reaction_before_live_location_item_is_applied_when_parent_arrives(
     let beacon_id = event_id!("$beacon_info:example.org");
 
     // Reaction arrives before the beacon_info.
-    timeline.handle_live_event(timeline.factory.reaction(beacon_id, "👍").sender(&BOB)).await;
+    timeline.handle_live_event(timeline.factory.reaction(beacon_id, "👍").sender(User::Bob)).await;
 
     // Nothing visible yet — no parent item to attach to.
     assert_pending!(stream);
@@ -840,7 +848,7 @@ async fn test_reaction_before_live_location_item_is_applied_when_parent_arrives(
     // Now the beacon_info arrives.
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -855,15 +863,15 @@ async fn test_reaction_before_live_location_item_is_applied_when_parent_arrives(
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert!(item.content().as_live_location_state().is_some());
 
-    let reactions = item.content().reactions().expect("live location should expose reactions");
+    let reactions = item.reactions();
     let thumbs_up = reactions.get("👍").expect("👍 reaction should be present");
-    assert!(thumbs_up.get(*BOB).is_some(), "BOB's reaction should be pre-applied");
+    assert!(thumbs_up.get(&User::Bob).is_some(), "BOB's reaction should be pre-applied");
 
     assert_pending!(stream);
 }
 
-/// A locally-toggled reaction on a live location item produces a local echo
-/// and is then confirmed by the remote echo from sync.
+/// A locally-toggled reaction on a live location item produces a local echo and
+/// is then confirmed by the remote echo from sync.
 #[async_test]
 async fn test_local_reaction_on_live_location_item() {
     let timeline = TestTimeline::new().await;
@@ -872,7 +880,7 @@ async fn test_local_reaction_on_live_location_item() {
 
     timeline
         .send_beacon_info(
-            &ALICE,
+            User::Alice,
             beacon_id,
             BeaconInfoFields {
                 description: None,
@@ -892,18 +900,21 @@ async fn test_local_reaction_on_live_location_item() {
     // The item is updated with a local-echo reaction.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
     assert!(item.content().as_live_location_state().is_some());
-    let reactions = item.content().reactions().unwrap();
-    let reaction = reactions.get("👍").unwrap().get(*ALICE).unwrap();
+    let reactions = item.reactions();
+    let reaction = reactions.get("👍").unwrap().get(&User::Alice).unwrap();
     assert_matches!(&reaction.send_state, Some(EventSendState::NotSentYet { .. }));
 
     // Receive the remote echo from sync.
-    timeline.handle_live_event(timeline.factory.reaction(beacon_id, "👍").sender(&ALICE)).await;
+    timeline
+        .handle_live_event(timeline.factory.reaction(beacon_id, "👍").sender(User::Alice))
+        .await;
 
-    // The item is updated once more — now the reaction is a confirmed remote echo.
+    // The item is updated once more — now the reaction is a confirmed remote
+    // echo.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
     assert!(item.content().as_live_location_state().is_some());
-    let reactions = item.content().reactions().unwrap();
-    let reaction = reactions.get("👍").unwrap().get(*ALICE).unwrap();
+    let reactions = item.reactions();
+    let reaction = reactions.get("👍").unwrap().get(&User::Alice).unwrap();
     assert_matches!(&reaction.send_state, None);
 
     assert_pending!(stream);
@@ -1013,12 +1024,7 @@ impl TestTimeline {
     }
 
     /// Convenience: send a `beacon_info` state event from `sender`.
-    async fn send_beacon_info(
-        &self,
-        sender: &ruma::UserId,
-        event_id: &EventId,
-        info: BeaconInfoFields,
-    ) {
+    async fn send_beacon_info(&self, sender: User, event_id: &EventId, info: BeaconInfoFields) {
         let event = self
             .factory
             .beacon_info(info.description, info.duration, info.live, info.ts)
@@ -1032,7 +1038,7 @@ impl TestTimeline {
     /// `prev_content`, to model replacement of a previous session.
     async fn send_beacon_info_with_prev_content(
         &self,
-        sender: &ruma::UserId,
+        sender: User,
         event_id: &EventId,
         info: BeaconInfoFields,
         prev_content: BeaconInfoEventContent,
@@ -1050,7 +1056,7 @@ impl TestTimeline {
     /// Convenience: send a `beacon` location-update event from `sender`.
     async fn send_beacon_location(
         &self,
-        sender: &ruma::UserId,
+        sender: User,
         beacon_info_event_id: &EventId,
         latitude: f64,
         longitude: f64,

@@ -17,7 +17,6 @@
 use std::time::Duration;
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
@@ -27,11 +26,12 @@ use matrix_sdk::{
         RoomRelationsResponseTemplate,
     },
 };
-use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_test::{JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::timeline::{
     EventSendState, TimelineBuilder, TimelineEventFocusThreadMode, TimelineFocus,
 };
 use ruma::{event_id, events::room::message::RoomMessageEventContent, room_id};
+use strass::assert_let;
 use stream_assert::assert_pending;
 use tokio::time::sleep;
 
@@ -48,18 +48,18 @@ async fn test_new_focused() {
         .mock_room_event_context()
         .room(room_id)
         .ok(
-            // events_before are passed in reverse chronological order (newest first),
-            // as required by the /context response format.
+            // events_before are passed in reverse chronological order (newest
+            // first), as required by the /context response format.
             RoomContextResponseTemplate::new(
-                f.text_msg("in the end").event_id(target_event).sender(*BOB).into_event(),
+                f.text_msg("in the end").event_id(target_event).sender(User::Bob).into_event(),
             )
             .events_before(vec![
-                f.text_msg("and got so far").sender(*ALICE).into_event(),
-                f.text_msg("i tried so hard").sender(*ALICE).into_event(),
+                f.text_msg("and got so far").sender(User::Alice).into_event(),
+                f.text_msg("i tried so hard").sender(User::Alice).into_event(),
             ])
             .events_after(vec![
-                f.text_msg("it doesn't even").sender(*ALICE).into_event(),
-                f.text_msg("matter").sender(*ALICE).into_event(),
+                f.text_msg("it doesn't even").sender(User::Alice).into_event(),
+                f.text_msg("matter").sender(User::Alice).into_event(),
             ])
             .start("prev1")
             .end("next1"),
@@ -114,9 +114,9 @@ async fn test_new_focused() {
         .ok(RoomMessagesResponseTemplate::default().events(vec![
             // reversed manually here
             f.text_msg("And even though I tried, it all fell apart")
-                .sender(*BOB)
+                .sender(User::Bob)
                 .into_raw_timeline(),
-            f.text_msg("I kept everything inside").sender(*BOB).into_raw_timeline(),
+            f.text_msg("I kept everything inside").sender(User::Bob).into_raw_timeline(),
         ]))
         .mock_once()
         .mount()
@@ -146,9 +146,9 @@ async fn test_new_focused() {
         .match_from("next1")
         .ok(RoomMessagesResponseTemplate::default()
             .events(vec![
-                f.text_msg("I had to fall, to lose it all").sender(*BOB).into_raw_timeline(),
+                f.text_msg("I had to fall, to lose it all").sender(User::Bob).into_raw_timeline(),
                 f.text_msg("But in the end, it doesn't event matter")
-                    .sender(*BOB)
+                    .sender(User::Bob)
                     .into_raw_timeline(),
             ])
             .end_token("next2"))
@@ -191,7 +191,7 @@ async fn test_live_aggregations_are_reflected_on_focused_timelines() {
         .mock_room_event_context()
         .room(room_id)
         .ok(RoomContextResponseTemplate::new(
-            f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
+            f.text_msg("yolo").event_id(target_event).sender(User::Bob).into_event(),
         ))
         .mock_once()
         .mount()
@@ -217,7 +217,7 @@ async fn test_live_aggregations_are_reflected_on_focused_timelines() {
 
     let event_item = items[1].as_event().unwrap();
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
-    assert_eq!(event_item.content().reactions().cloned().unwrap_or_default().len(), 0);
+    assert_eq!(event_item.reactions().len(), 0);
 
     assert_pending!(timeline_stream);
 
@@ -228,9 +228,9 @@ async fn test_live_aggregations_are_reflected_on_focused_timelines() {
         .ok_and_run(&client, |builder| {
             builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_bulk([
                 // This event must be ignored.
-                f.text_msg("this is a sync event").sender(*ALICE).into(),
+                f.text_msg("this is a sync event").sender(User::Alice).into(),
                 // This event must not be ignored.
-                f.reaction(target_event, "👍").sender(*BOB).into(),
+                f.reaction(target_event, "👍").sender(User::Bob).into(),
             ]));
         })
         .await;
@@ -242,9 +242,9 @@ async fn test_live_aggregations_are_reflected_on_focused_timelines() {
 
     let event_item = item.as_event().unwrap();
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
-    let reactions = event_item.content().reactions().cloned().unwrap_or_default();
+    let reactions = event_item.reactions().clone();
     assert_eq!(reactions.len(), 1);
-    let _ = reactions["👍"][*BOB];
+    let _ = reactions["👍"][&User::Bob];
 }
 
 #[async_test]
@@ -261,7 +261,7 @@ async fn test_focused_timeline_local_echoes() {
         .mock_room_event_context()
         .room(room_id)
         .ok(RoomContextResponseTemplate::new(
-            f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
+            f.text_msg("yolo").event_id(target_event).sender(User::Bob).into_event(),
         ))
         .mock_once()
         .mount()
@@ -287,12 +287,13 @@ async fn test_focused_timeline_local_echoes() {
 
     let event_item = items[1].as_event().unwrap();
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
-    assert_eq!(event_item.content().reactions().cloned().unwrap_or_default().len(), 0);
+    assert_eq!(event_item.reactions().len(), 0);
 
     sleep(Duration::from_millis(100)).await;
     assert_pending!(timeline_stream);
 
-    // Add a reaction to the focused event, which will cause a local echo to happen.
+    // Add a reaction to the focused event, which will cause a local echo to
+    // happen.
     timeline.toggle_reaction(&event_item.identifier(), "✨").await.unwrap();
 
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
@@ -305,7 +306,7 @@ async fn test_focused_timeline_local_echoes() {
     // Text hasn't changed.
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
     // But now there's one reaction to the event.
-    let reactions = event_item.content().reactions().cloned().unwrap_or_default();
+    let reactions = event_item.reactions().clone();
     assert_eq!(reactions.len(), 1);
     assert!(reactions.get("✨").unwrap().get(client.user_id().unwrap()).is_some());
 
@@ -313,7 +314,7 @@ async fn test_focused_timeline_local_echoes() {
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
     assert_eq!(timeline_updates.len(), 1);
     assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
-    let reactions = item.as_event().unwrap().content().reactions().cloned().unwrap_or_default();
+    let reactions = item.as_event().unwrap().reactions().clone();
     let reaction = reactions.get("✨").unwrap().get(client.user_id().unwrap()).unwrap();
     assert_matches!(reaction.send_state, Some(EventSendState::SendingFailed { .. }));
 
@@ -336,7 +337,7 @@ async fn test_focused_timeline_doesnt_show_local_echoes() {
         .mock_room_event_context()
         .room(room_id)
         .ok(RoomContextResponseTemplate::new(
-            f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
+            f.text_msg("yolo").event_id(target_event).sender(User::Bob).into_event(),
         ))
         .mock_once()
         .mount()
@@ -362,7 +363,7 @@ async fn test_focused_timeline_doesnt_show_local_echoes() {
 
     let event_item = items[1].as_event().unwrap();
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
-    assert_eq!(event_item.content().reactions().cloned().unwrap_or_default().len(), 0);
+    assert_eq!(event_item.reactions().len(), 0);
 
     assert_pending!(timeline_stream);
 
@@ -460,7 +461,8 @@ async fn test_focused_timeline_handles_threaded_event() {
 
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
     assert_eq!(timeline_updates.len(), 1);
-    // The new item loaded is inserted at the start, just after the date divider.
+    // The new item loaded is inserted at the start, just after the date
+    // divider.
     assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
     assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Prev");
 
@@ -494,8 +496,8 @@ async fn test_focused_timeline_handles_threaded_event() {
 
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
     assert_eq!(timeline_updates.len(), 1);
-    // Same as before, the previous event is inserted at the front, after the date
-    // divider.
+    // Same as before, the previous event is inserted at the front, after the
+    // date divider.
     assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
     assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Root");
 
@@ -713,8 +715,8 @@ async fn test_focused_timeline_handles_other_thread_event_when_forcing_threaded_
     assert!(items[0].is_date_divider());
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "Ho");
 
-    // We paginate backwards once and hit the start of the thread which will trigger
-    // an /event request for the thread root.
+    // We paginate backwards once and hit the start of the thread which will
+    // trigger an /event request for the thread root.
     server
         .mock_room_relations()
         .match_from("prev_token")
@@ -911,7 +913,6 @@ async fn test_focused_timeline_filters_out_threaded_events() {
             start: "prev_token_1".to_owned(),
             end: Some("prev_token_2".to_owned()),
             state: Vec::new(),
-            delay: None,
         })
         .mock_once()
         .mount()
@@ -924,7 +925,8 @@ async fn test_focused_timeline_filters_out_threaded_events() {
     // Only the non-threaded event is inserted at the start.
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
     assert_eq!(timeline_updates.len(), 1);
-    // The new item loaded is inserted at the start, just after the date divider.
+    // The new item loaded is inserted at the start, just after the date
+    // divider.
     assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
     assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Prev no thread");
 
@@ -943,7 +945,6 @@ async fn test_focused_timeline_filters_out_threaded_events() {
             start: "next_token_1".to_owned(),
             end: Some("next_token_2".to_owned()),
             state: Vec::new(),
-            delay: None,
         })
         .mock_once()
         .mount()

@@ -15,7 +15,6 @@
 use std::ops::Not as _;
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
@@ -23,9 +22,7 @@ use matrix_sdk::{
     room::Receipts,
     test_utils::mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
 };
-use matrix_sdk_test::{
-    ALICE, BOB, CAROL, JoinedRoomBuilder, async_test, event_factory::EventFactory,
-};
+use matrix_sdk_test::{JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::timeline::{RoomExt, TimelineFocus, TimelineReadReceiptTracking};
 use ruma::{
     MilliSecondsSinceUnixEpoch, OwnedEventId,
@@ -44,6 +41,7 @@ use ruma::{
     uint, user_id,
 };
 use serde_json::json;
+use strass::assert_let;
 use stream_assert::{assert_pending, assert_ready};
 use tokio::task::yield_now;
 
@@ -263,15 +261,15 @@ async fn test_read_receipts_updates_on_filtered_events() {
     let own_receipt_timeline_event =
         timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await;
     assert_matches!(own_receipt_timeline_event, None);
-    let alice_receipt = timeline.latest_user_read_receipt(*ALICE).await;
+    let alice_receipt = timeline.latest_user_read_receipt(User::Alice.into()).await;
     assert_matches!(alice_receipt, None);
     let alice_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*ALICE).await;
+        timeline.latest_user_read_receipt_timeline_event_id(User::Alice.into()).await;
     assert_matches!(alice_receipt_timeline_event, None);
-    let bob_receipt = timeline.latest_user_read_receipt(*BOB).await;
+    let bob_receipt = timeline.latest_user_read_receipt(User::Bob.into()).await;
     assert_matches!(bob_receipt, None);
     let bob_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await;
+        timeline.latest_user_read_receipt_timeline_event_id(User::Bob.into()).await;
     assert_matches!(bob_receipt_timeline_event, None);
 
     let f = EventFactory::new();
@@ -284,10 +282,12 @@ async fn test_read_receipts_updates_on_filtered_events() {
                     f.text_msg("is dancing").sender(own_user_id).event_id(event_a_id),
                 )
                 // Event B
-                .add_timeline_event(f.notice("I'm dancing too").sender(*BOB).event_id(event_b_id))
+                .add_timeline_event(
+                    f.notice("I'm dancing too").sender(User::Bob).event_id(event_b_id),
+                )
                 // Event C
                 .add_timeline_event(
-                    f.text_msg("Viva la macarena!").sender(*ALICE).event_id(event_c_id),
+                    f.text_msg("Viva la macarena!").sender(User::Alice).event_id(event_c_id),
                 ),
         )
         .await;
@@ -312,11 +312,12 @@ async fn test_read_receipts_updates_on_filtered_events() {
     assert_eq!(event_a.read_receipts().len(), 1);
 
     // Real receipt is on event B.
-    let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
+    let (bob_receipt_event_id, _) =
+        timeline.latest_user_read_receipt(User::Bob.into()).await.unwrap();
     assert_eq!(bob_receipt_event_id, event_b_id);
     // Visible receipt is on event A.
     let bob_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await.unwrap();
+        timeline.latest_user_read_receipt_timeline_event_id(User::Bob.into()).await.unwrap();
     assert_eq!(bob_receipt_timeline_event, event_a.event_id().unwrap());
 
     // Implicit read receipt of @alice:localhost.
@@ -324,10 +325,11 @@ async fn test_read_receipts_updates_on_filtered_events() {
     let event_c = item_c.as_event().unwrap();
     assert_eq!(event_c.read_receipts().len(), 1);
 
-    let (alice_receipt_event_id, _) = timeline.latest_user_read_receipt(*ALICE).await.unwrap();
+    let (alice_receipt_event_id, _) =
+        timeline.latest_user_read_receipt(User::Alice.into()).await.unwrap();
     assert_eq!(alice_receipt_event_id, event_c_id);
     let alice_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*ALICE).await.unwrap();
+        timeline.latest_user_read_receipt_timeline_event_id(User::Alice.into()).await.unwrap();
     assert_eq!(alice_receipt_timeline_event, event_c_id);
 
     assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[3]);
@@ -359,7 +361,7 @@ async fn test_read_receipts_updates_on_filtered_events() {
             &client,
             JoinedRoomBuilder::new(room_id).add_receipt(
                 f.read_receipts()
-                    .add(event_c_id, *BOB, EventReceiptType::Read, ReceiptThread::Unthreaded)
+                    .add(event_c_id, User::Bob, EventReceiptType::Read, ReceiptThread::Unthreaded)
                     .into_event(),
             ),
         )
@@ -377,10 +379,11 @@ async fn test_read_receipts_updates_on_filtered_events() {
     assert_eq!(event_c.read_receipts().len(), 2);
 
     // Both real and visible receipts are now on event C.
-    let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
+    let (bob_receipt_event_id, _) =
+        timeline.latest_user_read_receipt(User::Bob.into()).await.unwrap();
     assert_eq!(bob_receipt_event_id, event_c_id);
     let bob_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await.unwrap();
+        timeline.latest_user_read_receipt_timeline_event_id(User::Bob.into()).await.unwrap();
     assert_eq!(bob_receipt_timeline_event, event_c_id);
 
     // Private read receipt is updated.
@@ -441,15 +444,15 @@ async fn test_read_receipts_updates_on_message_like_events() {
     let own_receipt_timeline_event =
         timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await;
     assert_matches!(own_receipt_timeline_event, None);
-    let alice_receipt = timeline.latest_user_read_receipt(*ALICE).await;
+    let alice_receipt = timeline.latest_user_read_receipt(User::Alice.into()).await;
     assert_matches!(alice_receipt, None);
     let alice_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*ALICE).await;
+        timeline.latest_user_read_receipt_timeline_event_id(User::Alice.into()).await;
     assert_matches!(alice_receipt_timeline_event, None);
-    let bob_receipt = timeline.latest_user_read_receipt(*BOB).await;
+    let bob_receipt = timeline.latest_user_read_receipt(User::Bob.into()).await;
     assert_matches!(bob_receipt, None);
     let bob_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await;
+        timeline.latest_user_read_receipt_timeline_event_id(User::Bob.into()).await;
     assert_matches!(bob_receipt_timeline_event, None);
 
     let f = EventFactory::new();
@@ -462,10 +465,12 @@ async fn test_read_receipts_updates_on_message_like_events() {
                     f.text_msg("is dancing").sender(own_user_id).event_id(event_a_id),
                 )
                 // Event B
-                .add_timeline_event(f.room_name("Party Room").sender(*BOB).event_id(event_b_id))
+                .add_timeline_event(
+                    f.room_name("Party Room").sender(User::Bob).event_id(event_b_id),
+                )
                 // Event C
                 .add_timeline_event(
-                    f.text_msg("Viva la macarena!").sender(*ALICE).event_id(event_c_id),
+                    f.text_msg("Viva la macarena!").sender(User::Alice).event_id(event_c_id),
                 ),
         )
         .await;
@@ -494,11 +499,12 @@ async fn test_read_receipts_updates_on_message_like_events() {
     assert_eq!(event_b.read_receipts().len(), 0);
 
     // Real receipt is on event B.
-    let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
+    let (bob_receipt_event_id, _) =
+        timeline.latest_user_read_receipt(User::Bob.into()).await.unwrap();
     assert_eq!(bob_receipt_event_id, event_b_id);
     // Visible receipt is on event A.
     let bob_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await.unwrap();
+        timeline.latest_user_read_receipt_timeline_event_id(User::Bob.into()).await.unwrap();
     assert_eq!(bob_receipt_timeline_event, event_a.event_id().unwrap());
 
     // Implicit read receipt of @alice:localhost.
@@ -506,10 +512,11 @@ async fn test_read_receipts_updates_on_message_like_events() {
     let event_c = item_c.as_event().unwrap();
     assert_eq!(event_c.read_receipts().len(), 1);
 
-    let (alice_receipt_event_id, _) = timeline.latest_user_read_receipt(*ALICE).await.unwrap();
+    let (alice_receipt_event_id, _) =
+        timeline.latest_user_read_receipt(User::Alice.into()).await.unwrap();
     assert_eq!(alice_receipt_event_id, event_c_id);
     let alice_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*ALICE).await.unwrap();
+        timeline.latest_user_read_receipt_timeline_event_id(User::Alice.into()).await.unwrap();
     assert_eq!(alice_receipt_timeline_event, event_c_id);
 
     assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[4]);
@@ -541,7 +548,7 @@ async fn test_read_receipts_updates_on_message_like_events() {
             &client,
             JoinedRoomBuilder::new(room_id).add_receipt(
                 f.read_receipts()
-                    .add(event_c_id, *BOB, EventReceiptType::Read, ReceiptThread::Unthreaded)
+                    .add(event_c_id, User::Bob, EventReceiptType::Read, ReceiptThread::Unthreaded)
                     .into_event(),
             ),
         )
@@ -559,10 +566,11 @@ async fn test_read_receipts_updates_on_message_like_events() {
     assert_eq!(event_c.read_receipts().len(), 2);
 
     // Both real and visible receipts are now on event C.
-    let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
+    let (bob_receipt_event_id, _) =
+        timeline.latest_user_read_receipt(User::Bob.into()).await.unwrap();
     assert_eq!(bob_receipt_event_id, event_c_id);
     let bob_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await.unwrap();
+        timeline.latest_user_read_receipt_timeline_event_id(User::Bob.into()).await.unwrap();
     assert_eq!(bob_receipt_timeline_event, event_c_id);
 
     // Private read receipt is updated.
@@ -917,7 +925,7 @@ async fn test_send_single_receipt_threaded() {
 
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id.to_owned() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id.to_owned() })
         .build()
         .await
         .unwrap();
@@ -1040,7 +1048,8 @@ async fn test_send_single_receipt_with_unread_flag() {
             .unwrap();
     }
 
-    // Unthreaded receipts on unknown events are set and the unread flag is unset.
+    // Unthreaded receipts on unknown events are set and the unread flag is
+    // unset.
     {
         let _guards = (
             server
@@ -1086,8 +1095,8 @@ async fn test_send_single_receipt_with_unread_flag() {
             .unwrap();
     }
 
-    // Threaded receipt with unknown previous receipt is sent, but the unread flag
-    // is not unset.
+    // Threaded receipt with unknown previous receipt is sent, but the unread
+    // flag is not unset.
     {
         let _guard = server
             .mock_send_receipt(CreateReceiptType::Read)
@@ -1164,8 +1173,8 @@ async fn test_mark_as_read() {
         .await
         .unwrap();
 
-    // Then no request is actually sent, because the event forming the timeline item
-    // (the message) is known as read.
+    // Then no request is actually sent, because the event forming the timeline
+    // item (the message) is known as read.
     assert!(has_sent.not());
 
     server.mock_send_receipt(CreateReceiptType::Read).ok().mock_once().mount().await;
@@ -1198,8 +1207,8 @@ async fn test_mark_as_read_after_own_reply() {
     let own_user_id = client.user_id().unwrap();
     let alice_event_id = event_id!("$alice_event_id");
 
-    // Alice sends a message, the user replies. The user's reply is the latest event
-    // and but the homeserver has no receipt for Alice's message.
+    // Alice sends a message, the user replies. The user's reply is the latest
+    // event and but the homeserver has no receipt for Alice's message.
     let f = EventFactory::new();
     server
         .sync_room(
@@ -1225,9 +1234,9 @@ async fn test_mark_as_read_after_own_reply() {
         .await;
 
     // Marking the room as read still sends a receipt (for Alice's message, the
-    // latest event not sent by the user) instead of being suppressed by the user's
-    // implicit receipt. This is required to allow the server to re-compute the
-    // push/badge count.
+    // latest event not sent by the user) instead of being suppressed by the
+    // user's implicit receipt. This is required to allow the server to
+    // re-compute the push/badge count.
     let has_sent = timeline.mark_as_read(CreateReceiptType::Read).await.unwrap();
     assert!(has_sent);
 }
@@ -1266,8 +1275,9 @@ async fn test_mark_as_read_with_only_own_events() {
         )
         .await;
 
-    // With no other user's event to point at, the receipt falls back to the user's
-    // own latest event so a lingering server-side push/badge count can be reset.
+    // With no other user's event to point at, the receipt falls back to the
+    // user's own latest event so a lingering server-side push/badge count can
+    // be reset.
     server
         .mock_send_receipt(CreateReceiptType::Read)
         .match_event_id(event_id!("$second"))
@@ -1301,8 +1311,8 @@ async fn test_send_read_receipt_redirects_from_own_event() {
     let alice_event_id = event_id!("$alice_event_id");
     let own_event_id = event_id!("$own_event_id");
 
-    // Alice sends a message, then the user replies. The homeserver has no receipt
-    // for either yet.
+    // Alice sends a message, then the user replies. The homeserver has no
+    // receipt for either yet.
     let f = EventFactory::new();
     server
         .sync_room(
@@ -1440,7 +1450,7 @@ async fn test_mark_as_read_after_threaded_edit() {
     let (initial_events, mut stream) = timeline.subscribe().await;
     assert!(initial_events.is_empty());
 
-    let f = EventFactory::new().sender(*BOB);
+    let f = EventFactory::new().sender(User::Bob);
     let thread_root = event_id!("$thread_root");
     let threaded_reply = event_id!("$threaded_reply");
 
@@ -1551,7 +1561,8 @@ async fn test_mark_as_read_with_unread_flag() {
             .mount_as_scoped()
             .await;
 
-        // When I mark the room as read by sending a read receipt to the latest event,
+        // When I mark the room as read by sending a read receipt to the latest
+        // event,
         let has_sent = timeline.mark_as_read(CreateReceiptType::Read).await.unwrap();
 
         // The receipt is sent and the unread flag was unset.
@@ -1583,7 +1594,8 @@ async fn test_mark_as_read_with_unread_flag() {
             .mount_as_scoped()
             .await;
 
-        // When I mark the room as read by sending a read receipt to the latest event,
+        // When I mark the room as read by sending a read receipt to the latest
+        // event,
         let has_sent = timeline.mark_as_read(CreateReceiptType::Read).await.unwrap();
 
         // The receipt is not sent but the unread flag was unset.
@@ -1794,8 +1806,8 @@ async fn test_send_multiple_receipts_with_unread_flag() {
         timeline.send_multiple_receipts(first_receipts).await.unwrap();
     }
 
-    // Receipts with unknown previous receipts are always sent, and the unread flag
-    // is unset.
+    // Receipts with unknown previous receipts are always sent, and the unread
+    // flag is unset.
     {
         let _read_markers_guard =
             server.mock_send_read_markers().ok().expect(1).mount_as_scoped().await;
@@ -1939,20 +1951,20 @@ async fn test_no_duplicate_receipt_after_backpagination() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    client.event_cache().subscribe().unwrap();
-
     let room_id = room_id!("!a98sd12bjh:example.org");
 
     // We want the following final state in the room:
+    //
     // - received from back-pagination:
     //  - $1: an event from Alice
     //  - $2: an event from Bob
     // - received from sync:
     //  - $3: an hidden event sent by Alice, with a read receipt from Carol
     //
-    // As a result, since $3 is *after* the two others, Alice's implicit read
-    // receipt and Carol's receipt on the edit event should be placed onto the
-    // most recent rendered event, that is, $2.
+    // As a result, since
+    // $3 is _after_ the two others, Alice's implicit read receipt and Carol's
+    // receipt on the edit event should be placed onto the most recent rendered
+    // event, that is, $2.
 
     let eid1 = event_id!("$1_backpaginated_oldest");
     let eid2 = event_id!("$2_backpaginated_newest");
@@ -1964,14 +1976,14 @@ async fn test_no_duplicate_receipt_after_backpagination() {
     let ev3 = f
         .text_msg("* I am Alice.")
         .edit(eid1, RoomMessageEventContent::text_plain("I am Alice.").into())
-        .sender(*ALICE)
+        .sender(User::Alice)
         .event_id(eid3)
         .into_raw_sync();
 
     // Carol has a read receipt on the edit.
     let read_receipt_event = f
         .read_receipts()
-        .add(eid3, *CAROL, ruma::events::receipt::ReceiptType::Read, ReceiptThread::Unthreaded)
+        .add(eid3, User::Carol, ruma::events::receipt::ReceiptType::Read, ReceiptThread::Unthreaded)
         .into_event();
 
     let prev_batch_token = "prev-batch-token";
@@ -1994,8 +2006,8 @@ async fn test_no_duplicate_receipt_after_backpagination() {
         .match_from(prev_batch_token)
         .ok(RoomMessagesResponseTemplate::default().events(vec![
             // In reverse order!
-            f.text_msg("I am Bob.").sender(*BOB).event_id(eid2),
-            f.text_msg("I am the destroyer of worlds.").sender(*ALICE).event_id(eid1),
+            f.text_msg("I am Bob.").sender(User::Bob).event_id(eid2),
+            f.text_msg("I am the destroyer of worlds.").sender(User::Alice).event_id(eid1),
         ]))
         .mock_once()
         .mount()
@@ -2020,17 +2032,18 @@ async fn test_no_duplicate_receipt_after_backpagination() {
 
         let receipts = &event1.read_receipts();
 
-        // Carol has explicitly seen ev3, which is after Bob's event, so there shouldn't
-        // be a receipt for them here.
-        assert!(receipts.get(*CAROL).is_none());
+        // Carol has explicitly seen ev3, which is after Bob's event, so there
+        // shouldn't be a receipt for them here.
+        assert!(receipts.get(&User::Carol).is_none());
 
-        // Alice has seen this event, being the sender; but Alice has also sent an edit
-        // after Bob's message, so Alice must not have a read receipt here.
-        assert!(receipts.get(*ALICE).is_none());
+        // Alice has seen this event, being the sender; but Alice has also sent
+        // an edit after Bob's message, so Alice must not have a read receipt
+        // here.
+        assert!(receipts.get(&User::Alice).is_none());
 
-        // And Bob has seen the original, but posted something after it, so no receipt
-        // for Bob either.
-        assert!(receipts.get(*BOB).is_none());
+        // And Bob has seen the original, but posted something after it, so no
+        // receipt for Bob either.
+        assert!(receipts.get(&User::Bob).is_none());
 
         // In other words, no receipts here.
         assert!(receipts.is_empty());
@@ -2045,34 +2058,33 @@ async fn test_no_duplicate_receipt_after_backpagination() {
         let receipts = &event2.read_receipts();
         // Bob's event should hold *all* the receipts:
         assert_eq!(receipts.len(), 3);
-        receipts.get(*ALICE).unwrap();
-        receipts.get(*BOB).unwrap();
-        receipts.get(*CAROL).unwrap();
+        receipts.get(&User::Alice).unwrap();
+        receipts.get(&User::Bob).unwrap();
+        receipts.get(&User::Carol).unwrap();
     }
 }
 
 #[async_test]
 async fn test_no_duplicate_receipt_after_backpagination_with_message_like_events_tracking() {
-    // Regression test for a duplicate read receipt that only manifests when read
-    // receipts are tracked in `TimelineReadReceiptTracking::MessageLikeEvents`
-    // mode.
+    // Regression test for a duplicate read receipt that only manifests when
+    // read receipts are tracked in
+    // `TimelineReadReceiptTracking::MessageLikeEvents` mode.
     //
-    // In that mode a state event is *rendered* (`visible == true`) but *cannot
-    // hold a read receipt* (`can_show_read_receipts == false`).
-    // When a new visible event is inserted right after such a state event,
+    // In that mode a state event is _rendered_ (`visible == true`) but
+    // _cannot hold a read receipt_ (`can_show_read_receipts == false`). When a
+    // new visible event is inserted right after such a state event,
     // `compute_event_receipts` used to pick the state event as the "previous
     // rendered item" to steal folded receipts from — but the receipts actually
-    // live on the message-like event *before* the state event. The steal
+    // live on the message-like event _before_ the state event. The steal
     // missed, so the receipt was added to the new event while remaining on the
     // old one, tripping the `check_no_duplicate_read_receipts` invariant.
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    client.event_cache().subscribe().unwrap();
-
     let room_id = room_id!("!a98sd12bjh:example.org");
 
     // We want the following final state in the room:
+    //
     // - received from back-pagination:
     //  - $1: a message from Alice
     //  - $2: a *state event* from Bob (visible, but can't show read receipts)
@@ -2081,10 +2093,11 @@ async fn test_no_duplicate_receipt_after_backpagination_with_message_like_events
     //  - $4: a hidden edit of $3 (from our own user), with a read receipt from
     //    Carol
     //
-    // $4 is hidden and at the end, so Carol's receipt must land on the
-    // most recent event that can show read receipts, that is $3. Crucially, $3 is
-    // immediately preceded by the state event $2, which is rendered but cannot
-    // carry receipts — so the receipt-holder to reconcile against is $1, not $2.
+    // $4 is hidden and at the end, so Carol's receipt must land on the most
+    // recent event that can show read receipts, that is $3. Crucially, $3
+    // is immediately preceded by the state event $2, which is rendered but
+    // cannot carry receipts — so the receipt-holder to reconcile against is
+    // $1, not $2.
 
     let eid1 = event_id!("$1_alice_message");
     let eid2 = event_id!("$2_bob_state_event");
@@ -2106,7 +2119,7 @@ async fn test_no_duplicate_receipt_after_backpagination_with_message_like_events
     // …and Carol has a read receipt on that (hidden) edit.
     let read_receipt_event = f
         .read_receipts()
-        .add(eid4, *CAROL, ruma::events::receipt::ReceiptType::Read, ReceiptThread::Unthreaded)
+        .add(eid4, User::Carol, ruma::events::receipt::ReceiptType::Read, ReceiptThread::Unthreaded)
         .into_event();
 
     let prev_batch_token = "prev-batch-token";
@@ -2135,8 +2148,8 @@ async fn test_no_duplicate_receipt_after_backpagination_with_message_like_events
         .ok(RoomMessagesResponseTemplate::default().events(vec![
             // In reverse order!
             f.text_msg("I am me.").sender(&own_user_id).event_id(eid3).into_raw_timeline(),
-            f.room_name("Party Room").sender(*BOB).event_id(eid2).into_raw_timeline(),
-            f.text_msg("I am Alice.").sender(*ALICE).event_id(eid1).into_raw_timeline(),
+            f.room_name("Party Room").sender(User::Bob).event_id(eid2).into_raw_timeline(),
+            f.text_msg("I am Alice.").sender(User::Alice).event_id(eid1).into_raw_timeline(),
         ]))
         .mock_once()
         .mount()
@@ -2166,5 +2179,5 @@ async fn test_no_duplicate_receipt_after_backpagination_with_message_like_events
 
     // Carol's receipt must be on $3 (the message after the state event), and
     // nowhere else.
-    assert_eq!(seen_users.get(*CAROL).map(|id| id.as_ref()), Some(eid3));
+    assert_eq!(seen_users.get(User::Carol.as_str()).map(|id| id.as_ref()), Some(eid3));
 }

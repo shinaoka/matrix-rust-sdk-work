@@ -101,12 +101,10 @@ async fn test_full_incoming_owner_rejects_room_request_without_lookup_or_extra_s
     let mut other = request(&f, "!other:example.invalid", "$other:example.invalid");
     if let AnyMessageLikeEvent::RoomMessage(ruma::events::MessageLikeEvent::Original(event)) =
         &mut other
-    {
-        if let ruma::events::room::message::MessageType::VerificationRequest(content) =
+        && let ruma::events::room::message::MessageType::VerificationRequest(content) =
             &mut event.content.msgtype
-        {
-            content.to = "@other:example.invalid".try_into().unwrap();
-        }
+    {
+        content.to = "@other:example.invalid".try_into().unwrap();
     }
     f.bob.receive_verification_event(&other).await.unwrap();
     assert_eq!(

@@ -23,7 +23,7 @@ use std::{
 use bitflags::bitflags;
 use eyeball_im::{
     ObservableVector, ObservableVectorEntries, ObservableVectorEntry, ObservableVectorTransaction,
-    ObservableVectorTransactionEntry, VectorSubscriber,
+    VectorSubscriber,
 };
 use imbl::Vector;
 use ruma::EventId;
@@ -54,9 +54,9 @@ use super::{TimelineItem, metadata::EventMeta};
 /// Other methods like [`push_local`] or [`push_date_divider`] insert the items
 /// in the correct region, and check a couple of invariants.
 ///
-/// [`TimelineStart`]: super::VirtualTimelineItem::TimelineStart
-/// [`DateDivider`]: super::VirtualTimelineItem::DateDivider
-/// [`ReadMarker`]: super::VirtualTimelineItem::ReadMarker
+/// [`TimelineStart`]: VirtualTimelineItem::TimelineStart
+/// [`DateDivider`]: VirtualTimelineItem::DateDivider
+/// [`ReadMarker`]: VirtualTimelineItem::ReadMarker
 /// [`Remote`]: super::EventTimelineItemKind::Remote
 /// [`Local`]: super::EventTimelineItemKind::Local
 /// [`iter_all_regions`]: ObservableItemsTransaction::iter_all_regions
@@ -92,8 +92,8 @@ impl ObservableItems {
     pub fn new() -> Self {
         Self {
             // Upstream default capacity is currently 16, which is making
-            // sliding-sync tests with 20 events lag. This should still be
-            // small enough.
+            // sliding-sync tests with 20 events lag. This should still be small
+            // enough.
             items: ObservableVector::with_capacity(32),
             all_remote_events: AllRemoteEvents::default(),
         }
@@ -148,8 +148,8 @@ impl ObservableItems {
         ObservableItemsEntries(self.items.entries())
     }
 
-    /// Call the given closure for every element in this `ObservableItems`,
-    /// with an entry struct that allows updating that element.
+    /// Call the given closure for every element in this `ObservableItems`, with
+    /// an entry struct that allows updating that element.
     pub fn for_each<F>(&mut self, mut f: F)
     where
         F: FnMut(ObservableItemsEntry<'_>),
@@ -429,15 +429,54 @@ impl<'observable_items> ObservableItemsTransaction<'observable_items> {
         self.all_remote_events.clear();
     }
 
-    /// Call the given closure for every element in this `ObservableItems`,
-    /// with an entry struct that allows updating that element.
-    pub fn for_each<F>(&mut self, mut f: F)
-    where
-        F: FnMut(ObservableItemsTransactionEntry<'_, 'observable_items>),
-    {
-        self.items.for_each(|entry| {
-            f(ObservableItemsTransactionEntry { entry, all_remote_events: self.all_remote_events })
-        })
+    /// Clear all timeline items that are not local echoes nor date dividers,
+    /// and all remote events.
+    ///
+    /// Adjacent date dividers are merged, i.e. the oldest are removed, the
+    /// newest are kept.
+    ///
+    /// This method tries to generate a single `VectorDiff::Clear` then few
+    /// inserts, rather than many `VectorDiff::Remove`.
+    pub fn clear_remotes_only(&mut self) {
+        // In this algorithm, we collect items we want to keep. Then, we will
+        // clear everything, and re-insert the kept/rescued items.
+        //
+        // Capacity is defined optimistically.
+        let mut rescued_items = Vec::with_capacity(4);
+
+        let mut items = self.items.entries();
+
+        while let Some(item) = items.next() {
+            // Keep the local event.
+            if item.is_local_echo() {
+                rescued_items.push(item.clone());
+            }
+            // Keep the date divider if non-adjacent to another date divider.
+            else if item.is_date_divider() {
+                // There is a last kept item and is a date divider, then we can
+                // override it by this new one.
+                if let Some(last_rescued_item) = rescued_items.last_mut()
+                    && last_rescued_item.is_date_divider()
+                {
+                    *last_rescued_item = item.clone();
+                }
+                // Otherwise, this is the first date divider or the last item is a local event, we
+                // can keep date divider.
+                else {
+                    rescued_items.push(item.clone());
+                }
+            }
+        }
+
+        // Now we can clear all items and remote events: a single
+        // `VectorDiff::Clear` for the items!
+        self.items.clear();
+        self.all_remote_events.clear();
+
+        // And re-insert few items.
+        for item in rescued_items {
+            self.items.push_back(item);
+        }
     }
 
     /// Check whether there is at least one [`Local`] timeline item.
@@ -447,8 +486,7 @@ impl<'observable_items> ObservableItemsTransaction<'observable_items> {
         matches!(self.items.last(), Some(timeline_item) if timeline_item.is_local_echo())
     }
 
-    /// Return the index where to insert the first remote timeline
-    /// item.
+    /// Return the index where to insert the first remote timeline item.
     pub fn first_remotes_region_index(&self) -> usize {
         if self.items.get(0).is_some_and(|item| item.is_timeline_start()) { 1 } else { 0 }
     }
@@ -605,8 +643,9 @@ impl<'e> ObservableItemsTransactionIterBuilder<'e> {
 
             // The start region and the locals regions.
             //
-            // This combination isn't implemented yet (because it contains a hole), but it's also
-            // not necessary in our current code base; it's fine to ignore it.
+            // This combination isn't implemented yet (because it contains a
+            // hole), but it's also not necessary in our current code base; it's
+            // fine to ignore it.
             (true, false, true) => unimplemented!(
                 "Iterating over the start and the locals regions is not implemented yet"
             ),
@@ -675,44 +714,6 @@ impl Deref for ObservableItemsTransaction<'_> {
     }
 }
 
-/// A handle to a single timeline item in an `ObservableItemsTransaction`.
-pub struct ObservableItemsTransactionEntry<'observable_transaction_items, 'observable_items> {
-    entry: ObservableVectorTransactionEntry<
-        'observable_transaction_items,
-        'observable_items,
-        Arc<TimelineItem>,
-    >,
-    all_remote_events: &'observable_transaction_items mut AllRemoteEvents,
-}
-
-impl ObservableItemsTransactionEntry<'_, '_> {
-    /// Remove this timeline item, and its associated remote event if any.
-    pub fn remove_timeline_index_and_remote_event(this: Self) {
-        let timeline_item_index = ObservableVectorTransactionEntry::index(&this.entry);
-
-        ObservableVectorTransactionEntry::remove(this.entry);
-
-        if let Some(event_index) =
-            this.all_remote_events.timeline_item_has_been_removed_at(timeline_item_index)
-        {
-            this.all_remote_events.remove(event_index);
-        }
-    }
-}
-
-// It's fine to deref to an immutable reference to `Arc<TimelineItem>`.
-//
-// We don't want, however, to deref to a mutable reference: it should be done
-// via proper methods to control precisely the mapping between remote events and
-// timeline items.
-impl Deref for ObservableItemsTransactionEntry<'_, '_> {
-    type Target = Arc<TimelineItem>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.entry
-    }
-}
-
 #[cfg(test)]
 mod observable_items_tests {
     use std::ops::Not;
@@ -720,7 +721,7 @@ mod observable_items_tests {
     use assert_matches::assert_matches;
     use eyeball_im::VectorDiff;
     use ruma::{
-        MilliSecondsSinceUnixEpoch,
+        MilliSecondsSinceUnixEpoch, UInt,
         events::room::message::{MessageType, TextMessageEventContent},
         owned_user_id, uint,
     };
@@ -748,7 +749,6 @@ mod observable_items_tests {
                         edited: false,
                         mentions: None,
                     }),
-                    reactions: Default::default(),
                     thread_root: None,
                     in_reply_to: None,
                     thread_summary: None,
@@ -784,7 +784,6 @@ mod observable_items_tests {
                         edited: false,
                         mentions: None,
                     }),
-                    reactions: Default::default(),
                     thread_root: None,
                     in_reply_to: None,
                     thread_summary: None,
@@ -802,6 +801,15 @@ mod observable_items_tests {
 
     fn read_marker() -> Arc<TimelineItem> {
         TimelineItem::read_marker()
+    }
+
+    fn date_divider(ms: u32) -> Arc<TimelineItem> {
+        Arc::new(TimelineItem {
+            kind: TimelineItemKind::Virtual(VirtualTimelineItem::DateDivider(
+                MilliSecondsSinceUnixEpoch(UInt::from(ms)),
+            )),
+            internal_id: TimelineUniqueId(format!("__date_divider_{ms}")),
+        })
     }
 
     fn event_meta(event_id: &str) -> EventMeta {
@@ -1147,8 +1155,8 @@ mod observable_items_tests {
             | "$ev3"   | 3           | 3                   | // new
         }
 
-        // Timeline item with a remote event, but late.
-        // I don't know if this case is possible in reality, but let's be robust.
+        // Timeline item with a remote event, but late. I don't know if this
+        // case is possible in reality, but let's be robust.
         transaction.insert(3, item("$ev2"), Some(2));
 
         assert_mapping! {
@@ -1466,51 +1474,43 @@ mod observable_items_tests {
     }
 
     #[test]
-    fn test_transaction_for_each() {
+    fn test_transaction_clear_remotes_only() {
         let mut items = ObservableItems::new();
 
-        // Push events to iterate on.
-        let mut transaction = items.transaction();
-        transaction.push_back(item("$ev0"), Some(0));
-        transaction.push_back(item("$ev1"), Some(1));
-        transaction.push_back(item("$ev2"), Some(2));
-
-        let mut nth = 0;
-
-        // Iterate over events.
-        transaction.for_each(|entry| {
-            match nth {
-                0 => {
-                    assert_event_id!(entry, "$ev0");
-                }
-                1 => {
-                    assert_event_id!(entry, "$ev1");
-                }
-                2 => {
-                    assert_event_id!(entry, "$ev2");
-                }
-                _ => unreachable!(),
-            }
-
-            nth += 1;
-        });
-    }
-
-    #[test]
-    fn test_transaction_for_each_remove_timeline_item_and_remote_event() {
-        let mut items = ObservableItems::new();
-
-        // Push events to iterate on.
         let mut transaction = items.transaction();
 
+        // Remote event with its timeline item.
         transaction.push_back_remote_event(event_meta("$ev0"));
         transaction.push_back(item("$ev0"), Some(0));
 
+        // Timeline item without a remote event (for example a read marker).
+        transaction.push_back(read_marker(), None);
+
+        // Remote event with its timeline item.
         transaction.push_back_remote_event(event_meta("$ev1"));
         transaction.push_back(item("$ev1"), Some(1));
 
+        // Remote event without a timeline item (for example a reaction).
         transaction.push_back_remote_event(event_meta("$ev2"));
-        transaction.push_back(item("$ev2"), Some(2));
+
+        // Virtual event: a date divider.
+        transaction.push_back(date_divider(7), None);
+
+        // Remote event with its timeline item.
+        transaction.push_back_remote_event(event_meta("$ev3"));
+        transaction.push_back(item("$ev3"), Some(3));
+
+        // Virtual event: a date divider.
+        transaction.push_back(date_divider(42), None);
+
+        // Local event.
+        transaction.push_local(local_item("t0"));
+
+        // Virtual event: a date divider.
+        transaction.push_back(date_divider(153), None);
+
+        // Local event.
+        transaction.push_local(local_item("t1"));
 
         assert_mapping! {
             on transaction:
@@ -1518,28 +1518,45 @@ mod observable_items_tests {
             | event_id | event_index | timeline_item_index |
             |----------|-------------|---------------------|
             | "$ev0"   | 0           | 0                   |
-            | "$ev1"   | 1           | 1                   |
-            | "$ev2"   | 2           | 2                   |
+            | "$ev1"   | 1           | 2                   |
+            | "$ev2"   | 2           |                     |
+            | "$ev3"   | 3           | 4                   |
         }
 
-        // Iterate over events, and remove one.
-        transaction.for_each(|entry| {
-            if entry.as_event().unwrap().event_id().unwrap().as_str() == "$ev1" {
-                ObservableItemsTransactionEntry::remove_timeline_index_and_remote_event(entry);
-            }
-        });
+        assert_eq!(transaction.all_remote_events().0.len(), 4);
+        assert_eq!(transaction.len(), 9);
 
-        assert_mapping! {
-            on transaction:
+        // Let's clear the remote events only.
+        //
+        // Note that date divider 7 is removed because it becomes adjacent to
+        // 42. However, 42 doesn't become adjacent to 153 because there is a
+        // local event between them.
+        //
+        // Note that all remote events are cleared.
+        transaction.clear_remotes_only();
 
-            | event_id | event_index | timeline_item_index |
-            |----------|-------------|---------------------|
-            | "$ev0"   | 0           | 0                   |
-            | "$ev2"   | 1           | 1                   | // has shifted
-        }
+        assert!(transaction.all_remote_events().0.is_empty());
+        assert_eq!(transaction.len(), 4);
 
-        assert_eq!(transaction.all_remote_events().0.len(), 2);
-        assert_eq!(transaction.len(), 2);
+        // Date divider 42.
+        let date = assert_matches!(
+            transaction.get(0).unwrap().kind(),
+            TimelineItemKind::Virtual(VirtualTimelineItem::DateDivider(date)) => date
+        );
+        assert_eq!(date.get(), UInt::from(42u32));
+
+        // Local event `t0`.
+        assert!(transaction.get(1).unwrap().is_local_echo());
+
+        // Date divider 153.
+        let date = assert_matches!(
+            transaction.get(2).unwrap().kind(),
+            TimelineItemKind::Virtual(VirtualTimelineItem::DateDivider(date)) => date
+        );
+        assert_eq!(date.get(), UInt::from(153u32));
+
+        // Local event `t1`.
+        assert!(transaction.get(3).unwrap().is_local_echo());
     }
 
     #[test]
@@ -1961,8 +1978,9 @@ impl AllRemoteEvents {
 
     /// Get the position of an event in the events array by its ID.
     pub fn position_by_event_id(&self, event_id: &EventId) -> Option<usize> {
-        // Reverse the iterator to start looking at the end. Since this will give us the
-        // "reverse" position, reverse the index after finding the event.
+        // Reverse the iterator to start looking at the end. Since this will
+        // give us the "reverse" position, reverse the index after finding the
+        // event.
         self.0
             .iter()
             .enumerate()
@@ -1974,12 +1992,14 @@ impl AllRemoteEvents {
     /// greater than `new_timeline_item_index`.
     fn increment_all_timeline_item_index_after(&mut self, new_timeline_item_index: usize) {
         // Traverse items from back to front because:
-        // - if `new_timeline_item_index` is 0, we need to shift all items anyways, so
-        //   all items must be traversed,
-        // - otherwise, it's unlikely we want to traverse all items: the item has been
-        //   either inserted or pushed back, so there is no need to traverse the first
-        //   items; we can also break the iteration as soon as all timeline item index
-        //   after `new_timeline_item_index` has been updated.
+        //
+        // - if `new_timeline_item_index` is 0, we need to shift all items
+        //   anyways, so all items must be traversed,
+        // - otherwise, it's unlikely we want to traverse all items: the item
+        //   has been either inserted or pushed back, so there is no need to
+        //   traverse the first items; we can also break the iteration as soon
+        //   as all timeline item index after `new_timeline_item_index` has been
+        //   updated.
         for event_meta in self.0.iter_mut().rev() {
             if let Some(timeline_item_index) = event_meta.timeline_item_index.as_mut() {
                 if *timeline_item_index >= new_timeline_item_index {
@@ -1996,12 +2016,14 @@ impl AllRemoteEvents {
     /// `removed_timeline_item_index`.
     fn decrement_all_timeline_item_index_after(&mut self, removed_timeline_item_index: usize) {
         // Traverse items from back to front because:
-        // - if `new_timeline_item_index` is 0, we need to shift all items anyways, so
-        //   all items must be traversed,
-        // - otherwise, it's unlikely we want to traverse all items: the item has been
-        //   either inserted or pushed back, so there is no need to traverse the first
-        //   items; we can also break the iteration as soon as all timeline item index
-        //   after `new_timeline_item_index` has been updated.
+        //
+        // - if `new_timeline_item_index` is 0, we need to shift all items
+        //   anyways, so all items must be traversed,
+        // - otherwise, it's unlikely we want to traverse all items: the item
+        //   has been either inserted or pushed back, so there is no need to
+        //   traverse the first items; we can also break the iteration as soon
+        //   as all timeline item index after `new_timeline_item_index` has been
+        //   updated.
         for event_meta in self.0.iter_mut().rev() {
             if let Some(timeline_item_index) = event_meta.timeline_item_index.as_mut() {
                 if *timeline_item_index > removed_timeline_item_index {
@@ -2050,8 +2072,8 @@ impl AllRemoteEvents {
                 match (*timeline_item_index).cmp(&timeline_item_index_to_remove) {
                     Ordering::Equal => {
                         // This is the `event_meta` that holds the
-                        // `timeline_item_index` that is being
-                        // removed. So let's clean it.
+                        // `timeline_item_index` that is being removed. So let's
+                        // clean it.
                         event_meta.timeline_item_index = None;
                         found_event_index = Some(event_index);
                     }
@@ -2197,9 +2219,9 @@ mod all_remote_events_tests {
         // Push back with a `timeline_item_index`.
         events.push_back(event_meta("$ev2", Some(1)));
 
-        // Push back with a `timeline_item_index` pointing to a timeline item that is
-        // not the last one. Is it possible in practise? Normally not, but let's test
-        // it anyway.
+        // Push back with a `timeline_item_index` pointing to a timeline item
+        // that is not the last one. Is it possible in practise? Normally not,
+        // but let's test it anyway.
         events.push_back(event_meta("$ev3", Some(1)));
 
         assert_events!(

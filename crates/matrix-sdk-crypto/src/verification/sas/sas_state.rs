@@ -318,8 +318,8 @@ pub struct SasState<S: Clone> {
     // `Box` it to reduce the struct size.
     ids: Box<SasIds>,
 
-    /// The instant when the SAS object was created. If this more than
-    /// MAX_AGE seconds are elapsed, the event will be canceled with a
+    /// The instant when the SAS object was created. If this more than MAX_AGE
+    /// seconds are elapsed, the event will be canceled with a
     /// `CancelCode::Timeout`
     creation_time: Arc<Instant>,
 
@@ -393,8 +393,8 @@ pub struct Accepted {
     commitment: Base64,
 }
 
-/// The SAS state we're going to be in after we accepted our
-/// verification start event.
+/// The SAS state we're going to be in after we accepted our verification start
+/// event.
 #[derive(Clone, Debug)]
 pub struct WeAccepted {
     we_started: bool,
@@ -612,12 +612,12 @@ impl SasState<Created> {
         }
     }
 
-    /// Receive a m.key.verification.accept event, changing the state into
-    /// an Accepted one.
+    /// Receive a m.key.verification.accept event, changing the state into an
+    /// Accepted one.
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.accept event that was sent to us by
+    /// - `event` - The m.key.verification.accept event that was sent to us by
     ///   the other side.
     pub fn into_accepted(
         self,
@@ -661,11 +661,9 @@ impl SasState<Started> {
     ///
     /// # Arguments
     ///
-    /// * `account` - Our own account.
-    ///
-    /// * `other_device` - The other device which we are going to verify.
-    ///
-    /// * `event` - The m.key.verification.start event that was sent to us by
+    /// - `account` - Our own account.
+    /// - `other_device` - The other device which we are going to verify.
+    /// - `event` - The m.key.verification.start event that was sent to us by
     ///   the other side.
     pub fn from_start_event(
         account: StaticAccountData,
@@ -808,17 +806,17 @@ impl SasState<Started> {
         }
     }
 
-    /// Receive a m.key.verification.accept event, changing the state into
-    /// an Accepted one.
+    /// Receive a m.key.verification.accept event, changing the state into an
+    /// Accepted one.
     ///
     /// Note: Even though the other side has started the (or rather "a") sas
     /// verification, it can still accept one, if we have sent one
-    /// simultaneously. In this case we just go on with the verification
-    /// that *we* started.
+    /// simultaneously. In this case we just go on with the verification that
+    /// _we_ started.
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.accept event that was sent to us by
+    /// - `event` - The m.key.verification.accept event that was sent to us by
     ///   the other side.
     pub fn into_accepted(
         self,
@@ -860,8 +858,8 @@ impl SasState<WeAccepted> {
     /// The content needs to be sent to the other device.
     ///
     /// This should be sent out automatically if the SAS verification flow has
-    /// been started because of a
-    /// m.key.verification.request -> m.key.verification.ready flow.
+    /// been started because of a m.key.verification.request ->
+    /// m.key.verification.ready flow.
     pub fn as_content(&self) -> OwnedAcceptContent {
         let method = AcceptMethod::SasV1(
             AcceptV1ContentInit {
@@ -894,12 +892,12 @@ impl SasState<WeAccepted> {
         }
     }
 
-    /// Receive a m.key.verification.key event, changing the state into
-    /// a `KeyReceived` one
+    /// Receive a m.key.verification.key event, changing the state into a
+    /// `KeyReceived` one
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.key event that was sent to us by the
+    /// - `event` - The m.key.verification.key event that was sent to us by the
     ///   other side. The event will be modified so it doesn't contain any key
     ///   anymore.
     pub fn into_key_received(
@@ -929,12 +927,12 @@ impl SasState<WeAccepted> {
 }
 
 impl SasState<Accepted> {
-    /// Receive a m.key.verification.key event, changing the state into
-    /// a `KeyReceived` one
+    /// Receive a m.key.verification.key event, changing the state into a
+    /// `KeyReceived` one
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.key event that was sent to us by the
+    /// - `event` - The m.key.verification.key event that was sent to us by the
     ///   other side. The event will be modified so it doesn't contain any key
     ///   anymore.
     pub fn into_key_received(
@@ -967,7 +965,7 @@ impl SasState<Accepted> {
                 }),
             })
         } else {
-            Err(self.cancel(true, CancelCode::KeyMismatch))
+            Err(self.cancel(true, CancelCode::MismatchedCommitment))
         }
     }
 
@@ -1052,7 +1050,7 @@ impl SasState<KeySent> {
                 }),
             })
         } else {
-            Err(self.cancel(true, CancelCode::KeyMismatch))
+            Err(self.cancel(true, CancelCode::MismatchedCommitment))
         }
     }
 }
@@ -1154,12 +1152,12 @@ impl SasState<KeysExchanged> {
         )
     }
 
-    /// Receive a m.key.verification.mac event, changing the state into
-    /// a `MacReceived` one
+    /// Receive a m.key.verification.mac event, changing the state into a
+    /// `MacReceived` one
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.mac event that was sent to us by the
+    /// - `event` - The m.key.verification.mac event that was sent to us by the
     ///   other side.
     pub fn into_mac_received(
         self,
@@ -1218,12 +1216,12 @@ impl SasState<KeysExchanged> {
 }
 
 impl SasState<Confirmed> {
-    /// Receive a m.key.verification.mac event, changing the state into
-    /// a `Done` one
+    /// Receive a m.key.verification.mac event, changing the state into a `Done`
+    /// one
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.mac event that was sent to us by the
+    /// - `event` - The m.key.verification.mac event that was sent to us by the
     ///   other side.
     pub fn into_done(
         self,
@@ -1260,14 +1258,14 @@ impl SasState<Confirmed> {
         })
     }
 
-    /// Receive a m.key.verification.mac event, changing the state into
-    /// a `WaitingForDone` one. This method should be used instead of
+    /// Receive a m.key.verification.mac event, changing the state into a
+    /// `WaitingForDone` one. This method should be used instead of
     /// `into_done()` if the verification started with a
     /// `m.key.verification.request`.
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.mac event that was sent to us by the
+    /// - `event` - The m.key.verification.mac event that was sent to us by the
     ///   other side.
     pub fn into_waiting_for_done(
         self,
@@ -1320,8 +1318,8 @@ impl SasState<Confirmed> {
 impl SasState<MacReceived> {
     /// Confirm that the short auth string matches.
     ///
-    /// This needs to be done by the user, this will put us in the `Done`
-    /// state since the other side already confirmed and sent us a MAC event.
+    /// This needs to be done by the user, this will put us in the `Done` state
+    /// since the other side already confirmed and sent us a MAC event.
     pub fn confirm(self) -> SasState<Done> {
         SasState {
             inner: self.inner,
@@ -1434,12 +1432,12 @@ impl SasState<WaitingForDone> {
         }
     }
 
-    /// Receive a m.key.verification.mac event, changing the state into
-    /// a `Done` one
+    /// Receive a m.key.verification.mac event, changing the state into a `Done`
+    /// one
     ///
     /// # Arguments
     ///
-    /// * `event` - The m.key.verification.mac event that was sent to us by the
+    /// - `event` - The m.key.verification.mac event that was sent to us by the
     ///   other side.
     pub fn into_done(
         self,
@@ -1507,6 +1505,7 @@ mod tests {
             HashAlgorithm, KeyAgreementProtocol, MessageAuthenticationCode,
             ShortAuthenticationString,
             accept::{AcceptMethod, ToDeviceKeyVerificationAcceptEventContent},
+            cancel::CancelCode,
             start::{
                 SasV1Content, SasV1ContentInit, StartMethod,
                 ToDeviceKeyVerificationStartEventContent,
@@ -1516,13 +1515,14 @@ mod tests {
         user_id,
     };
     use serde_json::json;
+    use strass::assert_let;
 
     use super::{Accepted, Created, SasState, Started, SupportedMacMethod, WeAccepted};
     use crate::{
         AcceptedProtocols, Account, DeviceData,
         verification::{
             FlowId,
-            event_enums::{AcceptContent, KeyContent, MacContent, StartContent},
+            event_enums::{AcceptContent, CancelContent, KeyContent, MacContent, StartContent},
         },
     };
 
@@ -1761,9 +1761,48 @@ mod tests {
         let content = bob.as_content();
         let content = KeyContent::try_from(&content.0).unwrap();
 
-        alice
+        let alice = alice
             .into_key_received(bob.user_id(), &content)
             .expect_err("Didn't cancel on invalid commitment");
+
+        assert_eq!(alice.state.cancel_code, CancelCode::MismatchedCommitment);
+
+        let content = alice.as_content();
+        let content = CancelContent::try_from(&content).unwrap();
+        assert_eq!(content.cancel_code(), &CancelCode::MismatchedCommitment);
+    }
+
+    #[test]
+    fn test_sas_invalid_commitment_after_key_sent() {
+        let (alice, bob) = get_sas_pair(None);
+
+        let mut content = bob.as_content();
+        assert_let!(AcceptMethod::SasV1(c) = content.method_mut());
+        c.commitment = Base64::empty();
+
+        let content = AcceptContent::from(&content);
+
+        let alice: SasState<Accepted> = alice.into_accepted(bob.user_id(), &content).unwrap();
+
+        let content = alice.as_content();
+        let request_id = content.1.request_id;
+        let content = KeyContent::try_from(&content.0).unwrap();
+
+        let alice = alice.into_key_sent(&request_id).unwrap();
+        let bob = bob.into_key_received(alice.user_id(), &content).unwrap();
+
+        let (content, _) = bob.as_content();
+        let content = KeyContent::try_from(&content).unwrap();
+
+        let alice = alice
+            .into_keys_exchanged(bob.user_id(), &content)
+            .expect_err("Didn't cancel on invalid commitment");
+
+        assert_eq!(alice.state.cancel_code, CancelCode::MismatchedCommitment);
+
+        let content = alice.as_content();
+        let content = CancelContent::try_from(&content).unwrap();
+        assert_eq!(content.cancel_code(), &CancelCode::MismatchedCommitment);
     }
 
     #[test]

@@ -54,6 +54,7 @@ where
     ///
     /// It will run multiple back-paginations until one of these two conditions
     /// is met:
+    ///
     /// - either we've reached the start of the timeline,
     /// - or we've obtained enough events to fulfill the requested number of
     ///   events.
@@ -106,9 +107,9 @@ where
     /// Returns `Ok(None)` if the pagination token used during a network
     /// pagination has disappeared from the in-memory linked chunk after
     /// handling the response.
-    // Implementation note: return a future instead of making the function async, so
-    // as to not cause issues because the `cache` field is borrowed across await
-    // points.
+    // Implementation note: return a future instead of making the function
+    // async, so as to not cause issues because the `cache` field is borrowed
+    // across await points.
     fn run_backwards_impl(
         &self,
         batch_size: u16,
@@ -136,8 +137,8 @@ where
             }
 
             SharedPaginationStatus::Paginating { shared_task: shared } => {
-                // There was already a back-pagination request in progress; wait for it to
-                // finish and return its result.
+                // There was already a back-pagination request in progress; wait
+                // for it to finish and return its result.
                 let shared = shared.clone();
                 drop(status_guard);
                 return Either::Right(shared.fut.clone());
@@ -160,8 +161,8 @@ where
 
             match this.paginate_backwards_impl(batch_size).await? {
                 Some(outcome) => {
-                    // Back-pagination's over and successful, don't reset the status to the previous
-                    // value.
+                    // Back-pagination's over and successful, don't reset the
+                    // status to the previous value.
                     reset_status_on_drop_guard.disarm();
 
                     // Notify subscribers that pagination ended.
@@ -214,9 +215,9 @@ where
         &self,
         batch_size: u16,
     ) -> Result<Option<BackPaginationOutcome>> {
-        // A linked chunk might not be entirely loaded (if it's been lazy-loaded). Try
-        // to load from disk/storage first, then from network if disk/storage indicated
-        // there's no previous events chunk to load.
+        // A linked chunk might not be entirely loaded (if it's been
+        // lazy-loaded). Try to load from disk/storage first, then from network
+        // if disk/storage indicated there's no previous events chunk to load.
 
         loop {
             match self.cache.load_more_events_backwards().await? {
@@ -225,13 +226,13 @@ where
                     waited_for_initial_prev_token,
                 } => {
                     if prev_token.is_none() && !waited_for_initial_prev_token {
-                        // We didn't reload a pagination token, and we haven't waited for one; wait
-                        // and start over.
+                        // We didn't reload a pagination token, and we haven't
+                        // waited for one; wait and start over.
 
                         const DEFAULT_WAIT_FOR_TOKEN_DURATION: Duration = Duration::from_secs(3);
 
-                        // Otherwise, wait for a notification that we received a previous-batch
-                        // token.
+                        // Otherwise, wait for a notification that we received a
+                        // previous-batch token.
                         trace!("waiting for a pagination token…");
 
                         let _ = timeout(
@@ -246,16 +247,18 @@ where
 
                         // Retry!
                         //
-                        // Note: the next call to `load_more_events_backwards` should not return
-                        // `WaitForInitialPrevToken` because we've just marked we've waited for the
-                        // initial `prev_token`, so this is not an infinite loop.
+                        // Note: the next call to `load_more_events_backwards`
+                        // should not return `WaitForInitialPrevToken` because
+                        // we've just marked we've waited for the initial
+                        // `prev_token`, so this is not an infinite loop.
                         //
-                        // Note 2: not a recursive call, because recursive and async have a bad time
-                        // together.
+                        // Note 2: not a recursive call, because recursive and
+                        // async have a bad time together.
                         continue;
                     }
 
-                    // We have a gap, so resolve it with a network back-pagination.
+                    // We have a gap, so resolve it with a network
+                    // back-pagination.
                     return self.paginate_backwards_with_network(batch_size, prev_token).await;
                 }
 
@@ -285,8 +288,7 @@ where
     /// Run a single pagination request to the server.
     ///
     /// Returns `Ok(None)` if the pagination token used during the request has
-    /// disappeared from the in-memory linked chunk after handling the
-    /// response.
+    /// disappeared from the in-memory linked chunk after handling the response.
     async fn paginate_backwards_with_network(
         &self,
         batch_size: u16,
@@ -343,8 +345,8 @@ impl SharedPaginationTask {
 pub(in super::super) enum SharedPaginationStatus {
     /// No pagination is happening right now.
     Idle {
-        /// Have we hit the start of the timeline, i.e. paginating wouldn't
-        /// have any effect?
+        /// Have we hit the start of the timeline, i.e. paginating wouldn't have
+        /// any effect?
         hit_timeline_start: bool,
     },
 
@@ -399,8 +401,8 @@ pub(in super::super) trait PaginatedCache {
 pub enum PaginationStatus {
     /// No pagination is happening right now.
     Idle {
-        /// Have we hit the start of the timeline, i.e. paginating wouldn't
-        /// have any effect?
+        /// Have we hit the start of the timeline, i.e. paginating wouldn't have
+        /// any effect?
         hit_timeline_start: bool,
     },
 
@@ -436,12 +438,11 @@ pub struct BackPaginationOutcome {
     /// Did the back-pagination reach the start of the timeline?
     pub reached_start: bool,
 
-    /// All the events that have been returned in the back-pagination
-    /// request.
+    /// All the events that have been returned in the back-pagination request.
     ///
-    /// Events are presented in reverse order: the first element of the vec,
-    /// if present, is the most "recent" event from the chunk (or
-    /// technically, the last one in the topological ordering).
+    /// Events are presented in reverse order: the first element of the vec, if
+    /// present, is the most "recent" event from the chunk (or technically, the
+    /// last one in the topological ordering).
     pub events: Vec<Event>,
 }
 

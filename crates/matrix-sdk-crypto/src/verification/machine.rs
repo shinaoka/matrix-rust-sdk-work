@@ -931,9 +931,9 @@ impl VerificationMachine {
             .unwrap_or_default()
     }
 
-    /// Add a new `VerificationRequest` object to the cache.
-    /// If there are any existing requests with this user (and different
-    /// flow_id), both the existing and new request will be cancelled.
+    /// Add a new `VerificationRequest` object to the cache. If there are any
+    /// existing requests with this user (and different flow_id), both the
+    /// existing and new request will be cancelled.
     fn insert_request(&self, request: VerificationRequest) -> VerificationRequestInsertion {
         self.insert_request_with_delivery(request, false)
     }
@@ -994,8 +994,8 @@ impl VerificationMachine {
             }
         }
 
-        // We still want to add the new verification request, in case users
-        // want to inspect the verification object a matching
+        // We still want to add the new verification request, in case users want
+        // to inspect the verification object a matching
         // `m.key.verification.request` produced.
         user_requests.insert(
             request.flow_id().as_str().to_owned(),
@@ -1015,8 +1015,8 @@ impl VerificationMachine {
     fn is_timestamp_valid(timestamp: MilliSecondsSinceUnixEpoch) -> bool {
         // The event should be ignored if the event is older than 10 minutes
         let old_timestamp_threshold: UInt = uint!(600);
-        // The event should be ignored if the event is 5 minutes or more into the
-        // future.
+        // The event should be ignored if the event is 5 minutes or more into
+        // the future.
         let timestamp_threshold: UInt = uint!(300);
 
         let timestamp = timestamp.as_secs();
@@ -1248,13 +1248,13 @@ impl VerificationMachine {
             let device_result = self.store.get_device(event.sender(), content.from_device()).await;
             #[cfg(test)]
             self.pause_request_device_lookup_completed_for_test().await;
-            if let Some(claim) = initial_lookup.as_ref() {
-                if claim.retry_or_promote_initial_lookup(
+            if let Some(claim) = initial_lookup.as_ref()
+                && claim.retry_or_promote_initial_lookup(
                     observed_generation.unwrap_or(0),
                     !matches!(device_result, Ok(Some(_))),
-                ) {
-                    continue;
-                }
+                )
+            {
+                continue;
             }
             break device_result;
         };
@@ -1459,7 +1459,8 @@ impl VerificationMachine {
                     }
                 } else if let FlowId::ToDevice(_) = flow_id {
                     // TODO remove this soon, this has been deprecated by
-                    // MSC3122 https://github.com/matrix-org/matrix-doc/pull/3122
+                    // MSC3122
+                    // https://github.com/matrix-org/matrix-doc/pull/3122
                     if let Some(device) =
                         self.store.get_device(event.sender(), c.from_device()).await?
                     {
@@ -1616,7 +1617,7 @@ impl VerificationMachine {
             } else {
                 owner.entries.push_back(IncomingVerificationRequestEntry::Pending(
                     PendingToDeviceVerificationRequest {
-                        event: event.clone(),
+                        event,
                         state: PendingToDeviceVerificationRequestState::NeedsQuery,
                         committed_update_generation: 0,
                         cancelled: false,
@@ -1703,10 +1704,10 @@ impl VerificationMachine {
             return true;
         }
 
-        // Capacity exhaustion is an explicit protocol-terminal rejection, not a silent
-        // product drop. `UnexpectedMessage` is the existing generic
-        // protocol-level rejection code and carries no local queue details or
-        // private identifiers to the peer.
+        // Capacity exhaustion is an explicit protocol-terminal rejection, not a
+        // silent product drop. `UnexpectedMessage` is the existing
+        // generic protocol-level rejection code and carries no local
+        // queue details or private identifiers to the peer.
         if let Some(cancel) = request.cancel_with_code(CancelCode::UnexpectedMessage) {
             self.verifications.add_verification_request(cancel);
         }
@@ -2043,8 +2044,10 @@ impl VerificationMachine {
                         continue;
                     }
                     let publishable = publishable && !room_duplicate;
-                    // The pending slot and the resulting publication are transitioned under the
-                    // single owner lock, so recovery cannot strand a committed replay at capacity.
+                    // The pending slot and the resulting publication are
+                    // transitioned under the single owner
+                    // lock, so recovery cannot strand a committed replay at
+                    // capacity.
                     claim.publish(
                         request,
                         publishable,

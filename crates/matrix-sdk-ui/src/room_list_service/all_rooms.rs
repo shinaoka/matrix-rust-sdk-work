@@ -106,7 +106,7 @@ impl AllRoomsObservedIdsObservable {
             response_sequence,
             range_fully_loaded,
             maximum_number_of_rooms,
-            room_ids: room_ids.clone(),
+            room_ids,
         }));
     }
 
@@ -127,7 +127,7 @@ impl AllRoomsObservedIdsObservable {
             return;
         }
         let room_ids = Arc::new(room_ids);
-        observed.room_ids = room_ids.clone();
+        observed.room_ids = room_ids;
         self.latest.set(Some(observed));
     }
 
@@ -180,12 +180,14 @@ impl CommittedAllRoomsResponse {
         self.sequence
     }
 
-    /// Whether the committed response carried the required Sliding Sync position.
+    /// Whether the committed response carried the required Sliding Sync
+    /// position.
     pub fn pos_present(self) -> bool {
         self.pos_present
     }
 
-    /// Whether the complete growing room range was loaded by this committed response.
+    /// Whether the complete growing room range was loaded by this committed
+    /// response.
     pub fn range_fully_loaded(self) -> bool {
         self.range_fully_loaded
     }
@@ -245,8 +247,9 @@ impl fmt::Debug for CommittedAllRoomsResponseObservable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ruma::room_id;
+
+    use super::*;
 
     #[test]
     fn local_operation_rooms_survive_response_replacement() {

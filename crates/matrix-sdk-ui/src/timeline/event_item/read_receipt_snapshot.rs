@@ -18,22 +18,27 @@ use imbl::{OrdMap, Vector};
 use indexmap::IndexMap;
 use ruma::{OwnedUserId, UserId, events::receipt::Receipt};
 
-/// An immutable, cheaply cloned receipt collection in insertion/swap-remove order.
+/// An immutable, cheaply cloned receipt collection in insertion/swap-remove
+/// order.
 ///
 /// Reading this collection does not materialize the compatibility `IndexMap`.
-/// Clones share tree/vector storage; mutations copy affected nodes. No previous-version
-/// chain is retained.
+/// Clones share tree/vector storage; mutations copy affected nodes. No
+/// previous-version chain is retained.
 ///
 /// ```
 /// use matrix_sdk_ui::timeline::ReadReceiptSnapshot;
-/// use ruma::{user_id, events::receipt::Receipt};
+/// use ruma::{events::receipt::Receipt, user_id};
 /// let user = user_id!("@reader:example.org");
-/// let receipts = ReadReceiptSnapshot::from([(user.to_owned(), Receipt::default())]);
+/// let receipts =
+///     ReadReceiptSnapshot::from([(user.to_owned(), Receipt::default())]);
 /// let cloned = receipts.clone();
 /// assert_eq!(cloned.len(), 1);
 /// assert!(!cloned.is_empty());
 /// assert_eq!(cloned.iter().next().unwrap().0.as_str(), user.as_str());
-/// assert!(std::ptr::eq(receipts.get(user).unwrap(), cloned.get(user).unwrap()));
+/// assert!(std::ptr::eq(
+///     receipts.get(user).unwrap(),
+///     cloned.get(user).unwrap()
+/// ));
 /// ```
 #[derive(Default)]
 pub struct ReadReceiptSnapshot {
@@ -50,7 +55,8 @@ struct IndexedReceipt {
 
 impl PartialEq for IndexedReceipt {
     fn eq(&self, other: &Self) -> bool {
-        // The slot is compatibility-order bookkeeping, not a logical receipt field.
+        // The slot is compatibility-order bookkeeping, not a logical receipt
+        // field.
         self.receipt.ts == other.receipt.ts && self.receipt.thread == other.receipt.thread
     }
 }
@@ -72,7 +78,8 @@ impl ReadReceiptSnapshot {
         self.by_user.is_empty()
     }
 
-    /// Borrow a reader's receipt without materializing the full compatibility map.
+    /// Borrow a reader's receipt without materializing the full compatibility
+    /// map.
     pub fn get(&self, user_id: &UserId) -> Option<&Receipt> {
         self.by_user.get(user_id).map(|entry| &entry.receipt)
     }
@@ -96,10 +103,11 @@ impl ReadReceiptSnapshot {
     ///
     /// ```
     /// use matrix_sdk_ui::timeline::ReadReceiptSnapshot;
-    /// use ruma::{user_id, events::receipt::Receipt};
+    /// use ruma::{events::receipt::Receipt, user_id};
     /// let user = user_id!("@reader:example.org");
     /// let before = ReadReceiptSnapshot::default();
-    /// let after = ReadReceiptSnapshot::from([(user.to_owned(), Receipt::default())]);
+    /// let after =
+    ///     ReadReceiptSnapshot::from([(user.to_owned(), Receipt::default())]);
     /// let (changed_user, receipt) = after.changes_since(&before).next().unwrap();
     /// assert_eq!(changed_user.as_str(), user.as_str());
     /// assert!(receipt.is_some());
@@ -109,13 +117,12 @@ impl ReadReceiptSnapshot {
         &'a self,
         previous: &'a Self,
     ) -> impl Iterator<Item = (&'a OwnedUserId, Option<&'a Receipt>)> {
-        let changed_or_removed = previous.by_user.iter().filter_map(|(user, entry)| {
-            match self.by_user.get(user) {
+        let changed_or_removed =
+            previous.by_user.iter().filter_map(|(user, entry)| match self.by_user.get(user) {
                 Some(new) if new != entry => Some((user, Some(&new.receipt))),
                 Some(_) => None,
                 None => Some((user, None)),
-            }
-        });
+            });
 
         let added = self.by_user.iter().filter_map(|(user, entry)| {
             (!previous.by_user.contains_key(user)).then_some((user, Some(&entry.receipt)))
@@ -292,27 +299,27 @@ mod tests {
             .unwrap()
         }
 
-        // A read receipt set as large as the biggest rooms allow: the explicit value
-        // comparison in `changes_since` must still report exactly the readers whose
-        // receipt changed, was added or was removed, and nothing else. It scans the
-        // previous set, so this also protects the incremental-notification contract
+        // A read receipt set as large as the biggest rooms allow: the explicit
+        // value comparison in `changes_since` must still report exactly
+        // the readers whose receipt changed, was added or was removed,
+        // and nothing else. It scans the previous set, so this also
+        // protects the incremental-notification contract
         // from a cheaper-but-wrong diff.
-        let users: Vec<OwnedUserId> = (0..10_000)
-            .map(|i| UserId::parse(format!("@u{i}:example.org")).unwrap().into())
-            .collect();
+        let users: Vec<OwnedUserId> =
+            (0..10_000).map(|i| UserId::parse(format!("@u{i}:example.org")).unwrap()).collect();
         let before: ReadReceiptSnapshot =
             users.iter().cloned().map(|user| (user, Receipt::default())).collect();
 
         let mut after = before.clone();
         after.insert(users[123].clone(), Receipt::new(ts_for(1)));
         after.swap_remove(&users[456]);
-        let added = UserId::parse("@newcomer:example.org").unwrap().to_owned();
+        let added = UserId::parse("@newcomer:example.org").unwrap();
         after.insert(added.clone(), Receipt::new(ts_for(2)));
 
-        // Documented order: changed and removed readers in the earlier snapshot's
-        // order, then readers that only exist in this snapshot.
-        let changed: Vec<(&OwnedUserId, Option<&Receipt>)> =
-            after.changes_since(&before).collect();
+        // Documented order: changed and removed readers in the earlier
+        // snapshot's order, then readers that only exist in this
+        // snapshot.
+        let changed: Vec<(&OwnedUserId, Option<&Receipt>)> = after.changes_since(&before).collect();
 
         assert_eq!(changed.len(), 3, "only the changed, removed and added readers");
         assert_eq!(changed[0].0, &users[123]);

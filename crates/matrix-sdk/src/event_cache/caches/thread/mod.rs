@@ -21,10 +21,15 @@ pub mod pagination;
 mod state;
 mod updates;
 
-use std::{collections::HashMap, fmt, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use eyeball::AsyncLock;
 use matrix_sdk_base::{
+    deserialized_responses::ThreadSummary,
     event_cache::{Event, thread::ThreadInfo},
     read_receipts::ReadReceipts,
     sync::Timeline,
@@ -111,11 +116,16 @@ impl ThreadEventCache {
     ) -> Result<Self> {
         let update_sender = ThreadEventCacheUpdateSender::new(generic_update_sender.clone());
 
+        // Computed while building the state: nothing may await once the state
+        // is inserted, or a cancellation or error would leave it
+        // inserted without its cache, making every later attempt fail.
+        let mut timeline_is_not_empty = false;
+
         let cache_state = state
             .try_insert_once_with(
                 ThreadStateSelector::new(room_id.clone(), thread_id.clone()),
-                |store_guard| {
-                    ThreadEventCacheState::new(
+                async |store_guard| {
+                    let cache_state = ThreadEventCacheState::new(
                         room_id.clone(),
                         thread_id.clone(),
                         weak_room.clone(),
@@ -126,12 +136,15 @@ impl ThreadEventCache {
                         linked_chunk_update_sender,
                         pending_redactions,
                     )
+                    .await?;
+
+                    timeline_is_not_empty =
+                        cache_state.thread_linked_chunk.revents().next().is_some();
+
+                    Ok(cache_state)
                 },
             )
             .await?;
-
-        let timeline_is_not_empty =
-            cache_state.read().await?.thread_linked_chunk().revents().next().is_some();
 
         let cache = Self {
             inner: Arc::new(ThreadEventCacheInner {
@@ -145,8 +158,8 @@ impl ThreadEventCache {
             }),
         };
 
-        // If at least one event has been loaded, it means there is a timeline. Let's
-        // emit a generic update.
+        // If at least one event has been loaded, it means there is a timeline.
+        // Let's emit a generic update.
         if timeline_is_not_empty {
             let _ = generic_update_sender
                 .send(RoomEventCacheGenericUpdate { room_id: room_id.to_owned() });
@@ -286,8 +299,8 @@ impl ThreadEventCache {
                     diffs: timeline_event_diffs,
                     origin: EventsOrigin::Sync,
                 }),
-                // This function is part of the `RoomEventCache` flow. The generic update is
-                // handled by it.
+                // This function is part of the `RoomEventCache` flow. The
+                // generic update is handled by it.
                 None,
             );
         }
@@ -299,6 +312,19 @@ impl ThreadEventCache {
         }
 
         Ok(())
+    }
+
+    /// Update the [`ThreadSummary`] for this thread, and return a copy of it.
+    pub(in super::super) async fn update_thread_summary(&self) -> Result<ThreadSummary> {
+        let mut state = self.inner.state.write().await?;
+
+        let thread_summary = state.update_thread_summary().await?;
+
+        state
+            .update_sender
+            .send(ThreadEventCacheUpdate::UpdateSummary(thread_summary.clone()), None);
+
+        Ok(thread_summary)
     }
 
     /// Find a single event in this thread.
@@ -316,8 +342,8 @@ impl ThreadEventCache {
     /// Try to find an event by ID in this thread, along with its related
     /// events.
     ///
-    /// You can filter which types of related events to retrieve using
-    /// `filter`. `None` will retrieve related events of any type.
+    /// You can filter which types of related events to retrieve using `filter`.
+    /// `None` will retrieve related events of any type.
     ///
     /// The related events are sorted like this:
     ///
@@ -355,20 +381,21 @@ impl ThreadEventCache {
         let mut state = self.inner.state.write().await?;
         let timeline_event_diffs = state.replace_in_memory_utds(resolved_events)?;
 
-        // Drain the updates to the store, events have already been updated before
-        // calling this method.
+        // Drain the updates to the store, events have already been updated
+        // before calling this method.
         let _ = state.thread_linked_chunk_mut().store_updates().take();
 
         state
             .post_process_upserted_events(
                 resolved_events.iter().filter_map(|resolved_event| resolved_event.as_resolved()),
-                // Read receipt events aren't encrypted, so we can't have decrypted a new
-                // one here. As a result, we don't have any new receipt events to
-                // post-process, so we can just pass `None` here.
+                // Read receipt events aren't encrypted, so we can't have
+                // decrypted a new one here. As a result, we don't have any new
+                // receipt events to post-process, so we can just pass `None`
+                // here.
                 //
-                // Note: read receipts may be updated anyhow in the post-processing step,
-                // as the redecryption may have decrypted some events that don't count as
-                // unreads.
+                // Note: read receipts may be updated anyhow in the
+                // post-processing step, as the redecryption may have decrypted
+                // some events that don't count as unreads.
                 None,
             )
             .await?;
@@ -400,7 +427,6 @@ mod timed_tests {
     use std::sync::Arc;
 
     use assert_matches::assert_matches;
-    use assert_matches2::assert_let;
     use eyeball_im::VectorDiff;
     use futures_util::FutureExt as _;
     use matrix_sdk_base::{
@@ -417,12 +443,13 @@ mod timed_tests {
         store::StoreConfig,
         sync::Timeline,
     };
-    use matrix_sdk_test::{ALICE, async_test, event_factory::EventFactory};
+    use matrix_sdk_test::{User, async_test, event_factory::EventFactory};
     use ruma::{
         event_id,
         events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent},
         room_id, user_id,
     };
+    use strass::assert_let;
     use tokio::task::yield_now;
 
     use super::{
@@ -453,8 +480,7 @@ mod timed_tests {
             .build()
             .await;
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
+        let event_cache = client.event_cache().unwrap();
 
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
@@ -546,8 +572,7 @@ mod timed_tests {
             .build()
             .await;
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
+        let event_cache = client.event_cache().unwrap();
 
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
@@ -587,8 +612,9 @@ mod timed_tests {
             assert!(msg.as_original().unwrap().unsigned.relations.replace.is_some());
         }
 
-        // The one in storage keeps the replacement candidate, so a bundle-only edit
-        // survives reconstruction; other bundled summaries are dropped.
+        // The one in storage keeps the replacement candidate, so a bundle-only
+        // edit survives reconstruction; other bundled summaries are
+        // dropped.
         let linked_chunk = from_all_chunks::<3, _, _>(
             event_cache_store
                 .load_all_chunks(LinkedChunkId::Thread(room_id, thread_root))
@@ -620,8 +646,6 @@ mod timed_tests {
         let room_id = room_id!("!r0");
         let f = EventFactory::new().room(room_id).sender(user_id!("@mnt_io:matrix.org"));
 
-        let event_cache_store = Arc::new(MemoryStore::new());
-
         let thread_root = event_id!("$t0_ev0");
         let thread_event_id_0 = event_id!("$t0_ev1");
         let thread_event_id_1 = event_id!("$t0_ev2");
@@ -638,6 +662,7 @@ mod timed_tests {
             .into_event();
 
         // Prefill the store with some data.
+        let event_cache_store = Arc::new(MemoryStore::new());
         event_cache_store
             .handle_linked_chunk_updates(
                 LinkedChunkId::Thread(room_id, thread_root),
@@ -693,8 +718,7 @@ mod timed_tests {
             .build()
             .await;
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
+        let event_cache = client.event_cache().unwrap();
 
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
@@ -712,8 +736,8 @@ mod timed_tests {
 
         // But only part of events are loaded from the store.
         {
-            // The thread must contain only one event because only one chunk has been
-            // loaded.
+            // The thread must contain only one event because only one chunk has
+            // been loaded.
             assert_eq!(thread_events.len(), 1);
             assert_eq!(thread_events[0].event_id().unwrap(), thread_event_id_1);
 
@@ -757,8 +781,7 @@ mod timed_tests {
             }
         );
 
-        // … same with a generic update.
-        // (update for the clearing of the room)
+        // … same with a generic update. (update for the clearing of the room)
         assert_matches!(
             generic_stream.recv().await,
             Ok(RoomEventCacheGenericUpdate { room_id: received_room_id }) => {
@@ -774,8 +797,8 @@ mod timed_tests {
         );
         assert!(generic_stream.is_empty());
 
-        // Events individually are forgotten by the event cache, after clearing the
-        // threads.
+        // Events individually are forgotten by the event cache, after clearing
+        // the threads.
         assert!(thread_event_cache.find_event(thread_event_id_0).await.unwrap().is_none());
         assert!(thread_event_cache.find_event(thread_event_id_1).await.unwrap().is_none());
 
@@ -815,9 +838,9 @@ mod timed_tests {
             .in_thread(thread_root, thread_event_id_1)
             .into_event();
 
-        // Prefill the store with some data. The room usually has all events duplicated
-        // from the threads. It's important to make the test pass when checking the
-        // generic update.
+        // Prefill the store with some data. The room usually has all events
+        // duplicated from the threads. It's important to make the test pass
+        // when checking the generic update.
         let updates = vec![
             // An empty items chunk.
             Update::NewItemsChunk { previous: None, new: ChunkIdentifier::new(0), next: None },
@@ -871,19 +894,19 @@ mod timed_tests {
             .build()
             .await;
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
+        let event_cache = client.event_cache().unwrap();
 
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
-        // Let's check whether the generic updates are received for the initialisation.
+        // Let's check whether the generic updates are received for the
+        // initialisation.
         let mut generic_stream = event_cache.subscribe_to_room_generic_updates();
         let (thread_event_cache, _drop_handles) =
             event_cache.thread(room_id, thread_root).await.unwrap();
         let (thread_events, mut thread_stream) = thread_event_cache.subscribe().await.unwrap();
 
-        // The room **and** the thread have been loaded. Two generic updates must have
-        // been triggered.
+        // The room **and** the thread have been loaded. Two generic updates
+        // must have been triggered.
         for _ in 0..2 {
             assert_matches!(
                 generic_stream.recv().await,
@@ -894,14 +917,14 @@ mod timed_tests {
         }
         assert!(generic_stream.is_empty());
 
-        // The initial events contain one event because only the last chunk is loaded by
-        // default.
+        // The initial events contain one event because only the last chunk is
+        // loaded by default.
         assert_eq!(thread_events.len(), 1);
         assert_eq!(thread_events[0].event_id().unwrap(), thread_event_id_1);
         assert!(thread_stream.is_empty());
 
-        // The thread knows all events in the storage though, even if they aren't
-        // loaded.
+        // The thread knows all events in the storage though, even if they
+        // aren't loaded.
         assert!(thread_event_cache.find_event(thread_event_id_0).await.unwrap().is_some());
         assert!(thread_event_cache.find_event(thread_event_id_1).await.unwrap().is_some());
 
@@ -936,13 +959,13 @@ mod timed_tests {
             .await
             .unwrap();
 
-        // Just checking the generic update is correct. There is a duplicate event, so
-        // no generic changes whatsoever!
+        // Just checking the generic update is correct. There is a duplicate
+        // event, so no generic changes whatsoever!
         assert!(generic_stream.recv().now_or_never().is_none());
 
-        // The stream doesn't report these changes *yet*. Use the events vector given
-        // when subscribing, to check that the events correspond to their new
-        // positions. The duplicated item is removed (so it's not the first
+        // The stream doesn't report these changes _yet_. Use the events vector
+        // given when subscribing, to check that the events correspond to their
+        // new positions. The duplicated item is removed (so it's not the first
         // element anymore), and it's added to the back of the list.
         let (thread_events, _) = thread_event_cache.subscribe().await.unwrap();
         assert_eq!(thread_events.len(), 2);
@@ -955,8 +978,6 @@ mod timed_tests {
         let room_id = room_id!("!r0");
         let f = EventFactory::new().room(room_id).sender(user_id!("@mnt_io:matrix.org"));
 
-        let event_cache_store = Arc::new(MemoryStore::new());
-
         let thread_root = event_id!("$t0");
         let thread_event_id_0 = event_id!("$t0_ev0");
 
@@ -967,6 +988,7 @@ mod timed_tests {
             .into_event();
 
         // Prefill the store with invalid data: two chunks that form a cycle.
+        let event_cache_store = Arc::new(MemoryStore::new());
         event_cache_store
             .handle_linked_chunk_updates(
                 LinkedChunkId::Thread(room_id, thread_root),
@@ -1002,8 +1024,7 @@ mod timed_tests {
             .build()
             .await;
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
+        let event_cache = client.event_cache().unwrap();
 
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
@@ -1015,8 +1036,8 @@ mod timed_tests {
         // there are no events in the cache.
         assert!(thread_events.is_empty());
 
-        // Storage doesn't contain anything. It would also be valid that it contains a
-        // single initial empty items chunk.
+        // Storage doesn't contain anything. It would also be valid that it
+        // contains a single initial empty items chunk.
         let raw_chunks = event_cache_store
             .load_all_chunks(LinkedChunkId::Thread(room_id, thread_root))
             .await
@@ -1029,8 +1050,51 @@ mod timed_tests {
         let user_id = user_id!("@mnt_io:matrix.org");
         let room_id = room_id!("!raclette:patate.ch");
 
+        let event_factory = EventFactory::new().room(room_id).sender(user_id);
+
+        let thread_root = event_id!("$t0");
+        let thread_event_id_0 = event_id!("$t0_ev0");
+        let thread_event_id_1 = event_id!("$t0_ev1");
+
+        let thread_event_0 = event_factory
+            .text_msg("comté")
+            .event_id(thread_event_id_0)
+            .in_thread(thread_root, thread_root)
+            .into_event();
+        let thread_event_1 = event_factory
+            .text_msg("morbier")
+            .event_id(thread_event_id_1)
+            .in_thread(thread_root, thread_event_id_0)
+            .into_event();
+
         // The storage shared by the two clients.
         let event_cache_store = MemoryStore::new();
+        event_cache_store
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Thread(room_id, thread_root),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![thread_event_0],
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(0)),
+                        new: ChunkIdentifier::new(1),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(1), 0),
+                        items: vec![thread_event_1],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
 
         // Client for the process 0.
         let client_p0 = MockClientBuilder::new(None)
@@ -1058,64 +1122,10 @@ mod timed_tests {
             .build()
             .await;
 
-        let event_factory = EventFactory::new().room(room_id).sender(user_id);
-
-        let thread_root = event_id!("$t0");
-        let thread_event_id_0 = event_id!("$t0_ev0");
-        let thread_event_id_1 = event_id!("$t0_ev1");
-
-        let thread_event_0 = event_factory
-            .text_msg("comté")
-            .event_id(thread_event_id_0)
-            .in_thread(thread_root, thread_root)
-            .into_event();
-        let thread_event_1 = event_factory
-            .text_msg("morbier")
-            .event_id(thread_event_id_1)
-            .in_thread(thread_root, thread_event_id_0)
-            .into_event();
-
-        // Add events to the storage (shared by the two clients!).
-        client_p0
-            .event_cache_store()
-            .lock()
-            .await
-            .expect("[p0] Could not acquire the event cache lock")
-            .as_clean()
-            .expect("[p0] Could not acquire a clean event cache lock")
-            .handle_linked_chunk_updates(
-                LinkedChunkId::Thread(room_id, thread_root),
-                vec![
-                    Update::NewItemsChunk {
-                        previous: None,
-                        new: ChunkIdentifier::new(0),
-                        next: None,
-                    },
-                    Update::PushItems {
-                        at: Position::new(ChunkIdentifier::new(0), 0),
-                        items: vec![thread_event_0],
-                    },
-                    Update::NewItemsChunk {
-                        previous: Some(ChunkIdentifier::new(0)),
-                        new: ChunkIdentifier::new(1),
-                        next: None,
-                    },
-                    Update::PushItems {
-                        at: Position::new(ChunkIdentifier::new(1), 0),
-                        items: vec![thread_event_1],
-                    },
-                ],
-            )
-            .await
-            .unwrap();
-
         // Subscribe the event caches, and create the room.
         let (thread_event_cache_p0, thread_event_cache_p1) = {
-            let event_cache_p0 = client_p0.event_cache();
-            event_cache_p0.subscribe().unwrap();
-
-            let event_cache_p1 = client_p1.event_cache();
-            event_cache_p1.subscribe().unwrap();
+            let event_cache_p0 = client_p0.event_cache().unwrap();
+            let event_cache_p1 = client_p1.event_cache().unwrap();
 
             client_p0.base_client().get_or_create_room(room_id, RoomState::Joined);
             client_p1.base_client().get_or_create_room(room_id, RoomState::Joined);
@@ -1130,8 +1140,9 @@ mod timed_tests {
 
         // Okay. We are ready for the test!
         //
-        // First off, let's check `thread_event_cache_p0` has access to the first event
-        // loaded in-memory, then do a pagination, and see more events.
+        // First off, let's check `thread_event_cache_p0` has access to the
+        // first event loaded in-memory, then do a pagination, and see more
+        // events.
         let mut updates_stream_p0 = {
             let thread_event_cache = &thread_event_cache_p0;
 
@@ -1196,16 +1207,17 @@ mod timed_tests {
 
         // Do this a couple times, for the fun.
         for _ in 0..3 {
-            // Third, because `thread_event_cache_p1` has locked the store, the lock
-            // is dirty for `thread_event_cache_p0`, so it will shrink to its last
-            // chunk for the thread!
+            // Third, because `thread_event_cache_p1` has locked the store, the
+            // lock is dirty for `thread_event_cache_p0`, so it will shrink to
+            // its last chunk for the thread!
             {
                 let thread_event_cache = &thread_event_cache_p0;
                 let updates_stream = &mut updates_stream_p0;
 
-                // `thread_event_id_1` must be loaded in memory, just like before.
-                // However, `thread_event_id_0` must NOT be loaded in memory. It WAS loaded, but
-                // the state has been reloaded to its last chunk.
+                // `thread_event_id_1` must be loaded in memory, just like
+                // before. However, `thread_event_id_0` must NOT be loaded in
+                // memory. It WAS loaded, but the state has been reloaded to its
+                // last chunk.
                 let (initial_updates, _) = thread_event_cache.subscribe().await.unwrap();
 
                 assert_eq!(initial_updates.len(), 1);
@@ -1226,12 +1238,19 @@ mod timed_tests {
                         );
                     }
                 );
+                assert_matches!(
+                    updates_stream.recv().await.unwrap(),
+                    ThreadEventCacheUpdate::UpdateSummary(summary) => {
+                        assert_eq!(summary.latest_reply.as_deref(), Some(thread_event_id_1));
+                        assert_eq!(summary.num_replies, 2);
+                    }
+                );
 
                 // Load one more event with a backpagination.
                 thread_event_cache.pagination().run_backwards_once(1).await.unwrap();
 
-                // `thread_event_id_0` must now be loaded in memory.
-                // The pagination can be observed via the updates.
+                // `thread_event_id_0` must now be loaded in memory. The
+                // pagination can be observed via the updates.
                 assert_matches!(
                     updates_stream.recv().await.unwrap(),
                     ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) => {
@@ -1244,18 +1263,21 @@ mod timed_tests {
                         );
                     }
                 );
+
+                assert!(updates_stream.is_empty());
             }
 
-            // Fourth, because `thread_event_cache_p0` has locked the store again, the lock
-            // is dirty for `thread_event_cache_p1` too!, so it will shrink to its last
-            // chunk for the thread!
+            // Fourth, because `thread_event_cache_p0` has locked the store
+            // again, the lock is dirty for `thread_event_cache_p1` too!, so it
+            // will shrink to its last chunk for the thread!
             {
                 let thread_event_cache = &thread_event_cache_p1;
                 let updates_stream = &mut updates_stream_p1;
 
-                // `thread_event_id_1` must be loaded in memory, just like before.
-                // However, `thread_event_id_0` must NOT be loaded in memory. It WAS loaded, but
-                // the state has shrunk to its last chunk.
+                // `thread_event_id_1` must be loaded in memory, just like
+                // before. However, `thread_event_id_0` must NOT be loaded in
+                // memory. It WAS loaded, but the state has shrunk to its last
+                // chunk.
                 let (initial_updates, _) = thread_event_cache.subscribe().await.unwrap();
 
                 assert_eq!(initial_updates.len(), 1);
@@ -1276,12 +1298,19 @@ mod timed_tests {
                         );
                     }
                 );
+                assert_matches!(
+                    updates_stream.recv().await.unwrap(),
+                    ThreadEventCacheUpdate::UpdateSummary(summary) => {
+                        assert_eq!(summary.latest_reply.as_deref(), Some(thread_event_id_1));
+                        assert_eq!(summary.num_replies, 2);
+                    }
+                );
 
                 // Load one more event with a backpagination.
                 thread_event_cache.pagination().run_backwards_once(1).await.unwrap();
 
-                // `thread_event_id_0` must now be loaded in memory.
-                // The pagination can be observed via the updates.
+                // `thread_event_id_0` must now be loaded in memory. The
+                // pagination can be observed via the updates.
                 assert_matches!(
                     updates_stream.recv().await.unwrap(),
                     ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) => {
@@ -1303,9 +1332,7 @@ mod timed_tests {
         let room_id = room_id!("!r0");
         let thread_id = event_id!("$t0");
 
-        let client = MockClientBuilder::new(None).build().await;
-
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
 
         let event_id_0 = event_id!("$ev0");
         let event_id_1 = event_id!("$ev1");
@@ -1317,44 +1344,49 @@ mod timed_tests {
         let event_1 =
             f.text_msg("world").event_id(event_id_1).in_thread(thread_id, event_id_1).into_event();
 
-        // Fill the event cache store with an initial linked chunk with 2 events chunks.
-        {
-            client
-                .event_cache_store()
-                .lock()
-                .await
-                .expect("Could not acquire the event cache lock")
-                .as_clean()
-                .expect("Could not acquire a clean event cache lock")
-                .handle_linked_chunk_updates(
-                    LinkedChunkId::Thread(room_id, thread_id),
-                    vec![
-                        Update::NewItemsChunk {
-                            previous: None,
-                            new: ChunkIdentifier::new(0),
-                            next: None,
-                        },
-                        Update::PushItems {
-                            at: Position::new(ChunkIdentifier::new(0), 0),
-                            items: vec![thread_root, event_0],
-                        },
-                        Update::NewItemsChunk {
-                            previous: Some(ChunkIdentifier::new(0)),
-                            new: ChunkIdentifier::new(1),
-                            next: None,
-                        },
-                        Update::PushItems {
-                            at: Position::new(ChunkIdentifier::new(1), 0),
-                            items: vec![event_1],
-                        },
-                    ],
-                )
-                .await
-                .unwrap();
-        }
+        // Fill the event cache store with an initial linked chunk with 2 events
+        // chunks.
+        let event_cache_store = MemoryStore::new();
+        event_cache_store
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Thread(room_id, thread_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![thread_root, event_0],
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(0)),
+                        new: ChunkIdentifier::new(1),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(1), 0),
+                        items: vec![event_1],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
+        let client = MockClientBuilder::new(None)
+            .on_builder(move |builder| {
+                builder.store_config(
+                    StoreConfig::new(CrossProcessLockConfig::MultiProcess {
+                        holder_name: "foo".to_owned(),
+                    })
+                    .event_cache_store(event_cache_store),
+                )
+            })
+            .build()
+            .await;
+
+        let event_cache = client.event_cache().unwrap();
 
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
@@ -1376,8 +1408,8 @@ mod timed_tests {
         assert_eq!(outcome.events[1].event_id(), Some(thread_id));
         assert!(outcome.reached_start);
 
-        // We also get an update about the loading from the store. Ignore it, for this
-        // test's sake.
+        // We also get an update about the loading from the store. Ignore it,
+        // for this test's sake.
         assert_let_timeout!(
             Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
                 stream1.recv()
@@ -1398,9 +1430,9 @@ mod timed_tests {
         assert_eq!(expected_room_id, room_id);
         assert!(generic_stream.is_empty());
 
-        // Have another subscriber.
-        // Since it's not the first one, and the previous one loaded some more events,
-        // the second subscribers sees them all.
+        // Have another subscriber. Since it's not the first one, and the
+        // previous one loaded some more events, the second subscribers sees
+        // them all.
         let (events2, stream2) = thread_event_cache.subscribe().await.unwrap();
         assert_eq!(events2.len(), 3);
         assert_eq!(events2[0].event_id(), Some(thread_id));

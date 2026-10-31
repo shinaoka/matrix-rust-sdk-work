@@ -22,6 +22,8 @@
 use std::{fmt, ops::Deref, str::Utf8Error, sync::Arc};
 
 #[cfg(any(test, feature = "testing"))]
+mod controlled_memory_store;
+#[cfg(any(test, feature = "testing"))]
 #[macro_use]
 pub mod integration_tests;
 mod memory_store;
@@ -39,7 +41,10 @@ use ruma::{OwnedEventId, events::AnySyncTimelineEvent, serde::Raw};
 use tracing::trace;
 
 #[cfg(any(test, feature = "testing"))]
-pub use self::integration_tests::EventCacheStoreIntegrationTests;
+pub use self::{
+    controlled_memory_store::ControlledMemoryStore,
+    integration_tests::EventCacheStoreIntegrationTests,
+};
 pub use self::{
     memory_store::MemoryStore,
     traits::{DEFAULT_CHUNK_CAPACITY, DynEventCacheStore, EventCacheStore, IntoEventCacheStore},
@@ -192,8 +197,8 @@ pub enum EventCacheStoreError {
     #[error(transparent)]
     Backend(Arc<dyn std::error::Error + Send + Sync>),
 
-    /// The store is locked with a passphrase and an incorrect passphrase
-    /// was given.
+    /// The store is locked with a passphrase and an incorrect passphrase was
+    /// given.
     #[error("The event cache store failed to be unlocked")]
     Locked,
 
@@ -250,8 +255,8 @@ impl From<EventCacheStoreError> for CrossProcessLockError {
 /// An `EventCacheStore` specific result type.
 pub type Result<T, E = EventCacheStoreError> = std::result::Result<T, E>;
 
-/// A type that wraps the [`EventCacheStore`] but implements [`TryLock`] to
-/// make it usable inside the cross process lock.
+/// A type that wraps the [`EventCacheStore`] but implements [`TryLock`] to make
+/// it usable inside the cross process lock.
 #[derive(Clone, Debug)]
 struct LockableEventCacheStore(Arc<DynEventCacheStore>);
 

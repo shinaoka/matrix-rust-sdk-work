@@ -124,6 +124,7 @@ async fn test_interactive_verification_started_from_request() {
     .await;
 
     // ----------------------------------------------------------------------------
+    //
     // On Alice's device:
     let bob_device = alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap();
 
@@ -134,6 +135,7 @@ async fn test_interactive_verification_started_from_request() {
         bob_device.request_verification_with_methods(vec![VerificationMethod::SasV1]);
 
     // ----------------------------------------------------------------------------
+    //
     // On Bobs's device:
     let event = request_to_event(alice.user_id(), &request);
     bob.handle_verification_event(&event).await;
@@ -148,6 +150,7 @@ async fn test_interactive_verification_started_from_request() {
     let (_, start_request_from_bob) = verification_request.start_sas().await.unwrap().unwrap();
 
     // ----------------------------------------------------------------------------
+    //
     // On Alice's device:
 
     // Alice receives the Ready
@@ -164,11 +167,12 @@ async fn test_interactive_verification_started_from_request() {
     let event = request_to_event(bob.user_id(), &start_request_from_bob);
     alice.handle_verification_event(&event).await;
 
-    // Since Alice's user id is lexicographically smaller than Bob's, Alice does not
-    // do anything with the request, however.
+    // Since Alice's user id is lexicographically smaller than Bob's, Alice does
+    // not do anything with the request, however.
     assert!(alice.user_id() < bob.user_id());
 
     // ----------------------------------------------------------------------------
+    //
     // On Bob's device:
 
     // Bob receives Alice's start:
@@ -188,6 +192,7 @@ async fn test_interactive_verification_started_from_request() {
     let event = bob_sas.accept().map(|r| request_to_event(bob.user_id(), &r)).unwrap();
 
     // ----------------------------------------------------------------------------
+    //
     // On Alice's device:
 
     // Alice receives the Accept request:
@@ -201,6 +206,7 @@ async fn test_interactive_verification_started_from_request() {
     alice.inner.verification_machine.mark_request_as_sent(&msg.request_id);
 
     // ----------------------------------------------------------------------------
+    //
     // On Bob's device:
 
     // And bob receive's it:
@@ -214,6 +220,7 @@ async fn test_interactive_verification_started_from_request() {
     bob.inner.verification_machine.mark_request_as_sent(&msg.request_id);
 
     // ----------------------------------------------------------------------------
+    //
     // On Alice's device:
 
     // And alice receives it
@@ -224,6 +231,7 @@ async fn test_interactive_verification_started_from_request() {
     assert!(bob_sas.emoji().is_some());
 
     // ----------------------------------------------------------------------------
+    //
     // On Bob's device:
 
     assert_eq!(alice_sas.emoji(), bob_sas.emoji());
@@ -235,6 +243,7 @@ async fn test_interactive_verification_started_from_request() {
     let event = request_to_event(bob.user_id(), &contents[0]);
 
     // ----------------------------------------------------------------------------
+    //
     // On Alice's device:
 
     // ...which alice receives
@@ -252,6 +261,7 @@ async fn test_interactive_verification_started_from_request() {
     let event_done = request_to_event(alice.user_id(), &contents[1]);
 
     // ----------------------------------------------------------------------------
+    //
     // On Bob's device:
 
     // Bob receives the MAC message
@@ -275,6 +285,7 @@ async fn test_interactive_verification_started_from_request() {
     assert!(alice_device.is_verified());
 
     // ----------------------------------------------------------------------------
+    //
     // On Alice's device:
 
     assert!(!alice_sas.is_done());
@@ -1115,7 +1126,8 @@ async fn test_unknown_sender_scheduling_failure_remains_retryable() {
         VerificationEventResult::UnknownSenderQueued { query_needed: true, .. }
     ));
 
-    // Do not acknowledge scheduling, exactly as if `mark_user_as_changed` failed.
+    // Do not acknowledge scheduling, exactly as if `mark_user_as_changed`
+    // failed.
     let retry = bob.inner.verification_machine.receive_to_device_event(&event).await.unwrap();
     assert!(matches!(
         retry,
@@ -1498,9 +1510,10 @@ async fn test_pending_replay_does_not_publish_a_preexisting_cached_request() {
         .await
         .unwrap();
 
-    // Materialize through the generic path so the same-flow cache entry exists while the
-    // deferred slot remains pending. This models store/device churn without assigning recovery
-    // publication ownership to that pending slot.
+    // Materialize through the generic path so the same-flow cache entry exists
+    // while the deferred slot remains pending. This models store/device
+    // churn without assigning recovery publication ownership to that
+    // pending slot.
     bob.inner.verification_machine.receive_any_event(&event).await.unwrap();
     let normal_delivery = recovered_requests
         .next()
@@ -1741,8 +1754,9 @@ async fn test_incoming_request_claim_and_subscriber_replacement_are_linearized_t
         bob_device.request_verification_with_methods(vec![VerificationMethod::SasV1]);
     let mut event = request_to_event(alice.user_id(), &request);
 
-    // Claim wins the owner lock first: replacement cannot revoke that active head lease,
-    // even when it is created before `next()` returns it to the old subscriber.
+    // Claim wins the owner lock first: replacement cannot revoke that active
+    // head lease, even when it is created before `next()` returns it to the
+    // old subscriber.
     let first_owner = bob.subscribe_to_incoming_verification_requests();
     bob.handle_verification_event(&event).await;
     let entered = Arc::new(Barrier::new(2));
@@ -1764,7 +1778,8 @@ async fn test_incoming_request_claim_and_subscriber_replacement_are_linearized_t
     assert!(replacement.next().now_or_never().is_none());
     first_delivery.commit();
 
-    // Replacement wins the owner lock first: the stale generation cannot claim a later head.
+    // Replacement wins the owner lock first: the stale generation cannot claim
+    // a later head.
     let ToDeviceEvents::KeyVerificationRequest(event) = &mut event else {
         panic!("request helper must return a verification request event");
     };

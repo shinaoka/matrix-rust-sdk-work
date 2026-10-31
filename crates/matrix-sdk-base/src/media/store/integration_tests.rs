@@ -183,7 +183,8 @@ where
         let stored = self.get_media_content_inner(&request_avg, time).await.unwrap();
         assert!(stored.is_none());
 
-        // If there are both a cache size and a file size, the minimum value is used.
+        // If there are both a cache size and a file size, the minimum value is
+        // used.
         let policy = MediaRetentionPolicy::empty()
             .with_max_cache_size(Some(200))
             .with_max_file_size(Some(1000));
@@ -479,8 +480,8 @@ where
         let stored = self.get_media_content_inner(&request_small_5, time).await.unwrap();
         assert!(stored.is_some());
 
-        // Cleanup still removes the oldest content first, which is not the same as
-        // before.
+        // Cleanup still removes the oldest content first, which is not the same
+        // as before.
         time += Duration::from_secs(1);
         tracing::info!(?self, "before");
         self.clean_inner(policy, time).await.unwrap();
@@ -598,8 +599,8 @@ where
         let stored = self.get_media_content_inner(&request_5, time).await.unwrap();
         assert!(stored.is_some());
 
-        // We are now at UNIX_EPOCH + 10 seconds, the oldest content was accessed 5
-        // seconds ago.
+        // We are now at UNIX_EPOCH + 10 seconds, the oldest content was
+        // accessed 5 seconds ago.
         time += Duration::from_secs(1);
         assert_eq!(time, SystemTime::UNIX_EPOCH + Duration::from_secs(10));
 
@@ -622,12 +623,13 @@ where
         let stored = self.get_media_content_inner(&request_5, time).await.unwrap();
         assert!(stored.is_some());
 
-        // We are now at UNIX_EPOCH + 16 seconds, the oldest content was accessed 5
-        // seconds ago.
+        // We are now at UNIX_EPOCH + 16 seconds, the oldest content was
+        // accessed 5 seconds ago.
         time += Duration::from_secs(1);
         assert_eq!(time, SystemTime::UNIX_EPOCH + Duration::from_secs(16));
 
-        // Jump 26 seconds in the future, so the 2 first media contents are expired.
+        // Jump 26 seconds in the future, so the 2 first media contents are
+        // expired.
         time += Duration::from_secs(26);
 
         // Cleanup removes the two oldest media contents.
@@ -675,11 +677,13 @@ where
             format: MediaFormat::File,
         };
 
-        // A policy that will result in only one media content in the cache, which is
-        // the average or small content, depending on the last access time.
+        // A policy that will result in only one media content in the cache,
+        // which is the average or small content, depending on the last access
+        // time.
         let policy = MediaRetentionPolicy::empty().with_max_cache_size(Some(150));
 
-        // Try to add all the big content without ignoring the policy, it should fail.
+        // Try to add all the big content without ignoring the policy, it should
+        // fail.
         let mut time = SystemTime::UNIX_EPOCH;
         self.add_media_content_inner(
             &request_big,
@@ -694,7 +698,8 @@ where
         let stored = self.get_media_content_inner(&request_big, time).await.unwrap();
         assert!(stored.is_none());
 
-        // Try to add it again but ignore the policy this time, it should succeed.
+        // Try to add it again but ignore the policy this time, it should
+        // succeed.
         time += Duration::from_secs(1);
         self.add_media_content_inner(
             &request_big,
@@ -740,12 +745,14 @@ where
         let stored = self.get_media_content_inner(&request_avg, time).await.unwrap();
         assert!(stored.is_some());
 
-        // Ignore the average content for now so the max cache size is not reached.
+        // Ignore the average content for now so the max cache size is not
+        // reached.
         self.set_ignore_media_retention_policy_inner(&request_avg, IgnoreMediaRetentionPolicy::Yes)
             .await
             .unwrap();
 
-        // Because the big and average contents are ignored, cleanup has no effect.
+        // Because the big and average contents are ignored, cleanup has no
+        // effect.
         time += Duration::from_secs(1);
         self.clean_inner(policy, time).await.unwrap();
 
@@ -778,7 +785,8 @@ where
         assert!(stored.is_none());
 
         // Stop ignoring the average media. Since the cache size is bigger than
-        // the max, the content that was not the last accessed should be cleaned up.
+        // the max, the content that was not the last accessed should be cleaned
+        // up.
         self.set_ignore_media_retention_policy_inner(&request_avg, IgnoreMediaRetentionPolicy::No)
             .await
             .unwrap();
@@ -963,20 +971,21 @@ where
     }
 }
 
-/// Macro building to allow your [`MediaStoreInner`] implementation to run
-/// the entire tests suite locally.
+/// Macro building to allow your [`MediaStoreInner`] implementation to run the
+/// entire tests suite locally.
 ///
 /// Can be run with the `with_media_size_tests` argument to include more tests
 /// about the media cache retention policy based on content size. It is not
 /// recommended to run those in encrypted stores because the size of the
 /// encrypted content may vary compared to what the tests expect.
 ///
-/// You need to provide an `async fn get_media_store() ->
-/// media::store::Result<Store>` that provides a fresh media store
-/// that implements `MediaStoreInner` on the same level you invoke the
-/// macro.
+/// You need to provide an
+/// `async fn get_media_store() -> media::store::Result<Store>` that provides a
+/// fresh media store that implements `MediaStoreInner` on the same level you
+/// invoke the macro.
 ///
-/// ## Usage Example:
+/// ## Usage example
+///
 /// ```no_run
 /// # use matrix_sdk_base::media::store::{
 /// #    MediaStore,
@@ -1071,6 +1080,9 @@ pub trait MediaStoreIntegrationTests {
 
     /// Test replacing a MXID.
     async fn test_replace_media_key(&self);
+
+    /// Test media sizes.
+    async fn test_media_sizes(&self);
 }
 
 impl<Store> MediaStoreIntegrationTests for Store
@@ -1232,17 +1244,88 @@ where
         // Finding with the new request does work.
         assert_eq!(self.get_media_content(&new_req).await.unwrap().unwrap(), b"hello");
     }
+
+    async fn test_media_sizes(&self) {
+        let uri = mxc_uri!("mxc://localhost/media");
+        let other_uri = mxc_uri!("mxc://localhost/media-other");
+        let missing_uri = mxc_uri!("mxc://localhost/media-missing");
+
+        let file = b"hello";
+        let thumbnail = b"world!";
+        let other_file = b"foo";
+
+        let request_file = MediaRequestParameters {
+            source: MediaSource::Plain(uri.to_owned()),
+            format: MediaFormat::File,
+        };
+        let request_thumbnail = MediaRequestParameters {
+            source: MediaSource::Plain(uri.to_owned()),
+            format: MediaFormat::Thumbnail(MediaThumbnailSettings::with_method(
+                Method::Crop,
+                uint!(100),
+                uint!(100),
+            )),
+        };
+        let request_other_file = MediaRequestParameters {
+            source: MediaSource::Plain(other_uri.to_owned()),
+            format: MediaFormat::File,
+        };
+
+        // Nothing is stored yet.
+        assert!(self.media_sizes(&[]).await.unwrap().is_empty());
+        assert!(self.media_sizes(&[uri.to_owned()]).await.unwrap().is_empty());
+
+        self.add_media_content(&request_file, file.to_vec(), IgnoreMediaRetentionPolicy::No)
+            .await
+            .expect("adding media failed");
+        self.add_media_content(
+            &request_thumbnail,
+            thumbnail.to_vec(),
+            IgnoreMediaRetentionPolicy::No,
+        )
+        .await
+        .expect("adding media failed");
+        self.add_media_content(
+            &request_other_file,
+            other_file.to_vec(),
+            IgnoreMediaRetentionPolicy::No,
+        )
+        .await
+        .expect("adding media failed");
+
+        // The same media is requested twice and a media that isn't stored is
+        // also requested: only the two stored media are returned.
+        let sizes = self
+            .media_sizes(&[
+                uri.to_owned(),
+                other_uri.to_owned(),
+                missing_uri.to_owned(),
+                uri.to_owned(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(sizes.len(), 2);
+        assert!(!sizes.contains_key(missing_uri));
+
+        // `uri` has a file and a thumbnail stored, so its size is the sum of
+        // both contents. Encrypted stores add overhead to the stored bytes,
+        // hence this would have to be compared with the plaintext lengths
+        // using `>=`.
+        assert!(sizes.get(uri).copied().unwrap() >= (file.len() + thumbnail.len()) as u64);
+        assert!(sizes.get(other_uri).copied().unwrap() >= other_file.len() as u64);
+    }
 }
 
-/// Macro building to allow your [`MediaStore`] implementation to run
-/// the entire tests suite locally.
+/// Macro building to allow your [`MediaStore`] implementation to run the entire
+/// tests suite locally.
 ///
-/// You need to provide an `async fn get_media_store() ->
-/// media::store::Result<Store>` that provides a fresh media store
-/// that implements `MediaStoreInner` on the same level you invoke the
-/// macro.
+/// You need to provide an
+/// `async fn get_media_store() -> media::store::Result<Store>` that provides a
+/// fresh media store that implements `MediaStoreInner` on the same level you
+/// invoke the macro.
 ///
-/// ## Usage Example:
+/// ## Usage example
+///
 /// ```no_run
 /// # use matrix_sdk_base::media::store::{
 /// #    MediaStore,
@@ -1282,12 +1365,18 @@ macro_rules! media_store_integration_tests {
                 let media_store = get_media_store().await.unwrap();
                 media_store.test_replace_media_key().await;
             }
+
+            #[async_test]
+            async fn test_media_sizes() {
+                let media_store = get_media_store().await.unwrap();
+                media_store.test_media_sizes().await;
+            }
         }
     };
 }
 
-/// Macro generating tests for the media store, related to time (mostly
-/// for the cross-process lock).
+/// Macro generating tests for the media store, related to time (mostly for the
+/// cross-process lock).
 #[allow(unused_macros)]
 #[macro_export]
 macro_rules! media_store_integration_tests_time {
@@ -1315,11 +1404,13 @@ macro_rules! media_store_integration_tests_time {
                 let acquired2 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
                 assert_eq!(acquired2, Some(1)); // same lock generation
 
-                // Should extend the lease automatically (same holder + time is ok).
+                // Should extend the lease automatically (same holder + time is
+                // ok).
                 let acquired3 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
                 assert_eq!(acquired3, Some(1)); // same lock generation
 
-                // Another attempt at taking the lock should fail, because it's taken.
+                // Another attempt at taking the lock should fail, because it's
+                // taken.
                 let acquired4 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
                 assert!(acquired4.is_none()); // not acquired
 

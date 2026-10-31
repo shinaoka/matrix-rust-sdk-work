@@ -116,7 +116,8 @@ pub enum ManualVerifyError {
         failure_user_count: usize,
         /// Number of rejected signatures in the upload response.
         failure_key_count: usize,
-        /// Number of rejected signatures whose errcode is `M_INVALID_SIGNATURE`.
+        /// Number of rejected signatures whose errcode is
+        /// `M_INVALID_SIGNATURE`.
         invalid_signature_count: usize,
         /// Number of rejected signatures with a known non-`M_INVALID_SIGNATURE`
         /// errcode.

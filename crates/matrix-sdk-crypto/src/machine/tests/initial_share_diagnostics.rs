@@ -16,12 +16,12 @@
 
 use std::{iter, sync::Arc};
 
-use assert_matches2::assert_let;
 use matrix_sdk_test::async_test;
 use ruma::{
     api::client::to_device::send_event_to_device::v3::Response as ToDeviceResponse, room_id,
     user_id,
 };
+use strass::assert_let;
 
 use crate::{
     EncryptionSettings,
@@ -98,7 +98,7 @@ async fn test_initial_share_records_index0_outcome_for_every_eligible_device() {
     .await;
     let room_id = room_id!("!test:example.org");
 
-    let events = share_and_ack(&alice, &bob, &room_id).await;
+    let events = share_and_ack(&alice, &bob, room_id).await;
     let devices = initial_share_device_events(&events);
 
     // Every stage is observed for exactly the eligible receiver device, in
@@ -295,7 +295,7 @@ async fn test_initial_share_diagnostics_never_expose_identifiers_or_material() {
     .await;
     let room_id = room_id!("!test:example.org");
 
-    let events = share_and_ack(&alice, &bob, &room_id).await;
+    let events = share_and_ack(&alice, &bob, room_id).await;
     let debug = format!("{events:?}");
     for forbidden in [
         "a:example.org",

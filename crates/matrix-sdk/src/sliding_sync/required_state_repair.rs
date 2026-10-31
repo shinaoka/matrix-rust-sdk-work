@@ -93,14 +93,14 @@ fn validated(raw: Raw<AnyStateEvent>, candidate: &Candidate) -> Option<Raw<AnySy
     if event.room_id() != candidate.room {
         return None;
     }
-    let valid = match (&candidate.kind, event) {
-        (StateEventType::RoomTopic, AnyStateEvent::RoomTopic(StateEvent::Original(_))) => true,
-        (
-            StateEventType::RoomPowerLevels,
-            AnyStateEvent::RoomPowerLevels(StateEvent::Original(_)),
-        ) => true,
-        _ => false,
-    };
+    let valid = matches!(
+        (&candidate.kind, event),
+        (StateEventType::RoomTopic, AnyStateEvent::RoomTopic(StateEvent::Original(_)))
+            | (
+                StateEventType::RoomPowerLevels,
+                AnyStateEvent::RoomPowerLevels(StateEvent::Original(_))
+            )
+    );
     valid.then(|| raw.cast())
 }
 
@@ -118,7 +118,8 @@ pub(super) async fn repair(
                 Request::new(candidate.room.clone(), candidate.kind.clone(), String::new());
             request.format = StateEventFormat::Event;
             // Unlike SendRequest, send_inner never refreshes authentication or
-            // repeats a GET on M_UNKNOWN_TOKEN. This repair has no auth authority.
+            // repeats a GET on M_UNKNOWN_TOKEN. This repair has no auth
+            // authority.
             let raw = client
                 .send_inner(
                     request,

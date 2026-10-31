@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, pin::pin, sync::Arc};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
@@ -8,7 +8,7 @@ use matrix_sdk::{
     test_utils::mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
 };
 use matrix_sdk_base::sync::UnreadNotificationsCount;
-use matrix_sdk_test::{ALICE, async_test, event_factory::EventFactory};
+use matrix_sdk_test::{User, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::{
     RoomListService,
     room_list_service::{
@@ -23,6 +23,7 @@ use ruma::{
     owned_mxc_uri, room_id,
     time::{Duration, Instant},
 };
+use serde_json::{Value, json};
 use stream_assert::{assert_next_matches, assert_pending};
 use tempfile::TempDir;
 use tokio::{spawn, sync::Barrier, task::yield_now, time::sleep};
@@ -51,6 +52,33 @@ async fn new_persistent_room_list_service(
 
 // Same macro as in the main, with additional checking that the state
 // before/after the sync loop match those we expect.
+/// The extensions the room list service enables on every request.
+fn expected_extensions() -> Value {
+    expected_extensions_with(json!({}))
+}
+
+/// The extensions the room list service enables on every request, plus `extra`
+/// ones (those depending on what the server advertises).
+fn expected_extensions_with(extra: Value) -> Value {
+    let mut extensions = json!({
+        "account_data": { "enabled": true },
+        "receipts": { "enabled": true, "rooms": ["*"] },
+        "typing": { "enabled": true },
+        "org.matrix.msc4262.profiles": { "enabled": true },
+    });
+
+    #[cfg(feature = "unstable-msc4354")]
+    {
+        extensions["org.matrix.msc4354.sticky_events"] = json!({ "enabled": true });
+    }
+
+    if let Value::Object(extra) = extra {
+        extensions.as_object_mut().unwrap().extend(extra);
+    }
+
+    extensions
+}
+
 macro_rules! sync_then_assert_request_and_fake_response {
     (
         [$server:ident, $room_list:ident, $stream:ident]
@@ -344,7 +372,8 @@ async fn test_room_subscription_checkpoint_tracks_the_response_generation_and_ga
         },
     };
 
-    let generation = room_list.reconcile_room_subscriptions_with_generation(&[room_id]).await.generation;
+    let generation =
+        room_list.reconcile_room_subscriptions_with_generation(&[room_id]).await.generation;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -360,7 +389,8 @@ async fn test_room_subscription_checkpoint_tracks_the_response_generation_and_ga
         },
     };
 
-    // Subscribe after publication to prove the latest room checkpoint is retained.
+    // Subscribe after publication to prove the latest room checkpoint is
+    // retained.
     let checkpoints = room_list.room_subscription_checkpoints();
     let retained = checkpoints.get();
     let checkpoint = retained.get(room_id).expect("retained room checkpoint");
@@ -398,7 +428,8 @@ async fn test_room_subscription_checkpoint_does_not_reuse_the_baseline_observati
         },
     };
 
-    let generation = room_list.reconcile_room_subscriptions_with_generation(&[room_id]).await.generation;
+    let generation =
+        room_list.reconcile_room_subscriptions_with_generation(&[room_id]).await.generation;
     let checkpoints = room_list.room_subscription_checkpoints();
 
     sync_then_assert_request_and_fake_response! {
@@ -437,7 +468,8 @@ async fn test_delayed_subscription_response_cannot_repopulate_a_replaced_generat
         },
     };
 
-    let old_generation = room_list.reconcile_room_subscriptions_with_generation(&[old_room_id]).await.generation;
+    let old_generation =
+        room_list.reconcile_room_subscriptions_with_generation(&[old_room_id]).await.generation;
 
     let delayed_old_response = async {
         sync_then_assert_request_and_fake_response! {
@@ -496,7 +528,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -534,21 +566,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
                     "timeline_limit": 1,
                 },
             },
-            "extensions": {
-                "account_data": {
-                    "enabled": true
-                },
-                "receipts": {
-                    "enabled": true,
-                    "rooms": ["*"]
-                },
-                "typing": {
-                    "enabled": true,
-                },
-                "org.matrix.msc4262.profiles": {
-                    "enabled": true,
-                },
-            },
+            "extensions": expected_extensions(),
         },
         respond with = {
             "pos": "0",
@@ -625,8 +643,8 @@ async fn test_sync_all_states() -> Result<(), Error> {
         [server, room_list, sync]
         states = Running => Running,
         assert pos Some("2"),
-        // Still no long-polling because the list isn't fully-loaded,
-        // but it's about to be!
+        // Still no long-polling because the list isn't fully-loaded, but it's
+        // about to be!
         assert timeout Some(0),
         assert request >= {
             "conn_id": "room-list",
@@ -688,7 +706,7 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
     // Start a sync, and drop it at the end of the block.
     {
         let sync = room_list.sync();
-        pin_mut!(sync);
+        let mut sync = pin!(sync);
 
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
@@ -717,7 +735,7 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
     // Start a sync, and drop it at the end of the block.
     {
         let sync = room_list.sync();
-        pin_mut!(sync);
+        let mut sync = pin!(sync);
 
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
@@ -746,7 +764,7 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
     // Start a sync, and drop it at the end of the block.
     {
         let sync = room_list.sync();
-        pin_mut!(sync);
+        let mut sync = pin!(sync);
 
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
@@ -784,7 +802,7 @@ async fn test_sync_resumes_from_previous_state_after_restart() -> Result<(), Err
     {
         let (server, room_list) = new_persistent_room_list_service(store_path).await?;
         let sync = room_list.sync();
-        pin_mut!(sync);
+        let mut sync = pin!(sync);
 
         let all_rooms = room_list.all_rooms().await?;
         let mut all_rooms_loading_state = all_rooms.loading_state();
@@ -819,7 +837,7 @@ async fn test_sync_resumes_from_previous_state_after_restart() -> Result<(), Err
     {
         let (server, room_list) = new_persistent_room_list_service(store_path).await?;
         let sync = room_list.sync();
-        pin_mut!(sync);
+        let mut sync = pin!(sync);
 
         let all_rooms = room_list.all_rooms().await?;
         let mut all_rooms_loading_state = all_rooms.loading_state();
@@ -876,7 +894,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -902,7 +920,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
 
     // Start a new sync.
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -951,7 +969,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
 
     // Start a new sync.
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -1023,7 +1041,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
 
     // Start a new sync.
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -1119,7 +1137,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
 
     // Start a new sync.
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -1176,12 +1194,12 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
 async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
-    // Let's stop the sync before actually syncing (we never know!).
-    // We get an error, obviously.
+    // Let's stop the sync before actually syncing (we never know!). We get an
+    // error, obviously.
     assert!(room_list.stop_sync().is_err());
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -1212,7 +1230,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
 
     // Start a new sync.
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -1267,7 +1285,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
 
     // Start a new sync.
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     // Do a regular sync from the `Terminated` state.
     sync_then_assert_request_and_fake_response! {
@@ -1351,7 +1369,7 @@ async fn test_loading_states() -> Result<(), Error> {
         let (client, server, room_list) = new_room_list_service().await?;
 
         let sync = room_list.sync();
-        pin_mut!(sync);
+        let mut sync = pin!(sync);
 
         let all_rooms = room_list.all_rooms().await?;
         let mut all_rooms_loading_state = all_rooms.loading_state();
@@ -1415,7 +1433,8 @@ async fn test_loading_states() -> Result<(), Error> {
         // Wait on Tokio to run all the tasks. Necessary only when testing.
         yield_now().await;
 
-        // There is a loading state update because the number of rooms has been updated.
+        // There is a loading state update because the number of rooms has been
+        // updated.
         assert_next_matches!(
             all_rooms_loading_state,
             RoomListLoadingState::Loaded { maximum_number_of_rooms: Some(12) }
@@ -1460,9 +1479,10 @@ async fn test_loading_states() -> Result<(), Error> {
         let mut all_rooms_loading_state = all_rooms.loading_state();
 
         let sync = room_list.sync();
-        pin_mut!(sync);
+        let mut sync = pin!(sync);
 
-        // The loading state is loaded! Indeed, there is data loaded from the cache.
+        // The loading state is loaded! Indeed, there is data loaded from the
+        // cache.
         assert_next_matches!(
             all_rooms_loading_state,
             RoomListLoadingState::Loaded { maximum_number_of_rooms: Some(12) }
@@ -1509,12 +1529,12 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
     let (_client, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let all_rooms = room_list.all_rooms().await?;
 
     let (dynamic_entries_stream, dynamic_entries) = all_rooms.entries_with_dynamic_adapters(5);
-    pin_mut!(dynamic_entries_stream);
+    let mut dynamic_entries_stream = pin!(dynamic_entries_stream);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -1555,8 +1575,8 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
         },
     };
 
-    // Ensure the dynamic entries' stream is pending because there is no filter set
-    // yet.
+    // Ensure the dynamic entries' stream is pending because there is no filter
+    // set yet.
     assert_pending!(dynamic_entries_stream);
 
     // Now, let's define a filter.
@@ -1658,35 +1678,19 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
         },
     };
 
-    // Assert the dynamic entries.
-    // It's pushed on the front because rooms are sorted by recency.
+    // Assert the dynamic entries. It's pushed on the front because rooms are
+    // sorted by recency.
     assert_entries_batch! {
         [dynamic_entries_stream]
         push front [ "!r1:bar.org" ];
         push front [ "!r4:bar.org" ];
         end;
     };
-    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
-    // removed.
+    // The room info notable updates are drained in one batch, and deduplicated
+    // by room: one `set` per room.
     assert_entries_batch! {
         [dynamic_entries_stream]
         set [ 1 ] [ "!r1:bar.org" ];
-        end;
-    };
-    assert_entries_batch! {
-        [dynamic_entries_stream]
-        set [ 0 ] [ "!r4:bar.org" ];
-        end;
-    };
-    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
-    // removed.
-    assert_entries_batch! {
-        [dynamic_entries_stream]
-        set [ 1 ] [ "!r1:bar.org" ];
-        end;
-    };
-    assert_entries_batch! {
-        [dynamic_entries_stream]
         set [ 0 ] [ "!r4:bar.org" ];
         end;
     };
@@ -1771,30 +1775,11 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
         push front [ "!r7:bar.org" ];
         end;
     };
-    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
-    // removed.
+    // The room info notable updates are drained in one batch, and deduplicated
+    // by room: one `set` per room.
     assert_entries_batch! {
         [dynamic_entries_stream]
         set [ 1 ] [ "!r5:bar.org" ];
-        end;
-    };
-    assert_entries_batch! {
-        [dynamic_entries_stream]
-        set [ 0 ] [ "!r7:bar.org" ];
-        end;
-    };
-
-    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
-    // removed.
-    assert_entries_batch! {
-        [dynamic_entries_stream]
-        set [ 1 ] [ "!r5:bar.org" ];
-        end;
-    };
-    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
-    // removed.
-    assert_entries_batch! {
-        [dynamic_entries_stream]
         set [ 0 ] [ "!r7:bar.org" ];
         end;
     };
@@ -1914,9 +1899,8 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
         },
     };
 
-    // Assert the dynamic entries.
-    // `!r0:bar.org` has a new state event. The room must move in the room list
-    // because it has the highest recency.
+    // Assert the dynamic entries. `!r0:bar.org` has a new state event. The room
+    // must move in the room list because it has the highest recency.
     assert_entries_batch! {
         [dynamic_entries_stream]
         pop back;
@@ -1949,12 +1933,12 @@ async fn test_room_sorting() -> Result<(), Error> {
     let (_client, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let all_rooms = room_list.all_rooms().await?;
 
     let (stream, dynamic_entries) = all_rooms.entries_with_dynamic_adapters(10);
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2023,8 +2007,8 @@ async fn test_room_sorting() -> Result<(), Error> {
         },
     };
 
-    // Ensure the dynamic entries' stream is pending because there is no filter set
-    // yet.
+    // Ensure the dynamic entries' stream is pending because there is no filter
+    // set yet.
     assert_pending!(stream);
 
     // Now, let's define a filter.
@@ -2118,51 +2102,17 @@ async fn test_room_sorting() -> Result<(), Error> {
     };
 
     // Assert rooms are moving because their recency (based on the latest event)
-    // have changed.
-
-    // `!r0` is moving.
+    // have changed. The room info notable updates are drained in one batch,
+    // and deduplicated by room: the read receipt updates of `!r0`, `!r1` and
+    // `!r2` are folded into their moves.
     assert_entries_batch! {
         [stream]
         remove [ 3 ];
         push front [ "!r0:bar.org" ];
-        end;
-    };
-
-    // `!r1` is moving.
-    assert_entries_batch! {
-        [stream]
         remove [ 3 ];
         insert [ 1 ] [ "!r1:bar.org" ];
-        end;
-    };
-
-    // `!r2` is supposed to move, but meanwhile, `!r0` receives a read receipt
-    // update.
-    assert_entries_batch! {
-        [stream]
-        set [ 0 ] [ "!r0:bar.org" ];
-        end;
-    };
-
-    // `!r2` is moving.
-    assert_entries_batch! {
-        [stream]
         remove [ 4 ];
         push front [ "!r2:bar.org" ];
-        end;
-    };
-
-    // `!r1` receives a read receipt update.
-    assert_entries_batch! {
-        [stream]
-        set [ 2 ] [ "!r1:bar.org" ];
-        end;
-    };
-
-    // `!r2` receives a read receipt update.
-    assert_entries_batch! {
-        [stream]
-        set [ 0 ] [ "!r2:bar.org" ];
         end;
     };
 
@@ -2246,25 +2196,15 @@ async fn test_room_sorting() -> Result<(), Error> {
     // | 4     | !r4     | 5       |      |
     // | 5     | !r3     | 4       |      |
 
-    // `!r6` receives an unknown reason update.
-    assert_entries_batch! {
-        [stream]
-        set [ 1 ] [ "!r6:bar.org" ];
-        end;
-    };
-
-    // `!r6` receives a latest event update.
-    assert_entries_batch! {
-        [stream]
-        set [ 1 ] [ "!r6:bar.org" ];
-        end;
-    };
-
-    // `!r3` is moving.
+    // All the remaining updates (`!r3`'s new bump stamp and latest event,
+    // `!r6`'s name, latest event and read receipts) are drained and
+    // deduplicated into ONE batch: `!r3` moves to the front, `!r6` is refreshed
+    // in place.
     assert_entries_batch! {
         [stream]
         remove [ 5 ];
         push front [ "!r3:bar.org" ];
+        set [ 2 ] [ "!r6:bar.org" ];
         end;
     };
 
@@ -2279,27 +2219,6 @@ async fn test_room_sorting() -> Result<(), Error> {
     // | 4     | !r1     | 6       | Aaa  |
     // | 5     | !r4     | 5       |      |
 
-    // `!r6` receives a new name.
-    assert_entries_batch! {
-        [stream]
-        set [ 2 ] [ "!r6:bar.org" ];
-        end;
-    };
-
-    // `!r3` receives a read receipt update.
-    assert_entries_batch! {
-        [stream]
-        set [ 0 ] [ "!r3:bar.org" ];
-        end;
-    };
-
-    // `!r6` receives a read receipt update.
-    assert_entries_batch! {
-        [stream]
-        set [ 2 ] [ "!r6:bar.org" ];
-        end;
-    };
-
     assert_pending!(stream);
 
     Ok(())
@@ -2310,7 +2229,7 @@ async fn test_room() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let room_id_0 = room_id!("!r0:bar.org");
     let room_id_1 = room_id!("!r1:bar.org");
@@ -2362,8 +2281,8 @@ async fn test_room() -> Result<(), Error> {
     // Room has not received a name from sliding sync, then it's calculated.
     assert_eq!(room1.cached_display_name(), Some(RoomDisplayName::Empty));
 
-    // Room has not received an avatar from sliding sync, then it's calculated, but
-    // there is nothing to calculate from, so there is no URL.
+    // Room has not received an avatar from sliding sync, then it's calculated,
+    // but there is nothing to calculate from, so there is no URL.
     assert_eq!(room1.avatar_url(), None);
 
     sync_then_assert_request_and_fake_response! {
@@ -2426,7 +2345,7 @@ async fn test_room_subscription() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let room_id_0 = room_id!("!r0:bar.org");
     let room_id_1 = room_id!("!r1:bar.org");
@@ -2514,8 +2433,8 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        // strict comparison (with `=`) because we want to ensure
-        // the exact shape of `room_subscriptions`.
+        // strict comparison (with `=`) because we want to ensure the exact
+        // shape of `room_subscriptions`.
         assert request = {
             "conn_id": "room-list",
             "lists": {
@@ -2571,12 +2490,7 @@ async fn test_room_subscription() -> Result<(), Error> {
                     "timeline_limit": 20,
                 },
             },
-            "extensions": {
-                "account_data": { "enabled": true },
-                "receipts": { "enabled": true, "rooms": [ "*" ] },
-                "typing": { "enabled": true },
-                "org.matrix.msc4262.profiles": { "enabled": true },
-            },
+            "extensions": expected_extensions(),
         },
         respond with = {
             "pos": "2",
@@ -2590,8 +2504,8 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        // strict comparison (with `=`) because we want to ensure
-        // the exact shape of `room_subscriptions`.
+        // strict comparison (with `=`) because we want to ensure the exact
+        // shape of `room_subscriptions`.
         assert request = {
             "conn_id": "room-list",
             "lists": {
@@ -2671,12 +2585,7 @@ async fn test_room_subscription() -> Result<(), Error> {
                     "timeline_limit": 20,
                 },
             },
-            "extensions": {
-                "account_data": { "enabled": true },
-                "receipts": { "enabled": true, "rooms": [ "*" ] },
-                "typing": { "enabled": true },
-                "org.matrix.msc4262.profiles": { "enabled": true },
-            },
+            "extensions": expected_extensions(),
         },
         respond with = {
             "pos": "3",
@@ -2693,7 +2602,7 @@ async fn test_remove_and_reset_room_subscriptions() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let room_id_0 = room_id!("!r0:bar.org");
     let room_id_1 = room_id!("!r1:bar.org");
@@ -2807,12 +2716,7 @@ async fn test_remove_and_reset_room_subscriptions() -> Result<(), Error> {
                     "timeline_limit": 20,
                 },
             },
-            "extensions": {
-                "account_data": { "enabled": true },
-                "receipts": { "enabled": true, "rooms": [ "*" ] },
-                "typing": { "enabled": true },
-                "org.matrix.msc4262.profiles": { "enabled": true },
-            },
+            "extensions": expected_extensions(),
         },
         respond with = {
             "pos": "2",
@@ -2829,7 +2733,8 @@ async fn test_remove_and_reset_room_subscriptions() -> Result<(), Error> {
 
     room_list.reset_and_add_room_subscriptions(&[room_id_0, room_id_1]).await;
 
-    // `set_room_subscriptions` would have kept the members of `room_id_1` synced.
+    // `set_room_subscriptions` would have kept the members of `room_id_1`
+    // synced.
     assert!(!room_1.are_members_synced());
 
     sync_then_assert_request_and_fake_response! {
@@ -2914,12 +2819,7 @@ async fn test_remove_and_reset_room_subscriptions() -> Result<(), Error> {
                     "timeline_limit": 20,
                 },
             },
-            "extensions": {
-                "account_data": { "enabled": true },
-                "receipts": { "enabled": true, "rooms": [ "*" ] },
-                "typing": { "enabled": true },
-                "org.matrix.msc4262.profiles": { "enabled": true },
-            },
+            "extensions": expected_extensions(),
         },
         respond with = {
             "pos": "3",
@@ -2936,7 +2836,7 @@ async fn test_room_unread_notifications() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let room_id = room_id!("!r0:bar.org");
 
@@ -3008,7 +2908,7 @@ async fn test_room_timeline() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let room_id = room_id!("!r0:bar.org");
 
@@ -3107,7 +3007,7 @@ async fn test_room_latest_event() -> Result<(), Error> {
     server.mock_room_state_encryption().plain().mount().await;
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let room_id = room_id!("!r0:bar.org");
 
@@ -3132,10 +3032,10 @@ async fn test_room_latest_event() -> Result<(), Error> {
     let room = room_list.room(room_id)?;
     let timeline = room.timeline_builder().build().await.unwrap();
 
-    // We could subscribe to the room —with `RoomList::set_room_subscriptions`— to
-    // automatically listen to the latest event updates, but we will do it
+    // We could subscribe to the room —with `RoomList::set_room_subscriptions`—
+    // to automatically listen to the latest event updates, but we will do it
     // manually here (so that we can ignore the subscription thingies).
-    let latest_events = client.latest_events().await;
+    let latest_events = client.latest_events().await.unwrap();
     latest_events.listen_to_room(room_id).await.unwrap();
 
     // The latest event does not exist.
@@ -3182,7 +3082,7 @@ async fn test_sync_indicator() -> Result<(), Error> {
     const DELAY_BEFORE_HIDING: Duration = Duration::from_millis(0);
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let sync_indicator = room_list.sync_indicator(DELAY_BEFORE_SHOWING, DELAY_BEFORE_HIDING);
 
@@ -3205,7 +3105,7 @@ async fn test_sync_indicator() -> Result<(), Error> {
     }
 
     let sync_indicator_task = spawn(async move {
-        pin_mut!(sync_indicator);
+        let mut sync_indicator = pin!(sync_indicator);
 
         let barrier = barrier_sync_indicator;
 
@@ -3216,8 +3116,8 @@ async fn test_sync_indicator() -> Result<(), Error> {
 
         // Request 1.
         {
-            // The state transitions into `Init`. The `SyncIndicator` stays in `Hide` as
-            // nothing is happening yet.
+            // The state transitions into `Init`. The `SyncIndicator` stays in
+            // `Hide` as nothing is happening yet.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Hide,
@@ -3229,8 +3129,8 @@ async fn test_sync_indicator() -> Result<(), Error> {
 
         // Request 2.
         {
-            // The state transitions into `SettingUp`. The `SyncIndicator` must be `Show` as
-            // the service has now been started.
+            // The state transitions into `SettingUp`. The `SyncIndicator` must
+            // be `Show` as the service has now been started.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Show,
@@ -3242,7 +3142,8 @@ async fn test_sync_indicator() -> Result<(), Error> {
 
         // Request 3.
         {
-            // The state transitions into `Running`. The `SyncIndicator` must be `Hide`.
+            // The state transitions into `Running`. The `SyncIndicator` must be
+            // `Hide`.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Hide,
@@ -3254,7 +3155,8 @@ async fn test_sync_indicator() -> Result<(), Error> {
 
         // Request 4.
         {
-            // The state transitions into `Error`. The `SyncIndicator` must be `Show`.
+            // The state transitions into `Error`. The `SyncIndicator` must be
+            // `Show`.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Show,
@@ -3266,7 +3168,8 @@ async fn test_sync_indicator() -> Result<(), Error> {
 
         // Request 5.
         {
-            // The state transitions into `Recovering`. The `SyncIndicator` must be `Hide`.
+            // The state transitions into `Recovering`. The `SyncIndicator` must
+            // be `Hide`.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Hide,
@@ -3319,7 +3222,7 @@ async fn test_sync_indicator() -> Result<(), Error> {
     };
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     barrier.wait().await;
 
@@ -3359,7 +3262,7 @@ async fn test_multiple_timeline_init() {
     let room_list = RoomListService::new(client.clone()).await.unwrap();
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let room_id = room_id!("!r0:bar.org");
 
@@ -3388,19 +3291,20 @@ async fn test_multiple_timeline_init() {
 
     server.mock_room_state_encryption().plain().mount().await;
 
-    let f = EventFactory::new().room(room_id).sender(*ALICE);
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
 
     // Send back-pagination responses with a small delay.
     server
         .mock_room_messages()
+        .with_delay(Duration::from_millis(500))
         .ok(RoomMessagesResponseTemplate::default()
-            .events(vec![f.text_msg("hello").into_raw_timeline()])
-            .with_delay(Duration::from_millis(500)))
+            .events(vec![f.text_msg("hello").into_raw_timeline()]))
         .mount()
         .await;
 
     let task = {
-        // Get a RoomListService::Room, initialize the timeline, start a pagination.
+        // Get a RoomListService::Room, initialize the timeline, start a
+        // pagination.
         let room = room_list.room(room_id).unwrap();
 
         let timeline = room.timeline_builder().build().await.unwrap();
@@ -3424,16 +3328,17 @@ async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_i
     let server = MatrixMockServer::new().await;
 
     {
-        // The first time, don't advertise support for MSC4306; the extension will NOT
-        // enabled in this case, despite the client requesting it.
+        // The first time, don't advertise support for MSC4306; the extension
+        // will NOT enabled in this case, despite the client requesting it.
         server
             .mock_versions()
             .ok()
             .named("/versions, first time")
-            // This used to be a `mock_once()`, but we're not caching the versions in the
-            // `RoomListService::new()` method anymore, so we're now doing a couple more requests
-            // for this. The sync will want to know about the `/versions` once it tries to build
-            // the request path.
+            // This used to be a `mock_once()`, but we're not caching the
+            // versions in the `RoomListService::new()` method anymore, so we're
+            // now doing a couple more requests for this. The sync will want to
+            // know about the `/versions` once it tries to build the request
+            // path.
             .up_to_n_times(3)
             .expect(3..)
             .mount()
@@ -3452,7 +3357,7 @@ async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_i
         let room_list = RoomListService::new(client.clone()).await.unwrap();
 
         let sync = room_list.sync();
-        pin_mut!(sync);
+        let mut sync = pin!(sync);
 
         let room_id = room_id!("!r0:bar.org");
 
@@ -3461,21 +3366,7 @@ async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_i
             [mock_server, room_list, sync]
             assert request = {
                 "conn_id": "room-list",
-                "extensions": {
-                    "account_data": {
-                        "enabled": true,
-                    },
-                    "receipts": {
-                        "enabled": true,
-                        "rooms": ["*"],
-                    },
-                    "typing": {
-                        "enabled": true,
-                    },
-                    "org.matrix.msc4262.profiles": {
-                        "enabled": true,
-                    },
-                },
+                "extensions": expected_extensions(),
                 "lists": {
                     "all_rooms": {
                         "filters": {},
@@ -3550,7 +3441,7 @@ async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_i
     let room_list = RoomListService::new(client.clone()).await.unwrap();
 
     let sync = room_list.sync();
-    pin_mut!(sync);
+    let mut sync = pin!(sync);
 
     let room_id = room_id!("!r0:bar.org");
 
@@ -3559,25 +3450,9 @@ async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_i
         [mock_server, room_list, sync]
         assert request = {
             "conn_id": "room-list",
-            "extensions": {
-                "account_data": {
-                    "enabled": true,
-                },
-                "receipts": {
-                    "enabled": true,
-                    "rooms": ["*"],
-                },
-                "typing": {
-                    "enabled": true,
-                },
-                "io.element.msc4308.thread_subscriptions": {
-                    "enabled": true,
-                    "limit": 10,
-                },
-                "org.matrix.msc4262.profiles": {
-                    "enabled": true,
-                },
-            },
+            "extensions": expected_extensions_with(json!({
+                "io.element.msc4308.thread_subscriptions": { "enabled": true, "limit": 10 },
+            })),
             "lists": {
                 "all_rooms": {
                     "filters": {},
@@ -3643,7 +3518,8 @@ async fn test_reconcile_identical_set_is_a_true_noop() -> Result<(), Error> {
         },
     };
 
-    let generation = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await.generation;
+    let generation =
+        room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await.generation;
     let checkpoints_before = room_list.room_subscription_checkpoints().get().clone();
     let members_synced_before = client.get_room(room_a).unwrap().are_members_synced();
 
@@ -3657,7 +3533,7 @@ async fn test_reconcile_identical_set_is_a_true_noop() -> Result<(), Error> {
     assert_eq!(result.retained, 1);
     assert_eq!(room_list.active_room_subscriptions(), BTreeSet::from([room_a.to_owned()]));
     assert_eq!(
-        room_list.room_subscription_checkpoints().get().clone(),
+        room_list.room_subscription_checkpoints().get(),
         checkpoints_before,
         "checkpoints must be unchanged on a no-op"
     );
@@ -3691,7 +3567,8 @@ async fn test_reconcile_adds_only_new_rooms_and_retains_intersection() -> Result
         },
     };
 
-    let generation_a = room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await.generation;
+    let generation_a =
+        room_list.reconcile_room_subscriptions_with_generation(&[room_a]).await.generation;
     // Simulate both rooms completing a member fetch so the reconciliation's
     // invalidation is observable (member completeness is otherwise false for
     // both, making the assertions vacuous).

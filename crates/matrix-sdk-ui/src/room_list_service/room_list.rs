@@ -12,7 +12,7 @@
 // See the License for that specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt, future::ready, ops::Deref, sync::Arc};
+use std::{fmt, future::ready, ops::Deref, pin::pin, sync::Arc};
 
 use async_cell::sync::AsyncCell;
 use async_rx::StreamExt as _;
@@ -20,12 +20,12 @@ use async_stream::stream;
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::{Vector, VectorDiff};
 use eyeball_im_util::vector::VectorObserverExt;
-use futures_util::{Stream, StreamExt as _, pin_mut};
+use futures_util::{Stream, StreamExt as _};
 use matrix_sdk::{
     Client, Room, RoomRecencyStamp, RoomState, SlidingSync, SlidingSyncList,
     SlidingSyncListLoadingState, task_monitor::BackgroundTaskHandle,
 };
-use matrix_sdk_base::{RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons};
+use matrix_sdk_base::RoomInfoNotableUpdate;
 use ruma::MilliSecondsSinceUnixEpoch;
 use tokio::{
     select,
@@ -144,11 +144,11 @@ impl RoomList {
             _loading_state_task: client
                 .task_monitor()
                 .spawn_infinite_task("room_list::loading_state_task", async move {
-                    pin_mut!(room_list_service_state);
+                    let mut room_list_service_state = pin!(room_list_service_state);
 
-                    // As soon as `RoomListService` changes its state, if it isn't
-                    // `Terminated` nor `Error`, we know we have fetched something,
-                    // so the room list is loaded.
+                    // As soon as `RoomListService` changes its state, if it
+                    // isn't `Terminated` nor `Error`, we know we have fetched
+                    // something, so the room list is loaded.
                     while let Some(state) = room_list_service_state.next().await {
                         use State::*;
 
@@ -163,7 +163,8 @@ impl RoomList {
 
                     loading_state.set(RoomListLoadingState::Loaded { maximum_number_of_rooms });
 
-                    // Wait for updates on the maximum number of rooms to update again.
+                    // Wait for updates on the maximum number of rooms to update
+                    // again.
                     let mut maximum_number_of_rooms_stream =
                         sliding_sync_list.maximum_number_of_rooms_stream();
 
@@ -187,7 +188,8 @@ impl RoomList {
         self.loading_state.subscribe_reset()
     }
 
-    /// Read the current `all_rooms` entries without waiting for stream delivery.
+    /// Read the current `all_rooms` entries without waiting for stream
+    /// delivery.
     ///
     /// This snapshot is updated before the matching committed-response evidence
     /// is published, so consumers can reconcile from it without depending on
@@ -227,8 +229,8 @@ impl RoomList {
     /// The returned stream will only start yielding diffs once a filter is set
     /// through the returned [`RoomListDynamicEntriesController`]. For every
     /// call to [`RoomListDynamicEntriesController::set_filter`], the stream
-    /// will yield a [`VectorDiff::Reset`] followed by any updates of the
-    /// room list under that filter (until the next reset).
+    /// will yield a [`VectorDiff::Reset`] followed by any updates of the room
+    /// list under that filter (until the next reset).
     pub fn entries_with_dynamic_adapters(
         &self,
         page_size: usize,
@@ -269,7 +271,12 @@ impl RoomList {
                 let (values, stream) = (values, stream)
                     .filter(filter_fn)
                     .sort_by(new_sorter_lexicographic(vec![
+                        // Sort by latest event's kind, i.e. put the rooms with
+                        // a **local** latest event first.
                         Box::new(new_sorter_latest_event()),
+                        // Sort rooms by their recency (either by looking at
+                        // their latest event's timestamp, or their
+                        // `recency_stamp`).
                         Box::new(new_sorter_recency()),
                         Box::new(new_sorter_name()),
                     ]))
@@ -320,7 +327,7 @@ fn merge_stream_and_receiver(
     mut room_info_notable_update_receiver: broadcast::Receiver<RoomInfoNotableUpdate>,
 ) -> impl Stream<Item = Vec<VectorDiff<RoomListItem>>> {
     stream! {
-        pin_mut!(raw_stream);
+        let mut raw_stream = pin!(raw_stream);
 
         loop {
             select! {
@@ -348,28 +355,48 @@ fn merge_stream_and_receiver(
                 update = room_info_notable_update_receiver.recv() => {
                     match update {
                         Ok(update) => {
-                            // Filter which _reason_ can trigger an update of
-                            // the room list.
-                            //
-                            // If the update is strictly about the
-                            // `RECENCY_STAMP`, let's ignore it, because the
-                            // Latest Event type is used to sort the room list
-                            // by recency already. We don't want to trigger an
-                            // update because of `RECENCY_STAMP`.
-                            //
-                            // If the update contains more reasons than
-                            // `RECENCY_STAMP`, then it's fine. That's why we
-                            // are using `==` instead of `contains`.
-                            if update.reasons == RoomInfoNotableUpdateReasons::RECENCY_STAMP {
-                                continue;
+                            // Drain every update already sitting in the
+                            // channel, so that a burst of updates (e.g. a
+                            // batch of freshly computed latest events, or the
+                            // per-room updates of one sync response) is
+                            // processed as a single batch of `VectorDiff`s.
+                            // Each room is kept once, in arrival order.
+                            let mut room_ids = Vec::new();
+                            let mut seen = std::collections::HashSet::new();
+                            let mut add = |update: RoomInfoNotableUpdate| {
+                                if seen.insert(update.room_id.clone()) {
+                                    room_ids.push(update.room_id);
+                                }
+                            };
+
+                            add(update);
+
+                            loop {
+                                use broadcast::error::TryRecvError;
+
+                                match room_info_notable_update_receiver.try_recv() {
+                                    Ok(update) => add(update),
+                                    Err(TryRecvError::Lagged(n)) => {
+                                        error!(number_of_missed_updates = n, "Lag when receiving room info notable update");
+                                    }
+                                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                                }
                             }
 
-                            // Emit a `VectorDiff::Set` for the specific rooms.
-                            if let Some(index) = current_values.iter().position(|room| room.room_id() == update.room_id) {
-                                let mut room = current_values[index].clone();
-                                room.refresh_cached_data();
+                            // Emit a `VectorDiff::Set` for each updated room.
+                            let mut diffs = Vec::with_capacity(room_ids.len());
 
-                                yield vec![VectorDiff::Set { index, value: room }];
+                            for room_id in room_ids {
+                                if let Some(index) = current_values.iter().position(|room| room.room_id() == room_id) {
+                                    let room = &mut current_values[index];
+                                    room.refresh_cached_data();
+
+                                    diffs.push(VectorDiff::Set { index, value: room.clone() });
+                                }
+                            }
+
+                            if !diffs.is_empty() {
+                                yield diffs;
                             }
                         }
 
@@ -398,9 +425,9 @@ fn merge_stream_and_receiver(
 /// See [`RoomList::loading_state`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RoomListLoadingState {
-    /// The [`RoomList`] has not been loaded yet, i.e. a sync might run
-    /// or not run at all, there is nothing to show in this `RoomList` yet.
-    /// It's a good opportunity to show a placeholder to the user.
+    /// The [`RoomList`] has not been loaded yet, i.e. a sync might run or not
+    /// run at all, there is nothing to show in this `RoomList` yet. It's a good
+    /// opportunity to show a placeholder to the user.
     ///
     /// From [`Self::NotLoaded`], it's only possible to move to
     /// [`Self::Loaded`].
@@ -421,9 +448,9 @@ pub enum RoomListLoadingState {
         ///
         /// It does not mean that there are exactly this many rooms to display.
         /// The room entries are represented by [`RoomListItem`]. The room entry
-        /// might have been synced or not synced yet, but we know for sure
-        /// (from the server), that there will be this amount of rooms in the
-        /// list at the end.
+        /// might have been synced or not synced yet, but we know for sure (from
+        /// the server), that there will be this amount of rooms in the list at
+        /// the end.
         ///
         /// Note that it's an `Option`, because it may be possible that the
         /// server did miss to send us this value. It's up to you, dear reader,
@@ -480,10 +507,10 @@ impl RoomListDynamicEntriesController {
         let limit = self.limit.get();
 
         if limit < max {
-            // With this logic, it is possible that `limit` becomes greater than `max` if
-            // `max - limit < page_size`, and that's perfectly fine. It's OK to have a
-            // `limit` greater than `max`, but it's not OK to increase the limit
-            // indefinitely.
+            // With this logic, it is possible that `limit` becomes greater than
+            // `max` if `max - limit < page_size`, and that's perfectly fine.
+            // It's OK to have a `limit` greater than `max`, but it's not OK to
+            // increase the limit indefinitely.
             self.limit.set_if_not_eq(limit + self.page_size);
         }
     }

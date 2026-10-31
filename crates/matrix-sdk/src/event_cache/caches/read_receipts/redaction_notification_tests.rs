@@ -1,7 +1,6 @@
 // Copyright 2026 The Matrix.org Foundation C.I.C.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::ReadReceiptsExt as _;
 use matrix_sdk_base::read_receipts::ReadReceipts;
 use matrix_sdk_test::event_factory::EventFactory;
 use ruma::{
@@ -9,6 +8,8 @@ use ruma::{
     push::{Action, HighlightTweakValue, Tweak},
     room_id, user_id,
 };
+
+use super::ReadReceiptsExt as _;
 
 #[test]
 fn redaction_event_does_not_leave_a_notification_after_the_message_is_read() {

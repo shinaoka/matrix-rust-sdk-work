@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{copy, create_dir_all, remove_dir_all, remove_file, rename},
 };
 
@@ -69,12 +69,6 @@ enum SwiftCommand {
         /// default values provided by the Rust and Xcode toolchains.
         #[clap(long)]
         watchos_deployment_target: Option<String>,
-
-        /// Build the targets one by one instead of passing all of them
-        /// to cargo in one go, which makes it hang on lesser devices like plain
-        /// Apple Silicon M1s
-        #[clap(long)]
-        sequentially: bool,
     },
 }
 
@@ -94,18 +88,17 @@ impl SwiftArgs {
                 macos_deployment_target,
                 ios_deployment_target,
                 watchos_deployment_target,
-                sequentially,
             } => {
-                // The dev profile seems to cause crashes on some platforms so we default to
-                // reldbg (https://github.com/matrix-org/matrix-rust-sdk/issues/4009)
+                // The dev profile seems to cause crashes on some platforms so
+                // we default to reldbg
+                // (https://github.com/matrix-org/matrix-rust-sdk/issues/4009)
                 let profile =
-                    profile.as_deref().unwrap_or(if release { "small-release" } else { "reldbg" });
+                    profile.as_deref().unwrap_or(if release { STRIPPED_PROFILE } else { "reldbg" });
                 build_xcframework(
                     profile,
                     targets,
                     tier3_targets,
                     components_path,
-                    sequentially,
                     macos_deployment_target.as_deref(),
                     ios_deployment_target.as_deref(),
                     watchos_deployment_target.as_deref(),
@@ -165,11 +158,29 @@ impl Platform {
         }
     }
 }
+
+/// The profile used for release builds, whose static library gets its debug
+/// info stripped.
+const STRIPPED_PROFILE: &str = "small-release-stripped";
+
 /// The base name of the FFI library.
 const FFI_LIBRARY_NAME: &str = "libmatrix_sdk_ffi.a";
 
 /// The features enabled for the FFI library.
 const FFI_FEATURES: &str = "sentry";
+
+/// Symbols the library keeps to itself, as `ld -unexported_symbols_list`
+/// patterns.
+///
+/// The bundled SQLite is compiled into the archive as ordinary global symbols.
+/// An app that also links the system `libsqlite3` (Firebase Analytics, GRDB,
+/// SQLite.swift, FMDB…) then lets the linker resolve rusqlite's references from
+/// whichever it sees first. With the iOS 27 SDK the system library exports
+/// newer functions such as `sqlite3_set_errmsg`, so the bundled copy is
+/// silently dropped and the app crashes at launch on older systems that lack
+/// the symbol. Binding the references inside the archive and hiding the
+/// definitions keeps SQLite private to the SDK.
+const PRIVATE_SYMBOL_PATTERNS: &[&str] = &["_sqlite3_*"];
 
 /// The list of targets supported by the SDK.
 const TARGETS: &[Target] = &[
@@ -274,7 +285,6 @@ fn build_xcframework(
     targets: Option<Vec<String>>,
     tier3_targets: bool,
     components_path: Option<Utf8PathBuf>,
-    sequentially: bool,
     macos_deployment_target: Option<&str>,
     ios_deployment_target: Option<&str>,
     watchos_deployment_target: Option<&str>,
@@ -310,7 +320,6 @@ fn build_xcframework(
     let platform_build_paths = build_targets(
         targets,
         profile,
-        sequentially,
         macos_deployment_target,
         ios_deployment_target,
         watchos_deployment_target,
@@ -382,15 +391,15 @@ fn build_xcframework(
 fn build_targets(
     targets: Vec<&Target>,
     profile: &str,
-    sequentially: bool,
     macos_deployment_target: Option<&str>,
     ios_deployment_target: Option<&str>,
     watchos_deployment_target: Option<&str>,
 ) -> Result<HashMap<Platform, Vec<Utf8PathBuf>>> {
     let sh = sh();
 
-    // Note: `push_env` stores environment variables and returns a RAII guard that
-    // will restore the environment variable to its previous value when dropped.
+    // Note: `push_env` stores environment variables and returns a RAII guard
+    // that will restore the environment variable to its previous value when
+    // dropped.
     let _env_guard1 =
         sh.push_env("CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS", "-Clinker=/usr/bin/clang");
     let _env_guard2 = sh.push_env("AARCH64_APPLE_IOS_CC", "/usr/bin/clang");
@@ -401,58 +410,162 @@ fn build_targets(
     let _env_guard5 =
         watchos_deployment_target.map(|target| sh.push_env("WATCHOS_DEPLOYMENT_TARGET", target));
 
-    if sequentially {
-        for target in &targets {
-            let triple = target.triple;
+    // `cargo build` would also produce the `lib` crate type, which silently
+    // disables the profile's LTO. `cargo rustc` restricts the output to the
+    // static library, but only accepts one target per invocation.
+    for target in &targets {
+        let triple = target.triple;
 
-            println!("-- Building for {}", target.description);
-            if target.status == TargetStatus::TopTier {
-                cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi --target {triple} --profile {profile} --features {FFI_FEATURES}")
-                    .run()?;
-            } else {
-                cmd!(sh, "rustup run nightly cargo build -p matrix-sdk-ffi -Zbuild-std --target {triple} --profile {profile} --features {FFI_FEATURES}")
-                    .run()?;
-            }
-        }
-    } else {
-        let (stable_targets, tier3_targets): (Vec<&Target>, Vec<&Target>) =
-            targets.iter().partition(|t| t.status == TargetStatus::TopTier);
-
-        if !stable_targets.is_empty() {
-            let triples = stable_targets.iter().map(|target| target.triple).collect::<Vec<_>>();
-            let mut cmd = cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi");
-            for triple in &triples {
-                cmd = cmd.arg("--target").arg(triple);
-            }
-            cmd = cmd.arg("--profile").arg(profile).arg("--features").arg(FFI_FEATURES);
-
-            println!("-- Building for {} targets", triples.len());
-            cmd.run()?;
-        }
-
-        if !tier3_targets.is_empty() {
-            let triples = tier3_targets.iter().map(|target| target.triple).collect::<Vec<_>>();
-            let mut cmd = cmd!(sh, "rustup run nightly cargo build -p matrix-sdk-ffi -Zbuild-std");
-            for triple in &triples {
-                cmd = cmd.arg("--target").arg(triple);
-            }
-            cmd = cmd.arg("--profile").arg(profile).arg("--features").arg(FFI_FEATURES);
-
-            println!("-- Building for {} targets with nightly -Zbuild-std", triples.len());
-            cmd.run()?;
+        println!("-- Building for {}", target.description);
+        if target.status == TargetStatus::TopTier {
+            cmd!(sh, "rustup run stable cargo rustc -p matrix-sdk-ffi --crate-type staticlib --target {triple} --profile {profile} --features {FFI_FEATURES}")
+                .run()?;
+        } else {
+            cmd!(sh, "rustup run nightly cargo rustc -p matrix-sdk-ffi --crate-type staticlib -Zbuild-std --target {triple} --profile {profile} --features {FFI_FEATURES}")
+                .run()?;
         }
     }
 
-    // a hashmap of platform to array, where each array contains all the paths for
-    // that platform.
+    // a hashmap of platform to array, where each array contains all the paths
+    // for that platform.
     let mut platform_build_paths = HashMap::new();
     for target in targets {
         let path = build_path_for_target(target, profile)?;
+        let strip_debug_info = profile == STRIPPED_PROFILE;
+        localize_private_symbols(&path, target, strip_debug_info)?;
         let paths = platform_build_paths.entry(target.platform.clone()).or_insert_with(Vec::new);
         paths.push(path);
     }
 
     Ok(platform_build_paths)
+}
+
+/// Rewrites the static library so that the symbols matching
+/// [`PRIVATE_SYMBOL_PATTERNS`] are resolved inside it and no longer exported.
+///
+/// `ld -r` merges the objects that use those symbols into one relocatable
+/// object, binding their references, and the unexported list turns the matching
+/// definitions into local symbols. That object and the untouched rest of the
+/// archive are wrapped back up under the original name.
+///
+/// `ld -r` doesn't carry the merged objects' DWARF over, only a debug map
+/// pointing at them. With `strip_debug_info` set, that debug map is left out of
+/// the merged object, as Cargo's `strip = "debuginfo"` never reaches a static
+/// library since nothing links it. Otherwise the extracted objects are kept so
+/// that `dsymutil` and debuggers can still find the debug info on this machine.
+fn localize_private_symbols(
+    library: &Utf8Path,
+    target: &Target,
+    strip_debug_info: bool,
+) -> Result<()> {
+    let sh = sh();
+    let directory = library.parent().expect("the library lives in a directory");
+    let symbols_list = directory.join("private_symbols.txt");
+    let merged_object = directory.join("libmatrix_sdk_ffi_merged.o");
+    let objects_directory = directory.join("objects");
+    let remainder = directory.join("libmatrix_sdk_ffi_remainder.a");
+
+    std::fs::write(&symbols_list, PRIVATE_SYMBOL_PATTERNS.join("\n") + "\n")?;
+
+    // Everything belonging to a crate that touches the private symbols has to
+    // be merged: a crate's codegen units share hidden symbols, which can't bind
+    // across the merge. Every other object is left alone, keeping the
+    // subsections that let consumers dead strip the library function by
+    // function when they link it statically.
+    let crates = private_symbol_crates(library)?;
+    let all_members = cmd!(sh, "ar t {library}").read()?;
+    let members: Vec<String> = all_members
+        .lines()
+        .filter(|member| crates.contains(crate_of(member)))
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if members.is_empty() {
+        return Err(
+            format!("found no object using {PRIVATE_SYMBOL_PATTERNS:?} in {library}").into()
+        );
+    }
+
+    let _ = remove_dir_all(&objects_directory);
+    create_dir_all(&objects_directory)?;
+    {
+        let _directory = sh.push_dir(&objects_directory);
+        cmd!(sh, "ar x {library}").args(&members).quiet().run()?;
+    }
+    let objects: Vec<Utf8PathBuf> =
+        members.iter().map(|member| objects_directory.join(member)).collect();
+    if let Some(missing) = objects.iter().find(|object| !object.exists()) {
+        // `ar` skips members that share a name with an earlier one.
+        return Err(format!("{missing} was not extracted from {library}").into());
+    }
+
+    copy(library, &remainder)?;
+    cmd!(sh, "ar d {remainder}").args(&members).quiet().run()?;
+
+    println!(
+        "-- Localizing private symbols for {} ({} of {} objects)",
+        target.description,
+        members.len(),
+        all_members.lines().count()
+    );
+    // Drop the debug map while merging rather than stripping the library
+    // afterwards as `strip` corrupts aws-lc's assembly objects.
+    let strip_flag = strip_debug_info.then_some("-S");
+    cmd!(sh, "ld -r -unexported_symbols_list {symbols_list} {strip_flag...} -o {merged_object}")
+        .args(&objects)
+        .quiet()
+        .run()?;
+    remove_file(library)?;
+    // Plenty of the objects carry no symbols; that's not worth a warning each.
+    cmd!(sh, "libtool -static -no_warning_for_no_symbols -o {library} {merged_object} {remainder}")
+        .run()?;
+    if strip_debug_info {
+        remove_dir_all(&objects_directory)?;
+    }
+
+    remove_file(merged_object)?;
+    remove_file(remainder)?;
+    remove_file(symbols_list)?;
+    Ok(())
+}
+
+/// The crates owning an object that defines or references one of the private
+/// symbols.
+fn private_symbol_crates(library: &Utf8Path) -> Result<HashSet<String>> {
+    let sh = sh();
+    let prefix = format!("{library}:");
+    // `nm` is noisy about the objects it has nothing to say about: it warns and
+    // exits non-zero for those carrying no symbols, and errors on the ones
+    // built by a newer LLVM than Xcode's, all of them runtime crates that can't
+    // be using the private symbols anyway.
+    let symbols = cmd!(sh, "nm -A -g {library}").ignore_status().ignore_stderr().read()?;
+
+    Ok(symbols
+        .lines()
+        .filter(|line| {
+            line.split_whitespace().next_back().is_some_and(|symbol| {
+                PRIVATE_SYMBOL_PATTERNS
+                    .iter()
+                    .any(|pattern| symbol.starts_with(pattern.trim_end_matches('*')))
+            })
+        })
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .filter_map(|line| line.split(':').next())
+        .map(|member| crate_of(member).to_owned())
+        .collect())
+}
+
+/// The crate an object file belongs to, or its own name for the objects that
+/// don't come from one, such as the bundled SQLite.
+fn crate_of(member: &str) -> &str {
+    member
+        .split_once('-')
+        .filter(|(_, rest)| {
+            rest.len() > 16
+                && rest.as_bytes()[16] == b'.'
+                && rest[..16].bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map_or(member, |(name, _)| name)
 }
 
 /// The path of the built library for a specific target and profile.
@@ -554,19 +667,22 @@ fn consolidate_modulemap_files(source: &Utf8Path, destination: &Utf8Path) -> Res
 
         if entry.file_type()?.is_file() {
             let path = entry.path();
+
             if path.extension() == Some("modulemap") {
                 let contents = std::fs::read_to_string(path)?;
+
                 if base_contents.is_none() {
                     base_contents = Some(contents);
                 } else {
                     for line in contents.lines() {
-                        if line.trim().starts_with("header ")
-                            && !extra_headers.contains(&line.to_string())
-                        {
-                            extra_headers.push(line.to_string());
+                        let line = line.trim().to_owned();
+
+                        if line.starts_with("header ") && !extra_headers.contains(&line) {
+                            extra_headers.push(line);
                         }
                     }
                 }
+
                 remove_file(path)?;
             }
         }
@@ -580,13 +696,16 @@ fn consolidate_modulemap_files(source: &Utf8Path, destination: &Utf8Path) -> Res
     let mut last_header_position: Option<usize> = None;
 
     for line in base.lines() {
+        let line = line.trim();
+
         if line.starts_with("module ") {
-            lines.push("module MatrixSDKFFI {".to_string());
+            lines.push("module MatrixSDKFFI {".to_owned());
         } else {
             if line.trim().starts_with("header ") {
                 last_header_position = Some(lines.len());
             }
-            lines.push(line.to_string());
+
+            lines.push(line.to_owned());
         }
     }
 

@@ -15,15 +15,20 @@
 
 #[cfg(feature = "e2e-encryption")]
 use std::sync::Arc;
+#[cfg(all(feature = "e2e-encryption", feature = "unstable-msc4354"))]
+use std::sync::Mutex as StdMutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     ops::Deref,
+    time::Instant,
 };
 
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::{Vector, VectorDiff};
 use futures_util::Stream;
+#[cfg(all(feature = "e2e-encryption", feature = "unstable-msc4354"))]
+use matrix_sdk_common::executor::AbortOnDrop;
 use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "experimental-x509-identity-verification")]
 use matrix_sdk_crypto::x509::{RawX509Signer, RawX509Verifier};
@@ -31,8 +36,8 @@ use matrix_sdk_crypto::x509::{RawX509Signer, RawX509Verifier};
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, EncryptionSettings, OlmError, OlmMachine,
     OlmMachineBuilder, RoomKeyMemberReloadContext, RoomKeyRotationReason, TrustRequirement,
-    store::DynCryptoStore,
-    store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
+    store::DynCryptoStore, store::types::RoomPendingKeyBundleDetails,
+    types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
 use ruma::DeviceId;
@@ -49,12 +54,11 @@ use ruma::{
     },
     profile::UserProfileUpdate,
     push::Ruleset,
-    time::Instant,
 };
 use tokio::sync::{Mutex, MutexGuard, broadcast};
 #[cfg(feature = "e2e-encryption")]
 use tokio::sync::{RwLock, RwLockReadGuard};
-use tracing::{Level, debug, enabled, info, instrument, warn};
+use tracing::{Level, debug, info, instrument, warn};
 
 #[cfg(feature = "e2e-encryption")]
 use crate::RoomMemberships;
@@ -111,8 +115,8 @@ pub struct BaseClient {
 
     /// The store used for encryption.
     ///
-    /// This field is only meant to be used for `OlmMachine` initialization.
-    /// All operations on it happen inside the `OlmMachine`.
+    /// This field is only meant to be used for `OlmMachine` initialization. All
+    /// operations on it happen inside the `OlmMachine`.
     #[cfg(feature = "e2e-encryption")]
     crypto_store: Arc<DynCryptoStore>,
 
@@ -123,7 +127,7 @@ pub struct BaseClient {
     olm_machine: Arc<RwLock<Option<OlmMachine>>>,
 
     /// Observable of when a user is ignored/unignored.
-    pub(crate) ignore_user_list_changes: SharedObservable<Vec<String>>,
+    pub(crate) ignore_user_list_changes: SharedObservable<Vec<OwnedUserId>>,
 
     /// Broadcasts the user IDs whose global profile changed during a sync.
     /// Requires the Profiles sliding sync extension to be enabled.
@@ -141,6 +145,12 @@ pub struct BaseClient {
     /// If the client should handle verification events received when syncing.
     #[cfg(feature = "e2e-encryption")]
     pub handle_verification_events: bool,
+
+    /// The task retrying to decrypt encrypted sticky events (MSC4354) as room
+    /// keys arrive. Bound to the room keys stream of the current `OlmMachine`,
+    /// so it is replaced whenever the machine is.
+    #[cfg(all(feature = "e2e-encryption", feature = "unstable-msc4354"))]
+    sticky_redecryptor: Arc<StdMutex<Option<AbortOnDrop<()>>>>,
 
     /// Whether the client supports threads or not.
     pub threading_support: ThreadingSupport,
@@ -187,8 +197,8 @@ pub enum ThreadingSupport {
         /// Enable client-wide thread subscriptions support (MSC4306 / MSC4308).
         ///
         /// This may cause filtering out of thread subscriptions, and loading
-        /// the thread subscriptions via the sliding sync extension,
-        /// when the room list service is being used.
+        /// the thread subscriptions via the sliding sync extension, when the
+        /// room list service is being used.
         with_subscriptions: bool,
     },
     /// Threading disabled.
@@ -200,7 +210,7 @@ impl BaseClient {
     ///
     /// # Arguments
     ///
-    /// * `config` - the configuration for the stores (state store, event cache
+    /// - `config` - the configuration for the stores (state store, event cache
     ///   store and crypto store).
     pub fn new(
         config: StoreConfig,
@@ -227,6 +237,8 @@ impl BaseClient {
             },
             #[cfg(feature = "e2e-encryption")]
             handle_verification_events: true,
+            #[cfg(all(feature = "e2e-encryption", feature = "unstable-msc4354"))]
+            sticky_redecryptor: Default::default(),
             threading_support,
             #[cfg(feature = "experimental-x509-identity-verification")]
             x509_signer: None,
@@ -251,7 +263,9 @@ impl BaseClient {
             state_store: BaseStateStore::new(config.state_store),
             event_cache_store: config.event_cache_store,
             media_store: config.media_store,
-            // We copy the crypto store as well as the `OlmMachine` for two reasons:
+            // We copy the crypto store as well as the `OlmMachine` for two
+            // reasons:
+            //
             // 1. The `self.crypto_store` is the same as the one used inside the `OlmMachine`.
             // 2. We need to ensure that the parent and child use the same data and caches inside
             //    the `OlmMachine` so the various ratchets and places where new randomness gets
@@ -264,6 +278,8 @@ impl BaseClient {
             room_key_recipient_strategy: self.room_key_recipient_strategy.clone(),
             decryption_settings: self.decryption_settings.clone(),
             handle_verification_events,
+            #[cfg(feature = "unstable-msc4354")]
+            sticky_redecryptor: Default::default(),
             threading_support: self.threading_support,
             #[cfg(feature = "experimental-x509-identity-verification")]
             x509_signer: self.x509_signer.clone(),
@@ -306,9 +322,9 @@ impl BaseClient {
 
     /// Get the session meta information.
     ///
-    /// If the client is currently logged in, this will return a
-    /// [`SessionMeta`] object which contains the user ID and device ID.
-    /// Otherwise it returns `None`.
+    /// If the client is currently logged in, this will return a [`SessionMeta`]
+    /// object which contains the user ID and device ID. Otherwise it returns
+    /// `None`.
     pub fn session_meta(&self) -> Option<&SessionMeta> {
         self.state_store.session_meta()
     }
@@ -370,10 +386,11 @@ impl BaseClient {
     ///
     /// # Arguments
     ///
-    /// * `session_meta` - The meta of a session that the user already has from
+    /// - `session_meta` - The meta of a session that the user already has from
     ///   a previous login call.
-    ///
-    /// * `custom_account` - A custom
+    /// - `room_load_settings` — Specify how many rooms must be restored; use
+    ///   `::default()` if you don't know which value to pick.
+    /// - `custom_account` - A custom
     ///   [`matrix_sdk_crypto::vodozemac::olm::Account`] to be used for the
     ///   identity and one-time keys of this [`BaseClient`]. If no account is
     ///   provided, a new default one or one from the store will be used. If an
@@ -381,9 +398,6 @@ impl BaseClient {
     ///   [`UserId`]/[`DeviceId`] combination, an error will be raised. This is
     ///   useful if one wishes to create identity keys before knowing the
     ///   user/device IDs, e.g., to use the identity key as the device ID.
-    ///
-    /// * `room_load_settings` — Specify how many rooms must be restored; use
-    ///   `::default()` if you don't know which value to pick.
     ///
     /// # Panics
     ///
@@ -403,6 +417,9 @@ impl BaseClient {
         self.state_store.load_rooms(&session_meta.user_id, room_load_settings).await?;
         self.state_store.load_sync_token().await?;
         self.state_store.set_session_meta(session_meta);
+
+        let ignore_user_list = self.get_ignore_user_list().await?;
+        self.ignore_user_list_changes.set_if_not_eq(ignore_user_list);
 
         #[cfg(feature = "e2e-encryption")]
         self.regenerate_olm(custom_account).await?;
@@ -434,12 +451,31 @@ impl BaseClient {
 
         let olm_machine = builder.build().await.map_err(OlmError::from)?;
 
+        // Subscribe before the machine is shared, so that no room key is
+        // missed.
+        #[cfg(feature = "unstable-msc4354")]
+        let room_keys_stream = olm_machine.store().room_keys_received_stream();
+
         *self.olm_machine.write().await = Some(olm_machine);
+
+        // Retry pending encrypted sticky events as this machine receives room
+        // keys; the task bound to the previous machine, if any, is dropped.
+        #[cfg(feature = "unstable-msc4354")]
+        {
+            let redecryptor = crate::sticky::spawn_redecryptor(
+                room_keys_stream,
+                self.olm_machine.clone(),
+                self.decryption_settings.clone(),
+                self.state_store.clone(),
+            );
+            *self.sticky_redecryptor.lock().unwrap() = Some(redecryptor);
+        }
+
         Ok(())
     }
 
-    /// Get the current, if any, sync token of the client.
-    /// This will be None if the client didn't sync at least once.
+    /// Get the current, if any, sync token of the client. This will be None if
+    /// the client didn't sync at least once.
     pub async fn sync_token(&self) -> Option<String> {
         self.state_store.sync_token.read().await.clone()
     }
@@ -453,8 +489,8 @@ impl BaseClient {
         if room.state() != RoomState::Knocked {
             let store_guard = self.state_store.lock().lock().await;
 
-            // We are no longer joined to the room, so the invite acceptance details are no
-            // longer relevant.
+            // We are no longer joined to the room, so the invite acceptance
+            // details are no longer relevant.
             #[cfg(feature = "e2e-encryption")]
             if let Some(olm_machine) = self.olm_machine().await.as_ref() {
                 olm_machine.store().clear_room_pending_key_bundle(room_id).await?
@@ -480,15 +516,15 @@ impl BaseClient {
     /// The method will create a [`Room`] object if one does not exist yet and
     /// set the state of the [`Room`] to [`RoomState::Joined`]. The [`Room`]
     /// object will be persisted in the cache. Please note that the [`Room`]
-    /// will be a stub until a sync has been received with the full room
-    /// state using [`BaseClient::receive_sync_response`].
+    /// will be a stub until a sync has been received with the full room state
+    /// using [`BaseClient::receive_sync_response`].
     ///
     /// Update the internal and cached state accordingly. Return the final Room.
     ///
     /// # Arguments
     ///
-    /// * `room_id` - The unique ID identifying the joined room.
-    /// * `inviter` - When joining this room in response to an invitation, the
+    /// - `room_id` - The unique ID identifying the joined room.
+    /// - `inviter` - When joining this room in response to an invitation, the
     ///   inviter should be recorded before sending the join request to the
     ///   server. Providing the inviter here ensures that the
     ///   [`RoomPendingKeyBundleDetails`] are stored for this room.
@@ -522,23 +558,25 @@ impl BaseClient {
     ) -> Result<Room> {
         let room = self.state_store.get_or_create_room(room_id, RoomState::Joined);
 
-        // If the state isn't `RoomState::Joined` then this means that we knew about
-        // this room before. Let's modify the existing state now.
+        // If the state isn't `RoomState::Joined` then this means that we knew
+        // about this room before. Let's modify the existing state now.
         if room.state() != RoomState::Joined {
             let store_guard = self.state_store_lock().lock().await;
 
             #[cfg(feature = "e2e-encryption")]
             {
-                // If our previous state was an invite and we're now in the joined state, this
-                // means that the user has explicitly accepted an invite. Let's
-                // remember some details about the invite.
+                // If our previous state was an invite and we're now in the
+                // joined state, this means that the user has explicitly
+                // accepted an invite. Let's remember some details about the
+                // invite.
                 //
-                // This is somewhat of a workaround for our lack of cryptographic membership.
-                // Later on we will decide if historic room keys should be accepted
-                // based on this info. If a user has accepted an invite and we receive a room
-                // key bundle shortly after, we might accept it. If we don't do
-                // this, the homeserver could trick us into accepting any historic room key
-                // bundle.
+                // This is somewhat of a workaround for our lack of
+                // cryptographic membership. Later on we will decide if historic
+                // room keys should be accepted based on this info. If a user
+                // has accepted an invite and we receive a room key bundle
+                // shortly after, we might accept it. If we don't do this, the
+                // homeserver could trick us into accepting any historic room
+                // key bundle.
                 let previous_state = room.state();
                 if previous_state == RoomState::Invited
                     && let Some(inviter) = inviter
@@ -576,8 +614,9 @@ impl BaseClient {
         room_id: &RoomId,
         inviter: OwnedUserId,
     ) -> Result<Room> {
-        // Read whether the room existed, and its state, under the store lock, so a
-        // concurrent sync cannot change either between the two observations.
+        // Read whether the room existed, and its state, under the store lock,
+        // so a concurrent sync cannot change either between the two
+        // observations.
         let store_guard = self.state_store_lock().lock().await;
         let room_existed = self.state_store.room_exists(room_id);
         let room = self.state_store.get_or_create_room(room_id, RoomState::Joined);
@@ -585,9 +624,9 @@ impl BaseClient {
 
         #[cfg(feature = "e2e-encryption")]
         {
-            // See `room_joined`: the caller saw the invite before joining, so a room
-            // that a sync response has already marked as joined still counts as an
-            // accepted invite.
+            // See `room_joined`: the caller saw the invite before joining, so a
+            // room that a sync response has already marked as
+            // joined still counts as an accepted invite.
             let accepted_invite = previous_state == RoomState::Invited
                 || (room_existed && previous_state == RoomState::Joined);
             if accepted_invite && let Some(olm_machine) = self.olm_machine().await.as_ref() {
@@ -627,15 +666,15 @@ impl BaseClient {
         if room.state() != RoomState::Left {
             let store_guard = self.state_store.lock().lock().await;
 
-            // We are no longer joined to the room, so the invite acceptance details are no
-            // longer relevant.
+            // We are no longer joined to the room, so the invite acceptance
+            // details are no longer relevant.
             #[cfg(feature = "e2e-encryption")]
             if let Some(olm_machine) = self.olm_machine().await.as_ref() {
                 olm_machine.store().clear_room_pending_key_bundle(room_id).await?
             }
 
             room.update_and_save_room_info_with_store_guard(&store_guard, |mut info| {
-                info.mark_as_left_locally();
+                info.mark_as_left();
                 info.mark_state_partially_synced();
                 info.mark_members_missing_with_reason(RoomMembersMissingReason::MembershipChange);
                 (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
@@ -676,8 +715,8 @@ impl BaseClient {
     ///
     /// # Arguments
     ///
-    /// * `response` - The response that we received after a successful sync.
-    /// * `requested_required_states` - The requested required state events.
+    /// - `response` - The response that we received after a successful sync.
+    /// - `requested_required_states` - The requested required state events.
     pub async fn receive_sync_response_with_requested_required_states(
         &self,
         response: api::sync::sync_events::v3::Response,
@@ -691,10 +730,10 @@ impl BaseClient {
             return Ok(SyncResponse::default());
         }
 
-        let now = if enabled!(Level::INFO) { Some(Instant::now()) } else { None };
+        let _time = timer!(Level::INFO, "Processing a sync response");
 
-        // Acquire the state store lock and hold on to it while processing
-        // the sync response below.
+        // Acquire the state store lock and hold on to it while processing the
+        // sync response below.
         let state_store_guard = self.state_store_lock().lock().await;
 
         let user_id = self
@@ -727,9 +766,10 @@ impl BaseClient {
                     ProcessedToDeviceEvent, ToDeviceUnableToDecryptInfo,
                     ToDeviceUnableToDecryptReason,
                 };
+                use ruma::events::ToDeviceEventType;
 
-                if let Ok(Some(event_type)) = raw.get_field::<String>("type") {
-                    if event_type == "m.room.encrypted" {
+                if let Ok(Some(event_type)) = raw.get_field::<ToDeviceEventType>("type") {
+                    if event_type == ToDeviceEventType::RoomEncrypted {
                         ProcessedToDeviceEvent::UnableToDecrypt {
                             encrypted_event: raw,
                             utd_info: ToDeviceUnableToDecryptInfo {
@@ -877,8 +917,9 @@ impl BaseClient {
 
         let mut context = Context::default();
 
-        // Now that all the rooms information have been saved, update the display name
-        // of the updated rooms (which relies on information stored in the database).
+        // Now that all the rooms information have been saved, update the
+        // display name of the updated rooms (which relies on information stored
+        // in the database).
         processors::room::display_name::update_for_rooms(
             &mut context,
             &room_updates,
@@ -899,10 +940,6 @@ impl BaseClient {
         // Release the state store lock
         drop(state_store_guard);
 
-        if enabled!(Level::INFO) {
-            info!("Processed a sync response in {:?}", now.map(|now| now.elapsed()));
-        }
-
         let response = SyncResponse {
             rooms: room_updates,
             presence: response.presence.events,
@@ -922,9 +959,8 @@ impl BaseClient {
     ///
     /// # Arguments
     ///
-    /// * `room_id` - The room id this response belongs to.
-    ///
-    /// * `response` - The raw response that was received from the server.
+    /// - `room_id` - The room id this response belongs to.
+    /// - `response` - The raw response that was received from the server.
     #[instrument(skip_all, fields(?room_id))]
     pub async fn receive_all_members(
         &self,
@@ -947,9 +983,10 @@ impl BaseClient {
     ) -> Result<()> {
         if request.membership.is_some() || request.not_membership.is_some() || request.at.is_some()
         {
-            // This function assumes all members are loaded at once to optimise how display
-            // name disambiguation works. Using it with partial member list results
-            // would produce incorrect disambiguated display name entries
+            // This function assumes all members are loaded at once to optimise
+            // how display name disambiguation works. Using it with partial
+            // member list results would produce incorrect disambiguated display
+            // name entries
             return Err(Error::InvalidReceiveMembersParameters);
         }
 
@@ -982,14 +1019,15 @@ impl BaseClient {
                 }
             };
 
-            // TODO: All the actions in this loop used to be done only when the membership
-            // event was not in the store before. This was changed with the new room API,
-            // because e.g. leaving a room makes members events outdated and they need to be
-            // fetched by `members`. Therefore, they need to be overwritten here, even
-            // if they exist.
-            // However, this makes a new problem occur where setting the member events here
-            // potentially races with the sync.
-            // See <https://github.com/matrix-org/matrix-rust-sdk/issues/1205>.
+            // TODO: All the actions in this loop used to be done only when the
+            // membership event was not in the store before. This was changed
+            // with the new room API, because e.g. leaving a room makes members
+            // events outdated and they need to be fetched by `members`.
+            // Therefore, they need to be overwritten here, even if they exist.
+            // However, this makes a new problem occur where setting the member
+            // events here potentially races with the sync. See [#1205].
+            //
+            // [#1205]: https://github.com/matrix-org/matrix-rust-sdk/issues/1205
 
             #[cfg(feature = "e2e-encryption")]
             match member.membership() {
@@ -1053,10 +1091,11 @@ impl BaseClient {
 
         #[cfg(feature = "e2e-encryption")]
         if let Some(olm) = self.olm_machine().await.as_ref() {
-            // With the introduction of MSC4268, it is no longer sufficient to check for
-            // changes to session recipients when we send a message, since we may miss
-            // join/leave pairs in our view of the room state. Instead, we should rotate
-            // the room key whenever we fully reload the member list as a precaution.
+            // With the introduction of MSC4268, it is no longer sufficient to
+            // check for changes to session recipients when we send a message,
+            // since we may miss join/leave pairs in our view of the room state.
+            // Instead, we should rotate the room key whenever we fully reload
+            // the member list as a precaution.
             tracing::debug!("Rotating room key due to full member list reload");
             let rotation_reason = match members_missing_reason {
                 RoomMembersMissingReason::Unknown => RoomKeyRotationReason::FullMemberListReload,
@@ -1098,13 +1137,12 @@ impl BaseClient {
     ///
     /// The filter id can later be retrieved with the [`get_filter`] method.
     ///
-    ///
     /// # Arguments
     ///
-    /// * `filter_name` - The name that should be used to persist the filter id
+    /// - `filter_name` - The name that should be used to persist the filter id
     ///   in the store.
     ///
-    /// * `response` - The successful filter upload response containing the
+    /// - `response` - The successful filter upload response containing the
     ///   filter id.
     ///
     /// [`get_filter`]: #method.get_filter
@@ -1124,12 +1162,12 @@ impl BaseClient {
 
     /// Get the filter id of a previously uploaded filter.
     ///
-    /// *Note*: A filter will first need to be uploaded and persisted using
+    /// _Note_: A filter will first need to be uploaded and persisted using
     /// [`receive_filter_upload`].
     ///
     /// # Arguments
     ///
-    /// * `filter_name` - The name of the filter that was previously used to
+    /// - `filter_name` - The name of the filter that was previously used to
     ///   persist the filter.
     ///
     /// [`receive_filter_upload`]: #method.receive_filter_upload
@@ -1225,8 +1263,8 @@ impl BaseClient {
     /// Get the push rules.
     ///
     /// Gets the push rules previously processed, otherwise get them from the
-    /// store. As a fallback, uses [`Ruleset::server_default`] if the user
-    /// is logged in.
+    /// store. As a fallback, uses [`Ruleset::server_default`] if the user is
+    /// logged in.
     pub(crate) async fn get_push_rules(
         &self,
         global_account_data_processor: &processors::account_data::Global,
@@ -1251,9 +1289,25 @@ impl BaseClient {
         }
     }
 
+    /// Gets the ignore user list.
+    ///
+    /// Retrieves the ignored users from the state store, returning an empty
+    /// list if no ignored user list has been stored.
+    async fn get_ignore_user_list(&self) -> Result<Vec<OwnedUserId>> {
+        let Some(raw) =
+            self.state_store.get_account_data_event_static::<IgnoredUserListEventContent>().await?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let event = raw.deserialize()?;
+
+        Ok(event.content.ignored_users.into_keys().collect())
+    }
+
     /// Returns a subscriber that publishes an event every time the ignore user
     /// list changes
-    pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<Vec<String>> {
+    pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<Vec<OwnedUserId>> {
         self.ignore_user_list_changes.subscribe()
     }
 
@@ -1398,9 +1452,9 @@ impl BaseClient {
 /// For example, if a sync requests the `m.room.encryption` state event, and the
 /// server replies with nothing, if means the room **is not** encrypted. Without
 /// knowing which state event was required by the sync, it is impossible to
-/// interpret the absence of state event from the server as _the room's
-/// encryption state is **not encrypted**_ or _the room's encryption state is
-/// **unknown**_.
+/// interpret the absence of state event from the server as
+/// _the room's encryption state is **not encrypted**_ or
+/// _the room's encryption state is **unknown**_.
 #[derive(Debug, Default)]
 pub struct RequestedRequiredStates {
     default: Vec<(StateEventType, String)>,
@@ -1427,12 +1481,13 @@ impl RequestedRequiredStates {
 
 impl From<&v5::Request> for RequestedRequiredStates {
     fn from(request: &v5::Request) -> Self {
-        // The following information is missing in the MSC4186 at the time of writing
-        // (2025-03-12) but: the `required_state`s from all lists and from all room
-        // subscriptions are combined by doing an union.
+        // The following information is missing in the MSC4186 at the time of
+        // writing (2025-03-12) but: the `required_state`s from all lists and
+        // from all room subscriptions are combined by doing an union.
         //
         // Thus, we can do the same here, put the union in `default` and keep
-        // `for_rooms` empty. The `Self::for_room` will automatically do the fallback.
+        // `for_rooms` empty. The `Self::for_room` will automatically do the
+        // fallback.
         let mut default = BTreeSet::new();
 
         for list in request.lists.values() {
@@ -1464,13 +1519,10 @@ pub enum DmRoomDefinition {
 mod tests {
     use std::collections::HashMap;
 
-    use assert_matches2::assert_let;
-    #[cfg(feature = "e2e-encryption")]
-    use assert_matches2::assert_matches;
     use futures_util::FutureExt as _;
     use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use matrix_sdk_test::{
-        BOB, InvitedRoomBuilder, LeftRoomBuilder, SyncResponseBuilder, async_test,
+        InvitedRoomBuilder, LeftRoomBuilder, SyncResponseBuilder, User, async_test,
         event_factory::EventFactory, ruma_response_from_json,
     };
     #[cfg(feature = "unstable-msc4426")]
@@ -1487,6 +1539,7 @@ mod tests {
         user_id,
     };
     use serde_json::{json, value::to_raw_value};
+    use strass::assert_let;
 
     use super::{BaseClient, RequestedRequiredStates};
     use crate::{
@@ -1610,7 +1663,8 @@ mod tests {
         {
             let requested_required_states = RequestedRequiredStates::from(&request);
 
-            // Union of state events, all in `default`, still nothing in `for_rooms`.
+            // Union of state events, all in `default`, still nothing in
+            // `for_rooms`.
             assert_eq!(
                 requested_required_states.default,
                 &[
@@ -1638,7 +1692,8 @@ mod tests {
         {
             let requested_required_states = RequestedRequiredStates::from(&request);
 
-            // Union of state events, all in `default`, still nothing in `for_rooms`.
+            // Union of state events, all in `default`, still nothing in
+            // `for_rooms`.
             assert_eq!(
                 requested_required_states.default,
                 &[
@@ -1868,8 +1923,8 @@ mod tests {
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 
-        // When I process the result of a /members request that only contains an invited
-        // member,
+        // When I process the result of a /members request that only contains an
+        // invited member,
         let request = api::membership::get_member_events::v3::Request::new(room_id.to_owned());
 
         let raw_member_event = json!({
@@ -1926,7 +1981,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Preamble: let the SDK know about the room, and that the invited user left it.
+        // Preamble: let the SDK know about the room, and that the invited user
+        // left it.
         let f = EventFactory::new().sender(user_id);
         let mut sync_builder = SyncResponseBuilder::new();
         let response = sync_builder
@@ -2132,16 +2188,16 @@ mod tests {
         let f = EventFactory::new();
         let mut sync_builder = SyncResponseBuilder::new();
         let response = sync_builder
-            .add_global_account_data(f.ignored_user_list([(*BOB).into()]))
+            .add_global_account_data(f.ignored_user_list([User::Bob.into()]))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 
         assert_let!(Some(ignored) = subscriber.next().await);
-        assert_eq!(ignored, [BOB.to_string()]);
+        assert_eq!(ignored, [User::Bob]);
 
         // Receive the same response.
         let response = sync_builder
-            .add_global_account_data(f.ignored_user_list([(*BOB).into()]))
+            .add_global_account_data(f.ignored_user_list([User::Bob.into()]))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 
@@ -2155,6 +2211,63 @@ mod tests {
 
         assert_let!(Some(ignored) = subscriber.next().await);
         assert!(ignored.is_empty());
+    }
+
+    async fn store_with_ignored_user() -> StoreConfig {
+        let store = StoreConfig::new(CrossProcessLockConfig::SingleProcess);
+        let user_id = user_id!("@alice:example.org");
+
+        let client =
+            BaseClient::new(store.clone(), ThreadingSupport::Disabled, DmRoomDefinition::default());
+
+        client
+            .activate(
+                SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
+                RoomLoadSettings::default(),
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Ignore a user.
+        let event_factory = EventFactory::new();
+        let response = SyncResponseBuilder::new()
+            .add_global_account_data(event_factory.ignored_user_list([User::Bob.into()]))
+            .build_sync_response();
+
+        client.receive_sync_response(response).await.unwrap();
+
+        store
+    }
+
+    #[async_test]
+    async fn test_ignored_user_list_restored_on_activation() {
+        let store = store_with_ignored_user().await;
+        let user_id = user_id!("@alice:example.org");
+
+        // New client with the previously populated store.
+        let client =
+            BaseClient::new(store, ThreadingSupport::Disabled, DmRoomDefinition::default());
+
+        // Acrivation should hydrate the ignored user list.
+        client
+            .activate(
+                SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
+                RoomLoadSettings::default(),
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut subscriber = client.subscribe_to_ignore_user_list_changes();
+
+        // The ignored user list is restored from the store.
+        assert_eq!(subscriber.get(), [User::Bob]);
+
+        // No changes occurred after subscribing.
+        assert!(subscriber.next().now_or_never().is_none());
     }
 
     #[async_test]
@@ -2186,8 +2299,9 @@ mod tests {
         client.receive_sync_response(response).await.unwrap();
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Invited);
 
-        // The inviter was read before the `/join` request, but the sync response
-        // carrying our own join is processed before the join completes.
+        // The inviter was read before the `/join` request, but the sync
+        // response carrying our own join is processed before the join
+        // completes.
         sync_builder.clear();
         let response = sync_builder
             .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id))
@@ -2200,11 +2314,11 @@ mod tests {
             .await
             .expect("We should be able to mark a room as joined");
 
-        // We still accepted an invite from the inviter, so the details are kept.
+        // We still accepted an invite from the inviter, so the details are
+        // kept.
         assert_eq!(joined_room.state(), RoomState::Joined);
-        assert_matches!(
-            client.get_pending_key_bundle_details_for_room(room_id).await,
-            Ok(Some(details))
+        assert_let!(
+            Ok(Some(details)) = client.get_pending_key_bundle_details_for_room(room_id).await
         );
         assert_eq!(details.inviter, inviter);
     }
@@ -2257,8 +2371,8 @@ mod tests {
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 
-        // Let us first check the initial state, we should have a room in the invite
-        // state.
+        // Let us first check the initial state, we should have a room in the
+        // invite state.
         let invited_room = client
             .get_room(known_room_id)
             .expect("The sync should have created a room in the invited state");
@@ -2276,14 +2390,13 @@ mod tests {
 
         // Yup, we now have some invite details.
         assert_eq!(joined_room.state(), RoomState::Joined);
-        assert_matches!(
-            client.get_pending_key_bundle_details_for_room(known_room_id).await,
-            Ok(Some(details))
+        assert_let!(
+            Ok(Some(details)) = client.get_pending_key_bundle_details_for_room(known_room_id).await
         );
         assert_eq!(details.inviter, user_id);
 
-        // If we didn't know about the room before the join, we assume that there wasn't
-        // an invite and we don't record the timestamp.
+        // If we didn't know about the room before the join, we assume that
+        // there wasn't an invite and we don't record the timestamp.
         assert!(client.get_room(unknown_room_id).is_none());
         let unknown_room = client
             .room_joined(unknown_room_id, Some(user_id.to_owned()))

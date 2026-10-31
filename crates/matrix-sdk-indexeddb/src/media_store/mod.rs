@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-// Allow dead code here, as this module is still in the process
-// of being developed, so some functions will be used later on.
-// Once development is complete, we can remove this line and
-// clean up any unused code.
+// Allow dead code here, as this module is still in the process of being
+// developed, so some functions will be used later on. Once development is
+// complete, we can remove this line and clean up any unused code.
 #![allow(dead_code)]
 
 mod builder;
@@ -24,7 +23,7 @@ mod migrations;
 mod serializer;
 mod transaction;
 mod types;
-use std::{rc::Rc, time::Duration};
+use std::{collections::BTreeMap, rc::Rc, time::Duration};
 
 pub use builder::IndexeddbMediaStoreBuilder;
 pub use error::IndexeddbMediaStoreError;
@@ -45,7 +44,7 @@ use matrix_sdk_base::{
     },
     timer,
 };
-use ruma::{MilliSecondsSinceUnixEpoch, MxcUri, time::SystemTime};
+use ruma::{MilliSecondsSinceUnixEpoch, MxcUri, OwnedMxcUri, time::SystemTime};
 use tracing::instrument;
 
 use crate::{
@@ -57,9 +56,8 @@ use crate::{
     transaction::TransactionError,
 };
 
-/// A type for providing an IndexedDB implementation of [`MediaStore`][1].
-/// This is meant to be used as a backend to [`MediaStore`][1] in browser
-/// contexts.
+/// A type for providing an IndexedDB implementation of [`MediaStore`][1]. This
+/// is meant to be used as a backend to [`MediaStore`][1] in browser contexts.
 ///
 /// [1]: matrix_sdk_base::media::store::MediaStore
 #[derive(Debug, Clone)]
@@ -68,8 +66,8 @@ pub struct IndexeddbMediaStore {
     inner: Rc<Database>,
     // A serializer with functionality tailored to `IndexeddbMediaStore`
     serializer: IndexedTypeSerializer,
-    // A service for conveniently delegating media-related queries to an `MediaStoreInner`
-    // implementation
+    // A service for conveniently delegating media-related queries to an
+    // `MediaStoreInner` implementation
     media_service: MediaService,
 }
 
@@ -81,8 +79,8 @@ impl IndexeddbMediaStore {
     }
 
     /// Initializes a new transaction on the underlying IndexedDB database and
-    /// returns a handle which can be used to combine database operations
-    /// into an atomic unit.
+    /// returns a handle which can be used to combine database operations into
+    /// an atomic unit.
     pub fn transaction<'a>(
         &'a self,
         stores: &[&str],
@@ -182,7 +180,8 @@ impl MediaStore for IndexeddbMediaStore {
         let transaction =
             self.transaction(&[MediaMetadata::OBJECT_STORE], TransactionMode::Readwrite)?;
         if let Some(mut metadata) = transaction.get_media_metadata_by_id(from).await? {
-            // delete before adding, in case `from` and `to` generate the same key
+            // delete before adding, in case `from` and `to` generate the same
+            // key
             transaction.delete_media_metadata_by_id(from).await?;
             metadata.request_parameters = to.clone();
             transaction.add_media_metadata(&metadata)?;
@@ -266,7 +265,32 @@ impl MediaStore for IndexeddbMediaStore {
     }
 
     async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
-        Ok(None)
+        self.transaction(&[MediaMetadata::OBJECT_STORE], TransactionMode::Readonly)?
+            .get_cache_size(IgnoreMediaRetentionPolicy::No)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[instrument(skip_all)]
+    async fn media_sizes(
+        &self,
+        uris: &[OwnedMxcUri],
+    ) -> Result<BTreeMap<OwnedMxcUri, u64>, Self::Error> {
+        let _timer = timer!("method");
+
+        let transaction =
+            self.transaction(&[MediaMetadata::OBJECT_STORE], TransactionMode::Readonly)?;
+        let mut sizes = BTreeMap::new();
+
+        for uri in uris {
+            let metadata = transaction.get_media_metadata_by_uri(uri).await?;
+            if !metadata.is_empty() {
+                let size: usize = metadata.iter().map(|media| media.content_size).sum();
+                sizes.insert(uri.clone(), size as u64);
+            }
+        }
+
+        Ok(sizes)
     }
 
     async fn close(&self) -> Result<(), Self::Error> {

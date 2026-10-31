@@ -210,7 +210,8 @@ pub enum RoomKeyRotationReason {
     EncryptionSettingsChanged,
     /// An explicit discard invalidated the prior session.
     ExplicitDiscard,
-    /// A full member-list reload invalidated the prior session, but its trigger is unknown.
+    /// A full member-list reload invalidated the prior session, but its trigger
+    /// is unknown.
     FullMemberListReload,
     /// A new Sliding Sync room subscription forced a full member-list reload.
     RoomSubscription,
@@ -315,7 +316,8 @@ pub struct RoomKeyMemberReloadDiagnostic {
     pub members_were_synced_before_invalidation: Option<bool>,
     /// Invalidation count bucket: 0, 1, 2-5, 6-20, or 21+.
     pub invalidation_count_bucket: u8,
-    /// Time from first invalidation to reload, when process-local provenance exists.
+    /// Time from first invalidation to reload, when process-local provenance
+    /// exists.
     pub invalidation_age_ms: Option<u64>,
     /// Homeserver `/members` request duration, when available.
     pub request_elapsed_ms: Option<u64>,
@@ -931,6 +933,10 @@ impl RoomKeyDiagnosticHub {
         RoomKeyRotationClassification { reason, discard_elapsed_ms: None }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one named parameter per rotation diagnostic field"
+    )]
     pub(crate) fn emit_rotation(
         &self,
         room_id: &RoomId,
@@ -973,6 +979,10 @@ impl RoomKeyDiagnosticHub {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "forwards every emit_rotation diagnostic field unchanged"
+    )]
     pub(crate) async fn emit_rotation_and_persist(
         &self,
         store: &Store,
@@ -1207,8 +1217,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ruma::{OwnedTransactionId, device_id, room_id, user_id};
+
+    use super::*;
 
     #[test]
     fn aliases_are_stable_per_machine_and_restart_from_one() {

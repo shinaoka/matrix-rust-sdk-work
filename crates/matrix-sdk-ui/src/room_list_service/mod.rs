@@ -60,13 +60,14 @@ mod state;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    pin::pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use async_stream::stream;
 use eyeball::{SharedObservable, Subscriber};
-use futures_util::{Stream, StreamExt, pin_mut};
+use futures_util::{Stream, StreamExt};
 use matrix_sdk::{
     Client, Error as SlidingSyncError, Room, SlidingSync, SlidingSyncList, SlidingSyncMode,
     event_cache::EventCacheError, sliding_sync::PollTimeout, timeout::timeout,
@@ -109,8 +110,8 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::SpaceChild, "*"),
     // Required for live location sharing to work - beacon events reference this state.
     (StateEventType::BeaconInfo, "*"),
-    // Required for `Room::retention`/`Room::effective_retention` (MSC1763) to see
-    // room-level retention overrides.
+    // Required for `Room::retention`/`Room::effective_retention` (MSC1763) to
+    // see room-level retention overrides.
     (StateEventType::RoomRetention, ""),
 ];
 
@@ -332,6 +333,14 @@ impl RoomListService {
                 enabled: Some(true),
             }));
 
+        #[cfg(feature = "unstable-msc4354")]
+        {
+            builder = builder.with_sticky_events_extension(assign!(
+                http::request::StickyEvents::default(),
+                { enabled: Some(true) }
+            ));
+        }
+
         match client.enabled_thread_subscriptions().await {
             Ok(true) => {
                 debug!("Client requested thread subscriptions extension");
@@ -359,10 +368,11 @@ impl RoomListService {
         }
 
         if share_pos {
-            // The e2ee extensions aren't enabled in this sliding sync instance, and this is
-            // the only one that could be used from a different process. So it's
-            // fine to enable position sharing (i.e. reloading it from disk),
-            // since it's always exclusively owned by the current process.
+            // The e2ee extensions aren't enabled in this sliding sync instance,
+            // and this is the only one that could be used from a different
+            // process. So it's fine to enable position sharing (i.e. reloading
+            // it from disk), since it's always exclusively owned by the current
+            // process.
             debug!("Enabling `share_pos` for the room list sliding sync");
             builder = builder.share_pos();
         }
@@ -383,17 +393,21 @@ impl RoomListService {
                         client.user_id(),
                     ))
                     .filters(Some(assign!(http::request::ListFilters::default(), {
-                        // As defined in the [SlidingSync MSC](https://github.com/matrix-org/matrix-spec-proposals/blob/9450ced7fb9cf5ea9077d029b3adf36aebfa8709/proposals/3575-sync.md?plain=1#L444)
-                        // If unset, both invited and joined rooms are returned. If false, no invited rooms are
-                        // returned. If true, only invited rooms are returned.
+                        // As defined in the [SlidingSync MSC] If unset, both
+                        // invited and joined rooms are returned. If false, no
+                        // invited rooms are returned. If true, only invited
+                        // rooms are returned.
+                        //
+                        // [SlidingSync MSC]: https://github.com/matrix-org/matrix-spec-proposals/blob/9450ced7fb9cf5ea9077d029b3adf36aebfa8709/proposals/3575-sync.md?plain=1#L444
                         is_invite: None,
                     })))
                     .requires_timeout(move |request_generator| {
-                        // We want Sliding Sync to apply the poll + network timeout —i.e. to do the
-                        // long-polling— in some particular cases. Let's define them.
+                        // We want Sliding Sync to apply the poll + network
+                        // timeout —i.e. to do the long-polling— in some
+                        // particular cases. Let's define them.
                         match observable_state.get() {
-                            // These are the states where we want an immediate response from the
-                            // server, with no long-polling.
+                            // These are the states where we want an immediate
+                            // response from the server, with no long-polling.
                             State::Init
                             | State::SettingUp
                             | State::Recovering
@@ -420,9 +434,6 @@ impl RoomListService {
             .map(Arc::new)
             .map_err(Error::SlidingSync)?;
 
-        // Eagerly subscribe the event cache to sync responses.
-        client.event_cache().subscribe()?;
-
         Ok(Self {
             client,
             sliding_sync,
@@ -439,14 +450,14 @@ impl RoomListService {
     /// It's the main method of this entire API. Calling `sync` allows to
     /// receive updates on the room list: new rooms, rooms updates etc. Those
     /// updates can be read with `RoomList::entries` for example. This method
-    /// returns a [`Stream`] where produced items only hold an empty value
-    /// in case of a sync success, otherwise an error.
+    /// returns a [`Stream`] where produced items only hold an empty value in
+    /// case of a sync success, otherwise an error.
     ///
     /// The `RoomListService`' state machine is run by this method.
     ///
     /// Stopping the [`Stream`] (i.e. by calling [`Self::stop_sync`]), and
-    /// calling [`Self::sync`] again will resume from the previous state of
-    /// the state machine.
+    /// calling [`Self::sync`] again will resume from the previous state of the
+    /// state machine.
     ///
     /// This should be used only for testing. In practice, most users should be
     /// using the [`SyncService`](crate::sync_service::SyncService) instead.
@@ -454,10 +465,10 @@ impl RoomListService {
     pub fn sync(&self) -> impl Stream<Item = Result<(), Error>> + '_ {
         stream! {
             let sync = self.sliding_sync.sync();
-            pin_mut!(sync);
+            let mut sync = pin!(sync);
 
-            // This is a state machine implementation.
-            // Things happen in this order:
+            // This is a state machine implementation. Things happen in this
+            // order:
             //
             // 1. The next state is calculated,
             // 2. The actions associated to the next state are run,
@@ -563,9 +574,9 @@ impl RoomListService {
     ///
     /// It's of utter importance to call this method rather than stop polling
     /// the `Stream` returned by [`Self::sync`] because it will force the
-    /// cancellation and exit the sync loop, i.e. it will cancel any
-    /// in-flight HTTP requests, cancel any pending futures etc. and put the
-    /// service into a termination state.
+    /// cancellation and exit the sync loop, i.e. it will cancel any in-flight
+    /// HTTP requests, cancel any pending futures etc. and put the service into
+    /// a termination state.
     ///
     /// Ideally, one wants to consume the `Stream` returned by [`Self::sync`]
     /// until it returns `None`, because of [`Self::stop_sync`], so that it
@@ -592,10 +603,10 @@ impl RoomListService {
 
         // Usually, when the session expires, it leads the state to be `Error`,
         // thus some actions (like refreshing the lists) are executed. However,
-        // if the sync loop has been stopped manually, the state is `Terminated`, and
-        // when the session is forced to expire, the state remains `Terminated`, thus
-        // the actions aren't executed as expected. Consequently, let's update the
-        // state.
+        // if the sync loop has been stopped manually, the state is
+        // `Terminated`, and when the session is forced to expire, the state
+        // remains `Terminated`, thus the actions aren't executed as expected.
+        // Consequently, let's update the state.
         if let State::Terminated { from } = self.state_machine.get() {
             self.state_machine.set(State::Error { from });
         }
@@ -615,8 +626,8 @@ impl RoomListService {
             // Ensure the `SyncIndicator` is always hidden to start with.
             yield SyncIndicator::Hide;
 
-            // Let's not wait for an update to happen. The `SyncIndicator` must be
-            // computed as fast as possible.
+            // Let's not wait for an update to happen. The `SyncIndicator` must
+            // be computed as fast as possible.
             let mut current_state = state.next_now();
 
             loop {
@@ -632,17 +643,17 @@ impl RoomListService {
 
                 // `state.next().await` has a maximum of `yield_delay` time to execute…
                 let next_state = match timeout(state.next(), yield_delay).await {
-                    // A new state has been received before `yield_delay` time. The new
-                    // `sync_indicator` value won't be yielded.
+                    // A new state has been received before `yield_delay` time.
+                    // The new `sync_indicator` value won't be yielded.
                     Ok(next_state) => next_state,
 
-                    // No new state has been received before `yield_delay` time. The
-                    // `sync_indicator` value can be yielded.
+                    // No new state has been received before `yield_delay` time.
+                    // The `sync_indicator` value can be yielded.
                     Err(_) => {
                         yield sync_indicator;
 
-                        // Now that `sync_indicator` has been yielded, let's wait on
-                        // the next state again.
+                        // Now that `sync_indicator` has been yielded, let's
+                        // wait on the next state again.
                         state.next().await
                     }
                 };
@@ -684,7 +695,8 @@ impl RoomListService {
         self.list_for(ALL_ROOMS_LIST_NAME).await
     }
 
-    /// Subscribe to coarse evidence of successfully committed `all_rooms` responses.
+    /// Subscribe to coarse evidence of successfully committed `all_rooms`
+    /// responses.
     pub fn committed_all_rooms_response(&self) -> Subscriber<CommittedAllRoomsResponse> {
         self.committed_all_rooms_response.subscribe()
     }
@@ -706,7 +718,8 @@ impl RoomListService {
     /// [listen_to_room]: matrix_sdk::latest_events::LatestEvents::listen_to_room
     /// [`LatestEventValue`]: matrix_sdk::latest_events::LatestEventValue
     pub async fn set_room_subscriptions(&self, room_ids: &[&RoomId]) {
-        // Read the state before the await: the state machine can drift meanwhile.
+        // Read the state before the await: the state machine can drift
+        // meanwhile.
         let cancel_in_flight_request = self.must_cancel_in_flight_request();
 
         self.listen_to_latest_events(room_ids).await;
@@ -730,7 +743,8 @@ impl RoomListService {
     /// Contrary to [`Self::set_room_subscriptions`], the members of every room
     /// of `room_ids` are marked as missing, so that they are re-fetched.
     pub async fn reset_and_add_room_subscriptions(&self, room_ids: &[&RoomId]) {
-        // Read the state before the await: the state machine can drift meanwhile.
+        // Read the state before the await: the state machine can drift
+        // meanwhile.
         let cancel_in_flight_request = self.must_cancel_in_flight_request();
 
         self.listen_to_latest_events(room_ids).await;
@@ -743,16 +757,12 @@ impl RoomListService {
     }
 
     async fn listen_to_latest_events(&self, room_ids: &[&RoomId]) {
-        if !self.client.event_cache().has_subscribed() {
-            return;
-        }
-
-        let latest_events = self.client.latest_events().await;
-
-        for room_id in room_ids {
-            if let Err(error) = latest_events.listen_to_room(room_id).await {
-                // A failure here must not fail the room subscription.
-                error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+        if let Some(latest_events) = self.client.latest_events().await {
+            for room_id in room_ids {
+                if let Err(error) = latest_events.listen_to_room(room_id).await {
+                    // A failure here must not fail the room subscription.
+                    error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+                }
             }
         }
     }
@@ -780,7 +790,8 @@ impl RoomListService {
         &self,
         room_ids: &[&RoomId],
     ) -> RoomSubscriptionReconcile {
-        // Read the state before the await: the state machine can drift meanwhile.
+        // Read the state before the await: the state machine can drift
+        // meanwhile.
         let cancel_in_flight_request = self.must_cancel_in_flight_request();
 
         self.listen_to_latest_events(room_ids).await;
@@ -793,10 +804,10 @@ impl RoomListService {
         // mismatched generation/checkpoint view.
         let mut state = self.room_subscription_state.lock().unwrap();
 
-        // The standard Sliding Sync API applies the desired set; read the actual
-        // subscribed set before and after. A session expiry (UnknownPos) can clear
-        // the actual map without touching the logical active set, which shows up
-        // as an addition here.
+        // The standard Sliding Sync API applies the desired set; read the
+        // actual subscribed set before and after. A session expiry
+        // (UnknownPos) can clear the actual map without touching the
+        // logical active set, which shows up as an addition here.
         let before = self.sliding_sync.subscribed_rooms();
 
         self.sliding_sync.set_room_subscriptions(
@@ -821,8 +832,8 @@ impl RoomListService {
                 .collect();
             let checkpoints_retained = !retained_checkpoints.is_empty();
             // set_if_not_eq: an ordinary identical-set reconcile must not emit
-            // checkpoint-channel churn; an expiry repair that actually changes the
-            // map still notifies.
+            // checkpoint-channel churn; an expiry repair that actually changes
+            // the map still notifies.
             self.room_subscription_checkpoints.set_if_not_eq(Arc::new(retained_checkpoints));
             return RoomSubscriptionReconcile {
                 generation: RoomSubscriptionGeneration(state.generation),
@@ -862,7 +873,6 @@ impl RoomListService {
         }
     }
 
-
     /// The actual Sliding Sync subscribed-room set (the authoritative request
     /// state, which a session expiry can clear independently of the logical
     /// active set).
@@ -899,8 +909,10 @@ impl RoomListService {
             let mut observation_baselines = BTreeMap::new();
 
             for room_id in &state.active_rooms {
-                let sequence = if let Some(room) = self.client.get_room(room_id) {
-                    match room.event_cache().await {
+                let sequence = if let Some(room) = self.client.get_room(room_id)
+                    && let Some(event_cache) = self.client.event_cache()
+                {
+                    match event_cache.room(room.room_id()).await {
                         Ok((cache, _drop_handles)) => cache
                             .latest_sync_observation()
                             .await
@@ -936,8 +948,10 @@ impl RoomListService {
                 continue;
             }
             let baseline = iteration.observation_baselines.get(room_id).copied().unwrap_or(0);
-            let timeline = if let Some(room) = self.client.get_room(room_id) {
-                match room.event_cache().await {
+            let timeline = if let Some(room) = self.client.get_room(room_id)
+                && let Some(event_cache) = self.client.event_cache()
+            {
+                match event_cache.room(room.room_id()).await {
                     Ok((cache, _drop_handles)) => cache
                         .latest_sync_observation()
                         .await
@@ -998,9 +1012,7 @@ impl RoomListService {
     }
 }
 
-fn room_subscription_settings(
-    own_user_id: Option<&UserId>,
-) -> http::request::RoomSubscription {
+fn room_subscription_settings(own_user_id: Option<&UserId>) -> http::request::RoomSubscription {
     assign!(http::request::RoomSubscription::default(), {
         // Matrix desktop fork patch surface: expand the MSC4186 `$ME` member
         // placeholder to the authenticated user's exact state key, because some
@@ -1062,7 +1074,7 @@ pub enum SyncIndicator {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::ready, time::Duration};
+    use std::{future::ready, pin::pin, time::Duration};
 
     use eyeball_im::{Vector, VectorDiff};
     use futures_util::{FutureExt, StreamExt, pin_mut};
@@ -1075,9 +1087,9 @@ mod tests {
     use wiremock::ResponseTemplate;
 
     use super::{
-        ALL_ROOMS_LIST_NAME, Error, RoomListService,
-        RoomSubscriptionCheckpoint, RoomSubscriptionGeneration, RoomSubscriptionState, State,
-        filters::new_filter_non_left, required_state_for_user,
+        ALL_ROOMS_LIST_NAME, Error, RoomListService, RoomSubscriptionCheckpoint,
+        RoomSubscriptionGeneration, RoomSubscriptionState, State, filters::new_filter_non_left,
+        required_state_for_user,
     };
     use crate::sync_service::{State as SyncServiceState, SyncService};
 
@@ -1195,7 +1207,10 @@ mod tests {
             sync.next().await.expect("initial room-list sync result")?;
         }
 
-        let generation = room_list_service.reconcile_room_subscriptions_with_generation(&[room_id]).await.generation;
+        let generation = room_list_service
+            .reconcile_room_subscriptions_with_generation(&[room_id])
+            .await
+            .generation;
 
         {
             let _update_guard = server
@@ -1436,10 +1451,9 @@ mod tests {
         let requests = server.received_requests().await.expect("captured requests");
         let final_request = requests
             .iter()
-            .filter(|request| {
+            .rfind(|request| {
                 request.url.path() == "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync"
             })
-            .last()
             .expect("final all-rooms request");
         let final_body: Value = serde_json::from_slice(&final_request.body)?;
         assert_eq!(final_body["lists"]["all_rooms"]["ranges"], serde_json::json!([[0, 0]]));
@@ -1533,9 +1547,10 @@ mod tests {
         assert_eq!(provisional.entries().len(), 1);
         assert_eq!(provisional.entries()[0].room_id(), cache_only_room_id);
 
-        // Keep the dynamic stream alive with its cache-only Reset applied, but do not
-        // poll it after the response. This reproduces a committed consumer winning
-        // the scheduling race against authority Reset delivery.
+        // Keep the dynamic stream alive with its cache-only Reset applied, but
+        // do not poll it after the response. This reproduces a
+        // committed consumer winning the scheduling race against
+        // authority Reset delivery.
         let (entries, controller) = all_rooms.entries_with_dynamic_adapters(usize::MAX);
         pin_mut!(entries);
         assert!(controller.set_filter(Box::new(new_filter_non_left())));
@@ -2011,7 +2026,7 @@ mod tests {
         let room_list = RoomListService::new(client).await?;
 
         let sync = room_list.sync();
-        pin_mut!(sync);
+        let mut sync = pin!(sync);
 
         // Run a first sync.
         {

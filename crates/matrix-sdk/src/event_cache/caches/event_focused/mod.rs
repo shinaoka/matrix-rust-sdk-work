@@ -38,7 +38,7 @@ use matrix_sdk_base::{
     linked_chunk::OwnedLinkedChunkId,
 };
 use matrix_sdk_common::{linked_chunk::ChunkIdentifier, serde_helpers::extract_thread_root};
-use ruma::{OwnedEventId, UInt, api::Direction};
+use ruma::{OwnedEventId, OwnedRoomId, RoomId, UInt, api::Direction};
 use tokio::sync::broadcast::{Receiver, Sender};
 use tracing::{instrument, trace};
 
@@ -68,9 +68,9 @@ pub enum EventFocusThreadMode {
     /// threaded events.
     ///
     /// When the focused event is part of a thread, the linked chunk will be
-    /// focused on that thread's root. Otherwise, the linked chunk will
-    /// treat the target event itself as the thread root. Threaded events
-    /// will never be hidden.
+    /// focused on that thread's root. Otherwise, the linked chunk will treat
+    /// the target event itself as the thread root. Threaded events will never
+    /// be hidden.
     ForceThread,
 
     /// Automatically determine if the target event is part of a thread or not.
@@ -135,6 +135,7 @@ impl EventFocusedCacheState {
     /// appropriate pagination mode.
     ///
     /// Pagination tokens are stored as gaps in the linked chunk:
+    ///
     /// - Backward token (start): Gap at the front of the linked chunk.
     /// - Forward token (end): Gap at the back of the linked chunk.
     #[instrument(skip(self), fields(room_id = %self.room.room_id(), event_id = %self.focused_event_id))]
@@ -148,13 +149,13 @@ impl EventFocusedCacheState {
 
         let result = self.reload_impl().await?;
 
-        // Empty the updates_as_vector_diffs(), since it's impossible for an observer to
-        // have subscribed to this cache yet, since this code is part of the constructor
-        // flow.
+        // Empty the updates_as_vector_diffs(), since it's impossible for an
+        // observer to have subscribed to this cache yet, since this code is
+        // part of the constructor flow.
         //
-        // If we didn't empty those, such initial updates would be duplicated, since the
-        // subscriber would get the full initial list of events as diffs and as a set of
-        // initial events.
+        // If we didn't empty those, such initial updates would be duplicated,
+        // since the subscriber would get the full initial list of events as
+        // diffs and as a set of initial events.
         let _ = self.chunk.updates_as_vector_diffs();
 
         Ok(result)
@@ -205,8 +206,8 @@ impl EventFocusedCacheState {
                 let mut thread_root =
                     focused_event.and_then(|event| extract_thread_root(event.raw()));
 
-                // If there's no thread root, consider that the focused event itself is the
-                // thread root.
+                // If there's no thread root, consider that the focused event
+                // itself is the thread root.
                 if thread_root.is_none() {
                     thread_root = Some(self.focused_event_id.clone());
                 }
@@ -233,8 +234,8 @@ impl EventFocusedCacheState {
         if let Some(root_id) = thread_root {
             trace!(thread_root = %root_id, "focused event is part of a thread, setting up thread pagination");
 
-            // Check if the thread root is included in the response. Start from the
-            // beginning, since it's more likely to be around there, in that
+            // Check if the thread root is included in the response. Start from
+            // the beginning, since it's more likely to be around there, in that
             // case.
             let includes_root =
                 result.events.iter().any(|event| event.event_id() == Some(&root_id));
@@ -354,15 +355,16 @@ impl EventFocusedCacheState {
     /// Paginate backwards in this event-focused linked chunk.
     ///
     /// This finds the gap at the front of the linked chunk, fetches older
-    /// events, replaces the gap with the events, and inserts a new gap if
-    /// there are more events to fetch.
+    /// events, replaces the gap with the events, and inserts a new gap if there
+    /// are more events to fetch.
     #[instrument(skip(self), fields(room_id = %self.room.room_id()))]
     async fn paginate_backwards(&mut self, num_events: u16) -> Result<PaginationResult> {
         let room = self.room.get().ok_or(EventCacheError::ClientDropped)?;
 
         // Find the gap at the front (backward pagination token).
         let Some((gap_id, gap)) = self.first_chunk_as_gap() else {
-            // No gap at front means we've already hit the start of the timeline.
+            // No gap at front means we've already hit the start of the
+            // timeline.
             trace!("no front gap found, already at timeline start");
             return Ok(PaginationResult { events: Vec::new(), hit_end_of_timeline: true });
         };
@@ -380,8 +382,8 @@ impl EventFocusedCacheState {
             }
         };
 
-        // Events are in the reverse order, per the API contracts defined in the two
-        // fetch methods.
+        // Events are in the reverse order, per the API contracts defined in the
+        // two fetch methods.
         events.reverse();
 
         let hit_end = new_token.is_none();
@@ -466,8 +468,8 @@ impl EventFocusedCacheState {
     /// Paginate forwards in this event-focused timeline.
     ///
     /// This finds the gap at the back of the linked chunk, fetches newer
-    /// events, replaces the gap with the events, and inserts a new gap if
-    /// there are more events to fetch.
+    /// events, replaces the gap with the events, and inserts a new gap if there
+    /// are more events to fetch.
     #[instrument(skip(self), fields(room_id = %self.room.room_id()))]
     async fn paginate_forwards(&mut self, num_events: u16) -> Result<PaginationResult> {
         let room = self.room.get().ok_or(EventCacheError::ClientDropped)?;
@@ -565,6 +567,7 @@ impl EventFocusedCacheState {
 /// `/relations` API instead of `/messages`.
 ///
 /// Pagination tokens are stored as Gap items in the linked chunk itself:
+///
 /// - A gap at the **front** (first position) contains the backward pagination
 ///   token.
 /// - A gap at the **back** (last position) contains the forward pagination
@@ -573,6 +576,7 @@ impl EventFocusedCacheState {
 /// This is a shallow data structure, and can be cloned cheaply.
 #[derive(Clone)]
 pub struct EventFocusedCache {
+    room_id: OwnedRoomId,
     inner: Arc<CacheStateLock<EventFocusedStateSelector>>,
 }
 
@@ -585,12 +589,14 @@ impl EventFocusedCache {
         linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
         number_of_initial_events: u16,
     ) -> Result<Self> {
+        let room_id = room.room_id().to_owned();
         let thread_mode = key.thread_mode;
         let cache_state = state
             .try_insert_once_with(
-                EventFocusedStateSelector::new(room.room_id().to_owned(), key.clone()),
+                EventFocusedStateSelector::new(room_id.clone(), key.clone()),
                 |store_guard| async {
-                    // Keep the existing cross-process store lock through initialization.
+                    // Keep the existing cross-process store lock through
+                    // initialization.
                     let _store_guard = store_guard;
                     let mut cache = EventFocusedCacheState {
                         room,
@@ -606,15 +612,21 @@ impl EventFocusedCache {
                         update_sender: Sender::new(32),
                         linked_chunk_update_sender,
                     };
-                    // Register only after initialization succeeds. Dropping or failing
-                    // the context request must not strand a state without a cache handle.
+                    // Register only after initialization succeeds. Dropping or
+                    // failing the context request must not
+                    // strand a state without a cache handle.
                     cache.start_from(number_of_initial_events, thread_mode).await?;
                     Ok(cache)
                 },
             )
             .await?;
 
-        Ok(Self { inner: Arc::new(cache_state) })
+        Ok(Self { room_id, inner: Arc::new(cache_state) })
+    }
+
+    /// Get the room ID of this cache.
+    pub fn room_id(&self) -> &RoomId {
+        &self.room_id
     }
 
     /// Read all current events.
@@ -677,10 +689,11 @@ impl EventFocusedCache {
     ) -> Result<()> {
         let mut state = self.inner.write().await?;
 
-        // `Redecryptor` tried to resolve the events partly based on in-store events.
-        // Because this cache doesn't persist anything in the store, `Redecryptor` is
-        // unable to resolve some events present here. To address that, let's try to
-        // resolve events here with the current `EventLinkedChunk`.
+        // `Redecryptor` tried to resolve the events partly based on in-store
+        // events. Because this cache doesn't persist anything in the store,
+        // `Redecryptor` is unable to resolve some events present here. To
+        // address that, let's try to resolve events here with the current
+        // `EventLinkedChunk`.
         let new_resolved_events = resolved_events.try_resolve_events(&state.chunk);
 
         if state.chunk.replace_utds(&new_resolved_events) {

@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
 #[cfg(test)]
 use std::sync::{
     Mutex as StdMutex, OnceLock,
     atomic::{AtomicBool, Ordering},
+};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 use eyeball::{ObservableWriteGuard, SharedObservable, Subscriber};
@@ -66,14 +65,14 @@ pub struct ThreadListItem {
     /// The latest event in the thread (i.e. the most recent reply), if
     /// available.
     ///
-    /// This is initially populated from the server's bundled thread summary
-    /// and is updated in real time as new events arrive via sync.
+    /// This is initially populated from the server's bundled thread summary and
+    /// is updated in real time as new events arrive via sync.
     pub latest_event: Option<ThreadListItemEvent>,
 
     /// The number of replies in this thread (excluding the root event).
     ///
-    /// This is initially populated from the server's bundled thread summary
-    /// and is updated in real time as new events arrive via sync.
+    /// This is initially populated from the server's bundled thread summary and
+    /// is updated in real time as new events arrive via sync.
     pub num_replies: u32,
 }
 
@@ -243,48 +242,40 @@ impl ThreadListService {
     /// Creates a new [`ThreadListService`] for the given room.
     ///
     /// This immediately spawns a background task that listens to the room's
-    /// event cache for live updates. The task self-bootstraps by performing
-    /// the async event cache subscription internally.
+    /// event cache for live updates. The task self-bootstraps by performing the
+    /// async event cache subscription internally.
     pub fn new(room: Room) -> Self {
         let items: Arc<Mutex<ObservableVector<ThreadListItem>>> =
             Arc::new(Mutex::new(ObservableVector::new()));
         let proofs = Arc::new(Mutex::new(HashMap::new()));
 
-        // Eagerly subscribe the event cache to sync responses (this is a cheap,
-        // synchronous, idempotent call).
-        if let Err(e) = room.client().event_cache().subscribe() {
-            warn!("ThreadListService: failed to subscribe event cache to sync: {e}");
-        }
+        let client = room.client();
 
-        let event_cache_task = room
-            .client()
+        let event_cache_task = client
             .task_monitor()
             .spawn_infinite_task("thread_list_service::event_cache_listener", {
                 let room = room.clone();
                 let items = items.clone();
+                let client = client.clone();
                 let proofs = proofs.clone();
                 async move {
                     // Obtain the room event cache and a subscriber.
-                    let (_event_cache_drop, mut subscriber) = match async {
-                        let (room_event_cache, drop_handles) = room.event_cache().await?;
-                        let (_, subscriber) = room_event_cache.subscribe().await?;
-                        matrix_sdk::event_cache::Result::Ok((drop_handles, subscriber))
-                    }
-                    .await
+                    if let Some(event_cache) = client.event_cache()
+                        && let Ok((room_event_cache, _event_cache_drop_handles)) =
+                            event_cache.room(room.room_id()).await
+                        && let Ok((_initial_events, mut subscriber)) =
+                            room_event_cache.subscribe().await
                     {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            error!(
-                                "ThreadListService: failed to subscribe to room event cache, \
-                                 live updates will not work: {e}"
-                            );
-                            return;
-                        }
-                    };
+                        trace!("ThreadListService: event cache listener started");
 
-                    trace!("ThreadListService: event cache listener started");
-
-                    Self::event_cache_listener_loop(&room, &mut subscriber, items, proofs).await;
+                        Self::event_cache_listener_loop(&room, &mut subscriber, items, proofs)
+                            .await;
+                    } else {
+                        error!(
+                            "ThreadListService: failed to subscribe to room event cache, \
+                             live updates will not work"
+                        );
+                    }
                 }
             })
             .abort_on_drop();
@@ -352,7 +343,8 @@ impl ThreadListService {
 
         let mut pagination_token = self.token.lock().await;
 
-        // Build the options for this page, using the current token if we have one.
+        // Build the options for this page, using the current token if we have
+        // one.
         let from = match &*pagination_token {
             PaginationToken::HasMore(token) => Some(token.clone()),
             _ => None,
@@ -362,7 +354,8 @@ impl ThreadListService {
 
         match self.load_thread_list(opts).await {
             Ok(thread_list) => {
-                // Update the pagination token based on whether there are more pages.
+                // Update the pagination token based on whether there are more
+                // pages.
                 *pagination_token = match &thread_list.prev_batch_token {
                     Some(token) => PaginationToken::HasMore(token.clone()),
                     None => PaginationToken::HitEnd,
@@ -370,7 +363,8 @@ impl ThreadListService {
 
                 let end_reached = thread_list.prev_batch_token.is_none();
 
-                // Keep bundled summaries until local relation evidence proves their count.
+                // Keep bundled summaries until local relation evidence proves
+                // their count.
                 {
                     let mut proofs = self.proofs.lock();
                     for item in &thread_list.items {
@@ -397,8 +391,9 @@ impl ThreadListService {
                 // Append new items to the observable vector.
                 self.items.lock().append(thread_list.items.into());
 
-                // Resolve any already-persisted relation evidence as part of the
-                // initial proof, not only after a later cache update.
+                // Resolve any already-persisted relation evidence as part of
+                // the initial proof, not only after a later
+                // cache update.
                 for root_event_id in roots {
                     if let Ok(aggregate) =
                         resolve_thread_relation_aggregate(&self.room, &root_event_id).await
@@ -420,10 +415,10 @@ impl ThreadListService {
 
     /// Resets the service back to its initial state.
     ///
-    /// Clears all loaded items, discards the current pagination token, and
-    /// sets the pagination state to `Idle { end_reached: false }`.  The next
-    /// call to [`Self::paginate`] will therefore start from the beginning of
-    /// the thread list.
+    /// Clears all loaded items, discards the current pagination token, and sets
+    /// the pagination state to `Idle { end_reached: false }`. The next call to
+    /// [`Self::paginate`] will therefore start from the beginning of the thread
+    /// list.
     pub async fn reset(&self) {
         let mut pagination_token = self.token.lock().await;
         *pagination_token = PaginationToken::None;
@@ -457,20 +452,19 @@ impl ThreadListService {
         timeline_event: TimelineEvent,
     ) -> Option<ThreadListItem> {
         // Extract thread summary info before consuming the event.
-        let thread_summary = timeline_event.thread_summary.summary().cloned();
-        let bundled_latest_thread_event = timeline_event.bundled_latest_thread_event();
+        let thread_summary_with_latest_event = timeline_event.thread_summary_with_latest_event();
 
         // Build the root event using the same logic as latest events.
         let root_event = Self::build_event(room, timeline_event).await?;
 
-        // Build the latest event from the bundled thread summary, if available.
-        let num_replies = thread_summary.as_ref().map(|s| s.num_replies).unwrap_or(0);
+        // Build `latest_event` and `num_replies`.
+        let mut num_replies = 0;
+        let mut latest_event = None;
 
-        let latest_event = if let Some(ev) = bundled_latest_thread_event {
-            Self::build_event(room, ev).await
-        } else {
-            None
-        };
+        if let Some((thread_summary, latest_timeline_event)) = thread_summary_with_latest_event {
+            num_replies = thread_summary.num_replies;
+            latest_event = Self::build_event(room, latest_timeline_event).await
+        }
 
         Some(ThreadListItem { root_event, latest_event, num_replies })
     }
@@ -510,7 +504,14 @@ impl ThreadListService {
             }
         }
 
-        let (room_event_cache, _drop_handles) = room.event_cache().await?;
+        let (room_event_cache, _drop_handles) = room
+            .client()
+            .event_cache()
+            .ok_or_else(|| matrix_sdk::event_cache::EventCacheError::RoomNotFound {
+                room_id: room.room_id().to_owned(),
+            })?
+            .room(room.room_id())
+            .await?;
         let now = MilliSecondsSinceUnixEpoch::now();
         let related_events = room_event_cache
             .find_event_relations(root_event_id, Some(vec![RelationType::Thread]))
@@ -543,8 +544,9 @@ impl ThreadListService {
                 && let Some(content) = TimelineItemContent::from_event(room, replacement).await
                 && !content.is_unable_to_decrypt()
             {
-                // The original event remains the identity/profile/timestamp anchor;
-                // only its effective content comes from the validated replacement.
+                // The original event remains the identity/profile/timestamp
+                // anchor; only its effective content comes from
+                // the validated replacement.
                 projected.content = Some(content);
             }
 
@@ -656,7 +658,11 @@ impl ThreadListService {
     }
 
     async fn collect_affected_roots(room: &Room, events: &[Event]) -> Vec<OwnedEventId> {
-        let Ok((room_event_cache, _drop_handles)) = room.event_cache().await else {
+        let client = room.client();
+        let Some(event_cache) = client.event_cache() else {
+            return Vec::new();
+        };
+        let Ok((room_event_cache, _drop_handles)) = event_cache.room(room.room_id()).await else {
             return Vec::new();
         };
         let mut roots = HashSet::new();
@@ -783,7 +789,7 @@ struct ThreadList {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{pin::pin, sync::Arc, time::Duration};
 
     use assert_matches::assert_matches;
     use futures_util::{StreamExt, pin_mut};
@@ -805,7 +811,9 @@ mod tests {
                 encrypted::{
                     EncryptedEventScheme, MegolmV1AesSha2ContentInit, RoomEncryptedEventContent,
                 },
-                message::{RedactedRoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+                message::{
+                    RedactedRoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+                },
             },
             sticker::StickerEventContent,
         },
@@ -813,10 +821,8 @@ mod tests {
         serde::Raw,
         user_id,
     };
-    use serde_json::json;
     use stream_assert::{assert_next_matches, assert_pending};
     use tokio::sync::watch;
-    use wiremock::ResponseTemplate;
 
     use super::{
         ResolverTestGate, ThreadListPaginationState, ThreadListService, ThreadRelationAggregate,
@@ -886,9 +892,7 @@ mod tests {
         )
     }
 
-    async fn wait_for_timeline_update(
-        subscriber: &mut EventCacheSubscriber<RoomEventCacheUpdate>,
-    ) {
+    async fn wait_for_timeline_update(subscriber: &mut EventCacheSubscriber<RoomEventCacheUpdate>) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match subscriber.recv().await {
@@ -1020,11 +1024,8 @@ mod tests {
             vec![f.text_msg("Thread root").event_id(eid1).into_raw()];
         server
             .mock_room_threads()
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "chunk": chunk, "next_batch": null }))
-                    .set_delay(Duration::from_millis(100)),
-            )
+            .with_delay(Duration::from_millis(100))
+            .ok(chunk, None)
             .expect(1)
             .mount()
             .await;
@@ -1048,7 +1049,7 @@ mod tests {
     }
 
     /// When the server returns an error, [`ThreadListService::paginate`] must
-    /// propagate the error *and* reset the pagination state back to
+    /// propagate the error _and_ reset the pagination state back to
     /// `Idle { end_reached: false }` so that the caller can retry.
     #[async_test]
     async fn test_pagination_error() {
@@ -1064,7 +1065,7 @@ mod tests {
         // Pagination must surface the server error.
         service.paginate().await.expect_err("paginate should fail on a 500 response");
 
-        // The state must be reset so the caller can retry; it must *not* be
+        // The state must be reset so the caller can retry; it must _not_ be
         // stuck in `Loading`.
         assert_eq!(
             service.pagination_state(),
@@ -1135,7 +1136,7 @@ mod tests {
         let service = ThreadListService::new(room);
 
         let subscriber = service.subscribe_to_pagination_state_updates();
-        pin_mut!(subscriber);
+        let mut subscriber = pin!(subscriber);
 
         assert_pending!(subscriber);
 
@@ -1217,7 +1218,6 @@ mod tests {
     async fn test_sticker_thread_reply_contributes_to_exact_aggregate() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!aggregate-sticker:example.org");
         let root_id = event_id!("$aggregate-sticker-root");
@@ -1253,7 +1253,6 @@ mod tests {
     async fn test_relation_aggregate_preserves_original_identity_and_new_content() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!aggregate-edit:example.org");
         let root_id = event_id!("$aggregate-edit-root");
@@ -1297,7 +1296,7 @@ mod tests {
                     f.text_msg("* fallback one")
                         .event_id(first_edit_id)
                         .edit(
-                            &reply_id,
+                            reply_id,
                             RoomMessageEventContentWithoutRelation::text_plain("effective one"),
                         )
                         .into_raw_sync(),
@@ -1330,7 +1329,7 @@ mod tests {
                     f.text_msg("* fallback two")
                         .event_id(second_edit_id)
                         .edit(
-                            &reply_id,
+                            reply_id,
                             RoomMessageEventContentWithoutRelation::text_plain("effective two"),
                         )
                         .into_raw_sync(),
@@ -1341,7 +1340,7 @@ mod tests {
             .sync_room(
                 &client,
                 matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_event(
-                    f.redaction(&second_edit_id).event_id(event_id!("$aggregate-edit-redaction")),
+                    f.redaction(second_edit_id).event_id(event_id!("$aggregate-edit-redaction")),
                 ),
             )
             .await;
@@ -1367,7 +1366,6 @@ mod tests {
     async fn test_edit_before_original_replay_matches_in_order_aggregate() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().unwrap();
 
         let out_of_order_room = room_id!("!aggregate-edit-before-original:example.org");
         let in_order_room = room_id!("!aggregate-edit-in-order:example.org");
@@ -1381,7 +1379,7 @@ mod tests {
         let edit = f
             .text_msg("* fallback")
             .event_id(edit_id)
-            .edit(&reply_id, RoomMessageEventContentWithoutRelation::text_plain("effective"))
+            .edit(reply_id, RoomMessageEventContentWithoutRelation::text_plain("effective"))
             .into_raw_sync();
 
         server
@@ -1481,7 +1479,6 @@ mod tests {
                 })
                 .build()
                 .await;
-            client.event_cache().subscribe().unwrap();
             let room = server
                 .sync_room(
                     &client,
@@ -1498,7 +1495,7 @@ mod tests {
                 .sync_room(
                     &client,
                     matrix_sdk_test::JoinedRoomBuilder::new(room_id)
-                        .add_timeline_event(f.redaction(&reply_b_id).event_id(redaction_id)),
+                        .add_timeline_event(f.redaction(reply_b_id).event_id(redaction_id)),
                 )
                 .await;
             let live = resolve_thread_relation_aggregate(&room, root_id).await.unwrap();
@@ -1519,7 +1516,6 @@ mod tests {
             })
             .build()
             .await;
-        client.event_cache().subscribe().unwrap();
         let room = client.get_room(room_id).expect("room should reload from the state store");
         server
             .sync_room(
@@ -1543,7 +1539,6 @@ mod tests {
     async fn test_bundled_proof_keeps_latest_and_count_until_local_count_is_proven() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!aggregate-proof:example.org");
         let root_id = event_id!("$aggregate-proof-root");
@@ -1622,7 +1617,7 @@ mod tests {
             .sync_room(
                 &client,
                 matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_event(
-                    f.redaction(&local_four_id).event_id(event_id!("$aggregate-proof-redact-four")),
+                    f.redaction(local_four_id).event_id(event_id!("$aggregate-proof-redact-four")),
                 ),
             )
             .await;
@@ -1638,13 +1633,13 @@ mod tests {
             .sync_room(
                 &client,
                 matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_bulk(vec![
-                    f.redaction(&local_one_id)
+                    f.redaction(local_one_id)
                         .event_id(event_id!("$aggregate-proof-redact-one"))
                         .into_raw_sync(),
-                    f.redaction(&local_two_id)
+                    f.redaction(local_two_id)
                         .event_id(event_id!("$aggregate-proof-redact-two"))
                         .into_raw_sync(),
-                    f.redaction(&local_three_id)
+                    f.redaction(local_three_id)
                         .event_id(event_id!("$aggregate-proof-redact-three"))
                         .into_raw_sync(),
                 ]),
@@ -1664,7 +1659,6 @@ mod tests {
     async fn test_redaction_of_latest_reply_reconciles_exact_aggregate() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!aggregate-service:example.org");
         let root_id = event_id!("$aggregate-service-root");
@@ -1710,7 +1704,7 @@ mod tests {
             .sync_room(
                 &client,
                 matrix_sdk_test::JoinedRoomBuilder::new(room_id)
-                    .add_timeline_event(f.redaction(&reply_b_id).event_id(redaction_id)),
+                    .add_timeline_event(f.redaction(reply_b_id).event_id(redaction_id)),
             )
             .await;
         tokio::task::yield_now().await;
@@ -1724,7 +1718,6 @@ mod tests {
     async fn test_redaction_reconciles_all_tracked_roots() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!aggregate-all-roots:example.org");
         let root_a = event_id!("$aggregate-all-root-a");
@@ -1770,7 +1763,7 @@ mod tests {
             .sync_room(
                 &client,
                 matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_event(
-                    f.redaction(&reply_b).event_id(event_id!("$aggregate-all-redaction")),
+                    f.redaction(reply_b).event_id(event_id!("$aggregate-all-redaction")),
                 ),
             )
             .await;
@@ -1789,7 +1782,6 @@ mod tests {
     async fn test_serial_batches_leave_the_latest_final_aggregate() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!aggregate-serial:example.org");
         let root_id = event_id!("$aggregate-serial-root");
@@ -1822,7 +1814,7 @@ mod tests {
             .sync_room(
                 &client,
                 matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_event(
-                    f.redaction(&first_reply).event_id(event_id!("$aggregate-serial-redaction")),
+                    f.redaction(first_reply).event_id(event_id!("$aggregate-serial-redaction")),
                 ),
             )
             .await;
@@ -1849,7 +1841,6 @@ mod tests {
     async fn test_queued_newer_batch_wins_after_first_resolver_is_released() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!aggregate-queued-newer:example.org");
         let root_id = event_id!("$aggregate-queued-newer-root");
@@ -1866,7 +1857,8 @@ mod tests {
         let room = server.sync_joined_room(&client, room_id).await;
         let service = ThreadListService::new(room.clone());
         service.paginate().await.expect("paginate failed");
-        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        let (room_event_cache, _drop_handles) =
+            room.client().event_cache().unwrap().room(room.room_id()).await.unwrap();
         let (_, mut cache_updates) = room_event_cache.subscribe().await.unwrap();
         assert!(cache_updates.is_empty());
         let (_snapshot, updates) = service.subscribe_to_items_updates();
@@ -2032,8 +2024,8 @@ mod tests {
         ));
     }
 
-    /// Builds a [`ThreadListService`] and makes the room known to the client
-    /// by performing a sync.
+    /// Builds a [`ThreadListService`] and makes the room known to the client by
+    /// performing a sync.
     async fn make_service(server: &MatrixMockServer) -> ThreadListService {
         let client = server.client_builder().build().await;
         let room_id = room_id!("!a:b.c");

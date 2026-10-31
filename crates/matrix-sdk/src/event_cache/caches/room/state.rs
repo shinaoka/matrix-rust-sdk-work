@@ -28,10 +28,10 @@ use eyeball::SharedObservable;
 use eyeball_im::VectorDiff;
 use matrix_sdk_base::{
     RoomInfoNotableUpdateReasons, apply_redaction,
-    deserialized_responses::{ThreadSummary, ThreadSummaryStatus},
     event_cache::{Event, Gap, store::EventCacheStoreLockGuard},
     linked_chunk::{
-        ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position, Update, lazy_loader,
+        ChunkContent, ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position,
+        Update, lazy_loader,
     },
     serde_helpers::extract_redaction_target,
     sync::Timeline,
@@ -72,8 +72,11 @@ use super::{
         },
         subscriber::SubscribersHandle,
     },
-    RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdateSender, sort_positions_descending,
+    RFindMapOutcome, RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdateSender,
+    sort_positions_descending,
 };
+#[cfg(feature = "e2e-encryption")]
+use crate::event_cache::redecryptor;
 use crate::room::WeakRoom;
 
 /// Process-local identity counter for room-cache state instances.
@@ -92,8 +95,8 @@ pub struct RoomEventCacheState {
     /// The user's own user id.
     pub own_user_id: OwnedUserId,
 
-    /// The loaded events for the current room, that is, the in-memory
-    /// linked chunk for this room.
+    /// The loaded events for the current room, that is, the in-memory linked
+    /// chunk for this room.
     room_linked_chunk: EventLinkedChunk,
 
     pagination_status: SharedObservable<SharedPaginationStatus>,
@@ -121,10 +124,10 @@ pub struct RoomEventCacheState {
     /// The rules for the version of this room.
     room_version_rules: RoomVersionRules,
 
-    /// Have we ever waited for a previous-batch-token to come from sync, in
-    /// the context of pagination? We do this at most once per room,
-    /// the first time we try to run backward pagination. We reset
-    /// that upon clearing the timeline events.
+    /// Have we ever waited for a previous-batch-token to come from sync, in the
+    /// context of pagination? We do this at most once per room, the first time
+    /// we try to run backward pagination. We reset that upon clearing the
+    /// timeline events.
     waited_for_initial_prev_token: bool,
 
     /// A handle for subscribers.
@@ -138,10 +141,10 @@ impl RoomEventCacheState {
     /// Create a new state, or reload it from storage if it's been enabled.
     ///
     /// Not all events are going to be loaded. Only a portion of them. The
-    /// [`EventLinkedChunk`] relies on a [`LinkedChunk`] to store all
-    /// events. Only the last chunk will be loaded. It means the
-    /// events are loaded from the most recent to the oldest. To
-    /// load more events, see [`RoomPagination`].
+    /// [`EventLinkedChunk`] relies on a [`LinkedChunk`] to store all events.
+    /// Only the last chunk will be loaded. It means the events are loaded from
+    /// the most recent to the oldest. To load more events, see
+    /// [`RoomPagination`].
     ///
     /// [`LinkedChunk`]: matrix_sdk_common::linked_chunk::LinkedChunk
     /// [`RoomPagination`]: super::RoomPagination
@@ -161,11 +164,12 @@ impl RoomEventCacheState {
     ) -> Result<Self, EventCacheError> {
         let linked_chunk_id = LinkedChunkId::Room(&room_id);
 
-        // Load the full linked chunk's metadata, so as to feed the order tracker.
+        // Load the full linked chunk's metadata, so as to feed the order
+        // tracker.
         //
-        // If loading the full linked chunk failed, we'll clear the event cache, as it
-        // indicates that at some point, there's some malformed data.
-        let full_linked_chunk_metadata =
+        // If loading the full linked chunk failed, we'll clear the event cache,
+        // as it indicates that at some point, there's some malformed data.
+        let mut full_linked_chunk_metadata =
             match load_linked_chunk_metadata(&store_guard, linked_chunk_id).await {
                 Ok(metas) => metas,
                 Err(err) => {
@@ -192,6 +196,11 @@ impl RoomEventCacheState {
             Ok(linked_chunk) => linked_chunk,
             Err(err) => {
                 error!("error when loading a linked chunk's latest chunk from the store: {err}");
+
+                // The metadata no longer reflects the storage, which is about
+                // to be cleared. Drop it, so that the order
+                // tracker doesn't start from a stale state.
+                full_linked_chunk_metadata = None;
 
                 // Try to clear storage for this room.
                 store_guard
@@ -386,9 +395,10 @@ impl RoomEventCacheState {
             }
         }
 
-        // Only touch the store when this rebuild changed an in-memory event: the
-        // linked chunk can carry updates recorded while it was loaded, and draining
-        // them here would make creating a cache perform an unrelated store write.
+        // Only touch the store when this rebuild changed an in-memory event:
+        // the linked chunk can carry updates recorded while it was
+        // loaded, and draining them here would make creating a cache
+        // perform an unrelated store write.
         if replaced_in_memory {
             let updates = self.room_linked_chunk.store_updates().take();
             if !updates.is_empty() {
@@ -456,17 +466,71 @@ impl<'a> StateLockReadGuard<'a, RoomEventCacheState> {
     }
 
     //// Find a single event in this room, starting from the most recent event.
-    ///
     /// The `predicate` receives the current event as its single argument.
     ///
-    /// **Warning**! It looks into the loaded events from the in-memory
-    /// linked chunk **only**. It doesn't look inside the storage,
-    /// contrary to [`Self::find_event`].
+    /// **Warning**! It looks into the loaded events from the in-memory linked
+    /// chunk **only**. It doesn't look inside the storage, contrary to
+    /// [`Self::find_event`].
     pub fn rfind_map_event_in_memory_by<O, P>(&self, mut predicate: P) -> Option<O>
     where
         P: FnMut(&Event) -> Option<O>,
     {
         self.state.room_linked_chunk.revents().find_map(|(_, event)| predicate(event))
+    }
+
+    /// Find a single event in this room, starting from the most recent event,
+    /// and carrying on through the stored chunks preceding the in-memory ones,
+    /// until a gap or the start of the room.
+    ///
+    /// The `predicate` receives the current event as its single argument.
+    ///
+    /// The `max_stored_chunks` dictates up to how many paginations we can do in
+    /// the store if no suitable latest event is found in memory.
+    pub async fn rfind_map_event_until_gap_by<O, P>(
+        &self,
+        max_stored_chunks: usize,
+        mut predicate: P,
+    ) -> Result<RFindMapOutcome<O>, EventCacheError>
+    where
+        P: FnMut(&Event) -> Option<O>,
+    {
+        if let Some(found) = self.rfind_map_event_in_memory_by(&mut predicate) {
+            return Ok(RFindMapOutcome::Found(found));
+        }
+
+        if max_stored_chunks == 0 {
+            return Ok(RFindMapOutcome::ReachedLimit);
+        }
+
+        // Events behind an in-memory gap are unknown, so they may be newer than
+        // anything stored before it.
+        if self.state.room_linked_chunk.rgap().is_some() {
+            return Ok(RFindMapOutcome::ReachedGap);
+        }
+
+        let linked_chunk_id = LinkedChunkId::Room(&self.state.room_id);
+        let first_chunk_id = self.state.room_linked_chunk.first_chunk().identifier();
+        let mut prev_chunk_id = first_chunk_id;
+
+        for _ in 0..max_stored_chunks {
+            let Some(chunk) =
+                self.store.load_previous_chunk(linked_chunk_id, prev_chunk_id).await?
+            else {
+                return Ok(RFindMapOutcome::ReachedStart);
+            };
+            match chunk.content {
+                ChunkContent::Gap(_) => return Ok(RFindMapOutcome::ReachedGap),
+                ChunkContent::Items(events) => {
+                    if let Some(found) = events.iter().rev().find_map(&mut predicate) {
+                        return Ok(RFindMapOutcome::Found(found));
+                    }
+                }
+            }
+
+            prev_chunk_id = chunk.identifier;
+        }
+
+        Ok(RFindMapOutcome::ReachedLimit)
     }
 
     #[cfg(test)]
@@ -529,13 +593,15 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     ) -> Result<Vec<VectorDiff<Event>>, EventCacheError> {
         match preprocessing {
             ReloadPreprocessing::ForgetAll => {
-                // Clear the `LinkedChunk` and broadcast the updates to the store.
+                // Clear the `LinkedChunk` and broadcast the updates to the
+                // store.
                 self.room_linked_chunk_mut().reset();
                 self.propagate_changes().await?;
 
-                // Reset the pagination state too: pretend we never waited for the initial
-                // prev-batch token, and indicate that we're not at the start of the timeline,
-                // since we don't know about that anymore.
+                // Reset the pagination state too: pretend we never waited for
+                // the initial prev-batch token, and indicate that we're not at
+                // the start of the timeline, since we don't know about that
+                // anymore.
                 *self.waited_for_initial_prev_token_mut() = false;
 
                 // Note: this may cancel an ongoing pagination.
@@ -554,12 +620,12 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         Ok(self.room_linked_chunk_mut().updates_as_vector_diffs())
     }
 
-    /// If storage is enabled, unload all the chunks, then reloads only the
-    /// last one.
+    /// If storage is enabled, unload all the chunks, then reloads only the last
+    /// one.
     ///
-    /// If storage's enabled, return a diff update that starts with a clear
-    /// of all events; as a result, the caller may override any
-    /// pending diff updates with the result of this function.
+    /// If storage's enabled, return a diff update that starts with a clear of
+    /// all events; as a result, the caller may override any pending diff
+    /// updates with the result of this function.
     ///
     /// Otherwise, returns `None`.
     #[instrument(skip(self))]
@@ -567,7 +633,7 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         // Attempt to load the last chunk.
         let linked_chunk_id = LinkedChunkId::Room(&self.state.room_id);
 
-        let full_linked_chunk_metadata =
+        let mut full_linked_chunk_metadata =
             match load_linked_chunk_metadata(&self.store, linked_chunk_id).await {
                 Ok(metas) => metas,
                 Err(err) => {
@@ -588,8 +654,14 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                 Ok(pair) => pair,
 
                 Err(err) => {
-                    // If loading the last chunk failed, clear the entire linked chunk.
+                    // If loading the last chunk failed, clear the entire linked
+                    // chunk.
                     error!("error when reloading a linked chunk from memory: {err}");
+
+                    // The metadata no longer reflects the storage, which is
+                    // about to be cleared. Drop it, so that the order tracker
+                    // doesn't start from a stale state.
+                    full_linked_chunk_metadata = None;
 
                     // Clear storage for this room.
                     self.store
@@ -603,8 +675,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
 
         debug!("unloading the linked chunk, and resetting it to its last chunk");
 
-        // Remove all the chunks from the linked chunks, except for the last one, and
-        // updates the chunk identifier generator.
+        // Remove all the chunks from the linked chunks, except for the last
+        // one, and updates the chunk identifier generator.
         if let Err(err) = self.state.room_linked_chunk.shrink_to_last_reloaded_chunk(
             last_chunk,
             chunk_identifier_generator,
@@ -615,9 +687,9 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             self.state.room_linked_chunk.reset();
             self.propagate_changes().await?;
 
-            // Reset the pagination state too: pretend we never waited for the initial
-            // prev-batch token, and indicate that we're not at the start of the
-            // timeline, since we don't know about that anymore.
+            // Reset the pagination state too: pretend we never waited for the
+            // initial prev-batch token, and indicate that we're not at the
+            // start of the timeline, since we don't know about that anymore.
             self.state.waited_for_initial_prev_token = false;
 
             // Note: this may cancel an ongoing pagination.
@@ -628,8 +700,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             return Ok(());
         }
 
-        // Let pagination observers know that we may have not reached the start of the
-        // timeline. This may cancel an ongoing pagination.
+        // Let pagination observers know that we may have not reached the start
+        // of the timeline. This may cancel an ongoing pagination.
         self.state
             .pagination_status
             .set(SharedPaginationStatus::Idle { hit_timeline_start: false });
@@ -648,13 +720,13 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         trace!(number_of_subscribers, "received request to auto-shrink");
 
         if number_of_subscribers == 0 {
-            // There is no more subscribers listening to this cache, we can shrink the state
-            // to its last chunk to save memory.
+            // There is no more subscribers listening to this cache, we can
+            // shrink the state to its last chunk to save memory.
             //
-            // In theory, between the condition (`… == 0`) and this instruction, a new
-            // subscriber could be created, creating a race, except that this method takes a
-            // `&mut`, ensuring an exclusive access to the state, ensuring no other
-            // subscribers can be created.
+            // In theory, between the condition (`… == 0`) and this instruction,
+            // a new subscriber could be created, creating a race, except that
+            // this method takes a `&mut`, ensuring an exclusive access to the
+            // state, ensuring no other subscribers can be created.
             self.shrink_to_last_reloaded_chunk().await?;
 
             Ok(Some(self.state.room_linked_chunk.updates_as_vector_diffs()))
@@ -698,7 +770,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                 // Authoritative redaction evidence is always admitted.
                 false
             } else if cached_redacted {
-                // A redacted copy must not be revived by an unredacted re-delivery.
+                // A redacted copy must not be revived by an unredacted
+                // re-delivery.
                 true
             } else {
                 (!carries_usable_content(event) && carries_usable_content(&cached))
@@ -767,9 +840,10 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                 continue;
             }
 
-            // The refresh must go through the sanitizing, index-notifying update
-            // path, so a store-only root cannot acquire new visible text without
-            // the index subscriber seeing it and without the relation narrowing.
+            // The refresh must go through the sanitizing, index-notifying
+            // update path, so a store-only root cannot acquire new
+            // visible text without the index subscriber seeing it
+            // and without the relation narrowing.
             match location {
                 EventLocation::Memory(_) => {
                     self.replace_event_at(location, event.clone()).await?;
@@ -809,8 +883,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     /// Remove events by their position, in `EventLinkedChunk` and in
     /// `EventCacheStore`.
     ///
-    /// This method is purposely isolated because it must ensure that
-    /// positions are sorted appropriately or it can be disastrous.
+    /// This method is purposely isolated because it must ensure that positions
+    /// are sorted appropriately or it can be disastrous.
     #[instrument(skip_all)]
     pub async fn remove_events(
         &mut self,
@@ -885,8 +959,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     }
 
     /// Post-process the events committed by a live-tail refresh: flush the
-    /// linked-chunk updates to the store, then apply redactions and read-receipt
-    /// bookkeeping.
+    /// linked-chunk updates to the store, then apply redactions and
+    /// read-receipt bookkeeping.
     pub(super) async fn post_process_live_tail_events(
         &mut self,
         events: Vec<Event>,
@@ -907,10 +981,9 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
 
     /// Apply some updates that are effective only on the store itself.
     ///
-    /// This method should be used only for updates that happen *outside*
-    /// the in-memory linked chunk. Such updates must be applied
-    /// onto the ordering tracker as well as to the persistent
-    /// storage.
+    /// This method should be used only for updates that happen _outside_ the
+    /// in-memory linked chunk. Such updates must be applied onto the ordering
+    /// tracker as well as to the persistent storage.
     async fn apply_store_only_updates(
         &mut self,
         updates: Vec<Update<Event, Gap>>,
@@ -959,7 +1032,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         (bool, Vec<VectorDiff<Event>>, Option<super::RoomTimelineSyncObservation>),
         EventCacheError,
     > {
-        // Capture the committed-timeline provenance before consuming the timeline.
+        // Capture the committed-timeline provenance before consuming the
+        // timeline.
         let limited = timeline.limited;
         let event_count = timeline.events.len();
         let prev_batch_present = timeline.prev_batch.is_some();
@@ -982,26 +1056,27 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         )
         .await?;
 
-        // If the timeline isn't limited, and we already knew about some past events,
-        // then this definitely knows what the timeline head is (either we know
-        // about all the events persisted in storage, or we have a gap
-        // somewhere). In this case, we can ditch the previous-batch
-        // token, which is an optimization to avoid unnecessary future back-pagination
+        // If the timeline isn't limited, and we already knew about some past
+        // events, then this definitely knows what the timeline head is (either
+        // we know about all the events persisted in storage, or we have a gap
+        // somewhere). In this case, we can ditch the previous-batch token,
+        // which is an optimization to avoid unnecessary future back-pagination
         // requests.
         //
-        // We can also ditch it if we knew about all the events that came from sync,
-        // namely, they were all deduplicated. In this case, using the
+        // We can also ditch it if we knew about all the events that came from
+        // sync, namely, they were all deduplicated. In this case, using the
         // previous-batch token would only result in fetching other events we
-        // knew about. This is slightly incorrect in the presence of
-        // network splits, but this has shown to be Good Enough™.
+        // knew about. This is slightly incorrect in the presence of network
+        // splits, but this has shown to be Good Enough™.
         if !timeline.limited && self.state.room_linked_chunk.events().next().is_some()
             || all_duplicates
         {
             prev_batch_token = None;
         }
 
-        // A re-delivery that cannot be decrypted must not replace cached decrypted
-        // content: unknown is not proof that what we already decoded is wrong.
+        // A re-delivery that cannot be decrypted must not replace cached
+        // decrypted content: unknown is not proof that what we already
+        // decoded is wrong.
         self.merge_duplicate_evidence(
             &mut events,
             &mut in_memory_duplicated_event_ids,
@@ -1010,16 +1085,15 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         .await?;
 
         if all_duplicates {
-            // No new events and no gap (per the previous check), thus no need to change the
-            // room state. We're done!
+            // No new events and no gap (per the previous check), thus no need
+            // to change the room state. We're done!
             //
-            // That said, a duplicate can still carry a newer bundled replacement, so
-            // refresh it in place before returning instead of discarding the evidence.
+            // A duplicate can still carry a newer bundled replacement.
             let refreshed =
                 self.refresh_bundled_replacements(&events, &in_store_duplicated_event_ids).await?;
 
-            // We might have a new read receipt, though! If that's the case, handle it for
-            // unread counts tracking.
+            // We might have a new read receipt, though! If that's the case,
+            // handle it for unread counts tracking.
             //
             // Post-process the ephemeral events.
             self.post_process_upserted_events(empty(), read_receipt_event.as_ref()).await?;
@@ -1029,16 +1103,17 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
 
         let has_new_gap = prev_batch_token.is_some();
 
-        // If we've never waited for an initial previous-batch token, and we've now
-        // inserted a gap, no need to wait for a previous-batch token later.
+        // If we've never waited for an initial previous-batch token, and we've
+        // now inserted a gap, no need to wait for a previous-batch token later.
         if !self.state.waited_for_initial_prev_token && has_new_gap {
             self.state.waited_for_initial_prev_token = true;
         }
 
         // Remove the old duplicated events.
         //
-        // We don't have to worry the removals can change the position of the existing
-        // events, because we are pushing all _new_ `events` at the back.
+        // We don't have to worry the removals can change the position of the
+        // existing events, because we are pushing all _new_ `events` at the
+        // back.
         self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids).await?;
 
         self.redact_pending_events(&mut events);
@@ -1055,11 +1130,12 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         self.post_process_upserted_events(events.iter(), read_receipt_event.as_ref()).await?;
 
         if timeline.limited && has_new_gap {
-            // If there was a previous batch token for a limited timeline, unload the chunks
-            // so it only contains the last one; otherwise, there might be a
-            // valid gap in between, and observers may not render it (yet).
+            // If there was a previous batch token for a limited timeline,
+            // unload the chunks so it only contains the last one; otherwise,
+            // there might be a valid gap in between, and observers may not
+            // render it (yet).
             //
-            // We must do this *after* persisting these events to storage.
+            // We must do this _after_ persisting these events to storage.
             self.shrink_to_last_reloaded_chunk().await?;
         }
 
@@ -1096,8 +1172,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     }
 
     // --------------------------------------------
-    // utility methods
-    // --------------------------------------------
+    //
+    // ## Utility methods
 
     /// Post-process newly inserted or updated events.
     pub(super) async fn post_process_upserted_events<'i, I>(
@@ -1108,6 +1184,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     where
         I: Iterator<Item = &'i Event>,
     {
+        #[cfg(feature = "e2e-encryption")]
+        let room: Option<crate::Room> = self.state.weak_room.get();
         let events = events.cloned().collect::<Vec<_>>();
 
         // Replay any redaction that arrived before its target, now that the
@@ -1123,10 +1201,16 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         }
 
         for event in &events {
+            // Handle redaction.
             self.maybe_apply_new_redaction(event).await?;
 
-            // Save a bundled thread event, if there was one.
-            if let Some(bundled_thread) = event.bundled_latest_thread_event() {
+            #[cfg_attr(not(feature = "e2e-encryption"), allow(unused_mut))]
+            if let Some(mut bundled_thread) = event.bundled_latest_thread_event() {
+                // Attempt to decrypt the bundled thread event in place. No-op
+                // if unencrypted or we know concretely why it
+                // can't be decrypted.
+                #[cfg(feature = "e2e-encryption")]
+                redecryptor::try_decrypt_in_place(&mut bundled_thread, room.as_ref()).await;
                 self.save_events([bundled_thread]).await?;
             }
         }
@@ -1165,9 +1249,9 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         .await;
 
         if prev_read_receipts != read_receipts {
-            // The read receipt has changed! Do a little dance to update the `RoomInfo` in
-            // the state store, and then in the room itself, so that observers
-            // can be notified of the change.
+            // The read receipt has changed! Do a little dance to update the
+            // `RoomInfo` in the state store, and then in the room itself, so
+            // that observers can be notified of the change.
             let result = room
                 .update_and_save_room_info(|mut room_info| {
                     room_info.set_read_receipts(read_receipts);
@@ -1183,32 +1267,12 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         Ok(())
     }
 
-    /// Update a thread summary on the given thread root, if needs be.
-    #[must_use = "Propagate `VectorDiff` updates via `RoomEventCacheUpdate`"]
-    pub async fn update_thread_summary(
-        &mut self,
-        thread_id: &EventId,
-        new_thread_summary: Option<ThreadSummary>,
-    ) -> Result<Vec<VectorDiff<Event>>, EventCacheError> {
-        let Some((location, mut thread_root_event)) = self.find_event(thread_id).await? else {
-            trace!(%thread_id, "thread root event is missing from the room linked chunk");
-            return Ok(Vec::new());
-        };
-
-        // Trigger an update to observers.
-        trace!(%thread_id, "updating thread summary: {new_thread_summary:?}");
-        thread_root_event.thread_summary = ThreadSummaryStatus::from_opt(new_thread_summary);
-        self.replace_event_at(location, thread_root_event).await?;
-
-        Ok(self.room_linked_chunk.updates_as_vector_diffs())
-    }
-
     /// Replaces a single event, be it saved in memory or in the store.
     ///
-    /// If it was saved in memory, this will emit a notification to
-    /// observers that a single item has been replaced. Otherwise,
-    /// such a notification is not emitted, because observers are
-    /// unlikely to observe the store updates directly.
+    /// If it was saved in memory, this will emit a notification to observers
+    /// that a single item has been replaced. Otherwise, such a notification is
+    /// not emitted, because observers are unlikely to observe the store updates
+    /// directly.
     pub async fn replace_event_at(
         &mut self,
         location: EventLocation,
@@ -1220,8 +1284,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                     .room_linked_chunk
                     .replace_event_at(position, event)
                     .expect("should have been a valid position of an item");
-                // We just changed the in-memory representation; synchronize this with
-                // the store.
+                // We just changed the in-memory representation; synchronize
+                // this with the store.
                 self.propagate_changes().await?;
             }
             EventLocation::Store => {
@@ -1232,9 +1296,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         Ok(())
     }
 
-    /// If the given event is a redaction, try to retrieve the
-    /// to-be-redacted event in the chunk, and replace it by the
-    /// redacted form.
+    /// If the given event is a redaction, try to retrieve the to-be-redacted
+    /// event in the chunk, and replace it by the redacted form.
     #[instrument(skip_all)]
     async fn maybe_apply_new_redaction(&mut self, event: &Event) -> Result<(), EventCacheError> {
         let Some(target_event_id) =
@@ -1269,9 +1332,12 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             &self.room_version_rules.redaction,
         ) {
             // It's safe to cast `redacted_event` here:
-            // - either the event was an `AnyTimelineEvent` cast to `AnySyncTimelineEvent`
-            //   when calling .raw(), so it's still one under the hood.
-            // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this case.
+            //
+            // - either the event was an `AnyTimelineEvent` cast to
+            //   `AnySyncTimelineEvent` when calling .raw(), so it's still one
+            //   under the hood.
+            // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this
+            //   case.
             target_event.replace_raw(redacted_event.cast_unchecked());
 
             self.replace_event_at(location, target_event.clone()).await?;
@@ -1290,19 +1356,20 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         resolved_events: &[MaybeResolvedEvent],
     ) -> Result<Option<Vec<VectorDiff<Event>>>, EventCacheError> {
         Ok(if self.room_linked_chunk_mut().replace_utds(resolved_events) {
-            // Drain the updates to the store, events have already been updated with
-            // `save_events`!
+            // Drain the updates to the store, events have already been updated
+            // with `save_events`!
             let _ = self.room_linked_chunk_mut().store_updates().take();
 
             self.post_process_upserted_events(
                 resolved_events.iter().filter_map(|resolved_event| resolved_event.as_resolved()),
-                // Read receipt events aren't encrypted, so we can't have decrypted a new
-                // one here. As a result, we don't have any new receipt events to
-                // post-process, so we can just pass `None` here.
+                // Read receipt events aren't encrypted, so we can't have
+                // decrypted a new one here. As a result, we don't have any new
+                // receipt events to post-process, so we can just pass `None`
+                // here.
                 //
-                // Note: read receipts may be updated anyhow in the post-processing step,
-                // as the redecryption may have decrypted some events that don't count as
-                // unreads.
+                // Note: read receipts may be updated anyhow in the
+                // post-processing step, as the redecryption may have decrypted
+                // some events that don't count as unreads.
                 None,
             )
             .await?;
@@ -1428,10 +1495,10 @@ mod tests {
 
         let client = logged_in_client(None).await;
         let room_id = room_id!("!galette:saucisse.bzh");
-        client.event_cache().subscribe().unwrap();
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
         let room = client.get_room(room_id).unwrap();
-        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        let (room_event_cache, _drop_handles) =
+            client.event_cache().unwrap().room(room.room_id()).await.unwrap();
 
         let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
         let event_id = event_id!("$decoded");
@@ -1554,10 +1621,9 @@ mod tests {
     async fn test_redacted_root_is_not_revived_by_a_bundled_redelivery() {
         let client = logged_in_client(None).await;
         let room_id = room_id!("!redacted-bundle:saucisse.bzh");
-        client.event_cache().subscribe().unwrap();
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
         let room = client.get_room(room_id).unwrap();
-        let (cache, _handles) = room.event_cache().await.unwrap();
+        let (cache, _handles) = client.event_cache().unwrap().room(room.room_id()).await.unwrap();
         let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
         let root = event_id!("$redacted-bundle-root");
         let edit = event_id!("$redacted-bundle-edit");
@@ -1565,8 +1631,9 @@ mod tests {
         let plain = f.text_msg("originalneedle").event_id(root).into_event();
         assert!(sync_and_read_bundle(&cache, vec![plain], root).await.is_none());
 
-        // A redaction whose target we already know is pending until the target is
-        // revisited; it is positive proof, so the re-delivery must not revive it.
+        // A redaction whose target we already know is pending until the target
+        // is revisited; it is positive proof, so the re-delivery must
+        // not revive it.
         cache
             .inner
             .state
@@ -1589,10 +1656,9 @@ mod tests {
     async fn test_mixed_batch_keeps_the_cached_bundled_replacement() {
         let client = logged_in_client(None).await;
         let room_id = room_id!("!mixed-bundle:saucisse.bzh");
-        client.event_cache().subscribe().unwrap();
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
         let room = client.get_room(room_id).unwrap();
-        let (cache, _handles) = room.event_cache().await.unwrap();
+        let (cache, _handles) = client.event_cache().unwrap().room(room.room_id()).await.unwrap();
         let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
         let root = event_id!("$mixed-bundle-root");
         let edit = event_id!("$mixed-bundle-edit");
@@ -1618,10 +1684,9 @@ mod tests {
     async fn test_invalid_newer_bundle_does_not_erase_the_cached_replacement() {
         let client = logged_in_client(None).await;
         let room_id = room_id!("!invalid-bundle:saucisse.bzh");
-        client.event_cache().subscribe().unwrap();
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
         let room = client.get_room(room_id).unwrap();
-        let (cache, _handles) = room.event_cache().await.unwrap();
+        let (cache, _handles) = client.event_cache().unwrap().room(room.room_id()).await.unwrap();
         let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
         let root = event_id!("$invalid-bundle-root");
         let edit = event_id!("$invalid-bundle-edit");
@@ -1657,10 +1722,9 @@ mod tests {
     async fn test_redacted_redelivery_is_applied_instead_of_dropped() {
         let client = logged_in_client(None).await;
         let room_id = room_id!("!redacted-redelivery:saucisse.bzh");
-        client.event_cache().subscribe().unwrap();
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
         let room = client.get_room(room_id).unwrap();
-        let (cache, _handles) = room.event_cache().await.unwrap();
+        let (cache, _handles) = client.event_cache().unwrap().room(room.room_id()).await.unwrap();
         let sender = user_id!("@ben:saucisse.bzh");
         let f = EventFactory::new().room(room_id).sender(sender);
         let root = event_id!("$redacted-redelivery-root");
@@ -1672,9 +1736,10 @@ mod tests {
             Some((100, edit.to_string()))
         );
 
-        // The server re-sends the root already redacted. That envelope is the only
-        // redaction evidence this cache has, so it must be applied, not dropped as
-        // a downgrade of the bundled replacement.
+        // The server re-sends the root already redacted. That envelope is the
+        // only redaction evidence this cache has, so it must be
+        // applied, not dropped as a downgrade of the bundled
+        // replacement.
         let redacted =
             f.redacted(sender, RedactedRoomMessageEventContent::new()).event_id(root).into_event();
         sync_batch(&cache, vec![redacted]).await;
@@ -1684,8 +1749,9 @@ mod tests {
             is_positively_redacted_event(&cached),
             "a re-delivered redacted envelope must be applied"
         );
-        // `resolve_cached_message` only exists with `experimental-search`, so the
-        // end-to-end assertion is gated while the cache-level one always runs.
+        // `resolve_cached_message` only exists with `experimental-search`, so
+        // the end-to-end assertion is gated while the cache-level one
+        // always runs.
         #[cfg(feature = "experimental-search")]
         assert!(room.resolve_cached_message(root).await.unwrap().is_none());
     }
@@ -1694,10 +1760,9 @@ mod tests {
     async fn test_mixed_batch_keeps_the_newer_cached_bundle() {
         let client = logged_in_client(None).await;
         let room_id = room_id!("!mixed-older-bundle:saucisse.bzh");
-        client.event_cache().subscribe().unwrap();
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
         let room = client.get_room(room_id).unwrap();
-        let (cache, _handles) = room.event_cache().await.unwrap();
+        let (cache, _handles) = client.event_cache().unwrap().room(room.room_id()).await.unwrap();
         let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
         let root = event_id!("$mixed-older-root");
         let newer = event_id!("$mixed-older-newer");
@@ -1709,7 +1774,8 @@ mod tests {
         );
 
         // A mixed batch carries the duplicate root with an older aggregate; the
-        // batch is not all-duplicates, so it must still not downgrade the cache.
+        // batch is not all-duplicates, so it must still not downgrade the
+        // cache.
         let fresh = f.text_msg("unrelated").event_id(event_id!("$mixed-older-new")).into_event();
         assert_eq!(
             sync_and_read_bundle(&cache, vec![root_with_bundle(&f, root, older, 100), fresh], root)
@@ -1723,10 +1789,9 @@ mod tests {
     async fn test_mixed_batch_keeps_the_cached_bundle_over_a_malformed_one() {
         let client = logged_in_client(None).await;
         let room_id = room_id!("!mixed-malformed:saucisse.bzh");
-        client.event_cache().subscribe().unwrap();
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
         let room = client.get_room(room_id).unwrap();
-        let (cache, _handles) = room.event_cache().await.unwrap();
+        let (cache, _handles) = client.event_cache().unwrap().room(room.room_id()).await.unwrap();
         let sender = user_id!("@ben:saucisse.bzh");
         let f = EventFactory::new().room(room_id).sender(sender);
         let root = event_id!("$mixed-malformed-root");
@@ -1737,8 +1802,8 @@ mod tests {
             Some((100, edit.to_string()))
         );
 
-        // The newer aggregate does not decode into replacement content, so it is not
-        // evidence the cache can use.
+        // The newer aggregate does not decode into replacement content, so it
+        // is not evidence the cache can use.
         let malformed = f
             .text_msg("originalneedle")
             .event_id(root)
@@ -1758,16 +1823,13 @@ mod tests {
         let client = logged_in_client(None).await;
         let room_id = room_id!("!galette:saucisse.bzh");
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
-
         let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
         let event_id = event_id!("$1");
 
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
-        let room = client.get_room(room_id).unwrap();
+        let event_cache = client.event_cache().unwrap();
 
-        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        let (room_event_cache, _drop_handles) = event_cache.room(room_id).await.unwrap();
         room_event_cache
             .inner
             .state

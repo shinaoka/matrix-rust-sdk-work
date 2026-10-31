@@ -26,18 +26,21 @@
 //!
 //! [NSE]: https://developer.apple.com/documentation/usernotifications/unnotificationserviceextension
 
-use std::{pin::Pin, time::Duration};
+use std::{
+    pin::{Pin, pin},
+    time::Duration,
+};
 
 use async_stream::stream;
 use futures_core::stream::Stream;
-use futures_util::{StreamExt, pin_mut};
+use futures_util::StreamExt;
 use matrix_sdk::{Client, LEASE_DURATION_MS, SlidingSync, sleep::sleep};
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use ruma::{api::client::sync::sync_events::v5 as http, assign};
 use tokio::sync::OwnedMutexGuard;
 use tracing::{debug, instrument, trace};
 
-/// Unit type representing a permit to *use* an [`EncryptionSyncService`].
+/// Unit type representing a permit to _use_ an [`EncryptionSyncService`].
 ///
 /// This must be created once in the whole application's lifetime, wrapped in a
 /// mutex. Using an `EncryptionSyncService` must then lock that mutex in an
@@ -48,6 +51,10 @@ pub struct EncryptionSyncPermit(());
 impl EncryptionSyncPermit {
     /// Creates a permit token to place behind an application-owned shared
     /// mutex when serializing encryption sync owners.
+    #[expect(
+        clippy::new_without_default,
+        reason = "permit creation is explicit so encryption sync owners share one application-owned lock"
+    )]
     pub fn new() -> Self {
         Self(())
     }
@@ -77,9 +84,10 @@ impl EncryptionSyncService {
         client: Client,
         poll_and_network_timeouts: Option<(Duration, Duration)>,
     ) -> Result<Self, Error> {
-        // Make sure to use the same `conn_id` and caching store identifier, whichever
-        // process is running this sliding sync. There must be at most one
-        // sliding sync instance that enables the e2ee and to-device extensions.
+        // Make sure to use the same `conn_id` and caching store identifier,
+        // whichever process is running this sliding sync. There must be at most
+        // one sliding sync instance that enables the e2ee and to-device
+        // extensions.
         let mut builder = client
             .sliding_sync("encryption")
             .map_err(Error::SlidingSync)?
@@ -98,12 +106,13 @@ impl EncryptionSyncService {
         if let CrossProcessLockConfig::MultiProcess { holder_name } =
             client.cross_process_lock_config()
         {
-            // Gently try to enable the cross-process lock on behalf of the user.
+            // Gently try to enable the cross-process lock on behalf of the
+            // user.
             match client.encryption().enable_cross_process_store_lock(holder_name.clone()).await {
                 Ok(()) | Err(matrix_sdk::Error::BadCryptoStoreState) => {
                     // Ignore; we've already set the crypto store lock to
-                    // something, and that's sufficient as
-                    // long as it uniquely identifies the process.
+                    // something, and that's sufficient as long as it uniquely
+                    // identifies the process.
                 }
                 Err(err) => {
                     // Any other error is fatal
@@ -119,22 +128,23 @@ impl EncryptionSyncService {
     /// iteration so the caller can decide whether to continue or stop by
     /// dropping the stream.
     ///
-    /// Ends without yielding if the cross-process lock is configured but
-    /// can't be acquired (another process is expected to run the sync).
+    /// Ends without yielding if the cross-process lock is configured but can't
+    /// be acquired (another process is expected to run the sync).
     ///
     /// Note: the [`EncryptionSyncPermit`] parameter ensures that there's at
-    /// most one encryption sync running at any time. See its documentation
-    /// for more details.
+    /// most one encryption sync running at any time. See its documentation for
+    /// more details.
     pub fn run_iterations(
         self,
         permit: OwnedMutexGuard<EncryptionSyncPermit>,
     ) -> impl Stream<Item = Result<(), Error>> {
         stream!({
-            // Move the permit into the stream, so that it's held for as long as the stream
-            // is alive.
+            // Move the permit into the stream, so that it's held for as long as
+            // the stream is alive.
             let _permit = permit;
-            // Guard the exact encryption-sync generation for as long as this stream is
-            // alive; dropping it without a terminal transition cancels the generation.
+            // Guard the exact encryption-sync generation for as long as this
+            // stream is alive; dropping it without a terminal
+            // transition cancels the generation.
             let mut readiness = self.client.begin_encryption_sync_generation();
 
             let _lock_guard = if let CrossProcessLockConfig::MultiProcess { .. } =
@@ -148,10 +158,10 @@ impl EncryptionSyncService {
                     }
                 };
 
-                // Try to take the lock at the beginning; if it's busy, that means that another
-                // process already holds onto it, and as such we won't try to run the
-                // encryption sync loop at all (because we expect the other process to
-                // do so).
+                // Try to take the lock at the beginning; if it's busy, that
+                // means that another process already holds onto it, and as such
+                // we won't try to run the encryption sync loop at all (because
+                // we expect the other process to do so).
 
                 if lock_guard.is_none() {
                     tracing::debug!(
@@ -184,13 +194,14 @@ impl EncryptionSyncService {
 
             let sync = self.sliding_sync.sync();
 
-            pin_mut!(sync);
+            let mut sync = pin!(sync);
 
             loop {
                 match sync.next().await {
                     Some(Ok(update_summary)) => {
-                        // This API is only concerned with the e2ee and to-device extensions.
-                        // Warn if anything weird has been received from the homeserver.
+                        // This API is only concerned with the e2ee and
+                        // to-device extensions. Warn if anything weird has been
+                        // received from the homeserver.
                         if !update_summary.lists.is_empty() {
                             debug!(?update_summary.lists, "unexpected non-empty list of lists in encryption sync API");
                         }
@@ -226,30 +237,32 @@ impl EncryptionSyncService {
     /// This should be regularly polled.
     ///
     /// Note: the [`EncryptionSyncPermit`] parameter ensures that there's at
-    /// most one encryption sync running at any time. See its documentation
-    /// for more details.
+    /// most one encryption sync running at any time. See its documentation for
+    /// more details.
     #[doc(hidden)] // Only public for testing purposes.
     pub fn sync(
         &self,
         permit: OwnedMutexGuard<EncryptionSyncPermit>,
     ) -> impl Stream<Item = Result<(), Error>> + '_ {
         stream!({
-            // Move the permit into the stream, so that it's held for as long as the stream
-            // is alive.
+            // Move the permit into the stream, so that it's held for as long as
+            // the stream is alive.
             let _permit = permit;
-            // Guard the exact encryption-sync generation for as long as this stream is
-            // alive; dropping it without a terminal transition cancels the generation.
+            // Guard the exact encryption-sync generation for as long as this
+            // stream is alive; dropping it without a terminal
+            // transition cancels the generation.
             let mut readiness = self.client.begin_encryption_sync_generation();
 
             let sync = self.sliding_sync.sync();
 
-            pin_mut!(sync);
+            let mut sync = pin!(sync);
 
             loop {
                 match self.next_sync_with_lock(&mut sync).await? {
                     Some(Ok(update_summary)) => {
-                        // This API is only concerned with the e2ee and to-device extensions.
-                        // Warn if anything weird has been received from the homeserver.
+                        // This API is only concerned with the e2ee and
+                        // to-device extensions. Warn if anything weird has been
+                        // received from the homeserver.
                         if !update_summary.lists.is_empty() {
                             debug!(?update_summary.lists, "unexpected non-empty list of lists in encryption sync API");
                         }
@@ -303,8 +316,9 @@ impl EncryptionSyncService {
     ///
     /// This will unlock the cross-process lock, if taken.
     pub(crate) fn stop_sync(&self) -> Result<(), Error> {
-        // Stopping the sync loop will cause the next `next()` call to return `None`, so
-        // this will also release the cross-process lock automatically.
+        // Stopping the sync loop will cause the next `next()` call to return
+        // `None`, so this will also release the cross-process lock
+        // automatically.
         self.sliding_sync.stop_sync().map_err(Error::SlidingSync)?;
 
         Ok(())
