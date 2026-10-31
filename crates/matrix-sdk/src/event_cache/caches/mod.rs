@@ -501,6 +501,22 @@ impl Caches {
         Ok(())
     }
 
+    /// Refresh pending receipts after room-only history reveals their targets.
+    pub(super) async fn refresh_pending_thread_receipts(&self) -> Result<()> {
+        let threads = self.threads.read().await.values().cloned().collect::<Vec<_>>();
+        for thread in threads {
+            if !thread.read_receipts().await?.pending.is_empty() {
+                thread
+                    .handle_joined_room_update(
+                        Default::default(),
+                        read_receipts::MaybeReceiptEventContent::none(),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Get all in-memory events from all the event caches managed by this
     /// [`Caches`].
     ///

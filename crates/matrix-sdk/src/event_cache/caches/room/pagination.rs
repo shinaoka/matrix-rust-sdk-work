@@ -916,6 +916,7 @@ impl RoomPagination {
             );
             last_projection_batch = Some(projection_batch);
         }
+        self.0.cache.refresh_pending_thread_receipts().await?;
 
         let outcome = if after.continuity == RoomTimelineContinuity::Complete {
             RoomTimelineGapRepairOutcome::StartReached { events: events_count }
@@ -1197,8 +1198,8 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
         // Consider the following scenario:
         //
         // - sync returns [D, E, F]
-        // - then sync returns [] with a previous batch token PB1, so the
-        //   internal linked chunk state is [D, E, F, PB1].
+        // - then sync returns [] with a previous batch token PB1, so the internal
+        //   linked chunk state is [D, E, F, PB1].
         // - back-paginating with PB1 may return [A, B, C, D, E, F].
         //
         // Only inserting the new events when replacing PB1 would result in a
@@ -1256,6 +1257,9 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
             );
         }
 
+        // Publish before unlocking so sync cannot reorder the room diffs.
+        drop(state);
+        self.refresh_pending_thread_receipts().await?;
         Ok(Some(BackPaginationOutcome { events, reached_start }))
     }
 }

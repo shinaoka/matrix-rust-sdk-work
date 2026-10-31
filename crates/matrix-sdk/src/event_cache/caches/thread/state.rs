@@ -58,7 +58,8 @@ use super::{
         EventLocation,
         event_linked_chunk::{EventLinkedChunk, sort_positions_descending},
         read_receipts::{
-            MaybeReceiptEventContent, ThreadReadReceiptEventFilter, compute_unread_counts,
+            MaybeReceiptEventContent, ThreadReadReceiptEventFilter,
+            add_unthreaded_thread_boundaries, compute_unread_counts,
         },
         room::{RoomEventCacheLinkedChunkUpdate, RoomEventCacheState},
         subscriber::SubscribersHandle,
@@ -536,6 +537,14 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
 
         let client = room.client();
         let event_filter = ThreadReadReceiptEventFilter::new(&self.state, client.state_store());
+        add_unthreaded_thread_boundaries(
+            &self.state.own_user_id,
+            &event_filter,
+            &self.state.thread_linked_chunk,
+            &self.store,
+            &mut read_receipts,
+        )
+        .await?;
 
         compute_unread_counts(
             &self.state.own_user_id,
@@ -723,11 +732,9 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         ) {
             // It's safe to cast `redacted_event` here:
             //
-            // - either the event was an `AnyTimelineEvent` cast to
-            //   `AnySyncTimelineEvent` when calling .raw(), so it's still one
-            //   under the hood.
-            // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this
-            //   case.
+            // - either the event was an `AnyTimelineEvent` cast to `AnySyncTimelineEvent`
+            //   when calling .raw(), so it's still one under the hood.
+            // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this case.
             target_event.replace_raw(redacted_event.cast_unchecked());
 
             self.replace_event_at(location, target_event.clone()).await?;
