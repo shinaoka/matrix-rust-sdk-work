@@ -16,7 +16,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -48,6 +48,9 @@ use super::{
 /// Only [`EventCacheStore::handle_linked_chunk_updates`] and
 /// [`EventCacheStore::load_last_chunk`] are affected. All the other methods are
 /// forwarded to the inner [`MemoryStore`] as is.
+/// The updates of each store transaction, in write order.
+type RecordedWrites = Arc<Mutex<Vec<Vec<Update<Event, Gap>>>>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct ControlledMemoryStore {
     inner: MemoryStore,
@@ -56,6 +59,9 @@ pub struct ControlledMemoryStore {
     fail_last_chunk_load: Arc<AtomicBool>,
     write_started: Arc<Notify>,
     write_finished: Arc<Notify>,
+    /// The updates of each [`EventCacheStore::handle_linked_chunk_updates`]
+    /// call, so a test can pin what a path writes in one transaction.
+    recorded_writes: RecordedWrites,
 }
 
 impl ControlledMemoryStore {
@@ -100,6 +106,11 @@ impl ControlledMemoryStore {
         self.fail_last_chunk_load.store(false, Ordering::SeqCst);
     }
 
+    /// The updates written so far, one entry per store transaction.
+    pub fn recorded_writes(&self) -> Vec<Vec<Update<Event, Gap>>> {
+        self.recorded_writes.lock().unwrap().clone()
+    }
+
     /// Wait until a linked chunk write starts.
     ///
     /// Returns at once if a write has started since the last call.
@@ -125,6 +136,7 @@ impl EventCacheStore for ControlledMemoryStore {
         linked_chunk_id: LinkedChunkId<'_>,
         updates: Vec<Update<Event, Gap>>,
     ) -> Result<(), Self::Error> {
+        self.recorded_writes.lock().unwrap().push(updates.clone());
         self.write_started.notify_one();
 
         // Polling is good enough for tests, and simpler than a proper wake up.

@@ -297,7 +297,7 @@ impl RoomPagination {
             });
         }
 
-        state.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids).await?;
+        state.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids);
         let chronological_events = events.into_iter().rev().collect::<Vec<_>>();
         let new_gap = matches!(reconciliation, LiveTailReconciliation::Detached)
             .then_some(response.end)
