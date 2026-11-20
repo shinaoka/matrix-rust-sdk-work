@@ -135,6 +135,12 @@ pub struct RoomEventCacheState {
 
     /// A handle to the shared back-pagination queue.
     back_pagination_queue: Option<BackPaginationQueue>,
+
+    /// Removals of events that live only in the store, flushed ahead of the
+    /// linked chunk queue by the next [`StateLockWriteGuard::propagate_changes`]
+    /// so they are written together with the items pushed after them (#2011).
+    /// Only safe because removals precede pushes in the store.
+    pending_store_only_updates: Vec<Update<Event, Gap>>,
 }
 
 impl RoomEventCacheState {
@@ -227,6 +233,7 @@ impl RoomEventCacheState {
             waited_for_initial_prev_token: false,
             subscribers_handle: Default::default(),
             back_pagination_queue,
+            pending_store_only_updates: Vec::new(),
             pending_redactions,
             gap_topology_generation: 0,
             gap_snapshot_id: NEXT_GAP_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed),
@@ -880,17 +887,19 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         cached.raw().deserialize().map(|event| event.is_redacted()).unwrap_or(false)
     }
 
-    /// Remove events by their position, in `EventLinkedChunk` and in
-    /// `EventCacheStore`.
+    /// Remove events by their position in `EventLinkedChunk`, and stage their
+    /// removal from `EventCacheStore` for the next
+    /// [`Self::propagate_changes`]: both halves must reach the store in one
+    /// transaction (#2011).
     ///
     /// This method is purposely isolated because it must ensure that positions
     /// are sorted appropriately or it can be disastrous.
     #[instrument(skip_all)]
-    pub async fn remove_events(
+    pub fn remove_events(
         &mut self,
         in_memory_events: Vec<(OwnedEventId, Position)>,
         in_store_events: Vec<(OwnedEventId, Position)>,
-    ) -> Result<(), EventCacheError> {
+    ) {
         // In-store events.
         if !in_store_events.is_empty() {
             let mut positions = in_store_events
@@ -903,13 +912,16 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             let updates =
                 positions.into_iter().map(|pos| Update::RemoveItem { at: pos }).collect::<Vec<_>>();
 
-            self.apply_store_only_updates(updates).await?;
+            // Keep the order tracker in step with what is about to be written,
+            // then hand the updates to the next propagation.
+            self.state.room_linked_chunk.order_tracker.map_updates(&updates);
+            self.state.pending_store_only_updates.extend(updates);
         }
 
         // In-memory events.
         if in_memory_events.is_empty() {
             // Nothing else to do, return early.
-            return Ok(());
+            return;
         }
 
         // `remove_events_by_position` is responsible of sorting positions.
@@ -919,8 +931,6 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                 in_memory_events.into_iter().map(|(_event_id, position)| position).collect(),
             )
             .expect("failed to remove an event");
-
-        self.propagate_changes().await
     }
 
     /// Rebuild the pending-redaction map from the store, re-applying any
@@ -973,8 +983,11 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         Ok(())
     }
 
+    /// Write everything the linked chunk has queued, preceded by the staged
+    /// store-only removals, in a single store transaction.
     pub(super) async fn propagate_changes(&mut self) -> Result<(), EventCacheError> {
-        let updates = self.state.room_linked_chunk.store_updates().take();
+        let mut updates = std::mem::take(&mut self.state.pending_store_only_updates);
+        updates.extend(self.state.room_linked_chunk.store_updates().take());
 
         self.send_updates_to_store(updates).await
     }
@@ -1114,7 +1127,7 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         // We don't have to worry the removals can change the position of the
         // existing events, because we are pushing all _new_ `events` at the
         // back.
-        self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids).await?;
+        self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids);
 
         self.redact_pending_events(&mut events);
 

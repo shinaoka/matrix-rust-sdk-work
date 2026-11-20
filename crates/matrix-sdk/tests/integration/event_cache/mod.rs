@@ -5,7 +5,7 @@ use eyeball_im::VectorDiff;
 use futures_util::FutureExt;
 use imbl::Vector;
 use matrix_sdk::{
-    assert_let_timeout, assert_next_matches_with_timeout,
+    Client, assert_let_timeout, assert_next_matches_with_timeout,
     deserialized_responses::TimelineEvent,
     event_cache::{
         BackPaginationOutcome, EventCacheError, EventsOrigin, PaginationStatus,
@@ -14,7 +14,8 @@ use matrix_sdk::{
         RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome, TimelineVectorDiffs,
     },
     linked_chunk::{
-        ChunkIdentifier, LinkedChunkId, Position, Update, lazy_loader::from_all_chunks,
+        ChunkContent, ChunkIdentifier, LinkedChunkId, Position, Update,
+        lazy_loader::from_all_chunks,
     },
     store::StoreConfig,
     test_utils::{
@@ -24,12 +25,12 @@ use matrix_sdk::{
 };
 use matrix_sdk_base::event_cache::{
     Gap,
-    store::{EventCacheStore, MemoryStore},
+    store::{ControlledMemoryStore, EventCacheStore, MemoryStore},
 };
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk_test::{JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use ruma::{
-    EventId, OwnedEventId, event_id,
+    EventId, OwnedEventId, RoomId, event_id,
     events::{
         AnySyncMessageLikeEvent, AnySyncTimelineEvent, AnyTimelineEvent, TimelineEventType,
         room::message::{RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
@@ -1798,6 +1799,134 @@ async fn test_no_gap_stored_after_deduplicated_sync() {
         assert_event_matches_msg(&events[2], "sup");
         assert_eq!(events.len(), 3);
     }
+}
+
+/// #2011: a deduplicated sync removes the copy of an event it already knows and
+/// pushes the copies it just delivered. The removal must not reach the store
+/// without the push: written apart, a shutdown that cancels the sync task
+/// between the two transactions leaves a chunk with no items, and a restore
+/// then shows an empty timeline until the server replays it.
+///
+/// Both halves of the deduplication are covered: an event resident in memory,
+/// and one that only the store holds (its chunk was unloaded).
+#[async_test]
+async fn test_deduplicated_sync_writes_a_removal_with_its_replacement() {
+    let server = MatrixMockServer::new().await;
+
+    // Records what each store transaction writes.
+    let event_cache_store = Arc::new(ControlledMemoryStore::new());
+    let store_config = StoreConfig::new(CrossProcessLockConfig::multi_process("dedup-2011"))
+        .event_cache_store(event_cache_store.clone());
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.store_config(store_config))
+        .build()
+        .await;
+
+    let room_id = room_id!("!dedup-write:example.org");
+    let f = EventFactory::new().room(room_id).sender(user_id!("@a:b.c"));
+    let first = f.text_msg("first").event_id(event_id!("$1")).into_raw_sync();
+    let second = f.text_msg("second").event_id(event_id!("$2")).into_raw_sync();
+    let third = f.text_msg("third").event_id(event_id!("$3")).into_raw_sync();
+    let fourth = f.text_msg("fourth").event_id(event_id!("$4")).into_raw_sync();
+
+    server
+        .sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(first.clone()))
+        .await;
+
+    let (room_event_cache, _drop_handles) =
+        client.event_cache().unwrap().room(room_id).await.unwrap();
+
+    // Subscribe, so `$1` is resident in memory.
+    let (events, _subscriber) = room_event_cache.subscribe().await.unwrap();
+    assert!(events.iter().any(|event| event.event_id() == Some(event_id!("$1"))));
+
+    // Round one: re-deliver the in-memory `$1` along with a new event.
+    let writes_before = event_cache_store.recorded_writes().len();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(first.clone())
+                .add_timeline_event(second.clone()),
+        )
+        .await;
+    wait_for_linked_event(&client, room_id, event_id!("$2")).await;
+    assert_single_removal_with_push(&event_cache_store, writes_before);
+
+    // Round two: a limited sync unloads the chunk holding `$1`, so the store
+    // owns the only copy of it.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("t0")
+                .add_timeline_event(third.clone()),
+        )
+        .await;
+    wait_for_linked_event(&client, room_id, event_id!("$3")).await;
+    let (events, _subscriber) = room_event_cache.subscribe().await.unwrap();
+    assert!(
+        events.iter().all(|event| event.event_id() != Some(event_id!("$1"))),
+        "the chunk holding `$1` must have been unloaded"
+    );
+
+    // The same event again, now only known to the store.
+    let writes_before = event_cache_store.recorded_writes().len();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(first)
+                .add_timeline_event(fourth.clone()),
+        )
+        .await;
+    wait_for_linked_event(&client, room_id, event_id!("$4")).await;
+    assert_single_removal_with_push(&event_cache_store, writes_before);
+}
+
+/// Wait until the store links `event_id` in the room's event cache.
+async fn wait_for_linked_event(client: &Client, room_id: &RoomId, event_id: &EventId) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if linked_in_store(client, room_id, event_id).await {
+                return;
+            }
+            yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the store never linked {event_id}"));
+}
+
+async fn linked_in_store(client: &Client, room_id: &RoomId, event_id: &EventId) -> bool {
+    let store = client.event_cache_store().lock().await.unwrap();
+    let store = store.as_clean().expect("the event cache store is unlocked");
+    let chunks = store.load_all_chunks(LinkedChunkId::Room(room_id)).await.unwrap();
+
+    chunks.iter().any(|chunk| match &chunk.content {
+        ChunkContent::Items(items) => items.iter().any(|event| event.event_id() == Some(event_id)),
+        ChunkContent::Gap(_) => false,
+    })
+}
+
+/// The store transactions written after `writes_before` are exactly one, and the
+/// one that removes an item is the one that pushes its replacement.
+fn assert_single_removal_with_push(store: &ControlledMemoryStore, writes_before: usize) {
+    let writes = store.recorded_writes().split_off(writes_before);
+
+    assert_eq!(writes.len(), 1, "the removal and its replacement must be one store transaction");
+
+    let updates = &writes[0];
+    assert!(
+        updates.iter().any(|update| matches!(update, Update::RemoveItem { .. })),
+        "the deduplicated sync must remove the stale copy"
+    );
+    assert!(
+        updates.iter().any(|update| matches!(update, Update::PushItems { .. })),
+        "the deduplicated sync must push the replacements in the same transaction"
+    );
 }
 
 #[async_test]
