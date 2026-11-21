@@ -86,6 +86,7 @@ pub use self::{
         pagination::{BackPaginationOutcome, PaginationStatus},
         pinned_events::PinnedEventsCache,
         room::{
+            EventLocalWindow,
             RoomEventCache,
             RoomEventCacheGenericUpdate,
             RoomEventCacheUpdate,

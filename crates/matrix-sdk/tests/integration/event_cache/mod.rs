@@ -49,6 +49,7 @@ use tokio::{
 };
 use wiremock::ResponseTemplate;
 
+mod event_focused;
 mod read_receipts;
 mod threads;
 

@@ -16,6 +16,7 @@
 // docs/upstream/matrix-rust-sdk-feedback.md in the Koushi repository.
 
 mod live_tail;
+mod local_window;
 pub mod pagination;
 mod state;
 mod updates;
@@ -46,6 +47,7 @@ use tracing::{instrument, trace, warn};
 
 use self::pagination::{RoomPagination, RoomTimelineGapDescriptor};
 pub use self::{
+    local_window::EventLocalWindow,
     state::RoomEventCacheState,
     updates::{
         RoomEventCacheGenericUpdate, RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdate,
@@ -375,6 +377,25 @@ impl RoomEventCache {
     /// storage.
     pub async fn find_event(&self, event_id: &EventId) -> Result<Option<Event>> {
         Ok(self.inner.state.read().await?.find_event(event_id).await?.map(|(_loc, event)| event))
+    }
+
+    /// Try to find an event by ID, along with the contiguous, gap-free run of
+    /// in-memory events that contains it.
+    ///
+    /// Unlike [`Self::find_event`], this looks at the events loaded in memory
+    /// only, and it returns `None` for an event that is in the storage but not
+    /// loaded, or whose run cannot be paginated from both ends (see
+    /// [`EventLocalWindow`]).
+    ///
+    /// This is what lets a timeline start from the events the room already
+    /// holds, instead of fetching the same context from the server; the two
+    /// tokens of the run are the pagination tokens of the gaps that bound it,
+    /// so the timeline it seeds can still paginate both ways.
+    pub async fn find_event_local_window(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<EventLocalWindow>> {
+        Ok(self.inner.state.read().await?.local_window_around(event_id))
     }
 
     /// Try to find an event by ID in this room, along with its related events.

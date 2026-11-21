@@ -53,6 +53,7 @@ use super::{
     },
     TimelineVectorDiffs,
     event_linked_chunk::EventLinkedChunk,
+    room::EventLocalWindow,
 };
 use crate::{
     Room,
@@ -129,7 +130,10 @@ pub struct EventFocusedCacheState {
 impl EventFocusedCacheState {
     /// Initialize the cache from a focused event.
     ///
-    /// This uses `/context` to fetch the event with surrounding context.
+    /// When `local_window` is given and it covers the focused event usefully,
+    /// the cache is built from the events the room already holds, without any
+    /// request. Otherwise this uses `/context` to fetch the event with
+    /// surrounding context.
     ///
     /// This detects if the event is part of a thread and sets up the
     /// appropriate pagination mode.
@@ -138,16 +142,20 @@ impl EventFocusedCacheState {
     ///
     /// - Backward token (start): Gap at the front of the linked chunk.
     /// - Forward token (end): Gap at the back of the linked chunk.
-    #[instrument(skip(self), fields(room_id = %self.room.room_id(), event_id = %self.focused_event_id))]
+    #[instrument(skip(self, local_window), fields(room_id = %self.room.room_id(), event_id = %self.focused_event_id))]
     async fn start_from(
         &mut self,
         num_context_events: u16,
         thread_mode: EventFocusThreadMode,
+        local_window: Option<EventLocalWindow>,
     ) -> Result<StartFromResult> {
         self.initial_num_context_events = num_context_events;
         self.thread_mode = thread_mode;
 
-        let result = self.reload_impl().await?;
+        let result = match local_window.and_then(|window| self.seed_from_local_window(window)) {
+            Some(result) => result,
+            None => self.reload_impl().await?,
+        };
 
         // Empty the updates_as_vector_diffs(), since it's impossible for an
         // observer to have subscribed to this cache yet, since this code is
@@ -159,6 +167,62 @@ impl EventFocusedCacheState {
         let _ = self.chunk.updates_as_vector_diffs();
 
         Ok(result)
+    }
+
+    /// Build the linked chunk from a contiguous window of the room cache,
+    /// instead of asking the server for the same context.
+    ///
+    /// Returns `None` when the server's view is still needed, leaving the
+    /// caller to fall back to `/context`: a forced-thread timeline, and a
+    /// focused event that is itself part of a thread, both need `/context` to
+    /// locate the thread root and to know which events belong to the thread.
+    ///
+    /// The two tokens of the window become the front and back gaps, so both
+    /// pagination directions keep working exactly as after a `/context` start.
+    fn seed_from_local_window(&mut self, window: EventLocalWindow) -> Option<StartFromResult> {
+        let hide_thread_events = match self.thread_mode {
+            EventFocusThreadMode::ForceThread => {
+                trace!("forced thread mode needs /context to locate the thread root");
+                return None;
+            }
+
+            EventFocusThreadMode::Automatic { hide_threaded_events } => hide_threaded_events,
+        };
+
+        let focused_event = window.events.get(window.target_index)?;
+
+        // The room cache's window is the room's timeline, not the thread's: a
+        // threaded focused event must still go through `/context` to find its
+        // root and to keep only the thread's events.
+        if extract_thread_root(focused_event.raw()).is_some() {
+            trace!("the focused event belongs to a thread, /context is required");
+            return None;
+        }
+
+        let stage = crate::event_cache::focused_diagnostics::Stage::new("local_seed");
+
+        let mut events = window.events;
+
+        if hide_thread_events {
+            events.retain(|event| extract_thread_root(event.raw()).is_none());
+        }
+
+        let local_events = events.len();
+        let has_prev = window.prev_token.is_some();
+        let has_next = window.next_token.is_some();
+
+        self.pagination_mode = EventFocusedPaginationMode::Room { hide_thread_events };
+        self.add_initial_events_with_gaps(events.clone(), window.prev_token, window.next_token);
+        self.propagate_changes();
+
+        stage.finish(true);
+
+        trace!(
+            local_events,
+            has_prev, has_next, "seeded the event-focused linked chunk from the room cache"
+        );
+
+        Some(StartFromResult { events, has_prev, has_next })
     }
 
     /// Reload the event-focused cache: only the last events will be reloaded,
@@ -588,6 +652,7 @@ impl EventFocusedCache {
         state: &StateLock,
         linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
         number_of_initial_events: u16,
+        local_window: Option<EventLocalWindow>,
     ) -> Result<Self> {
         let room_id = room.room_id().to_owned();
         let thread_mode = key.thread_mode;
@@ -615,7 +680,7 @@ impl EventFocusedCache {
                     // Register only after initialization succeeds. Dropping or
                     // failing the context request must not
                     // strand a state without a cache handle.
-                    cache.start_from(number_of_initial_events, thread_mode).await?;
+                    cache.start_from(number_of_initial_events, thread_mode, local_window).await?;
                     Ok(cache)
                 },
             )
@@ -723,3 +788,165 @@ pub struct EventFocusedCacheKey {
 
 /// A small type to send updates in all channels.
 pub type EventFocusedCacheUpdateSender = Sender<TimelineVectorDiffs>;
+
+#[cfg(test)]
+mod tests {
+    use matrix_sdk_base::RoomState;
+    use matrix_sdk_test::{async_test, event_factory::EventFactory};
+    use ruma::{EventId, event_id, room_id, user_id};
+
+    use super::{
+        EventFocusThreadMode, EventFocusedCacheState, EventFocusedPaginationMode, EventLocalWindow,
+    };
+    use crate::{
+        event_cache::caches::event_linked_chunk::EventLinkedChunk, room::WeakRoom,
+        test_utils::client::MockClientBuilder,
+    };
+
+    async fn state(
+        thread_mode: EventFocusThreadMode,
+        focused_event_id: &EventId,
+    ) -> EventFocusedCacheState {
+        let room_id = room_id!("!focused-local-seed:example.org");
+        let client = MockClientBuilder::new(None).build().await;
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+
+        EventFocusedCacheState {
+            room: WeakRoom::new(client.downgrade(), room_id.to_owned()),
+            focused_event_id: focused_event_id.to_owned(),
+            pagination_mode: EventFocusedPaginationMode::Room { hide_thread_events: false },
+            chunk: EventLinkedChunk::new(),
+            initial_num_context_events: 0,
+            thread_mode,
+            update_sender: tokio::sync::broadcast::Sender::new(4),
+            linked_chunk_update_sender: tokio::sync::broadcast::Sender::new(4),
+        }
+    }
+
+    fn window(
+        events: &[(String, bool)],
+        target_index: usize,
+        prev_token: Option<&str>,
+        next_token: Option<&str>,
+    ) -> EventLocalWindow {
+        let factory = EventFactory::new()
+            .room(room_id!("!focused-local-seed:example.org"))
+            .sender(user_id!("@alice:example.org"));
+
+        EventLocalWindow {
+            events: events
+                .iter()
+                .map(|(event_id, threaded)| {
+                    let event_id = EventId::parse(event_id).unwrap();
+                    let builder = factory.text_msg("hello").event_id(&event_id);
+
+                    if *threaded {
+                        builder.in_thread(event_id!("$thread_root"), &event_id).into_event()
+                    } else {
+                        builder.into_event()
+                    }
+                })
+                .collect(),
+            target_index,
+            prev_token: prev_token.map(ToOwned::to_owned),
+            next_token: next_token.map(ToOwned::to_owned),
+        }
+    }
+
+    fn event_ids<I: IntoIterator<Item = matrix_sdk_base::event_cache::Event>>(
+        events: I,
+    ) -> Vec<String> {
+        events.into_iter().map(|event| event.event_id().unwrap().to_string()).collect()
+    }
+
+    /// A window becomes the linked chunk, with its two tokens as the two gaps,
+    /// so both pagination directions are still available.
+    #[async_test]
+    async fn test_a_local_window_becomes_the_two_gaps() {
+        let mut state =
+            state(EventFocusThreadMode::Automatic { hide_threaded_events: false }, event_id!("$2"))
+                .await;
+
+        let loaded = window(
+            &[("$1".to_owned(), false), ("$2".to_owned(), false), ("$3".to_owned(), false)],
+            1,
+            Some("older"),
+            Some("newer"),
+        );
+
+        let result = state.seed_from_local_window(loaded).expect("the window is usable");
+
+        assert_eq!(event_ids(result.events), ["$1", "$2", "$3"]);
+        assert!(result.has_prev);
+        assert!(result.has_next);
+
+        assert_eq!(
+            state.first_chunk_as_gap().map(|(_, gap)| gap.token),
+            Some("older".to_owned()),
+            "the window's older token is the front gap"
+        );
+        assert_eq!(
+            state.last_chunk_as_gap().map(|(_, gap)| gap.token),
+            Some("newer".to_owned()),
+            "the window's newer token is the back gap"
+        );
+
+        assert!(matches!(
+            state.pagination_mode,
+            EventFocusedPaginationMode::Room { hide_thread_events: false }
+        ));
+    }
+
+    /// A window that is the whole known timeline has no gaps at all, and says
+    /// so.
+    #[async_test]
+    async fn test_a_window_without_tokens_has_no_gaps() {
+        let mut state =
+            state(EventFocusThreadMode::Automatic { hide_threaded_events: false }, event_id!("$1"))
+                .await;
+
+        let loaded = window(&[("$1".to_owned(), false)], 0, None, None);
+
+        let result = state.seed_from_local_window(loaded).expect("the window is usable");
+
+        assert!(!result.has_prev);
+        assert!(!result.has_next);
+        assert!(state.first_chunk_as_gap().is_none());
+        assert!(state.last_chunk_as_gap().is_none());
+    }
+
+    /// Threads keep their server-side initialization: the room's window is the
+    /// room's timeline, not the thread's.
+    #[async_test]
+    async fn test_a_threaded_target_keeps_context() {
+        let mut automatic =
+            state(EventFocusThreadMode::Automatic { hide_threaded_events: false }, event_id!("$2"))
+                .await;
+
+        assert!(
+            automatic
+                .seed_from_local_window(window(
+                    &[("$1".to_owned(), false), ("$2".to_owned(), true)],
+                    1,
+                    Some("older"),
+                    Some("newer"),
+                ))
+                .is_none(),
+            "a threaded focused event needs /context to find its root"
+        );
+
+        let mut forced = state(EventFocusThreadMode::ForceThread, event_id!("$2")).await;
+
+        assert!(
+            forced
+                .seed_from_local_window(window(
+                    &[("$1".to_owned(), false), ("$2".to_owned(), false)],
+                    1,
+                    Some("older"),
+                    Some("newer"),
+                ))
+                .is_none(),
+            "a forced thread needs /context even for an unthreaded event"
+        );
+    }
+}
