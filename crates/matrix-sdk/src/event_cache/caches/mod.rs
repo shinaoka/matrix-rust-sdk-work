@@ -30,6 +30,7 @@ use ruma::{OwnedEventId, RoomId, room_version_rules::RoomVersionRules};
 use tokio::sync::{
     OnceCell, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, broadcast::Sender, mpsc,
 };
+use tracing::debug;
 
 use self::subscriber::AutoShrinkMessage;
 use super::{
@@ -291,12 +292,28 @@ impl Caches {
                 // Event-focused cache does not exist, let's create it.
                 Err(mut event_focused_caches) => {
                     let stage = super::focused_diagnostics::Stage::new("cache_initialization");
+
+                    // If the room already holds the focused event inside a
+                    // window it can paginate from both ends, the timeline can
+                    // start from those events instead of asking the server for
+                    // the very same context. Failing to look them up is not
+                    // fatal: `/context` remains the fallback.
+                    let local_window =
+                        match self.room.find_event_local_window(&key.focused_event_id).await {
+                            Ok(local_window) => local_window,
+                            Err(err) => {
+                                debug!("couldn't read the room cache's local window: {err}");
+                                None
+                            }
+                        };
+
                     let cache = event_focused::EventFocusedCache::new(
                         self.room.weak_room().clone(),
                         key.clone(),
                         &self.internals.state,
                         self.internals.linked_chunk_update_sender.clone(),
                         number_of_initial_events,
+                        local_window,
                     )
                     .await;
                     stage.finish(cache.is_ok());

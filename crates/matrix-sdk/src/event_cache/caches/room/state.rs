@@ -73,6 +73,7 @@ use super::{
         subscriber::SubscribersHandle,
     },
     RFindMapOutcome, RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdateSender,
+    local_window::{self, EventLocalWindow},
     sort_positions_descending,
 };
 #[cfg(feature = "e2e-encryption")]
@@ -423,6 +424,13 @@ impl<'a> StateLockReadGuard<'a, RoomEventCacheState> {
     /// Return the process-local room-cache snapshot identity.
     pub fn gap_snapshot_id(&self) -> u64 {
         self.state.gap_snapshot_id
+    }
+
+    /// See documentation of [`RoomEventCache::find_event_local_window`].
+    ///
+    /// [`RoomEventCache::find_event_local_window`]: super::RoomEventCache::find_event_local_window
+    pub fn local_window_around(&self, event_id: &EventId) -> Option<EventLocalWindow> {
+        local_window::window_around(&self.state.room_linked_chunk, event_id)
     }
 
     /// Return the monotonic persisted gap-topology generation.
