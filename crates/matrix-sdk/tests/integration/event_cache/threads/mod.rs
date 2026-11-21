@@ -2,20 +2,25 @@ mod read_receipts;
 mod unthreaded_pagination;
 mod unthreaded_receipts;
 
-use std::{ops::Not, time::Duration};
+use std::{ops::Not, sync::Arc, time::Duration};
 
 use eyeball_im::VectorDiff;
 use imbl::Vector;
+use matrix_sdk::linked_chunk::OwnedLinkedChunkId;
 use matrix_sdk::{
     Client, ThreadingSupport, assert_let_timeout,
     deserialized_responses::TimelineEvent,
     event_cache::{RoomEventCacheUpdate, Subscriber, ThreadEventCacheUpdate, TimelineVectorDiffs},
     sleep::sleep,
+    store::StoreConfig,
     test_utils::{
         assert_event_matches_msg,
         mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
     },
+    timeout::timeout,
 };
+use matrix_sdk_base::event_cache::store::ControlledMemoryStore;
+use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk_test::{JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use ruma::{
     OwnedEventId, OwnedRoomId, event_id,
@@ -59,6 +64,32 @@ async fn wait_for_initial_events(
     } else {
         events
     }
+}
+
+/// The next batch of timeline diffs published for the thread, skipping the
+/// summary updates that may arrive in between.
+async fn wait_for_thread_diffs(
+    stream: &mut broadcast::Receiver<ThreadEventCacheUpdate>,
+) -> Vec<VectorDiff<TimelineEvent>> {
+    let mut diffs = None;
+    timeout(
+        async {
+            while let Ok(update) = stream.recv().await {
+                if let ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                    diffs: update_diffs,
+                    ..
+                }) = update
+                {
+                    diffs = Some(update_diffs);
+                    return;
+                }
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the thread cache publishes its timeline update");
+    diffs.expect("the thread cache publishes its timeline update")
 }
 
 async fn client_with_threading_support(server: &MatrixMockServer) -> Client {
@@ -442,6 +473,147 @@ async fn thread_subscription_test_setup() -> ThreadSubscriptionTestSetup {
         thread_root: thread_root.to_owned(),
         room_id: room_id.to_owned(),
     }
+}
+
+/// #2011: a deduplicated sync removes the cached copy of a thread event and
+/// pushes the copies it just delivered. Both halves must reach the store in one
+/// transaction: written apart, a shutdown that cancels the sync task between
+/// the two commits leaves a chunk with no items, and a restore then shows an
+/// empty thread until the server replays it.
+///
+/// Both halves of the deduplication are covered: an event resident in memory,
+/// and one that only the store holds (its chunk was unloaded).
+#[async_test]
+async fn test_deduplicated_thread_sync_writes_a_removal_with_its_replacement() {
+    let server = MatrixMockServer::new().await;
+
+    // Records what each store transaction writes.
+    let event_cache_store = Arc::new(ControlledMemoryStore::new());
+    let store_config = StoreConfig::new(CrossProcessLockConfig::multi_process("dedup-thread-2011"))
+        .event_cache_store(event_cache_store.clone());
+    let client = server
+        .client_builder()
+        .on_builder(|builder| {
+            builder
+                .with_threading_support(ThreadingSupport::Enabled { with_subscriptions: false })
+                .store_config(store_config)
+        })
+        .build()
+        .await;
+
+    let event_cache = client.event_cache().unwrap();
+    let room_id = room_id!("!omelette:fromage.fr");
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+
+    let thread_root = event_id!("$thread_root");
+    let first_reply = f
+        .text_msg("hey there")
+        .in_thread(thread_root, thread_root)
+        .event_id(event_id!("$first_reply"))
+        .into_raw_timeline();
+    let second_reply = f
+        .text_msg("hoy!")
+        .in_thread(thread_root, event_id!("$first_reply"))
+        .event_id(event_id!("$second_reply"))
+        .into_raw_timeline();
+    let third_reply = f
+        .text_msg("again")
+        .in_thread(thread_root, event_id!("$second_reply"))
+        .event_id(event_id!("$third_reply"))
+        .into_raw_timeline();
+    let fourth_reply = f
+        .text_msg("once more")
+        .in_thread(thread_root, event_id!("$third_reply"))
+        .event_id(event_id!("$fourth_reply"))
+        .into_raw_timeline();
+    let limited_reply = f
+        .text_msg("after the gap")
+        .in_thread(thread_root, event_id!("$fourth_reply"))
+        .event_id(event_id!("$limited_reply"))
+        .into_raw_timeline();
+
+    // A room with a thread of two replies.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_bulk(vec![first_reply.cast(), second_reply.clone().cast()]),
+        )
+        .await;
+
+    let (thread_event_cache, _drop_handles) =
+        event_cache.thread(room_id, thread_root).await.unwrap();
+    let (events, mut thread_stream) = thread_event_cache.subscribe().await.unwrap();
+    let events = wait_for_initial_events(events, &mut thread_stream).await;
+    assert_eq!(events.len(), 2);
+
+    // Round one: re-deliver the in-memory `$second_reply` along with a new reply.
+    let writes_before = event_cache_store.recorded_writes().len();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_bulk(vec![second_reply.clone().cast(), third_reply.clone().cast()]),
+        )
+        .await;
+
+    // The diffs announce the removal of `$second_reply` and the re-append of
+    // both delivered replies, and they are sent after that sync's store write.
+    let diffs = wait_for_thread_diffs(&mut thread_stream).await;
+    assert!(
+        diffs.iter().any(|diff| matches!(diff, VectorDiff::Remove { .. })),
+        "the stale copy must be removed in memory too: {diffs:?}"
+    );
+
+    let thread_chunk = OwnedLinkedChunkId::Thread(room_id.to_owned(), thread_root.to_owned());
+    crate::event_cache::assert_removal_is_written_with_its_replacement(
+        &event_cache_store,
+        writes_before,
+        thread_chunk,
+    );
+
+    // Round two: a limited sync unloads the chunk holding `$second_reply`, so the
+    // store owns the only copy of it.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("t0")
+                .add_timeline_bulk(vec![limited_reply.cast()]),
+        )
+        .await;
+    // The limited sync appends its reply; the summaries in between are skipped.
+    wait_for_thread_diffs(&mut thread_stream).await;
+
+    let (events, _subscriber) = thread_event_cache.subscribe().await.unwrap();
+    assert!(
+        events.iter().all(|event| event.event_id() != Some(event_id!("$second_reply"))),
+        "the chunk holding `$second_reply` must have been unloaded"
+    );
+
+    // The same reply again, now only known to the store.
+    let writes_before = event_cache_store.recorded_writes().len();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_bulk(vec![second_reply.cast(), fourth_reply.cast()]),
+        )
+        .await;
+
+    let diffs = wait_for_thread_diffs(&mut thread_stream).await;
+    assert!(
+        diffs.iter().any(|diff| matches!(diff, VectorDiff::Append { .. })),
+        "the delivered replies must be appended in memory too: {diffs:?}"
+    );
+
+    let thread_chunk = OwnedLinkedChunkId::Thread(room_id.to_owned(), thread_root.to_owned());
+    crate::event_cache::assert_removal_is_written_with_its_replacement(
+        &event_cache_store,
+        writes_before,
+        thread_chunk,
+    );
 }
 
 #[async_test]

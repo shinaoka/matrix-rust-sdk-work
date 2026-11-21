@@ -119,6 +119,12 @@ pub struct ThreadEventCacheState {
     /// later must be redacted before it reaches the thread chunk or the
     /// store.
     pending_redactions: Arc<Mutex<HashMap<OwnedEventId, Event>>>,
+
+    /// Removals of events that live only in the store, flushed ahead of the
+    /// linked chunk queue by the next [`Self::propagate_changes`] so they are
+    /// written together with the items pushed after them (#2011). Only safe
+    /// because removals precede pushes in the store.
+    pending_store_only_updates: Vec<Update<Event, Gap>>,
 }
 
 impl ThreadEventCacheState {
@@ -218,6 +224,7 @@ impl ThreadEventCacheState {
             waited_for_initial_prev_token: false,
             subscribers_handle: SubscribersHandle::default(),
             pending_redactions,
+            pending_store_only_updates: Vec::new(),
         })
     }
 
@@ -298,8 +305,11 @@ impl ThreadEventCacheState {
         Ok(())
     }
 
+    /// Write everything the linked chunk has queued, preceded by the staged
+    /// store-only removals, in a single store transaction.
     pub async fn propagate_changes(&mut self, store: &EventCacheStoreLockGuard) -> Result<()> {
-        let updates = self.thread_linked_chunk.store_updates().take();
+        let mut updates = std::mem::take(&mut self.pending_store_only_updates);
+        updates.extend(self.thread_linked_chunk.store_updates().take());
 
         self.send_updates_to_store(updates, store).await
     }
@@ -457,7 +467,7 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         // We don't have to worry about the removals can change the position of
         // the existing events, because we are pushing all _new_ `events` at the
         // back.
-        self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids).await?;
+        self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids);
 
         let mut events = events;
         self.redact_pending_events(&mut events);
@@ -816,16 +826,19 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         Ok(())
     }
 
-    /// Remove events by their position, in `EventLinkedChunk`.
+    /// Remove events by their position in `EventLinkedChunk`, and stage their
+    /// removal from the store for the next
+    /// [`ThreadEventCacheState::propagate_changes`]: both halves must reach the
+    /// store in one transaction (#2011).
     ///
     /// This method is purposely isolated because it must ensure that positions
     /// are sorted appropriately or it can be disastrous.
     #[instrument(skip_all)]
-    pub async fn remove_events(
+    pub fn remove_events(
         &mut self,
         in_memory_events: Vec<(OwnedEventId, Position)>,
         in_store_events: Vec<(OwnedEventId, Position)>,
-    ) -> Result<()> {
+    ) {
         // In-store events.
         if !in_store_events.is_empty() {
             let mut positions = in_store_events
@@ -838,13 +851,16 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
             let updates =
                 positions.into_iter().map(|pos| Update::RemoveItem { at: pos }).collect::<Vec<_>>();
 
-            self.apply_store_only_updates(updates).await?;
+            // Keep the order tracker in step with what is about to be written,
+            // then hand the updates to the next propagation.
+            self.state.thread_linked_chunk.order_tracker.map_updates(&updates);
+            self.state.pending_store_only_updates.extend(updates);
         }
 
         // In-memory events.
         if in_memory_events.is_empty() {
             // Nothing else to do, return early.
-            return Ok(());
+            return;
         }
 
         // `remove_events_by_position` is responsible of sorting positions.
@@ -854,8 +870,6 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
                 in_memory_events.into_iter().map(|(_event_id, position)| position).collect(),
             )
             .expect("failed to remove an event");
-
-        self.state.propagate_changes(&self.store).await
     }
 
     /// Automatically shrink the thread if there are no more subscribers, as
@@ -882,16 +896,6 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         } else {
             Ok(None)
         }
-    }
-
-    /// Apply some updates that are effective only on the store itself.
-    ///
-    /// This method should be used only for updates that happen _outside_ the
-    /// in-memory linked chunk. Such updates must be applied onto the ordering
-    /// tracker as well as to the persistent storage.
-    async fn apply_store_only_updates(&mut self, updates: Vec<Update<Event, Gap>>) -> Result<()> {
-        self.state.thread_linked_chunk.order_tracker.map_updates(&updates);
-        self.state.send_updates_to_store(updates, &self.store).await
     }
 
     /// Try to locate the events in the linked chunk corresponding to the given

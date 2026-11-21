@@ -1,14 +1,15 @@
 use std::{ops::Not as _, sync::Arc};
 
+use eyeball_im::VectorDiff;
 use matrix_sdk::{
     Room,
-    linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
+    linked_chunk::{ChunkIdentifier, LinkedChunkId, OwnedLinkedChunkId, Position, Update},
     room::IncludeRelations,
     store::StoreConfig,
     test_utils::mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
     timeout::timeout,
 };
-use matrix_sdk_base::event_cache::store::{EventCacheStore, MemoryStore};
+use matrix_sdk_base::event_cache::store::{ControlledMemoryStore, EventCacheStore, MemoryStore};
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{EventId, event_id, owned_event_id, room_id, user_id};
@@ -416,5 +417,111 @@ async fn test_pinned_events_dont_include_thread_responses() {
         events[0].event_id().unwrap(),
         pinned_event_id,
         "The pinned event should have been loaded from network"
+    );
+}
+
+/// #2011: a deduplicated sync removes the cached copy of a pinned event's
+/// relation and pushes the copies it just delivered. Both halves must reach the
+/// store in one transaction: written apart, a shutdown that cancels the sync
+/// task between the two commits leaves a chunk with no items, and a restore
+/// then shows an empty pinned list until the server replays it.
+#[async_test]
+async fn test_deduplicated_pinned_sync_writes_a_removal_with_its_replacement() {
+    let room_id = room_id!("!galette-pinned-2011:saucisse.bzh");
+    let pinned_event_id = event_id!("$pinned_event");
+
+    let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.org"));
+
+    let pinned_event = f.text_msg("I'm pinned!").event_id(pinned_event_id).into_event();
+    let reaction = f.reaction(pinned_event_id, "ok").event_id(event_id!("$reaction")).into_event();
+    let new_reaction =
+        f.reaction(pinned_event_id, "nice").event_id(event_id!("$new_reaction")).into_event();
+
+    let server = MatrixMockServer::new().await;
+
+    // Records what each store transaction writes.
+    let event_cache_store = Arc::new(ControlledMemoryStore::new());
+    let store_config = StoreConfig::new(CrossProcessLockConfig::multi_process("dedup-pinned-2011"))
+        .event_cache_store(event_cache_store.clone());
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.store_config(store_config))
+        .build()
+        .await;
+
+    // The pinned list loads the pinned event, plus the relations to it.
+    server.mock_room_event().match_event_id().ok(pinned_event).mock_once().mount().await;
+    server
+        .mock_room_relations()
+        .match_subrequest(IncludeRelations::AllRelations)
+        .match_target_event(pinned_event_id.to_owned())
+        .ok(RoomRelationsResponseTemplate::default()
+            .events(vec![reaction.raw().clone().cast_unchecked()]))
+        .mock_once()
+        .mount()
+        .await;
+
+    let pinned_events_state = f.room_pinned_events(vec![pinned_event_id.to_owned()]);
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![pinned_events_state.into()]),
+        )
+        .await;
+
+    let event_cache = client.event_cache().unwrap();
+    let (pinned_events_cache, _drop_handles) = event_cache.pinned_events(room_id).await.unwrap();
+    let (events, mut subscriber) = pinned_events_cache.subscribe().await.unwrap();
+    let mut events = events.into();
+
+    // Wait for the background task to load the pinned event and its relation.
+    timeout(
+        async {
+            while let Ok(up) = subscriber.recv().await {
+                for diff in up.diffs {
+                    diff.apply(&mut events);
+                }
+                if events.len() == 2 {
+                    return;
+                }
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the pinned event and its relation are loaded from network");
+    assert_eq!(events.len(), 2);
+
+    let writes_before = event_cache_store.recorded_writes().len();
+
+    // A sync re-delivers the cached `$reaction` along with a new relation: the
+    // pinned cache removes its copy of `$reaction` and pushes both.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_bulk(vec![reaction.raw().clone(), new_reaction.raw().clone()]),
+        )
+        .await;
+
+    // The diffs announce the removal of `$reaction`, and they are sent after
+    // that sync's store write.
+    timeout(
+        async {
+            while let Ok(up) = subscriber.recv().await {
+                if up.diffs.iter().any(|diff| matches!(diff, VectorDiff::Remove { .. })) {
+                    return;
+                }
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the pinned cache publishes the removal of the stale relation");
+
+    crate::event_cache::assert_removal_is_written_with_its_replacement(
+        &event_cache_store,
+        writes_before,
+        OwnedLinkedChunkId::PinnedEvents(room_id.to_owned()),
     );
 }

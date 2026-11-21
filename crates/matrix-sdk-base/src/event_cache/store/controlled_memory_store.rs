@@ -26,8 +26,8 @@ use async_trait::async_trait;
 use matrix_sdk_common::{
     cross_process_lock::CrossProcessLockGeneration,
     linked_chunk::{
-        ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId, Position,
-        RawChunk, Update,
+        ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId,
+        OwnedLinkedChunkId, Position, RawChunk, Update,
     },
     sleep::sleep,
 };
@@ -48,8 +48,8 @@ use super::{
 /// Only [`EventCacheStore::handle_linked_chunk_updates`] and
 /// [`EventCacheStore::load_last_chunk`] are affected. All the other methods are
 /// forwarded to the inner [`MemoryStore`] as is.
-/// The updates of each store transaction, in write order.
-type RecordedWrites = Arc<Mutex<Vec<Vec<Update<Event, Gap>>>>>;
+/// The linked chunk and updates of each store transaction, in write order.
+type RecordedWrites = Arc<Mutex<Vec<(OwnedLinkedChunkId, Vec<Update<Event, Gap>>)>>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct ControlledMemoryStore {
@@ -59,8 +59,9 @@ pub struct ControlledMemoryStore {
     fail_last_chunk_load: Arc<AtomicBool>,
     write_started: Arc<Notify>,
     write_finished: Arc<Notify>,
-    /// The updates of each [`EventCacheStore::handle_linked_chunk_updates`]
-    /// call, so a test can pin what a path writes in one transaction.
+    /// The linked chunk and updates of each
+    /// [`EventCacheStore::handle_linked_chunk_updates`] call, so a test can pin
+    /// what a path writes in one transaction.
     recorded_writes: RecordedWrites,
 }
 
@@ -106,8 +107,9 @@ impl ControlledMemoryStore {
         self.fail_last_chunk_load.store(false, Ordering::SeqCst);
     }
 
-    /// The updates written so far, one entry per store transaction.
-    pub fn recorded_writes(&self) -> Vec<Vec<Update<Event, Gap>>> {
+    /// The updates written so far, one entry per store transaction, with the
+    /// linked chunk they belong to.
+    pub fn recorded_writes(&self) -> Vec<(OwnedLinkedChunkId, Vec<Update<Event, Gap>>)> {
         self.recorded_writes.lock().unwrap().clone()
     }
 
@@ -136,7 +138,7 @@ impl EventCacheStore for ControlledMemoryStore {
         linked_chunk_id: LinkedChunkId<'_>,
         updates: Vec<Update<Event, Gap>>,
     ) -> Result<(), Self::Error> {
-        self.recorded_writes.lock().unwrap().push(updates.clone());
+        self.recorded_writes.lock().unwrap().push((linked_chunk_id.to_owned(), updates.clone()));
         self.write_started.notify_one();
 
         // Polling is good enough for tests, and simpler than a proper wake up.

@@ -14,7 +14,7 @@ use matrix_sdk::{
         RoomTimelineGapRepairBudget, RoomTimelineGapRepairOutcome, TimelineVectorDiffs,
     },
     linked_chunk::{
-        ChunkContent, ChunkIdentifier, LinkedChunkId, Position, Update,
+        ChunkContent, ChunkIdentifier, LinkedChunkId, OwnedLinkedChunkId, Position, Update,
         lazy_loader::from_all_chunks,
     },
     store::StoreConfig,
@@ -1852,7 +1852,11 @@ async fn test_deduplicated_sync_writes_a_removal_with_its_replacement() {
         )
         .await;
     wait_for_linked_event(&client, room_id, event_id!("$2")).await;
-    assert_single_removal_with_push(&event_cache_store, writes_before);
+    assert_removal_is_written_with_its_replacement(
+        &event_cache_store,
+        writes_before,
+        OwnedLinkedChunkId::Room(room_id.to_owned()),
+    );
 
     // Round two: a limited sync unloads the chunk holding `$1`, so the store
     // owns the only copy of it.
@@ -1883,7 +1887,11 @@ async fn test_deduplicated_sync_writes_a_removal_with_its_replacement() {
         )
         .await;
     wait_for_linked_event(&client, room_id, event_id!("$4")).await;
-    assert_single_removal_with_push(&event_cache_store, writes_before);
+    assert_removal_is_written_with_its_replacement(
+        &event_cache_store,
+        writes_before,
+        OwnedLinkedChunkId::Room(room_id.to_owned()),
+    );
 }
 
 /// Wait until the store links `event_id` in the room's event cache.
@@ -1911,21 +1919,34 @@ async fn linked_in_store(client: &Client, room_id: &RoomId, event_id: &EventId) 
     })
 }
 
-/// The store transactions written after `writes_before` are exactly one, and the
-/// one that removes an item is the one that pushes its replacement.
-fn assert_single_removal_with_push(store: &ControlledMemoryStore, writes_before: usize) {
+/// `chunk`'s store transactions written after `writes_before` remove an item
+/// exactly once, and that transaction also pushes the replacement (#2011): a
+/// removal written on its own leaves a chunk with no items if the caller is
+/// cancelled before its push commits.
+pub(crate) fn assert_removal_is_written_with_its_replacement(
+    store: &ControlledMemoryStore,
+    writes_before: usize,
+    chunk: OwnedLinkedChunkId,
+) {
     let writes = store.recorded_writes().split_off(writes_before);
+    let removals = writes
+        .iter()
+        .filter(|(linked_chunk_id, updates)| {
+            *linked_chunk_id == chunk
+                && updates.iter().any(|u| matches!(u, Update::RemoveItem { .. }))
+        })
+        .map(|(_linked_chunk_id, updates)| updates)
+        .collect::<Vec<_>>();
 
-    assert_eq!(writes.len(), 1, "the removal and its replacement must be one store transaction");
-
-    let updates = &writes[0];
-    assert!(
-        updates.iter().any(|update| matches!(update, Update::RemoveItem { .. })),
-        "the deduplicated sync must remove the stale copy"
+    assert_eq!(
+        removals.len(),
+        1,
+        "the deduplicated sync must remove the stale copy of {chunk} once"
     );
     assert!(
-        updates.iter().any(|update| matches!(update, Update::PushItems { .. })),
-        "the deduplicated sync must push the replacements in the same transaction"
+        removals[0].iter().any(|u| matches!(u, Update::PushItems { .. })),
+        "the removal and its replacement must be one store transaction: {:?}",
+        removals[0]
     );
 }
 
