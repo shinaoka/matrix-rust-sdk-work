@@ -82,6 +82,12 @@ pub struct PinnedEventsCacheState {
     ///
     /// See also [`super::super::EventCacheInner::linked_chunk_update_sender`].
     linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
+
+    /// Removals of events that live only in the store, flushed ahead of the
+    /// linked chunk queue by the next [`StateLockWriteGuard::propagate_changes`]
+    /// so they are written together with the items pushed after them (#2011).
+    /// Only safe because removals precede pushes in the store.
+    pending_store_only_updates: Vec<Update<Event, Gap>>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -149,7 +155,7 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
         // We don't have to worry about the removals can change the position of
         // the existing events, because we are pushing all _new_ `events` at the
         // back.
-        self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids).await?;
+        self.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids);
 
         // We've found new relations; append them to the linked chunk.
         self.state.chunk.push_live_events(None, &events);
@@ -166,16 +172,18 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
         Ok(())
     }
 
-    /// Remove events by their position, in `EventLinkedChunk`.
+    /// Remove events by their position in `EventLinkedChunk`, and stage their
+    /// removal from the store for the next [`Self::propagate_changes`]: both
+    /// halves must reach the store in one transaction (#2011).
     ///
     /// This method is purposely isolated because it must ensure that positions
     /// are sorted appropriately or it can be disastrous.
     #[instrument(skip_all)]
-    pub async fn remove_events(
+    pub fn remove_events(
         &mut self,
         in_memory_events: Vec<(OwnedEventId, Position)>,
         in_store_events: Vec<(OwnedEventId, Position)>,
-    ) -> Result<()> {
+    ) {
         // In-store events.
         if !in_store_events.is_empty() {
             let mut positions = in_store_events
@@ -188,13 +196,13 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
             let updates =
                 positions.into_iter().map(|pos| Update::RemoveItem { at: pos }).collect::<Vec<_>>();
 
-            self.apply_store_only_updates(updates).await?;
+            self.state.pending_store_only_updates.extend(updates);
         }
 
         // In-memory events.
         if in_memory_events.is_empty() {
             // Nothing else to do, return early.
-            return Ok(());
+            return;
         }
 
         // `remove_events_by_position` is responsible of sorting positions.
@@ -204,17 +212,6 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
                 in_memory_events.into_iter().map(|(_event_id, position)| position).collect(),
             )
             .expect("failed to remove an event");
-
-        self.propagate_changes().await
-    }
-
-    /// Apply some updates that are effective only on the store itself.
-    ///
-    /// This method should be used only for updates that happen _outside_ the
-    /// in-memory linked chunk. Such updates must be applied onto the persistent
-    /// storage.
-    async fn apply_store_only_updates(&mut self, updates: Vec<Update<Event, Gap>>) -> Result<()> {
-        self.send_updates_to_store(updates).await
     }
 
     /// If the given event is a redaction, try to retrieve the to-be-redacted
@@ -398,10 +395,11 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
         Ok(())
     }
 
-    /// Propagate the changes in this linked chunk to observers, and save the
-    /// changes on disk.
+    /// Save everything the linked chunk has queued, preceded by the staged
+    /// store-only removals, in a single store transaction.
     pub async fn propagate_changes(&mut self) -> Result<()> {
-        let updates = self.state.chunk.store_updates().take();
+        let mut updates = std::mem::take(&mut self.state.pending_store_only_updates);
+        updates.extend(self.state.chunk.store_updates().take());
 
         self.send_updates_to_store(updates).await
     }
@@ -515,6 +513,7 @@ impl PinnedEventsCache {
                         chunk: EventLinkedChunk::new(),
                         update_sender: PinnedEventsCacheUpdateSender::new(),
                         linked_chunk_update_sender,
+                        pending_store_only_updates: Vec::new(),
                     })
                 },
             )

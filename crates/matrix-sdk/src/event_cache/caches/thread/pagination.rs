@@ -363,9 +363,7 @@ impl PaginatedCache for ThreadEventCacheWrapper {
 
         if !all_duplicates {
             // Let's forget all the previous events.
-            state
-                .remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids)
-                .await?;
+            state.remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids);
         } else {
             // All new events are duplicated, they can all be ignored.
             events.clear();
